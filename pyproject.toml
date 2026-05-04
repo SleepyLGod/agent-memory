@@ -1,0 +1,25 @@
+[project]
+name = "dspy-memory"
+version = "0.1.0"
+description = "DSPy-compatible memory policy experiments"
+readme = "README.md"
+authors = [
+    { name = "Von", email = "haodong.lu.me@gmail.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "dspy>=3.2.0",
+    "python-dotenv>=1.2.2",
+]
+
+[build-system]
+requires = ["uv_build>=0.8.11,<0.9.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.2.0",
+    "nbclient>=0.10.4",
+    "nbformat>=5.10.4",
+    "notebook>=7.5.6",
+]
