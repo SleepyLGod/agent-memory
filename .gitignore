@@ -78,6 +78,9 @@ target/
 # Jupyter Notebook
 .ipynb_checkpoints
 
+# dspy-memory examples
+examples/_out/
+
 # IPython
 profile_default/
 ipython_config.py
@@ -216,3 +219,5 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+docs/design/history/

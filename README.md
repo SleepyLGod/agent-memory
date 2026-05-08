@@ -1,13 +1,31 @@
-# dspy-memory
+# agent-memory
 
-`dspy-memory` is an early research package for designing DSPy-compatible memory
-policies. The current goal is to explore how memory schemas, workflows, and
-semantic operators can map cleanly onto DSPy-style signatures, modules, and
-optimizers.
+`agent-memory` is an early semantic memory framework for agent developers.
+The design goal is to help agent applications maintain durable memory over a
+growing log of messages and events.
 
-This repository is intentionally minimal right now. It contains the Python
-package skeleton, a `uv` environment, DSPy dependencies, and notebook support.
-The concrete memory API is not implemented yet.
+The current design centers on four ideas:
+
+- `Log`: the append-only source of messages or events.
+- `Views`: materialized semantic memory derived from the log or other views.
+- `Semantic operators`: operations such as grouping, mapping, filtering, and ranking that may compile to optimizable LM programs.
+- `Stores`: physical materialization choices for logs and views.
+
+DSPy may be used underneath as a compilation and optimization backend for
+semantic operators. It is not the product identity, and the public API is still
+under active design.
+
+## Status
+
+This repository is in design/prototype mode. The current source code should be
+treated as experimental and may be deleted or rewritten as the interface
+stabilizes. Do not treat the runtime prototype as the API contract.
+
+The main current design note is:
+
+```text
+docs/design/user-interface-design.md
+```
 
 ## Environment
 
@@ -17,29 +35,8 @@ Install and sync dependencies with `uv`:
 uv sync
 ```
 
-Run a quick import check:
+Register the local Jupyter kernel if notebook exploration is needed:
 
 ```bash
-uv run python -c "import dspy; import dspy_memory; print('ok')"
+uv run python -m ipykernel install --user --name agent-memory --display-name "Python (agent-memory)"
 ```
-
-Register the local Jupyter kernel:
-
-```bash
-uv run python -m ipykernel install --user --name dspy-memory --display-name "Python (dspy-memory)"
-```
-
-## Planned Direction
-
-The intended authoring style is:
-
-```python
-import dspy_memory as dm
-
-schema = dm.schema("topic")
-memory = dm.Claude(schema)
-```
-
-Future work will add the actual schema layer, workflow layer, semantic
-operators, storage backends, and example policies. Until then, this repository
-should not claim runtime memory behavior.
