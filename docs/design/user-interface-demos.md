@@ -1,19 +1,15 @@
-# Claude Code And Zep User Interface Demos
+# User Interface Demos
 
 This document is a source-backed design demo. It is not an implementation specification and does not claim that the APIs below exist today.
 
-The goal is to test whether the current `agent-memory` interface direction can express two realistic memory systems:
-
-- Claude Code-style file/topic memory.
-- Zep / Graphiti-style temporal graph memory.
-
-The proposed authoring surface is:
+The proposed authoring surface:
 
 - `am.Memory` for a memory policy.
 - `am.Log()` for append-only messages/events.
 - Pydantic `BaseModel` schemas for materialized views.
 - Chainable `sem_*` operators for semantic transformations.
-- Per-view `stores={...}` bindings for physical materialization.
+- Class-level `STORES = {...}` bindings for physical materialization.
+- Optional class-level `FRESHNESS = {...}` and `REFRESH_MODE = {...}` targets.
 
 ## 1. Source-Backed Summary
 
@@ -74,10 +70,8 @@ from pydantic import BaseModel, Field
 import agent_memory as am
 
 
-# Framework note: LogEntry is the default raw log row schema for this demo.
-# This comment is not compiler-visible prompt text. The class docstring and
-# field descriptions may be used by semantic operators or optimizers, so they
-# should describe the data itself rather than framework metadata.
+# Framework note: LogEntry is the default raw log table schema for this demo, not a view
+# policy writer can also override that
 class LogEntry(BaseModel):
     """A raw conversation event available to memory update policies."""
 
@@ -86,7 +80,7 @@ class LogEntry(BaseModel):
     timestamp: str | None = Field(default=None, description="event timestamp if available")
 
 
-# Policy-writer-specified materialized view schemas.
+# Policy-writer-specified materialized view schemas:
 class Topic(BaseModel):
     """A durable Claude Code-style topic memory file."""
 
@@ -114,7 +108,7 @@ class Catalog(BaseModel):
 
 All code below is proposed demo syntax.
 
-The semantic operators, repeated assignment capture, stores, and `refresh(...)` rules are candidate APIs, not implemented guarantees.
+The semantic operators, `STORES`, `FRESHNESS`, and `REFRESH_MODE` are candidate APIs, not implemented guarantees.
 
 ```python
 class ClaudeCodeMemory(am.Memory):
@@ -126,10 +120,31 @@ class ClaudeCodeMemory(am.Memory):
     code structure, git history, or facts already documented elsewhere.
     """
 
-    stores = {
-        "log": am.stores.JSONL(".memory/log.jsonl"),
-        "topic": am.stores.Directory(".memory/topics"),
-        "catalog": am.stores.Markdown(".memory/MEMORY.md"),
+    STORES = {
+        "log": {
+            "type": "jsonl",
+            "path": ".memory/log.jsonl",
+        },
+        "topic": {
+            "type": "directory",
+            "path": ".memory/topics",
+            "format": "markdown",
+        },
+        "catalog": {
+            "type": "markdown",
+            "path": ".memory/MEMORY.md",
+        },
+    }
+
+    # Optional. If omitted, runtime chooses update timing and strategy.
+    FRESHNESS = {
+        "topic": "10m",
+        "catalog": "1m",
+    }
+
+    REFRESH_MODE = {
+        "topic": "continuous",
+        "catalog": "full",
     }
 
     log = am.Log(LogEntry)
@@ -138,23 +153,48 @@ class ClaudeCodeMemory(am.Memory):
         Topic,
         """
         Analyze only the recent messages selected by the runtime for this
-        refresh and update durable topic memory files.
+        maintenance pass, together with existing topic metadata supplied by the
+        runtime, and update durable topic memory files.
 
-        Save durable memory only when it fits one of the Claude Code memory
-        types: user, feedback, project, or reference. Do not save code patterns,
-        architecture, file paths, project structure, git history, debugging
-        recipes, facts already documented in CLAUDE.md, or ephemeral task state.
+        Save durable memory only when it fits one of these Claude Code memory
+        types:
+
+        - user: stable information about the user's role, goals,
+          responsibilities, knowledge, preferences, or collaboration style that
+          should shape future assistance.
+        - feedback: guidance about how to approach future work, including
+          corrections, things to avoid, and non-obvious approaches the user
+          validated. Preserve the reason and how to apply it.
+        - project: ongoing work context, goals, initiatives, bugs, incidents,
+          constraints, deadlines, or motivations that are not otherwise
+          derivable from the code or git history. Convert relative dates to
+          absolute dates.
+        - reference: pointers to external systems or resources, and why they
+          matter, so future sessions know where to look for up-to-date
+          information.
+
+        Do not save code patterns, conventions, architecture, file paths,
+        project structure, git history, recent changes, who-changed-what,
+        debugging recipes, facts already documented in CLAUDE.md, or ephemeral
+        in-progress task details. These exclusions still apply when the user
+        asks to save an activity log or PR list; preserve only the surprising
+        or non-obvious durable signal.
 
         Check existing memory metadata before writing. Update an existing topic
         memory instead of creating a duplicate. Organize memories semantically by
         topic, not chronologically. Correct or remove memories that become wrong
         or outdated.
 
+        Maintain each topic as one durable memory record with current
+        frontmatter-compatible fields: a stable name, a specific one-line
+        description for future relevance decisions, a valid type, and a concise
+        markdown body following the selected type's structure.
+
         If the user explicitly asks to remember something, save it immediately
         as the best-fitting type. If the user asks to forget something, remove
         the relevant memory.
         """
-    ).refresh(on="turn")
+    )
 
     catalog = topic.sem_map(
         Catalog,
@@ -169,28 +209,7 @@ class ClaudeCodeMemory(am.Memory):
         line per entry, roughly under 150 characters. Remove pointers to stale,
         wrong, or superseded topic memories.
         """
-    ).refresh(on="source")
-
-    # Repeated assignment to `topic` appends a self-maintenance rule for the
-    # same logical view. The previous materialized topic state is the main input.
-    # `log` and `catalog` are evidence/context for consolidation, not a second
-    # canonical Log -> Topic view definition.
-    topic = topic.sem_map(
-        Topic,
-        """
-        Periodically consolidate existing topic memories.
-
-        First orient from the current memory directory: inspect the catalog and
-        skim existing topic memories so you improve them rather than creating
-        duplicates. Use logs or session transcripts only as narrow evidence when
-        they contain signal worth persisting.
-
-        Merge new signal into existing topic memories. Convert relative dates to
-        absolute dates. Delete or correct contradicted facts. Resolve conflicts
-        between memories. Keep topic memories durable, concise, and organized.
-        """,
-        context=[log, catalog],
-    ).refresh(every="24h", require={"sessions": 5})
+    )
 
     def query(self, query: str, *, k: int = 5):
         return self.topic.sem_topk(
@@ -213,13 +232,13 @@ class ClaudeCodeMemory(am.Memory):
         )
 ```
 
-**Explanitions**:
+**Explanations**:
 
-- The online `topic` rule represents Claude Code's background extraction path: recent log delta plus existing memory metadata updates durable topic files.
-- The periodic `topic` rule represents auto-dream consolidation: it operates on the existing topic state and may use log or catalog evidence, but it is not a second canonical `Log -> Topic` view path.
-- The online `sem_groupby(...)` rule intentionally represents extraction, topic grouping, and existing-topic update as one policy-level view query. The runtime
-  may lower it into multiple implementation steps such as candidate extraction, matching, merging, and storage writes. The user-facing API may not need a
-  separate `sem_map(...)` operator unless a custom workflow later wants to split those steps explicitly.
+- The `topic` rule represents Claude Code's background extraction path: recent log delta plus existing memory metadata updates durable topic files.
+- The `sem_groupby(...)` rule intentionally represents extraction, topic grouping, existing-topic update, and consolidation as one policy-level view query.
+- The runtime may lower this high-level `sem_groupby(...)` into multiple implementation steps such as `sem_filter(...)`, `sem_map(...)`, lower-level `sem_groupby(...)`, candidate matching, merging, periodic consolidation, and storage writes.
+- Claude Code's auto-dream consolidation is therefore modeled as runtime/lowering behavior for the same `topic` view, not as a second canonical `topic = topic.sem_map(...)` policy query.
+- `FRESHNESS` and `REFRESH_MODE` are optional maintenance targets. If omitted, the runtime chooses timing and strategy.
 
 ### Default And Override Stores
 
@@ -234,31 +253,33 @@ Users can override the physical layout without changing the logical policy:
 ```python
 memory = ClaudeCodeMemory(
     stores={
-        "log": am.stores.JSONL("/custom/memory/log.jsonl"),
-        "topic": am.stores.Directory("/custom/memory/topics"),
-        "catalog": am.stores.Markdown("/custom/memory/MEMORY.md"),
+        "log": {
+            "type": "jsonl",
+            "path": "/custom/memory/log.jsonl",
+        },
+        "topic": {
+            "type": "directory",
+            "path": "/custom/memory/topics",
+            "format": "markdown",
+        },
+        "catalog": {
+            "type": "markdown",
+            "path": "/custom/memory/MEMORY.md",
+        },
     }
 )
 ```
 
 The important interface question is whether a view such as `catalog` can be treated like any other materialized view while still being usable as explicit retrieval context. This demo assumes yes.
 
-### What This Demo Models
-
-- Topic memory files as Claude Code's primary durable memory object.
-- `MEMORY.md` as a catalog view over topic memory files, not a memory body.
-- Background extraction as a `Log -> Topic` materialized semantic view refresh.
-- Query-time relevant memory selection using topic metadata and catalog context.
-- Auto-dream-style consolidation as periodic self-maintenance over the same `Topic` view.
-
 ### What This Demo Does Not Model Yet
 
-- Team memory. Claude Code can maintain private and team memory directories with different scope rules. This demo only models one local memory directory.
-- KAIROS daily-log mode. That mode can be understood as a different refresh and materialization strategy: write append-only daily logs first, then distill them into topic files and `MEMORY.md` later. This demo models the standard topic-file mode directly.
-- Exact tool permission gates. Claude Code's extraction subagent is restricted to read tools, read-only Bash, and writes inside the memory directory. This demo expresses semantic behavior, not tool sandbox policy.
-- UI memory-saved notifications. Claude Code can add a system message after memory files are saved or improved. That notification is a transcript/UI
+- `[Store/runtime]` Team memory. Claude Code can maintain private and team memory directories with different scope rules. This demo only models one local memory directory.
+- `[API/runtime]` KAIROS daily-log mode. That mode can be understood as a different policy and materialization strategy: write append-only daily logs first, then distill them into topic files and `MEMORY.md` later. This demo models the standard topic-file mode directly.
+- `[Runtime]` Exact tool permission gates. Claude Code's extraction subagent is restricted to read tools, read-only Bash, and writes inside the memory directory. This demo expresses semantic behavior, not tool sandbox policy.
+- `[UI/runtime]` UI memory-saved notifications. Claude Code can add a system message after memory files are saved or improved. That notification is a transcript/UI
   event, not a durable memory view.
-- Exact runtime cursor, throttle, and coalescing. `lastMemoryMessageUuid` is the processed-message cursor that makes extraction consider only messages after the last successful run. `turnsSinceLastExtraction` is a turn-count throttle, so extraction does not have to run on every turn. In-progress coalescing prevents overlapping extraction runs from piling up.
+- `[Runtime]` Exact runtime cursor, throttle, and coalescing. `lastMemoryMessageUuid` is the processed-message cursor that makes extraction consider only messages after the last successful run. `turnsSinceLastExtraction` is a turn-count throttle, so extraction does not have to run on every turn. In-progress coalescing prevents overlapping extraction runs from piling up.
 
 ## 3. Zep / Graphiti Memory Demo
 
@@ -344,21 +365,70 @@ class ZepMemory(am.Memory):
     hybrid semantic, keyword, and graph-aware search.
     """
 
-    stores = {
-        "log": am.stores.JSONL(".memory/zep/log.jsonl"),
-        "episode": am.stores.Graph("neo4j://localhost:7687", label="Episodic"),
-        "entity": [
-            am.stores.Graph("neo4j://localhost:7687", label="Entity"),
-            am.stores.Vector("entity_name_embedding"),
-        ],
-        "relation": [
-            am.stores.Graph("neo4j://localhost:7687", relation="RELATES_TO"),
-            am.stores.Vector("fact_embedding"),
-        ],
-        "community": [
-            am.stores.Graph("neo4j://localhost:7687", label="Community"),
-            am.stores.Vector("community_name_embedding"),
-        ],
+    STORES = {
+        "log": {
+            "type": "jsonl",
+            "path": ".memory/zep/log.jsonl",
+        },
+        "episode": {
+            "type": "graph",
+            "uri": "neo4j://localhost:7687",
+            "label": "Episodic",
+        },
+        "entity": {
+            "primary": {
+                "type": "graph",
+                "uri": "neo4j://localhost:7687",
+                "label": "Entity",
+            },
+            "auxiliary": [
+                {
+                    "type": "vector",
+                    "collection": "entity_name_embedding",
+                    "field": "name",
+                },
+            ],
+        },
+        "relation": {
+            "primary": {
+                "type": "graph",
+                "uri": "neo4j://localhost:7687",
+                "relation": "RELATES_TO",
+            },
+            "auxiliary": [
+                {
+                    "type": "vector",
+                    "collection": "fact_embedding",
+                    "field": "fact",
+                },
+            ],
+        },
+        "community": {
+            "primary": {
+                "type": "graph",
+                "uri": "neo4j://localhost:7687",
+                "label": "Community",
+            },
+            "auxiliary": [
+                {
+                    "type": "vector",
+                    "collection": "community_name_embedding",
+                    "field": "name",
+                },
+            ],
+        },
+    }
+
+    FRESHNESS = {
+        "episode": "1m",
+        "entity": "10m",
+        "relation": "10m",
+    }
+
+    REFRESH_MODE = {
+        "episode": "continuous",
+        "entity": "continuous",
+        "relation": "continuous",
     }
 
     log = am.Log(ZepLogEvent)
@@ -374,7 +444,6 @@ class ZepMemory(am.Memory):
             provenance record for derived entities and relations.
             """,
         )
-        .refresh(on="add")
     )
 
     entity = (
@@ -382,40 +451,25 @@ class ZepMemory(am.Memory):
         .sem_map(
             Entity,
             """
-            Extract entity nodes from the current episode.
+            Extract, resolve, and maintain canonical entity nodes from episodes.
 
             For message episodes, extract the speaker and significant entities
             mentioned explicitly or implicitly in the current episode. Use
             recent previous episodes only for disambiguation. Do not extract
             relationships, actions, dates, times, or pronouns as entities.
+
+            Resolve extracted entities against existing entity memory. Reuse
+            canonical identities only when both names refer to the same
+            real-world object or concept. Do not merge entities that are merely
+            related, similar, or similarly named.
+
+            Preserve canonical entity identity after resolution. Update
+            attributes, labels, and summaries with important information from
+            the current episode and recent previous episodes when relevant.
             Use configured entity types when provided.
-            """,
-            context=episode.window(count=10),
-        )
-        .sem_join(
-            """
-            Resolve extracted entities against existing entity memory.
-
-            An extracted entity matches an existing entity only if both refer to
-            the same real-world object or concept. Do not merge entities that
-            are merely related, similar, or similarly named. Reuse the existing
-            identity when matched; otherwise keep a new entity.
-            """,
-            how="left",
-            context=episode.window(count=10),
-        )
-        .sem_map(
-            Entity,
-            """
-            Produce the maintained entity record.
-
-            Preserve the canonical entity identity after resolution. Update
-            attributes and summary with important information from the current
-            episode and recent previous episodes when relevant.
             """,
             context=[episode, episode.window(count=10)],
         )
-        .refresh(on="source")
     )
 
     relation = (
@@ -423,29 +477,22 @@ class ZepMemory(am.Memory):
         .sem_map(
             Relation,
             """
-            Extract factual relationships between resolved entities.
+            Extract, resolve, and maintain temporal factual relations between
+            resolved entities.
 
             Each fact must involve two distinct entities from the resolved
             entity view. Use entity identifiers from the resolved entities.
             Extract facts clearly stated or unambiguously implied by the current
             episode. Include relation type and temporal bounds when the episode
             provides explicit or resolvable time information.
-            """,
-            context=[entity, episode.window(count=10)],
-        )
-        .sem_join(
-            """
-            Resolve extracted facts against existing relation memory.
 
             Reuse existing facts when the new fact expresses identical factual
             information. Keep similar facts separate when they contain key
             differences. If a new fact contradicts existing facts, mark the
             older facts invalid instead of deleting them.
             """,
-            how="left",
             context=[episode, entity],
         )
-        .refresh(on="source")
     )
 
     community = (
@@ -461,7 +508,6 @@ class ZepMemory(am.Memory):
             """,
             context=relation,
         )
-        .refresh(mode="manual")
     )
 
     def query(self, query: str, *, k: int = 10):
@@ -484,21 +530,22 @@ class ZepMemory(am.Memory):
             k=min(k, 3),
         )
 
-        return am.pack(
-            facts=facts,
-            entities=entities,
-            communities=communities,
-            instruction="Return graph memory context useful for the agent query.",
-        )
+        return {
+            "facts": facts,
+            "entities": entities,
+            "communities": communities,
+        }
 ```
 
 ### Policy Semantics
 
-In this demo, a top-level assignment only defines or maintains a materialized view when the right-hand expression ends with  `.refresh(...)`. Intermediate  `sem_map(...)`, `sem_join(...)`, and `window(...)` calls are transient query stages inside that view rule.
+In this demo, a top-level assignment inside `am.Memory` defines a materialized view rule. Intermediate `sem_*` calls and `window(...)` calls are transient query stages inside that view rule.
 
-`window(...)` is a bounded relation used as data range or context. It is not a materialized view unless it is assigned to a memory attribute and refreshed.
+`window(...)` is a bounded relation used as data range or context. It is not a materialized view unless it is assigned to a memory attribute as a top-level view rule.
 
-An omitted-right `sem_join(...)` inside a refreshed view rule means an existing-state join: the current stage is joined against the existing state of the assignment target. For example, the `entity` rule lowers to extracted entity rows joined against the existing `entity` view before merge/update.
+The high-level `entity` and `relation` rules use stateful `sem_map(...)` to express extraction, candidate retrieval, duplicate resolution, contradiction handling, and MERGE-like effects as one logical view query.
+
+An omitted-right `sem_join(...)` remains an expert/lower-level expansion for existing-state matching. It is not required in the conceptual Zep demo.
 
 `MENTIONS`, `HAS_EPISODE`, and `NEXT_EPISODE` are structural or provenance links maintained by the runtime/store. They are not high-level semantic views in this demo.
 
@@ -509,47 +556,110 @@ memory = ZepMemory()
 
 custom_memory = ZepMemory(
     stores={
-        "log": am.stores.JSONL("./logs/zep.jsonl"),
-        "episode": am.stores.Graph("neo4j://localhost:7687", label="Episodic"),
-        "entity": [
-            am.stores.Graph("neo4j://localhost:7687", label="Entity"),
-            am.stores.Vector("entity_name_embedding"),
-        ],
-        "relation": [
-            am.stores.Graph("neo4j://localhost:7687", relation="RELATES_TO"),
-            am.stores.Vector("fact_embedding"),
-        ],
-        "community": [
-            am.stores.Graph("neo4j://localhost:7687", label="Community"),
-            am.stores.Vector("community_name_embedding"),
-        ],
+        "log": {
+            "type": "jsonl",
+            "path": "./logs/zep.jsonl",
+        },
+        "episode": {
+            "type": "graph",
+            "uri": "neo4j://localhost:7687",
+            "label": "Episodic",
+        },
+        "entity": {
+            "primary": {
+                "type": "graph",
+                "uri": "neo4j://localhost:7687",
+                "label": "Entity",
+            },
+            "auxiliary": [
+                {
+                    "type": "vector",
+                    "collection": "entity_name_embedding",
+                    "field": "name",
+                },
+            ],
+        },
+        "relation": {
+            "primary": {
+                "type": "graph",
+                "uri": "neo4j://localhost:7687",
+                "relation": "RELATES_TO",
+            },
+            "auxiliary": [
+                {
+                    "type": "vector",
+                    "collection": "fact_embedding",
+                    "field": "fact",
+                },
+            ],
+        },
+        "community": {
+            "primary": {
+                "type": "graph",
+                "uri": "neo4j://localhost:7687",
+                "label": "Community",
+            },
+            "auxiliary": [
+                {
+                    "type": "vector",
+                    "collection": "community_name_embedding",
+                    "field": "name",
+                },
+            ],
+        },
     }
 )
 ```
 
-Default stores are part of the memory style. Constructor-level `stores={...}` overrides change physical materialization without changing the logical policy. 
+Default stores are part of the memory style. Constructor-level `stores={...}` overrides change physical materialization without changing the logical policy.
 
 Graph storage and vector materialization are physical choices attached to logical views, not part of the schema definition.
 
-### What This Demo Models
-
-- Episode provenance as a durable `Episode` view.
-- Entity extraction, existing-state resolution, and entity summary/attribute updates.
-- Relation extraction, duplicate fact resolution, contradiction invalidation, and temporal fact fields.
-- Optional community maintenance as a manual view, matching Graphiti's opt-in community update path.
-- Query-time retrieval over relation, entity, and community views.
-
 ### What This Demo Does Not Model Yet
 
-- Custom entity types and excluded entity types.
-- Custom edge types and edge type maps.
-- Saga support, including `HAS_EPISODE` and `NEXT_EPISODE` links.
-- Raw episode content storage toggles.
-- Exact hybrid search, reranking, and candidate retrieval recipes.
-- Bulk add paths, tracing, concurrency, and queueing behavior.
-- Multi-tenant `group_id` semantics; v0 assumes a single project/user scope.
+- `[API]` Custom entity types and excluded entity types. Graphiti lets callers provide entity type schemas and exclude selected types from extraction. This demo uses one generic `Entity` schema, but this does not require changing the core `Log -> View -> refresh` model. One future option is to keep a polymorphic `Entity` view and pass entity schemas as prompt/schema context:
 
-## 4. Interface Adequacy Checklist
+  ```python
+  entity = episode.sem_map(
+      Entity,
+      "Extract and classify entities using the provided entity type schemas.",
+      context=[Person, Company, Product],
+  )
+  ```
+
+  Another option is to split the entity view into typed materialized views:
+
+  ```python
+  person = episode.sem_map(Person, "Extract people from the episode.")
+  company = episode.sem_map(Company, "Extract companies from the episode.")
+  ```
+
+  The generic `Entity` view is closer to Graphiti's current structure; typed views are a cleaner future alternative for stricter schemas.
+
+- `[API]` Custom edge types and edge type maps. Graphiti can restrict fact types by source/target entity type signatures. This demo uses one generic `Relation` schema, but custom edge types can also be modeled without changing the core view model. One option is to keep a polymorphic `Relation` view and pass relation schemas or source/target constraints as operator context or future structured config. Another option is to split relation types into typed relation views:
+
+  ```python
+  works_at = episode.sem_map(
+      WorksAt,
+      "Extract employment facts between people and companies.",
+      context=[person, company],
+  )
+
+  uses_product = episode.sem_map(
+      UsesProduct,
+      "Extract product usage facts involving people, companies, and products.",
+      context=[person, company, product],
+  )
+  ```
+
+  Source/target constraints such as `Person -> Company` allowing `WorksAt`, or `Person -> Product` allowing `UsesProduct`, are API-level schema/prompt constraints, not only runtime behavior.
+- `[Runtime/store]` Saga support, including `HAS_EPISODE` and `NEXT_EPISODE` links. These are structural/provenance links for episode grouping and ordering, not high-level semantic views.
+- `[Store/runtime]` Raw episode content storage toggles. Whether raw episode content is retained is a storage and privacy policy, not a semantic operator.
+- `[Runtime/lowering]` Exact hybrid search, reranking, graph traversal, and candidate retrieval recipes. The policy expresses logical `sem_join(...)` and `sem_topk(...)`; vector, keyword, BFS/k-hop graph expansion, RRF/MMR, graph-distance scoring, and reranking choices belong to runtime/store lowering. Graphiti-style BFS is a candidate retrieval or reranking ingredient, not high-level policy syntax.
+- `[Runtime]` Bulk add paths, tracing, concurrency, and queueing behavior. These are execution paths and observability controls, not policy API.
+- `[Runtime/scope]` Multi-tenant `group_id` semantics. v0 assumes a single project/user scope; namespace and tenant isolation can be added later.
+
+## 4. Cross-Demo Design Status
 
 The current interface direction can express both systems if the following are true:
 
@@ -560,13 +670,16 @@ The current interface direction can express both systems if the following are tr
 - Semantic joins can express both regular relation joins and existing-state joins.
 - Store bindings are per logical view and can support one or more physical stores.
 - `catalog` is just a normal view and can be passed as retrieval context.
+- `FRESHNESS` and `REFRESH_MODE` can optionally constrain maintenance targets without changing the logical query.
 
 API decisions in this document:
 
-- `refresh(...)` defines materialized view maintenance timing.
-- `window(...)` is transient unless it is assigned to a view and refreshed.
-- An omitted-right `sem_join(...)` inside a refreshed view rule means existing-state join.
-- There is no `maintain(...)` policy API in this direction; maintenance timing is expressed with `refresh(...)`.
+- A top-level assignment inside `am.Memory` defines a materialized view rule.
+- `window(...)` is transient unless it is assigned to a view as a top-level rule.
+- An omitted-right `sem_join(...)` inside a materialized view rule means existing-state join.
+- There is no `maintain(...)` policy API in this direction.
+- `FRESHNESS` is an optional time-lag target; `REFRESH_MODE` is optional and may be inferred by runtime, Flink-style.
+- `turn`, `add`, `query`, `count`, and `session` thresholds are runtime scheduling gates for now, not v0 `FRESHNESS` syntax.
 - v0 assumes a single project/user scope. `group_id` is a future namespace/scope extension.
 
 Runtime/lowering issues:
@@ -574,13 +687,13 @@ Runtime/lowering issues:
 - Delta, cursor, watermark, and checkpoint semantics.
 - Candidate retrieval implementation for semantic joins when the policy does not specify it.
 - MERGE-like insert/update/delete/invalidation effects.
-- Exact refresh scheduler behavior behind `refresh(...)`.
+- Exact scheduler behavior behind `FRESHNESS` / `REFRESH_MODE`.
 - Store-specific vector, keyword, graph, hybrid search, and reranking strategies.
 
 Still-open API issues:
 
 - Whether candidate retrieval inside semantic joins ever needs explicit low-level policy syntax, such as `sem_join_lateral(...)`.
-- `query()` return shape: plain Python objects, `am.pack(...)`, or framework-specific adapters.
+- `query()` return shape should default to plain Python objects; framework-specific adapters can wrap this later.
 
 Non-goals for this document:
 
