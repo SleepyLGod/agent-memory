@@ -1,6 +1,8 @@
-# Memory Views And DataFrame Execution
+# DataFrame Execution, Memory Views, And Semantic IVM
 
 This note records the current design story around DataFrame execution, semantic query systems, materialized memory views, lazy update, and incremental view maintenance.
+
+Status: the current golden API is DataFrame-first and is defined in `operator-api.md`. This file is rationale/background for that direction.
 
 ## 1. DataFrame Execution: Eager, Lazy, And Semantic Query Systems
 
@@ -46,7 +48,7 @@ In other words, we need:
 - durable materialized memory view runtime
 - agent memory protocols
 
-For a node/view such as `topic`, it is first a DataFrame-like object in its logical form. At the same time, it is also a materialized view with lifecycle.
+For a relation/view such as `topics`, it is first a DataFrame-like object in its logical form. At the same time, it is also a materialized view with lifecycle.
 
 At the current stage, agent memory is also eager in the memory-update sense.
 
@@ -63,17 +65,25 @@ The main values are:
 For example:
 
 ```python
-profile = topic.sem_groupby(Profile, "roll up topics into profiles")
+profile = topics.sem_groupby(
+    key=["topic_name"],
+    instruction="Roll up related topic rows into profile groups.",
+    agg=sem_agg(
+        input_cols=["topic_name", "topic_content"],
+        output_cols=["profile_name", "profile_content"],
+        instruction="Produce one profile row per group.",
+    ),
+)
 ```
 
-This lazy query plan describes how `Profile` is derived from `Topic`.
+This lazy query plan describes how a `profile` view is derived from a `topics` view.
 
-The memory runtime decides what happens after `Topic` changes:
+The memory runtime decides what happens after `topics` changes:
 
-- Update `Profile` immediately.
-- Delay `Profile` update.
-- Update `Profile` locally.
-- Update `Profile` at query-time.
+- Update `profile` immediately.
+- Delay `profile` update.
+- Update `profile` locally.
+- Update `profile` at query-time.
 
 Whether we should use memory lazy update is still uncertain.
 
@@ -140,8 +150,8 @@ Problems:
 View-defined memory looks like:
 
 ```python
-topic = log.sem_groupby(...)
-profile = topic.sem_groupby(...)
+topics = log.sem_groupby(key=[...], instruction="...", agg=sem_agg(...))
+profile = topics.sem_groupby(key=[...], instruction="...", agg=sem_agg(...))
 ```
 
 Benefits:

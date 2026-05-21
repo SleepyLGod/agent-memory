@@ -222,3 +222,18 @@ __marimo__/
 
 docs/design/history/
 .DS_Store
+
+# LaTeX build artifacts
+docs/optimization/build/
+docs/optimization/*.aux
+docs/optimization/*.bbl
+docs/optimization/*.bcf
+docs/optimization/*.blg
+docs/optimization/*.fdb_latexmk
+docs/optimization/*.fls
+docs/optimization/*.log
+docs/optimization/*.out
+docs/optimization/*.run.xml
+docs/optimization/*.synctex.gz
+docs/optimization/*.toc
+docs/optimization/*.pdf

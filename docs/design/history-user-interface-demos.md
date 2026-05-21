@@ -125,7 +125,7 @@ class ClaudeCodeMemory(am.Memory):
             "type": "jsonl",
             "path": ".memory/log.jsonl",
         },
-        "topic": {
+        "topics": {
             "type": "directory",
             "path": ".memory/topics",
             "format": "markdown",
@@ -138,65 +138,83 @@ class ClaudeCodeMemory(am.Memory):
 
     # Optional. If omitted, runtime chooses update timing and strategy.
     FRESHNESS = {
-        "topic": "10m",
+        "topics": "10m",
         "catalog": "1m",
     }
 
     REFRESH_MODE = {
-        "topic": "continuous",
+        "topics": "continuous",
         "catalog": "full",
     }
 
     log = am.Log(LogEntry)
 
-    topic = log.sem_groupby(
-        Topic,
-        """
-        Analyze only the recent messages selected by the runtime for this
-        maintenance pass, together with existing topic metadata supplied by the
-        runtime, and update durable topic memory files.
+    topics = (
+        log
+        .sem_map(
+            list[Topic],
+            """
+            Analyze only the recent messages selected by the runtime for this
+            maintenance pass and extract durable topic-memory candidates.
 
-        Save durable memory only when it fits one of these Claude Code memory
-        types:
+            Save durable memory only when it fits one of these Claude Code
+            memory types:
 
-        - user: stable information about the user's role, goals,
-          responsibilities, knowledge, preferences, or collaboration style that
-          should shape future assistance.
-        - feedback: guidance about how to approach future work, including
-          corrections, things to avoid, and non-obvious approaches the user
-          validated. Preserve the reason and how to apply it.
-        - project: ongoing work context, goals, initiatives, bugs, incidents,
-          constraints, deadlines, or motivations that are not otherwise
-          derivable from the code or git history. Convert relative dates to
-          absolute dates.
-        - reference: pointers to external systems or resources, and why they
-          matter, so future sessions know where to look for up-to-date
-          information.
+            - user: stable information about the user's role, goals,
+              responsibilities, knowledge, preferences, or collaboration style
+              that should shape future assistance.
+            - feedback: guidance about how to approach future work, including
+              corrections, things to avoid, and non-obvious approaches the user
+              validated. Preserve the reason and how to apply it.
+            - project: ongoing work context, goals, initiatives, bugs,
+              incidents, constraints, deadlines, or motivations that are not
+              otherwise derivable from the code or git history. Convert
+              relative dates to absolute dates.
+            - reference: pointers to external systems or resources, and why
+              they matter, so future sessions know where to look for
+              up-to-date information.
 
-        Do not save code patterns, conventions, architecture, file paths,
-        project structure, git history, recent changes, who-changed-what,
-        debugging recipes, facts already documented in CLAUDE.md, or ephemeral
-        in-progress task details. These exclusions still apply when the user
-        asks to save an activity log or PR list; preserve only the surprising
-        or non-obvious durable signal.
+            Do not save code patterns, conventions, architecture, file paths,
+            project structure, git history, recent changes, who-changed-what,
+            debugging recipes, facts already documented in CLAUDE.md, or
+            ephemeral in-progress task details. These exclusions still apply
+            when the user asks to save an activity log or PR list; preserve only
+            the surprising or non-obvious durable signal.
 
-        Check existing memory metadata before writing. Update an existing topic
-        memory instead of creating a duplicate. Organize memories semantically by
-        topic, not chronologically. Correct or remove memories that become wrong
-        or outdated.
+            If the user explicitly asks to remember something, extract it as
+            the best-fitting type. If the user asks to forget something, emit a
+            candidate indicating the relevant memory should be removed.
+            """,
+        )
+        .explode(Topic)
+        .sem_groupby(
+            Topic,
+            """
+            Group topic-memory candidates that belong to the same durable
+            semantic topic. Organize memories semantically by topic, not
+            chronologically.
+            """,
+        )
+        .sem_agg(
+            Topic,
+            """
+            Produce one durable topic memory record per group.
 
-        Maintain each topic as one durable memory record with current
-        frontmatter-compatible fields: a stable name, a specific one-line
-        description for future relevance decisions, a valid type, and a concise
-        markdown body following the selected type's structure.
+            Use existing topic metadata supplied by the runtime when available.
+            Update an existing topic memory instead of creating a duplicate.
+            Correct or remove memories that become wrong or outdated.
 
-        If the user explicitly asks to remember something, save it immediately
-        as the best-fitting type. If the user asks to forget something, remove
-        the relevant memory.
-        """
+            Maintain current frontmatter-compatible fields: a stable name, a
+            specific one-line description for future relevance decisions, a
+            valid type, and a concise markdown body following the selected
+            type's structure.
+            """,
+        )
     )
 
-    catalog = topic.sem_map(
+    # One Topic row maps to one Catalog row. The single MEMORY.md file is a
+    # store materialization detail, not a logical aggregation.
+    catalog = topics.sem_map(
         Catalog,
         """
         Maintain MEMORY.md as a concise catalog over durable topic memory files.
@@ -211,8 +229,8 @@ class ClaudeCodeMemory(am.Memory):
         """
     )
 
-    def query(self, query: str, *, k: int = 5):
-        return self.topic.sem_topk(
+    def query(self, query: str):
+        return self.topics.sem_topk(
             query,
             """
             Select memory files that are clearly useful for the query.
@@ -227,18 +245,20 @@ class ClaudeCodeMemory(am.Memory):
             warnings, gotchas, known issues, durable project context, user
             preferences, or relevant reference pointers.
             """,
-            k=k,
+            k=5,
             context=self.catalog,
         )
 ```
 
 **Explanations**:
 
-- The `topic` rule represents Claude Code's background extraction path: recent log delta plus existing memory metadata updates durable topic files.
-- The `sem_groupby(...)` rule intentionally represents extraction, topic grouping, existing-topic update, and consolidation as one policy-level view query.
-- The runtime may lower this high-level `sem_groupby(...)` into multiple implementation steps such as `sem_filter(...)`, `sem_map(...)`, lower-level `sem_groupby(...)`, candidate matching, merging, periodic consolidation, and storage writes.
-- Claude Code's auto-dream consolidation is therefore modeled as runtime/lowering behavior for the same `topic` view, not as a second canonical `topic = topic.sem_map(...)` policy query.
+- The `topics` rule represents Claude Code's background extraction path: recent log delta plus existing memory metadata updates durable topic files.
+- `sem_map(list[Topic], ...)` extracts topic-shaped candidates from log rows; `explode(Topic)` normalizes them into one topic candidate per row.
+- `sem_groupby(Topic, ...)` creates a grouped expression over candidates that belong to the same durable topic; `sem_agg(Topic, ...)` produces canonical topic rows.
+- The runtime may lower this logical rule into implementation steps such as semantic filtering, candidate matching, merging, periodic consolidation, and storage writes.
+- Claude Code's auto-dream consolidation is therefore modeled as runtime/lowering behavior for the same `topics` view, not as a second canonical `topics = topics.sem_map(...)` policy query.
 - `FRESHNESS` and `REFRESH_MODE` are optional maintenance targets. If omitted, the runtime chooses timing and strategy.
+- `catalog = topics.sem_map(Catalog, ...)` is a one-topic-row to one-catalog-row projection. The single `MEMORY.md` file is a store materialization detail, not a reason to add `sem_groupby` or `sem_agg` to the catalog rule.
 
 ### Default And Override Stores
 
@@ -257,7 +277,7 @@ memory = ClaudeCodeMemory(
             "type": "jsonl",
             "path": "/custom/memory/log.jsonl",
         },
-        "topic": {
+        "topics": {
             "type": "directory",
             "path": "/custom/memory/topics",
             "format": "markdown",
@@ -370,12 +390,12 @@ class ZepMemory(am.Memory):
             "type": "jsonl",
             "path": ".memory/zep/log.jsonl",
         },
-        "episode": {
+        "episodes": {
             "type": "graph",
             "uri": "neo4j://localhost:7687",
             "label": "Episodic",
         },
-        "entity": {
+        "entities": {
             "primary": {
                 "type": "graph",
                 "uri": "neo4j://localhost:7687",
@@ -389,7 +409,7 @@ class ZepMemory(am.Memory):
                 },
             ],
         },
-        "relation": {
+        "relations": {
             "primary": {
                 "type": "graph",
                 "uri": "neo4j://localhost:7687",
@@ -403,7 +423,7 @@ class ZepMemory(am.Memory):
                 },
             ],
         },
-        "community": {
+        "communities": {
             "primary": {
                 "type": "graph",
                 "uri": "neo4j://localhost:7687",
@@ -420,114 +440,126 @@ class ZepMemory(am.Memory):
     }
 
     FRESHNESS = {
-        "episode": "1m",
-        "entity": "10m",
-        "relation": "10m",
+        "episodes": "1m",
+        "entities": "10m",
+        "relations": "10m",
     }
 
     REFRESH_MODE = {
-        "episode": "continuous",
-        "entity": "continuous",
-        "relation": "continuous",
+        "episodes": "continuous",
+        "entities": "continuous",
+        "relations": "continuous",
     }
 
     log = am.Log(ZepLogEvent)
 
-    episode = (
-        log.sem_map(
-            Episode,
-            """
-            Convert each incoming event into a stored episode.
+    episodes = log.map(Episode)
 
-            Preserve name, source type, source description, content, reference
-            time, and scope metadata if configured. The episode is the
-            provenance record for derived entities and relations.
-            """,
-        )
-    )
-
-    entity = (
-        episode
+    entities = (
+        episodes
         .sem_map(
-            Entity,
+            list[Entity],
             """
-            Extract, resolve, and maintain canonical entity nodes from episodes.
-
             For message episodes, extract the speaker and significant entities
             mentioned explicitly or implicitly in the current episode. Use
             recent previous episodes only for disambiguation. Do not extract
             relationships, actions, dates, times, or pronouns as entities.
+            Use configured entity types when provided.
+            """,
+            context=episodes.window(count=10),
+        )
+        .explode(Entity)
+        .sem_groupby(
+            Entity,
+            """
+            Group entity rows that refer to the same real-world object or
+            concept.
 
-            Resolve extracted entities against existing entity memory. Reuse
-            canonical identities only when both names refer to the same
-            real-world object or concept. Do not merge entities that are merely
-            related, similar, or similarly named.
+            Reuse canonical identities only when names refer to the same
+            object or concept. Do not merge entities that are merely related,
+            similar, or similarly named.
+            """,
+        )
+        .sem_agg(
+            Entity,
+            """
+            Produce one canonical entity row per semantic group.
 
             Preserve canonical entity identity after resolution. Update
             attributes, labels, and summaries with important information from
             the current episode and recent previous episodes when relevant.
-            Use configured entity types when provided.
             """,
-            context=[episode, episode.window(count=10)],
         )
     )
 
-    relation = (
-        episode
+    relations = (
+        episodes
         .sem_map(
-            Relation,
+            list[Relation],
             """
-            Extract, resolve, and maintain temporal factual relations between
-            resolved entities.
-
             Each fact must involve two distinct entities from the resolved
             entity view. Use entity identifiers from the resolved entities.
             Extract facts clearly stated or unambiguously implied by the current
             episode. Include relation type and temporal bounds when the episode
             provides explicit or resolvable time information.
+            """,
+            context=entities,
+        )
+        .explode(Relation)
+        .sem_groupby(
+            Relation,
+            """
+            Group relation rows that express the same temporal fact.
 
             Reuse existing facts when the new fact expresses identical factual
             information. Keep similar facts separate when they contain key
             differences. If a new fact contradicts existing facts, mark the
             older facts invalid instead of deleting them.
             """,
-            context=[episode, entity],
+        )
+        .sem_agg(
+            Relation,
+            "Produce one canonical temporal fact row per semantic group.",
         )
     )
 
-    community = (
-        entity
+    communities = (
+        entities
         .sem_groupby(
+            Entity,
+            """
+            Optionally group related entities into communities affected by new
+            or updated entity and relation rows.
+            """,
+            context=relations,
+        )
+        .sem_agg(
             Community,
             """
-            Optionally maintain community summaries over related entities.
-
-            Update or create community summaries for neighborhoods affected by
-            new or updated entities. This corresponds to Graphiti's optional
-            community update path.
+            Produce one community summary row per entity community. This
+            corresponds to Graphiti's optional community update path.
             """,
-            context=relation,
         )
     )
 
-    def query(self, query: str, *, k: int = 10):
-        facts = self.relation.sem_topk(
+    def query(self, query: str):
+        facts = self.relations.sem_topk(
             query,
             "Retrieve relevant temporal facts with hybrid semantic and keyword search.",
-            k=k,
-            context=[self.entity, self.episode],
+            k=10,
+            context=[self.entities, self.episodes],
         )
 
-        entities = self.entity.sem_topk(
+        entities = self.entities.sem_topk(
             query,
             "Retrieve relevant entities using hybrid search.",
-            k=k,
+            k=10,
         )
 
-        communities = self.community.sem_topk(
+        communities = self.communities.sem_topk(
             query,
             "Retrieve relevant community summaries when available.",
-            k=min(k, 3),
+            k=3,
         )
 
         return {
@@ -543,7 +575,12 @@ In this demo, a top-level assignment inside `am.Memory` defines a materialized v
 
 `window(...)` is a bounded relation used as data range or context. It is not a materialized view unless it is assigned to a memory attribute as a top-level view rule.
 
-The high-level `entity` and `relation` rules use stateful `sem_map(...)` to express extraction, candidate retrieval, duplicate resolution, contradiction handling, and MERGE-like effects as one logical view query.
+The high-level `entities` and `relations` rules have two stages:
+
+- `sem_map(list[T], ...)` performs stateless semantic extraction into a list payload relation.
+- `explode(T)` normalizes the list payload into one `T` row at a time while runtime keeps source/provenance metadata.
+- `sem_groupby(T, ...)` creates a grouped expression over `T` rows.
+- `sem_agg(T, ...)` produces canonical durable rows/files, including duplicate handling, contradiction handling, and summary updates.
 
 An omitted-right `sem_join(...)` remains an expert/lower-level expansion for existing-state matching. It is not required in the conceptual Zep demo.
 
@@ -560,12 +597,12 @@ custom_memory = ZepMemory(
             "type": "jsonl",
             "path": "./logs/zep.jsonl",
         },
-        "episode": {
+        "episodes": {
             "type": "graph",
             "uri": "neo4j://localhost:7687",
             "label": "Episodic",
         },
-        "entity": {
+        "entities": {
             "primary": {
                 "type": "graph",
                 "uri": "neo4j://localhost:7687",
@@ -579,7 +616,7 @@ custom_memory = ZepMemory(
                 },
             ],
         },
-        "relation": {
+        "relations": {
             "primary": {
                 "type": "graph",
                 "uri": "neo4j://localhost:7687",
@@ -593,7 +630,7 @@ custom_memory = ZepMemory(
                 },
             ],
         },
-        "community": {
+        "communities": {
             "primary": {
                 "type": "graph",
                 "uri": "neo4j://localhost:7687",
@@ -617,21 +654,51 @@ Graph storage and vector materialization are physical choices attached to logica
 
 ### What This Demo Does Not Model Yet
 
-- `[API]` Custom entity types and excluded entity types. Graphiti lets callers provide entity type schemas and exclude selected types from extraction. This demo uses one generic `Entity` schema, but this does not require changing the core `Log -> View -> refresh` model. One future option is to keep a polymorphic `Entity` view and pass entity schemas as prompt/schema context:
+- `[API]` Custom entity types and excluded entity types. Graphiti lets callers provide entity type schemas and exclude selected types from extraction. This demo uses one generic `Entity` schema, but this does not require changing the core `Log -> materialized view` model. One future option is to keep a polymorphic `Entity` view and pass entity schemas as prompt/schema context:
 
   ```python
-  entity = episode.sem_map(
-      Entity,
-      "Extract and classify entities using the provided entity type schemas.",
-      context=[Person, Company, Product],
+  entities = (
+      episodes
+      .sem_map(
+          list[Entity],
+          "Extract and classify entity mentions using the provided entity type schemas.",
+          context=[Person, Company, Product],
+      )
+      .explode(Entity)
+      .sem_groupby(
+          Entity,
+          "Group entity rows that refer to the same real-world entity.",
+      )
+      .sem_agg(Entity, "Produce one canonical entity row per group.")
   )
   ```
 
   Another option is to split the entity view into typed materialized views:
 
   ```python
-  person = episode.sem_map(Person, "Extract people from the episode.")
-  company = episode.sem_map(Company, "Extract companies from the episode.")
+  people = (
+      episodes
+      .sem_map(list[Person], "Extract person mentions from each episode.")
+      .explode(Person)
+      .sem_groupby(Person, "Group person rows that refer to the same person.")
+      .sem_agg(Person, "Produce one canonical person row per group.")
+  )
+
+  companies = (
+      episodes
+      .sem_map(list[Company], "Extract company mentions from each episode.")
+      .explode(Company)
+      .sem_groupby(Company, "Group company rows that refer to the same company.")
+      .sem_agg(Company, "Produce one canonical company row per group.")
+  )
+
+  products = (
+      episodes
+      .sem_map(list[Product], "Extract product mentions from each episode.")
+      .explode(Product)
+      .sem_groupby(Product, "Group product rows that refer to the same product.")
+      .sem_agg(Product, "Produce one canonical product row per group.")
+  )
   ```
 
   The generic `Entity` view is closer to Graphiti's current structure; typed views are a cleaner future alternative for stricter schemas.
@@ -639,16 +706,34 @@ Graph storage and vector materialization are physical choices attached to logica
 - `[API]` Custom edge types and edge type maps. Graphiti can restrict fact types by source/target entity type signatures. This demo uses one generic `Relation` schema, but custom edge types can also be modeled without changing the core view model. One option is to keep a polymorphic `Relation` view and pass relation schemas or source/target constraints as operator context or future structured config. Another option is to split relation types into typed relation views:
 
   ```python
-  works_at = episode.sem_map(
-      WorksAt,
-      "Extract employment facts between people and companies.",
-      context=[person, company],
+  works_at = (
+      episodes
+      .sem_map(
+          list[WorksAt],
+          "Extract employment fact candidates between people and companies.",
+          context=[people, companies],
+      )
+      .explode(WorksAt)
+      .sem_groupby(
+          WorksAt,
+          "Group duplicate employment facts and preserve important temporal changes.",
+      )
+      .sem_agg(WorksAt, "Produce one canonical employment fact row per group.")
   )
 
-  uses_product = episode.sem_map(
-      UsesProduct,
-      "Extract product usage facts involving people, companies, and products.",
-      context=[person, company, product],
+  uses_products = (
+      episodes
+      .sem_map(
+          list[UsesProduct],
+          "Extract product usage fact candidates involving people, companies, and products.",
+          context=[people, companies, products],
+      )
+      .explode(UsesProduct)
+      .sem_groupby(
+          UsesProduct,
+          "Group duplicate product usage facts and preserve important temporal changes.",
+      )
+      .sem_agg(UsesProduct, "Produce one canonical product usage fact row per group.")
   )
   ```
 
@@ -659,7 +744,148 @@ Graph storage and vector materialization are physical choices attached to logica
 - `[Runtime]` Bulk add paths, tracing, concurrency, and queueing behavior. These are execution paths and observability controls, not policy API.
 - `[Runtime/scope]` Multi-tenant `group_id` semantics. v0 assumes a single project/user scope; namespace and tenant isolation can be added later.
 
-## 4. Cross-Demo Design Status
+## 4. Mem0 Memory Demo
+
+### Mem0 Memory
+
+#### Mem0 V3
+
+```python
+from pydantic import BaseModel, Field
+import agent_memory as am
+
+
+# Default raw log row schema. This is source data, not a materialized memory view.
+class LogEntry(BaseModel):
+    role: str = Field(description="conversation role, such as user or assistant")
+    content: str = Field(description="message content")
+    name: str | None = Field(default=None, description="optional actor name")
+
+class Entity(BaseModel):
+    """Canonical entity used internally for entity-linking retrieval."""
+
+    name: str = Field(description="canonical entity name")
+    kind: str | None = Field(default=None, description="optional entity type")
+
+class FactEntityLink(BaseModel):
+    """Internal relation linking a memory fact to entities it mentions."""
+
+    memory_id: str = Field(description="source memory fact id")
+    entity_id: str = Field(description="linked entity id")
+    mention: str = Field(description="entity surface form in the memory text")
+
+
+class Fact(BaseModel):
+    """Atomic long-term memory produced by Mem0 v3-style additive extraction."""
+
+    memory: str = Field(
+        description="self-contained long-term memory fact extracted from user or agent messages"
+    )
+    categories: list[str] = Field(
+        default_factory=list,
+        description="optional memory categories used for filtering or ranking"
+    )
+    metadata: dict = Field(
+        default_factory=dict,
+        description="optional source or application metadata"
+    )
+
+class Mem0V3Memory(am.Memory):
+    STORES = {
+        "log": {
+            "type": "jsonl",
+            "path": ".memory/mem0-v3/log.jsonl",
+        },
+        "facts": {
+            "primary": {
+                "type": "vector",
+                "collection": "mem0_v3_facts",
+                "field": "memory",
+            },
+            "auxiliary": [
+                {
+                    "type": "keyword",
+                    "collection": "mem0_v3_facts_bm25",
+                    "field": "memory",
+                },
+            ],
+        },
+        "_entities": {
+            "type": "vector",
+            "collection": "mem0_v3_entities",
+            "field": "name",
+        },
+        "_fact_entities": {
+            "type": "table",
+            "name": "mem0_v3_fact_entities",
+        },
+    }
+
+    FRESHNESS = {
+        "facts": "1m",
+        "_entities": "10m",
+        "_fact_entities": "10m",
+    }
+
+    log = am.Log(LogEntry)
+
+    facts = (
+        log
+        .sem_map(
+            list[Fact],
+            "Extract ADD-only long-term memories from conversation messages."
+        )
+        .explode(Fact)
+        .sem_groupby(
+            Fact,
+            "Group fact rows that express the same durable memory."
+        )
+        .sem_agg(
+            Fact,
+            "Produce one canonical long-term memory fact per semantic group."
+        )
+    )
+
+    # internal semantic materialized view, not normally shown to user.
+    _entities = (
+        facts
+        .sem_map(
+            list[Entity],
+            "Extract entities from stored memories for entity-linking retrieval."
+        )
+        .explode(Entity)
+        .sem_groupby(
+            Entity,
+            "Group entity rows that refer to the same real-world entity."
+        )
+        .sem_agg(
+            Entity,
+            "Produce one canonical entity row per semantic group for retrieval."
+        )
+    )
+
+    # Internal maintained link between memory facts and entities.
+    _fact_entities = (
+        facts
+        .sem_map(
+            list[FactEntityLink],
+            "Link each memory to the canonical entities it mentions.",
+            context=_entities,
+        )
+        .explode(FactEntityLink)
+    )
+
+    def query(self, query: str):
+        memories = self.facts.sem_topk(
+            query,
+            "Retrieve relevant memories; entity view may be used as retrieval context.",
+            k=10,
+            context=self._entities,
+        )
+        return {"memories": memories}
+```
+
+## 5. Cross-Demo Design Status
 
 The current interface direction can express both systems if the following are true:
 
@@ -667,6 +893,9 @@ The current interface direction can express both systems if the following are tr
 - `am.Log()` can act as the append-only source relation.
 - `sem_*` operators can accept Pydantic output schemas.
 - `sem_*` operators can accept explicit `context=...`.
+- `sem_map(T, ...)` and `sem_map(list[T], ...)` create new logical relation expressions rather than mutating the source table.
+- `explode(T)` normalizes `list[T]` outputs into one typed row at a time.
+- `sem_groupby(T, ...)` creates a grouped expression; `sem_agg(T, ...)` creates canonical rows/files from those groups.
 - Semantic joins can express both regular relation joins and existing-state joins.
 - Store bindings are per logical view and can support one or more physical stores.
 - `catalog` is just a normal view and can be passed as retrieval context.
@@ -680,6 +909,8 @@ API decisions in this document:
 - There is no `maintain(...)` policy API in this direction.
 - `FRESHNESS` is an optional time-lag target; `REFRESH_MODE` is optional and may be inferred by runtime, Flink-style.
 - `turn`, `add`, `query`, `count`, and `session` thresholds are runtime scheduling gates for now, not v0 `FRESHNESS` syntax.
+- Stateful grouping belongs to `sem_groupby(...)`; canonical durable rows/files are produced by `sem_agg(...)`; runtime lowering may still add candidate retrieval and MERGE-like writes.
+- Claude `Topic` rows and Zep `Entity` rows use the same logical operator grammar. Their physical behavior differs because `STORES` binds topics to markdown/directory storage and entities to graph/vector-style storage.
 - v0 assumes a single project/user scope. `group_id` is a future namespace/scope extension.
 
 Runtime/lowering issues:
