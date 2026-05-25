@@ -7,6 +7,39 @@ resolution-markers = [
 ]
 
 [[package]]
+name = "agent-memory"
+version = "0.1.0"
+source = { editable = "." }
+dependencies = [
+    { name = "dspy" },
+    { name = "python-dotenv" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "ipykernel" },
+    { name = "nbclient" },
+    { name = "nbformat" },
+    { name = "notebook" },
+    { name = "pytest" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "dspy", specifier = ">=3.2.0" },
+    { name = "python-dotenv", specifier = ">=1.2.2" },
+]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "ipykernel", specifier = ">=7.2.0" },
+    { name = "nbclient", specifier = ">=0.10.4" },
+    { name = "nbformat", specifier = ">=5.10.4" },
+    { name = "notebook", specifier = ">=7.5.6" },
+    { name = "pytest", specifier = ">=9.0.3" },
+]
+
+[[package]]
 name = "aiohappyeyeballs"
 version = "2.6.1"
 source = { registry = "https://pypi.org/simple" }
@@ -507,39 +540,6 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/9e/38/ab4b3ba261962cf1cd0456113253290329de5c80296ce968f060195c4a03/dspy-3.2.0.tar.gz", hash = "sha256:70593061e8d3df7924e6b7bfe5e61d064e5990f1505b82380b49252b00a88fd7", size = 278448, upload-time = "2026-04-21T17:15:49.917Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/fa/aa/5b064672fe12bdeb36bda5a70213a773122166ded763d2ccf4dad6eb145b/dspy-3.2.0-py3-none-any.whl", hash = "sha256:cbf82a3ddcd69df071db6cdf7455e7304d66cd47fcb09c856454739414e16d89", size = 331038, upload-time = "2026-04-21T17:15:48.703Z" },
-]
-
-[[package]]
-name = "dspy-memory"
-version = "0.1.0"
-source = { editable = "." }
-dependencies = [
-    { name = "dspy" },
-    { name = "python-dotenv" },
-]
-
-[package.dev-dependencies]
-dev = [
-    { name = "ipykernel" },
-    { name = "nbclient" },
-    { name = "nbformat" },
-    { name = "notebook" },
-    { name = "pytest" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "dspy", specifier = ">=3.2.0" },
-    { name = "python-dotenv", specifier = ">=1.2.2" },
-]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "ipykernel", specifier = ">=7.2.0" },
-    { name = "nbclient", specifier = ">=0.10.4" },
-    { name = "nbformat", specifier = ">=5.10.4" },
-    { name = "notebook", specifier = ">=7.5.6" },
-    { name = "pytest", specifier = ">=9.0.3" },
 ]
 
 [[package]]

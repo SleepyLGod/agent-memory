@@ -164,7 +164,7 @@ with placeholders.
 Single relation:
 
 ```python
-df.sem_filter("{message} contains durable user preference.")
+df.sem_filter(instruction="{message} contains durable user preference.")
 ```
 
 Multi-relation join:
@@ -172,7 +172,7 @@ Multi-relation join:
 ```python
 candidates.sem_join(
     topics,
-    "Determine whether {candidates: topic_name} and {topics: topic_name} refer to the same durable memory topic.",
+    instruction="Determine whether {candidates: topic_name} and {topics: topic_name} refer to the same durable memory topic.",
     how="left",
 )
 ```
@@ -197,14 +197,14 @@ The dictionary form is preferred when column descriptions improve the prompt.
 Semantic row filter.
 
 ```python
-df.sem_filter(instruction)
+df.sem_filter(instruction=instruction)
 ```
 
 Example:
 
 ```python
 durable = log.sem_filter(
-    "{message} contains information worth saving in long-term memory."
+    instruction="{message} contains information worth saving in long-term memory."
 )
 ```
 
@@ -403,7 +403,7 @@ Semantic join.
 ```python
 left.sem_join(
     right,
-    instruction,
+    instruction=instruction,
     how="inner",
 )
 ```
@@ -420,21 +420,21 @@ how="outer"
 Sugar aliases may also be supported:
 
 ```python
-left.sem_inner_join(right, instruction)
-left.sem_left_join(right, instruction)
-left.sem_right_join(right, instruction)
-left.sem_outer_join(right, instruction)
+left.sem_inner_join(right, instruction=instruction)
+left.sem_left_join(right, instruction=instruction)
+left.sem_right_join(right, instruction=instruction)
+left.sem_outer_join(right, instruction=instruction)
 ```
 
-The canonical documentation form is `sem_join(..., how=...)`, because it follows
-DataFrame style.
+The canonical documentation form is `sem_join(..., instruction=..., how=...)`,
+because it follows DataFrame style.
 
 Example:
 
 ```python
 joined = topic_candidates.sem_join(
     topics,
-    """
+    instruction="""
     Determine whether {topic_candidates: topic_name} and {topics: topic_name}
     refer to the same durable memory topic, including corrections,
     contradictions, supersession, or forget/delete targets.
@@ -461,12 +461,14 @@ Example:
 ```python
 memories = topics.sem_topk(
     "Find the memory rows most useful for the current user query.",
-    k=5,
+    5,
 )
 ```
 
 `method`, hybrid retrieval, reranking, graph traversal, and BFS are runtime or
-optimizer concerns for now.
+optimizer concerns for now. When used inside a memory `query(...)` method, the
+`instruction` argument is typically the end-user query text, while `k` is the
+policy author's initial retrieval width.
 
 ## 5. Differential Maintenance Notes
 
@@ -476,8 +478,8 @@ discussed in the same dataframe language.
 Simple operators:
 
 ```python
-V = D.sem_filter(instruction)
-V_prime = V.union(delta_D.sem_filter(instruction))
+V = D.sem_filter(instruction=instruction)
+V_prime = V.union(delta_D.sem_filter(instruction=instruction))
 
 V = D.sem_map(output_cols=[...], instruction="...")
 V_prime = V.union(delta_D.sem_map(output_cols=[...], instruction="..."))
@@ -513,7 +515,7 @@ delta_groups = delta_D.sem_groupby(
 
 V_prime = (
     delta_groups
-    .sem_join(V, join_instruction_prime, how="outer")
+    .sem_join(V, instruction=join_instruction_prime, how="outer")
     .sem_map(
         output_cols=V.columns,
         instruction="""
@@ -535,12 +537,12 @@ The final `sem_map` is a column-level semantic merge over joined rows, not a
 Join follows the usual relational delta shape:
 
 ```python
-V = L.sem_join(R, instruction, how="inner")
+V = L.sem_join(R, instruction=instruction, how="inner")
 
 V_prime = (
-    delta_L.sem_join(R, instruction, how="inner")
-    .union(L.sem_join(delta_R, instruction, how="inner"))
-    .union(delta_L.sem_join(delta_R, instruction, how="inner"))
+    delta_L.sem_join(R, instruction=instruction, how="inner")
+    .union(L.sem_join(delta_R, instruction=instruction, how="inner"))
+    .union(delta_L.sem_join(delta_R, instruction=instruction, how="inner"))
 )
 ```
 
