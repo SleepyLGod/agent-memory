@@ -5,7 +5,7 @@ a design target, not an implementation guarantee.
 
 The current direction is DataFrame-first. Logs, memory views, and intermediate
 results are dataframe-like relations. Users write a full view definition query
-`Q`; the system derives differential maintenance queries `Q'` and chooses
+`Q`; the system derives differential maintenance queries `ΔQ` and chooses
 runtime plans for cost, latency, and freshness.
 
 ## 1. Mental Model
@@ -16,7 +16,7 @@ runtime plans for cost, latency, and freshness.
   rows.
 - `View definition query`: the full logical query `Q` that defines what memory
   should contain.
-- `Differential query`: the derived maintenance query `Q'` that updates the view
+- `Differential query`: the derived maintenance query `ΔQ` that updates the view
   from new data without recomputing the full history.
 - `Ordinary operator`: deterministic dataframe or relational operation such as
   `select`, `filter`, `assign`, `concat`, `union`, or `subtract`.
@@ -40,14 +40,14 @@ topics = (
     .sem_groupby(
         key=["topic_name"],
         instruction="Find candidates related to the same durable memory topic.",
-        agg=sem_agg(
-            input_cols=["topic_name", "topic_content"],
-            output_cols={
-                "topic_name": "Canonical durable memory topic name.",
-                "topic_content": "Merged durable memory content.",
-            },
-            instruction="Choose a canonical topic name and merge topic content.",
-        ),
+    )
+    .sem_agg(
+        input_cols=["topic_name", "topic_content"],
+        output_cols={
+            "topic_name": "Canonical durable memory topic name.",
+            "topic_content": "Merged durable memory content.",
+        },
+        instruction="Choose a canonical topic name and merge topic content.",
     )
     .select(["topic_name", "topic_content"])
 )
@@ -282,54 +282,56 @@ topic_candidates = (
 
 ### `sem_groupby`
 
-Semantic grouping plus aggregation.
+Semantic grouping. In v0, grouped aggregation is expressed by chaining
+`.sem_agg(...)` on the returned grouped relation.
 
 ```python
 df.sem_groupby(
     key=[...],
     instruction="...",
-    agg=...
-)
+).sem_agg(...)
 ```
 
 `key` names the columns used as the grouping basis. The instruction determines
 semantic membership, for example whether two candidate topic names refer to the
-same durable memory. The aggregate expression produces the output row for each
-group.
+same durable memory. `sem_groupby(...)` partitions or assigns rows; the
+following `.sem_agg(...)` produces the output row for each group.
 
 Example:
 
 ```python
-topics = topic_candidates.sem_groupby(key=["topic_name"], instruction="...", agg=sem_agg(...))
-
-topics = topic_candidates.sem_groupby(
-    key=["topic_name"],
-    instruction="Find candidates related to the same durable memory topic.",
-    agg=sem_agg(
+topics = (
+    topic_candidates
+    .sem_groupby(
+        key=["topic_name"],
+        instruction="Find candidates related to the same durable memory topic.",
+    )
+    .sem_agg(
         input_cols=["topic_name", "topic_content"],
         output_cols={
             "topic_name": "Canonical durable memory topic name.",
             "topic_content": "Merged durable memory content.",
         },
         instruction="Choose a canonical topic name and merge topic content.",
-    ),
+    )
 )
 ```
 
 `sem_groupby` does not by itself decide all final output columns. If the visible
 key should be canonicalized, include that key in the aggregate input and output.
 
-Aggregate values can be ordinary or semantic:
+Future APIs may add ordinary deterministic grouped aggregates and mixed
+aggregate maps. They are not v0 primary syntax:
 
 ```python
 agg=count()
 agg=sum("score")
 agg=max("timestamp")
 agg=list_collect("evidence")
-agg=sem_agg(input_cols=["content"], output_cols=["summary"], instruction="Summarize.")
+agg=am.agg.sem_agg(input_cols=["content"], output_cols=["summary"], instruction="Summarize.")
 ```
 
-Multiple aggregates can be expressed with a mapping:
+A future mapping form could look like:
 
 ```python
 topics = topic_candidates.sem_groupby(
@@ -505,12 +507,16 @@ Semantic group-by with aggregation can use a coarse full-next-view maintenance
 rule:
 
 ```python
-V = D.sem_groupby(key=[...], instruction=group_instruction, agg=agg)
+V = (
+    D
+    .sem_groupby(key=[...], instruction=group_instruction)
+    .sem_agg(...)
+)
 
-delta_groups = delta_D.sem_groupby(
-    key=[...],
-    instruction=group_instruction,
-    agg=agg,
+delta_groups = (
+    delta_D
+    .sem_groupby(key=[...], instruction=group_instruction)
+    .sem_agg(...)
 )
 
 V_prime = (
@@ -582,7 +588,7 @@ This API follows the LOTUS direction closely:
 - `union` and `subtract` are explicit ordinary relational operators because
   incremental view maintenance needs exact set effects.
 - The system-level problem is not only semantic processing, but deriving and
-  executing `Q'` from user-authored memory view query `Q`.
+  executing `ΔQ` from user-authored memory view query `Q`.
 
 References:
 

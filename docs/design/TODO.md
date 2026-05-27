@@ -39,10 +39,10 @@ Status: the current golden line is `docs/optimization/incremental-semantic-view-
   v0.1 should decide whether to hide the expression behind `_expr` or promote a
   stable debug/inspection API.
 
-- `RewriteContext` currently exposes only `view` and `delta`. Cascading
-  maintenance, adapter capability checks, or upstream materialized state may
-  require additional fields such as `spec`, `adapter_capabilities`, or
-  `upstream_deltas` once concrete rules exist.
+- The first concrete differential rewrite rule must decide how executable `ΔQ`
+  references current view state `V` and changed input rows `ΔD`. v0.0 keeps
+  `ΔD` as a mathematical/runtime concept rather than modeling it as a current
+  `QueryExpr` operator.
 
 - Adapter capability and default adapter injection are still unresolved. Before
   adding non-LOTUS engines, decide what capability contract each execution
@@ -91,7 +91,7 @@ Later we may also add the 'context' fields to the semantic operator APIs
 
 ### Differential Instruction Rewriting
 
-- The generated `Q'` may need different instructions from the original full query `Q`. Who rewrites those instructions?
+- The generated `ΔQ` may need different instructions from the original full query `Q`. Who rewrites those instructions?
 - Should groupby/join maintenance instructions explicitly include contradiction, supersession, invalidation, and forget/delete targets?
 - How do we inspect and test rewritten instructions?
 

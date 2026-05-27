@@ -125,7 +125,7 @@ retrieve them efficiently later. In the current DataFrame-style API, the topic
 memory and catalog can be written as two views:
 
 \begin{verbatim}
-topic_candidates = (
+_topic_candidates = (
     log
     .sem_flat_map(
         input_cols=["message"],
@@ -141,17 +141,20 @@ topic_candidates = (
     .select(["topic_name", "topic_content"])
 )
 
-topics = topic_candidates.sem_groupby(
-    key=["topic_name"],
-    instruction="Find candidates related to the same durable memory topic.",
-    agg=sem_agg(
+topics = (
+    _topic_candidates
+    .sem_groupby(
+        key=["topic_name"],
+        instruction="Find candidates related to the same durable memory topic.",
+    )
+    .sem_agg(
         input_cols=["topic_name", "topic_content"],
         output_cols={
             "topic_name": "Canonical durable memory topic name.",
             "topic_content": "Merged durable memory content.",
         },
         instruction="Choose a canonical topic name and merge topic content.",
-    ),
+    )
 )
 
 catalog = (
@@ -202,6 +205,9 @@ recomputing \(\Q(\D \cup \DeltaD)\)?
 
 The maintenance query \(\DQ\) operates on small new data and maintained view
 state, so it can be much faster in user latency and much cheaper in token cost.
+Engineering documents may also write this derived maintenance query as
+\(\Delta Q\); in this document \(\DQ\) and \(\Delta Q\) refer to the same
+concept.
 Without semantic operators, this is the classical incremental view maintenance
 problem. Our setting is simpler than modern distributed dataflow systems
 because user memory is low-throughput, local, and privacy-sensitive. It is also
@@ -325,29 +331,35 @@ branch.
 
 \subsection{Semantic GroupBy with Aggregation}
 
-The current public API treats semantic group-by as semantic grouping plus an
-aggregate expression:
+The current public API treats semantic group-by as semantic grouping followed by
+chain aggregation:
 
 \begin{verbatim}
-V = D.sem_groupby(
-    key=[...],
-    instruction=group_instruction,
-    agg=agg,
+V = (
+    D
+    .sem_groupby(
+        key=[...],
+        instruction=group_instruction,
+    )
+    .sem_agg(...)
 )
 \end{verbatim}
 
 Here \texttt{key} names the columns used as the grouping basis, the instruction
-defines semantic membership, and \texttt{agg} produces the output row for each
-group. The aggregate can be ordinary, such as \texttt{count()} or
-\texttt{max("timestamp")}, or semantic, such as \texttt{sem\_agg(...)}.
+defines semantic membership, and \texttt{sem\_agg} produces the output row for
+each group. Future APIs may add deterministic grouped aggregates, but v0 uses
+the chain form \texttt{sem\_groupby(...).sem\_agg(...)}.
 
 A coarse full-next-view maintenance rule is:
 
 \begin{verbatim}
-delta_groups = delta_D.sem_groupby(
-    key=[...],
-    instruction=group_instruction,
-    agg=agg,
+delta_groups = (
+    delta_D
+    .sem_groupby(
+        key=[...],
+        instruction=group_instruction,
+    )
+    .sem_agg(...)
 )
 
 V_prime = (
@@ -459,7 +471,7 @@ maintenance usually requires re-retrieval or rescoring over \(\D\):
 The full view definition is:
 
 \begin{verbatim}
-topic_candidates = (
+_topic_candidates = (
     log
     .sem_flat_map(
         input_cols=["message"],
@@ -469,14 +481,17 @@ topic_candidates = (
     .select(["topic_name", "topic_content"])
 )
 
-topics = topic_candidates.sem_groupby(
-    key=["topic_name"],
-    instruction="Find candidates related to the same durable memory topic.",
-    agg=sem_agg(
+topics = (
+    _topic_candidates
+    .sem_groupby(
+        key=["topic_name"],
+        instruction="Find candidates related to the same durable memory topic.",
+    )
+    .sem_agg(
         input_cols=["topic_name", "topic_content"],
         output_cols=["topic_name", "topic_content"],
         instruction="Choose a canonical topic name and merge topic content.",
-    ),
+    )
 )
 
 catalog = (
@@ -503,14 +518,17 @@ delta_topic_candidates = (
     .select(["topic_name", "topic_content"])
 )
 
-delta_groups = delta_topic_candidates.sem_groupby(
-    key=["topic_name"],
-    instruction="Find candidates related to the same durable memory topic.",
-    agg=sem_agg(
+delta_groups = (
+    delta_topic_candidates
+    .sem_groupby(
+        key=["topic_name"],
+        instruction="Find candidates related to the same durable memory topic.",
+    )
+    .sem_agg(
         input_cols=["topic_name", "topic_content"],
         output_cols=["topic_name", "topic_content"],
         instruction="Choose a canonical topic name and merge topic content.",
-    ),
+    )
 )
 
 topics_prime = (
@@ -554,14 +572,17 @@ entity_candidates = (
     .select(["entity_name", "entity_type", "evidence"])
 )
 
-entities = entity_candidates.sem_groupby(
-    key=["entity_name"],
-    instruction="Find candidates that refer to the same real-world entity.",
-    agg=sem_agg(
+entities = (
+    entity_candidates
+    .sem_groupby(
+        key=["entity_name"],
+        instruction="Find candidates that refer to the same real-world entity.",
+    )
+    .sem_agg(
         input_cols=["entity_name", "entity_type", "evidence"],
         output_cols=["entity_name", "entity_type", "summary"],
         instruction="Choose a canonical entity and summarize evidence.",
-    ),
+    )
 )
 \end{verbatim}
 
@@ -584,14 +605,17 @@ fact_candidates = (
     .select(["fact", "subject", "evidence"])
 )
 
-facts = fact_candidates.sem_groupby(
-    key=["fact", "subject"],
-    instruction="Find candidates that represent the same durable memory fact.",
-    agg=sem_agg(
+facts = (
+    fact_candidates
+    .sem_groupby(
+        key=["fact", "subject"],
+        instruction="Find candidates that represent the same durable memory fact.",
+    )
+    .sem_agg(
         input_cols=["fact", "subject", "evidence"],
         output_cols=["fact", "subject", "summary"],
         instruction="Merge fact evidence into one canonical fact row.",
-    ),
+    )
 )
 \end{verbatim}
 
@@ -698,8 +722,8 @@ an accuracy decision as well as a cost decision.
 \section{Pointers}
 
 \begin{itemize}[leftmargin=*]
-  \item Current proposal source:
-  \path{docs/draft.txt}.
+  \item Current interface design:
+  \path{docs/design/v0.0-interface.md}.
 
   \item Current operator API:
   \path{docs/design/operator-api.md}.

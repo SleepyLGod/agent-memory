@@ -7,14 +7,14 @@ from typing import Any
 import pytest
 
 import agent_memory as am
-from agent_memory.logical import ColumnSpec, MemorySpec, RelationExpr
-from agent_memory.planner import RewriteContext
+from agent_memory.logical import ColumnSpec, MemorySpec, MemoryView, QueryExpr
+from agent_memory.planner import DifferentialQueryPlanner
 from agent_memory.planner.rules import RewriteRule
 from agent_memory.relation import GroupedRelation, Relation
 
 
-def test_relation_expr_params_are_deeply_frozen() -> None:
-    expr = RelationExpr(
+def test_query_expr_params_are_deeply_frozen() -> None:
+    expr = QueryExpr(
         op="test",
         params={
             "nested": {
@@ -43,8 +43,8 @@ def test_relation_expr_params_are_deeply_frozen() -> None:
     assert isinstance(expr.params["tags"], tuple)
 
 
-def test_relation_expr_is_hashable_for_planner_memoization() -> None:
-    expr = RelationExpr(
+def test_query_expr_is_hashable_for_planner_memoization() -> None:
+    expr = QueryExpr(
         op="sem_map",
         params={
             "input_cols": ["message"],
@@ -57,9 +57,9 @@ def test_relation_expr_is_hashable_for_planner_memoization() -> None:
     assert memo[expr] == "rewritten"
 
 
-def test_relation_expr_hash_is_canonical_for_param_key_order() -> None:
-    left = RelationExpr(op="sem_map", params={"a": 1, "b": {"c": 2, "d": 3}})
-    right = RelationExpr(op="sem_map", params={"b": {"d": 3, "c": 2}, "a": 1})
+def test_query_expr_hash_is_canonical_for_param_key_order() -> None:
+    left = QueryExpr(op="sem_map", params={"a": 1, "b": {"c": 2, "d": 3}})
+    right = QueryExpr(op="sem_map", params={"b": {"d": 3, "c": 2}, "a": 1})
 
     assert left == right
     assert hash(left) == hash(right)
@@ -155,7 +155,7 @@ def test_memory_spec_is_cached_after_first_collection() -> None:
 
 def test_topics_expression_uses_chain_groupby_then_aggregation() -> None:
     spec = am.ClaudeMemory.spec()
-    topics_expr = spec.views["topics"].relation.expr
+    topics_expr = spec.views["topics"].query
 
     assert topics_expr.op == "select"
     sem_agg_expr = topics_expr.inputs[0]
@@ -219,24 +219,29 @@ def test_rewrite_rule_supports_pattern_matching() -> None:
         output_cols=["topic_name", "topic_content"],
         instruction="Merge topic rows.",
     )
-    context = RewriteContext(
-        view=am.ClaudeMemory.spec().views["topics"],
-        delta=RelationExpr(op="delta_log"),
-    )
+    view = am.ClaudeMemory.spec().views["topics"]
 
     class GroupedAggRule:
-        def matches(self, expr: RelationExpr, context: RewriteContext) -> bool:
-            return expr.op == "sem_agg" and expr.inputs[0].op == "sem_groupby"
+        def matches(self, query: QueryExpr, view: MemoryView) -> bool:
+            return query.op == "sem_agg" and query.inputs[0].op == "sem_groupby"
 
-        def rewrite(self, expr: RelationExpr, context: RewriteContext) -> RelationExpr:
-            return RelationExpr(op="rewritten", inputs=(expr, context.delta))
+        def rewrite(self, query: QueryExpr, view: MemoryView) -> QueryExpr:
+            return QueryExpr(op="rewritten", inputs=(query,))
 
     rule: RewriteRule = GroupedAggRule()
 
-    assert rule.matches(aggregated.expr, context)
-    rewritten = rule.rewrite(aggregated.expr, context)
+    assert rule.matches(aggregated.expr, view)
+    rewritten = rule.rewrite(aggregated.expr, view)
     assert rewritten.op == "rewritten"
-    assert rewritten.inputs == (aggregated.expr, context.delta)
+    assert rewritten.inputs == (aggregated.expr,)
+
+
+def test_differential_query_planner_boundary_is_explicitly_unimplemented() -> None:
+    planner = DifferentialQueryPlanner()
+    view = am.ClaudeMemory.spec().views["topics"]
+
+    with pytest.raises(NotImplementedError, match="Differential query planning"):
+        planner.differentiate(view)
 
 
 def test_claude_memory_has_no_private_topic_candidates() -> None:
@@ -247,7 +252,7 @@ def test_claude_memory_has_no_private_topic_candidates() -> None:
 
 def test_catalog_expression_maps_from_topics() -> None:
     spec = am.ClaudeMemory.spec()
-    catalog_expr = spec.views["catalog"].relation.expr
+    catalog_expr = spec.views["catalog"].query
 
     assert catalog_expr.op == "select"
     sem_map_expr = catalog_expr.inputs[0]

@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING, Any, Mapping
 
 if TYPE_CHECKING:
     from .api import Log
-    from .relation import Relation
 
 
 # These helpers keep logical plans immutable and cache-safe. This is the same
@@ -58,15 +57,16 @@ class ColumnSpec:
 
 
 @dataclass(frozen=True)
-class RelationExpr:
-    """Internal immutable logical plan node.
+class QueryExpr:
+    """Internal immutable query tree node.
 
-    RelationExpr records a dataframe-style operation and its inputs. It does not
+    QueryExpr records a dataframe-style operator tree for a full view
+    definition query Q or a derived differential query DeltaQ. It does not
     execute queries, call models, or mutate memory state.
     """
 
     op: str
-    inputs: tuple["RelationExpr", ...] = ()
+    inputs: tuple["QueryExpr", ...] = ()
     params: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -79,10 +79,10 @@ class RelationExpr:
 
 @dataclass(frozen=True)
 class MemoryView:
-    """Named derived memory view collected from a Memory class."""
+    """Named derived view declaration V = Q(D) collected from a Memory class."""
 
     name: str
-    relation: "Relation"
+    query: QueryExpr
 
 
 @dataclass(frozen=True)
@@ -91,7 +91,7 @@ class MemorySpec:
 
     log: "Log"
     views: Mapping[str, MemoryView]
-    private_relations: Mapping[str, "Relation"]
+    private_relations: Mapping[str, QueryExpr]
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "views", MappingProxyType(dict(self.views)))

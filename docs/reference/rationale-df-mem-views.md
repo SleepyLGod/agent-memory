@@ -65,14 +65,17 @@ The main values are:
 For example:
 
 ```python
-profile = topics.sem_groupby(
-    key=["topic_name"],
-    instruction="Roll up related topic rows into profile groups.",
-    agg=sem_agg(
+profile = (
+    topics
+    .sem_groupby(
+        key=["topic_name"],
+        instruction="Roll up related topic rows into profile groups.",
+    )
+    .sem_agg(
         input_cols=["topic_name", "topic_content"],
         output_cols=["profile_name", "profile_content"],
         instruction="Produce one profile row per group.",
-    ),
+    )
 )
 ```
 
@@ -150,8 +153,8 @@ Problems:
 View-defined memory looks like:
 
 ```python
-topics = log.sem_groupby(key=[...], instruction="...", agg=sem_agg(...))
-profile = topics.sem_groupby(key=[...], instruction="...", agg=sem_agg(...))
+topics = log.sem_groupby(key=[...], instruction="...").sem_agg(...)
+profile = topics.sem_groupby(key=[...], instruction="...").sem_agg(...)
 ```
 
 Benefits:

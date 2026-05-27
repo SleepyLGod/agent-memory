@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from agent_memory.logical import RelationExpr
+from agent_memory.logical import QueryExpr
 
 
 @dataclass
@@ -19,8 +19,8 @@ class LotusAdapter:
 
     model: str | None = None
 
-    def execute(self, expr: RelationExpr, inputs: Mapping[str, Any]) -> Any:
-        """Execute a logical expression through LOTUS."""
+    def execute(self, query: QueryExpr, inputs: Mapping[str, Any]) -> Any:
+        """Execute a logical query expression through LOTUS."""
 
         raise NotImplementedError(
             "LOTUS execution is not implemented in the current v0.0 interface layer."

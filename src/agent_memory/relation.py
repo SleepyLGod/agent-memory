@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from .logical import ColumnSpec, RelationExpr
+from .logical import ColumnSpec, QueryExpr
 
 ColumnInput = Sequence[str] | None
 ColumnOutput = Sequence[str] | Mapping[str, str]
@@ -42,24 +42,24 @@ def _require_relation(value: Any, *, argument: str) -> "Relation":
 class Relation:
     """DataFrame-like chain handle for policy authoring.
 
-    Operator methods only build RelationExpr nodes. They do not execute queries,
+    Operator methods only build QueryExpr nodes. They do not execute queries,
     call models, or materialize memory state.
     """
 
-    def __init__(self, expr: RelationExpr) -> None:
+    def __init__(self, expr: QueryExpr) -> None:
         self.expr = expr
 
     def _derive(
         self,
         op: str,
         *,
-        inputs: Sequence[RelationExpr] | None = None,
+        inputs: Sequence[QueryExpr] | None = None,
         **params: Any,
     ) -> "Relation":
         """Build a new Relation by appending one logical expression node."""
 
         return Relation(
-            RelationExpr(
+            QueryExpr(
                 op=op,
                 inputs=tuple(inputs) if inputs is not None else (self.expr,),
                 params=params,
@@ -166,7 +166,7 @@ class Relation:
     ) -> "GroupedRelation":
         """Create a grouped semantic relation expression."""
 
-        expr = RelationExpr(
+        expr = QueryExpr(
             op="sem_groupby",
             inputs=(self.expr,),
             params={"key": tuple(key), "instruction": instruction},
@@ -219,7 +219,7 @@ class GroupedRelation:
     becomes a normal Relation only after sem_agg is called.
     """
 
-    def __init__(self, expr: RelationExpr) -> None:
+    def __init__(self, expr: QueryExpr) -> None:
         self.expr = expr
 
     def sem_agg(
@@ -232,7 +232,7 @@ class GroupedRelation:
         """Aggregate each semantic group into output columns."""
 
         return Relation(
-            RelationExpr(
+            QueryExpr(
                 op="sem_agg",
                 inputs=(self.expr,),
                 params={

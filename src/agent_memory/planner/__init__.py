@@ -1,5 +1,5 @@
-"""Memory view maintenance planner interfaces."""
+"""Differential query planner interfaces."""
 
-from .maintenance import MemoryViewMaintenancePlanner, RewriteContext
+from .maintenance import DifferentialQueryPlanner
 
-__all__ = ["MemoryViewMaintenancePlanner", "RewriteContext"]
+__all__ = ["DifferentialQueryPlanner"]

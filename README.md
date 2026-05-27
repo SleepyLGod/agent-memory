@@ -14,7 +14,7 @@ It can:
 - import `agent_memory as am`
 - define DataFrame-style memory policies
 - collect a `MemorySpec` from a policy class
-- inspect logical `RelationExpr` trees
+- inspect logical `QueryExpr` trees
 - instantiate the built-in `ClaudeMemory` policy
 
 It does not yet:
@@ -61,9 +61,9 @@ src/agent_memory/
   api.py                   Memory, Log, class-body spec collection, query wrapper
   message.py               normalized append input object
   relation.py              DataFrame-style Relation and GroupedRelation operators
-  logical.py               immutable RelationExpr, MemoryView, MemorySpec
+  logical.py               immutable QueryExpr, MemoryView, MemorySpec
   memories/claude.py       built-in ClaudeMemory policy
-  planner/                 future Q-to-Q' maintenance planner interfaces
+  planner/                 future Q-to-ΔQ differential query planner interfaces
   runtime/                 runtime state and future execution shell
   adapters/                execution adapter protocol and LotusAdapter shell
 

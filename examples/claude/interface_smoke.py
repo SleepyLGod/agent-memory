@@ -11,7 +11,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 path.insert(0, str(PROJECT_ROOT / "src"))
 
 import agent_memory as am  # noqa: E402
-from agent_memory.logical import RelationExpr  # noqa: E402
+from agent_memory.logical import QueryExpr  # noqa: E402
 
 
 def _format_value(value: Any) -> Any:
@@ -31,8 +31,8 @@ def _format_params(params: Mapping[str, Any]) -> str:
     return " " + repr(visible)
 
 
-def print_expr(expr: RelationExpr, *, indent: int = 0) -> None:
-    """Print a compact expression tree for a logical relation."""
+def print_expr(expr: QueryExpr, *, indent: int = 0) -> None:
+    """Print a compact query tree."""
 
     prefix = "  " * indent
     print(f"{prefix}- {expr.op}{_format_params(expr.params)}")
@@ -53,7 +53,7 @@ def main() -> None:
 
     for name, view in spec.views.items():
         print(f"\nview: {name}")
-        print_expr(view.relation.expr)
+        print_expr(view.query)
 
     memory = am.ClaudeMemory()
 

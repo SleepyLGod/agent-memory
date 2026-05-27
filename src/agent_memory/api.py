@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from functools import wraps
 from typing import Any
 
-from .logical import ColumnSpec, MemorySpec, MemoryView, RelationExpr
+from .logical import ColumnSpec, MemorySpec, MemoryView, QueryExpr
 from .message import MessageInput
 from .relation import Relation
 from .runtime import MemoryRuntime
@@ -27,7 +27,7 @@ class Log(Relation):
             ).items()
         )
         super().__init__(
-            RelationExpr(
+            QueryExpr(
                 op="log",
                 params={"columns": column_defs},
             )
@@ -101,7 +101,7 @@ class Memory:
     @classmethod
     def _collect_spec(cls) -> MemorySpec:
         log: Log | None = None
-        private_relations: dict[str, Relation] = {}
+        private_relations: dict[str, QueryExpr] = {}
         views: dict[str, MemoryView] = {}
 
         for name, value in vars(cls).items():
@@ -115,9 +115,9 @@ class Memory:
                 continue
 
             if name.startswith("_"):
-                private_relations[name] = value
+                private_relations[name] = value.expr
             else:
-                views[name] = MemoryView(name=name, relation=value)
+                views[name] = MemoryView(name=name, query=value.expr)
 
         if log is None:
             inherited_log_owner = next(
