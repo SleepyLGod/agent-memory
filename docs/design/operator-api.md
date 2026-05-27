@@ -39,7 +39,7 @@ topics = (
     topic_candidates
     .sem_groupby(
         key=["topic_name"],
-        instruction="Find candidates related to the same durable memory topic.",
+        instruction="Rows whose {topic_name} values refer to the same durable memory topic belong in one group.",
     )
     .sem_agg(
         input_cols=["topic_name", "topic_content"],
@@ -172,7 +172,7 @@ Multi-relation join:
 ```python
 candidates.sem_join(
     topics,
-    instruction="Determine whether {candidates: topic_name} and {topics: topic_name} refer to the same durable memory topic.",
+    instruction="{candidates: topic_name} and {topics: topic_name} refer to the same durable memory topic.",
     how="left",
 )
 ```
@@ -189,6 +189,19 @@ output_cols={
 ```
 
 The dictionary form is preferred when column descriptions improve the prompt.
+
+### Instruction Wording Convention
+
+All semantic operators use the parameter name `instruction`, but the expected
+content follows the operator semantics:
+
+- `sem_filter`: row-level predicate / claim, such as `"{message} contains a durable user preference."`
+- `sem_join`: pairwise predicate / match condition, such as `"{left} and {right} refer to the same topic."`
+- `sem_groupby`: grouping / assignment condition, such as `"{topic_name} values refer to the same durable memory topic."`
+- `sem_map`: transformation instruction, such as `"Produce catalog fields for this topic."`
+- `sem_flat_map`: extraction / generation instruction, such as `"Extract zero or more durable memory topic candidates from {message}."`
+- `sem_agg`: aggregation / merge instruction, such as `"Merge topic content into one durable memory."`
+- `sem_topk`: ranking query or relevance criterion; adapters may lower plain user query text into backend-specific column-aware expressions.
 
 ## 4. Semantic Operators
 
@@ -209,6 +222,9 @@ durable = log.sem_filter(
 ```
 
 `sem_filter` keeps rows whose content satisfies the semantic condition.
+For LOTUS-style lowering, write this as a row-level predicate over columns, such
+as `"{message} is coherent"` or `"{message} contains a durable preference"`.
+Avoid command wording like `"Find coherent messages"` for `sem_filter`.
 
 ### `sem_map`
 
@@ -230,6 +246,9 @@ Defaults:
 `sem_map` preserves existing columns and adds or replaces the requested output
 columns. Use `select` afterward when the desired result is a new logical table
 with only the output columns.
+Unlike `sem_filter`, `sem_map` is a transformation. Its instruction should say
+what fields to produce, such as `"Produce catalog fields for this topic"`, not
+just name the target concept.
 
 Example:
 
@@ -262,6 +281,8 @@ df.sem_flat_map(
 
 `sem_flat_map` preserves source columns for each emitted row and adds the output
 columns. Use `select` afterward when only the extracted columns should remain.
+Like `sem_map`, its instruction should describe the extraction/transformation;
+for example, `"Extract zero or more durable memory topic candidates from {message}"`.
 
 Example:
 
@@ -304,7 +325,7 @@ topics = (
     topic_candidates
     .sem_groupby(
         key=["topic_name"],
-        instruction="Find candidates related to the same durable memory topic.",
+        instruction="Rows whose {topic_name} values refer to the same durable memory topic belong in one group.",
     )
     .sem_agg(
         input_cols=["topic_name", "topic_content"],
@@ -336,7 +357,7 @@ A future mapping form could look like:
 ```python
 topics = topic_candidates.sem_groupby(
     key=["topic_name"],
-    instruction="Find candidates related to the same durable memory topic.",
+    instruction="Rows whose {topic_name} values refer to the same durable memory topic belong in one group.",
     agg={
         "topic_name": sem_agg(
             input_cols=["topic_name"],
@@ -437,8 +458,8 @@ Example:
 joined = topic_candidates.sem_join(
     topics,
     instruction="""
-    Determine whether {topic_candidates: topic_name} and {topics: topic_name}
-    refer to the same durable memory topic, including corrections,
+    {topic_candidates: topic_name} and {topics: topic_name} refer to the
+    same durable memory topic, including corrections,
     contradictions, supersession, or forget/delete targets.
     """,
     how="left",

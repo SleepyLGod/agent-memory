@@ -39,10 +39,11 @@ Status: the current golden line is `docs/optimization/incremental-semantic-view-
   v0.1 should decide whether to hide the expression behind `_expr` or promote a
   stable debug/inspection API.
 
-- The first concrete differential rewrite rule must decide how executable `ΔQ`
+- The first stateful differential rewrite rule must decide how executable `ΔQ`
   references current view state `V` and changed input rows `ΔD`. v0.0 keeps
   `ΔD` as a mathematical/runtime concept rather than modeling it as a current
-  `QueryExpr` operator.
+  `QueryExpr` operator; the current toy `sem_filter` rule works by binding the
+  source log to changed rows at runtime.
 
 - Adapter capability and default adapter injection are still unresolved. Before
   adding non-LOTUS engines, decide what capability contract each execution

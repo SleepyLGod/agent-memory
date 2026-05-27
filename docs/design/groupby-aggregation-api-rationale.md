@@ -10,7 +10,7 @@ topics = (
     topic_candidates
     .sem_groupby(
         key=["topic_name"],
-        instruction="Find candidates related to the same durable memory topic.",
+        instruction="Rows whose {topic_name} values refer to the same durable memory topic belong in one group.",
     )
     .sem_agg(
         input_cols=["topic_name", "topic_content"],
@@ -57,7 +57,7 @@ from agent_memory import sem_agg, count, min
 
 topics = topic_candidates.sem_groupby(
     key=["topic_name"],
-    instruction="Find candidates related to the same durable memory topic.",
+    instruction="Rows whose {topic_name} values refer to the same durable memory topic belong in one group.",
     agg=sem_agg(...),
 )
 ```
@@ -71,7 +71,7 @@ dataframe-style semantic query.
 ```python
 topics = topic_candidates.sem_groupby(
     key=["topic_name"],
-    instruction="Find candidates related to the same durable memory topic.",
+    instruction="Rows whose {topic_name} values refer to the same durable memory topic belong in one group.",
     agg=[
         am.agg.sem_agg(...),
         am.agg.count(),
@@ -93,7 +93,7 @@ starting point.
 ```python
 topics = topic_candidates.sem_groupby(
     key=["topic_name"],
-    instruction="Find candidates related to the same durable memory topic.",
+    instruction="Rows whose {topic_name} values refer to the same durable memory topic belong in one group.",
     agg=sem_agg(...),
 )
 ```
@@ -108,7 +108,7 @@ object. The chain form avoids that problem.
 ```python
 topics = topic_candidates.sem_groupby(
     key=["topic_name"],
-    instruction="Find candidates related to the same durable memory topic.",
+    instruction="Rows whose {topic_name} values refer to the same durable memory topic belong in one group.",
     agg=[
         "count",
         {
@@ -137,7 +137,7 @@ should not be the policy-author API in v0.
 ```python
 topics = topic_candidates.sem_groupby(
     key=["topic_name"],
-    instruction="Find candidates related to the same durable memory topic.",
+    instruction="Rows whose {topic_name} values refer to the same durable memory topic belong in one group.",
     agg=topic_candidates.sem_agg(
         input_cols=["topic_name", "topic_content"],
         output_cols={
