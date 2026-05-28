@@ -2,15 +2,21 @@
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
 from typing import Any
 
+import pandas as pd
 import pytest
+from dotenv import load_dotenv
 
 import agent_memory as am
-from agent_memory.logical import ColumnSpec, MemorySpec, MemoryView, QueryExpr
+from agent_memory.adapters import LotusAdapter
+from agent_memory.logical import ColumnSpec, MemorySpec, QueryExpr
 from agent_memory.planner import DifferentialQueryPlanner
-from agent_memory.planner.rules import RewriteRule
+from agent_memory.planner.rules import DifferentialRules
 from agent_memory.relation import GroupedRelation, Relation
+from examples.helloworld.helloworld_smoke import _flatten_locomo_rows
 
 
 def test_query_expr_params_are_deeply_frozen() -> None:
@@ -173,7 +179,7 @@ def test_topics_expression_uses_chain_groupby_then_aggregation() -> None:
 def test_grouped_relation_sem_agg_returns_normal_relation() -> None:
     grouped = am.Log().sem_groupby(
         key=["topic_name"],
-        instruction="Find candidates related to the same durable memory topic.",
+        instruction="Rows whose {topic_name} values refer to the same durable memory topic belong in one group.",
     )
     aggregated = grouped.sem_agg(
         input_cols=["topic_name", "topic_content"],
@@ -193,8 +199,12 @@ def test_grouped_relation_sem_agg_returns_normal_relation() -> None:
 def test_semantic_instruction_argument_shapes() -> None:
     log = am.Log()
 
-    filtered = log.sem_filter(instruction="Keep durable memory facts.")
-    joined = log.sem_join(log, instruction="Match related rows.", how="inner")
+    filtered = log.sem_filter(instruction="{message} contains a durable memory fact.")
+    joined = log.sem_join(
+        log,
+        instruction="The left row and right row describe the same memory fact.",
+        how="inner",
+    )
     topk = log.sem_topk("Find relevant rows.", 3)
 
     assert filtered.expr.op == "sem_filter"
@@ -204,44 +214,81 @@ def test_semantic_instruction_argument_shapes() -> None:
     assert topk.expr.params["k"] == 3
 
     with pytest.raises(TypeError):
-        log.sem_filter("Keep durable memory facts.")
+        log.sem_filter("{message} contains a durable memory fact.")
     with pytest.raises(TypeError):
-        log.sem_join(log, "Match related rows.")
+        log.sem_join(log, "The left row and right row describe the same memory fact.")
 
 
-def test_rewrite_rule_supports_pattern_matching() -> None:
+def test_differential_rules_reject_unsupported_operators() -> None:
     grouped = am.Log().sem_groupby(
         key=["topic_name"],
-        instruction="Find candidates related to the same durable memory topic.",
+        instruction="Rows whose {topic_name} values refer to the same durable memory topic belong in one group.",
     )
     aggregated = grouped.sem_agg(
         input_cols=["topic_name", "topic_content"],
         output_cols=["topic_name", "topic_content"],
         instruction="Merge topic rows.",
     )
-    view = am.ClaudeMemory.spec().views["topics"]
 
-    class GroupedAggRule:
-        def matches(self, query: QueryExpr, view: MemoryView) -> bool:
-            return query.op == "sem_agg" and query.inputs[0].op == "sem_groupby"
-
-        def rewrite(self, query: QueryExpr, view: MemoryView) -> QueryExpr:
-            return QueryExpr(op="rewritten", inputs=(query,))
-
-    rule: RewriteRule = GroupedAggRule()
-
-    assert rule.matches(aggregated.expr, view)
-    rewritten = rule.rewrite(aggregated.expr, view)
-    assert rewritten.op == "rewritten"
-    assert rewritten.inputs == (aggregated.expr,)
+    with pytest.raises(NotImplementedError, match="No differential rule"):
+        DifferentialRules().differentiate(aggregated.expr)
 
 
-def test_differential_query_planner_boundary_is_explicitly_unimplemented() -> None:
+def test_differential_rules_reject_malformed_unary_expr() -> None:
+    query = QueryExpr(op="sem_filter")
+
+    with pytest.raises(ValueError, match="expects exactly one input"):
+        DifferentialRules().differentiate(query)
+
+
+def test_differential_rules_preserve_sem_filter_instruction() -> None:
+    class FilterMemory(am.Memory):
+        log = am.Log({"message": "Raw input message."})
+        helloworld_tests = log.sem_filter(
+            instruction="{message} is a coherent sentence."
+        )
+
+    view = FilterMemory.spec().views["helloworld_tests"]
+    differentiated = DifferentialRules().differentiate(view.query)
+
+    assert differentiated == view.query
+    assert differentiated.params["instruction"] == "{message} is a coherent sentence."
+
+
+def test_differential_query_planner_rejects_unsupported_operators() -> None:
     planner = DifferentialQueryPlanner()
     view = am.ClaudeMemory.spec().views["topics"]
 
-    with pytest.raises(NotImplementedError, match="Differential query planning"):
+    with pytest.raises(NotImplementedError, match="No differential rule"):
         planner.differentiate(view)
+
+
+def test_differential_query_planner_supports_sem_filter_views() -> None:
+    class FilterMemory(am.Memory):
+        log = am.Log({"message": "Raw input message."})
+        helloworld_tests = log.sem_filter(
+            instruction="{message} is a coherent sentence."
+        )
+
+    view = FilterMemory.spec().views["helloworld_tests"]
+
+    assert DifferentialQueryPlanner().differentiate(view) == view.query
+
+
+def test_differential_query_planner_supports_sem_map_select_views() -> None:
+    class MapMemory(am.Memory):
+        log = am.Log({"message": "Raw input message."})
+        labels = log.sem_map(
+            output_cols={
+                "label": "One-word message label.",
+                "summary": "Short message summary.",
+            },
+            instruction="Produce a label and summary for {message}.",
+        ).select(["message", "label", "summary"])
+
+    view = MapMemory.spec().views["labels"]
+
+    assert DifferentialQueryPlanner().differentiate(view) == view.query
 
 
 def test_claude_memory_has_no_private_topic_candidates() -> None:
@@ -268,11 +315,261 @@ def test_catalog_expression_maps_from_topics() -> None:
         {"message": "Please remember that I prefer concise docs."},
     ],
 )
-def test_add_inputs_are_explicitly_unimplemented(message: object) -> None:
+def test_claude_add_inputs_reach_unsupported_differential_rule(message: object) -> None:
     memory = am.ClaudeMemory()
 
-    with pytest.raises(NotImplementedError, match="add/log maintenance"):
+    with pytest.raises(NotImplementedError, match="No differential rule"):
         memory.add(message)
+
+
+class HelloWorldTestMemory(am.Memory):
+    log = am.Log(
+        {
+            "message": "Raw LOCOMO dialogue utterance.",
+            "speaker": "Speaker name or role.",
+            "session_id": "LOCOMO session identifier.",
+            "turn_id": "Turn/dialogue identifier within the session.",
+            "timestamp": "Session or turn timestamp when available.",
+        }
+    )
+
+    helloworld_tests = (
+        log
+        .sem_filter(
+            instruction="{message} is a coherent LOCOMO dialogue utterance that contains a concrete personal fact, preference, relationship, event, plan, or other memory-worthy information."
+        )
+        .sem_map(
+            output_cols={
+                "memory_summary": "One-sentence memory-oriented summary of the utterance, including the relevant speaker when needed.",
+            },
+            instruction="Produce a concise memory summary for {speaker}'s utterance: {message}.",
+        )
+        .select(["memory_summary"])
+    )
+
+    def query(self, query: str) -> Relation:
+        return self.helloworld_tests.sem_topk(query, 2)
+
+
+def test_lotus_adapter_wraps_plain_topk_query_with_columns() -> None:
+    adapter = LotusAdapter()
+    frame = pd.DataFrame({"message": ["hello"]})
+
+    assert (
+        adapter._topk_instruction(frame, "friendly greetings")
+        == "{message} is relevant to: friendly greetings"
+    )
+
+
+def test_lotus_adapter_keeps_column_aware_topk_instruction() -> None:
+    adapter = LotusAdapter()
+    frame = pd.DataFrame({"message": ["hello"]})
+
+    assert (
+        adapter._topk_instruction(frame, "{message} is a friendly greeting")
+        == "{message} is a friendly greeting"
+    )
+
+
+def test_lotus_adapter_default_model_is_deepseek_v4_pro() -> None:
+    adapter = LotusAdapter()
+
+    assert adapter.model == "deepseek/deepseek-v4-pro"
+
+
+def test_helloworld_locomo_loader_flattens_dialogue_rows() -> None:
+    dataset = [
+        {
+            "conversation": {
+                "session_1_date_time": "2024-01-01",
+                "session_1": [
+                    {
+                        "dia_id": "1",
+                        "speaker": "Alice",
+                        "text": "I prefer concise design docs.",
+                    },
+                    {"dia_id": "2", "speaker": "Bob", "text": "   "},
+                    {
+                        "dia_id": "3",
+                        "speaker": "Alice",
+                        "text": "Let's meet Sarah tomorrow.",
+                    },
+                ],
+            }
+        }
+    ]
+
+    rows = _flatten_locomo_rows(dataset, sample_limit=1, turn_limit=1)
+
+    assert rows == [
+        {
+            "message": "I prefer concise design docs.",
+            "speaker": "Alice",
+            "session_id": "session_1",
+            "turn_id": "1",
+            "timestamp": "2024-01-01",
+        }
+    ]
+
+
+def test_helloworld_policy_keeps_only_memory_view_columns() -> None:
+    view_query = HelloWorldTestMemory.spec().views["helloworld_tests"].query
+
+    assert view_query.op == "select"
+    assert view_query.params["columns"] == ("memory_summary",)
+    sem_map_query = view_query.inputs[0]
+    assert sem_map_query.op == "sem_map"
+    sem_filter_query = sem_map_query.inputs[0]
+    assert sem_filter_query.op == "sem_filter"
+
+
+def test_lotus_adapter_uses_non_conflicting_sem_map_temp_column() -> None:
+    adapter = LotusAdapter()
+    frame = pd.DataFrame(
+        {
+            "message": ["hello"],
+            "_agent_memory_map": ["existing"],
+            "_agent_memory_map_1": ["existing"],
+        }
+    )
+
+    assert adapter._temporary_map_column(frame) == "_agent_memory_map_2"
+
+
+def test_lotus_adapter_applies_single_output_sem_map_result() -> None:
+    adapter = LotusAdapter()
+    source = pd.DataFrame({"message": ["hello", "bye"]})
+    mapped = pd.DataFrame(
+        {
+            "message": ["hello", "bye"],
+            "_agent_memory_map": ["A greeting.", "A goodbye."],
+        }
+    )
+
+    result = adapter._apply_sem_map_output(
+        source,
+        mapped,
+        "_agent_memory_map",
+        ColumnSpec("summary", "Short message summary."),
+    )
+
+    assert list(result.columns) == ["message", "summary"]
+    assert list(result["summary"]) == ["A greeting.", "A goodbye."]
+
+
+def test_lotus_adapter_rejects_multi_output_sem_map() -> None:
+    adapter = LotusAdapter()
+    query = QueryExpr(
+        op="sem_map",
+        params={
+            "output_cols": (
+                ColumnSpec("label", "One-word message label."),
+                ColumnSpec("summary", "Short message summary."),
+            )
+        },
+    )
+
+    with pytest.raises(NotImplementedError, match="one output column per sem_map"):
+        adapter._single_output_column(query)
+
+
+def test_lotus_adapter_accepts_single_output_sem_map() -> None:
+    adapter = LotusAdapter()
+    query = QueryExpr(
+        op="sem_map",
+        params={"output_cols": (ColumnSpec("summary", "Short message summary."),)},
+    )
+
+    assert adapter._single_output_column(query).name == "summary"
+
+
+def test_runtime_log_append_and_view_union_semantics() -> None:
+    memory = HelloWorldTestMemory()
+    current = pd.DataFrame({"message": ["hello"]})
+    duplicate = pd.DataFrame({"message": ["hello"]})
+    new_row = pd.DataFrame({"message": ["world"]})
+
+    log_state = memory._runtime._append_log_frame(current, duplicate)
+    view_state = memory._runtime._union_view_frame(current, duplicate)
+    view_state = memory._runtime._union_view_frame(view_state, new_row)
+
+    assert list(log_state["message"]) == ["hello", "hello"]
+    assert list(view_state["message"]) == ["hello", "world"]
+
+
+def test_helloworld_memory_real_lotus_e2e() -> None:
+    project_root = Path(__file__).resolve().parents[1]
+    load_dotenv(project_root / ".env")
+    if os.getenv("AGENT_MEMORY_RUN_LOTUS_E2E") != "1":
+        pytest.skip("set AGENT_MEMORY_RUN_LOTUS_E2E=1 to run real LOTUS e2e")
+    if not os.getenv("DEEPSEEK_API_KEY"):
+        pytest.skip("DEEPSEEK_API_KEY is required for real LOTUS e2e")
+
+    memory = HelloWorldTestMemory(adapter=LotusAdapter())
+
+    memory.add(
+        {
+            "message": "I prefer concise design documents when we discuss architecture.",
+            "speaker": "Alice",
+            "session_id": "session_1",
+            "turn_id": "1",
+            "timestamp": "2024-01-01",
+        }
+    )
+    memory.add(
+        {
+            "message": "green sleep quickly because table",
+            "speaker": "Bob",
+            "session_id": "session_1",
+            "turn_id": "2",
+            "timestamp": "2024-01-01",
+        }
+    )
+    memory.add(
+        {
+            "message": "I am planning to visit Sarah next weekend.",
+            "speaker": "Alice",
+            "session_id": "session_1",
+            "turn_id": "3",
+            "timestamp": "2024-01-01",
+        }
+    )
+    result = memory.query(
+        "Which memories are most relevant to a person's preferences, plans, or relationships?"
+    )
+
+    assert "log" in memory._runtime._state
+    assert "helloworld_tests" in memory._runtime._state
+    view = memory._runtime._state["helloworld_tests"]
+    assert set(view.columns) == {"memory_summary"}
+    assert isinstance(result, pd.DataFrame)
+    assert not result.empty
+
+
+def test_sem_map_memory_real_lotus_e2e() -> None:
+    project_root = Path(__file__).resolve().parents[1]
+    load_dotenv(project_root / ".env")
+    if os.getenv("AGENT_MEMORY_RUN_LOTUS_E2E") != "1":
+        pytest.skip("set AGENT_MEMORY_RUN_LOTUS_E2E=1 to run real LOTUS e2e")
+    if not os.getenv("DEEPSEEK_API_KEY"):
+        pytest.skip("DEEPSEEK_API_KEY is required for real LOTUS e2e")
+
+    class SemMapMemory(am.Memory):
+        log = am.Log({"message": "Raw input message."})
+        message_labels = log.sem_map(
+            output_cols={"summary": "Concise message summary."},
+            instruction="Produce a concise summary for {message}.",
+        ).select(["message", "summary"])
+
+    memory = SemMapMemory(adapter=LotusAdapter())
+
+    memory.add("Hello, hope you are doing well.")
+    memory.add("green sleep quickly because table")
+
+    view = memory._runtime._state["message_labels"]
+    assert set(view.columns) == {"message", "summary"}
+    assert len(view) == 2
+    assert view["summary"].notna().all()
 
 
 def test_claude_memory_query_is_policy_owned_placeholder() -> None:
@@ -327,7 +624,7 @@ def test_runtime_owns_empty_materialized_state_placeholder() -> None:
 
     assert memory._runtime._state == {}
     assert not hasattr(memory._runtime, "query")
-    with pytest.raises(NotImplementedError, match="query plan execution"):
+    with pytest.raises(KeyError, match="Missing adapter input 'catalog'"):
         memory._runtime.execute_query(memory.catalog.sem_topk("design docs", 5))
 
 

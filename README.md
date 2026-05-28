@@ -16,18 +16,17 @@ It can:
 - collect a `MemorySpec` from a policy class
 - inspect logical `QueryExpr` trees
 - instantiate the built-in `ClaudeMemory` policy
+- run the minimal LOTUS e2e path for row-local `sem_filter`, `sem_map`, and `sem_topk`
 
 It does not yet:
 
-- ingest log rows
-- execute `add(...)`
-- execute `query(...)`
-- run the maintenance planner
-- execute LOTUS or model calls
+- run general differential rules beyond row-local `sem_filter` and `sem_map`
+- execute general semantic view maintenance beyond the current narrow LOTUS path
 - persist views to storage
 
-Runtime and adapter execution are not implemented yet; methods that would run
-real maintenance or retrieval raise `NotImplementedError`.
+Runtime and adapter execution are intentionally narrow: v0.0 can append rows,
+maintain row-local `sem_filter`/`sem_map` views, and query materialized views
+with `sem_topk`. Unsupported policies still raise `NotImplementedError`.
 
 ## Quick Start
 
@@ -43,15 +42,30 @@ memory.add(am.Message(content="Please remember concise design docs."))
 memory.query("design docs")
 ```
 
-In the current interface-only stage, the final two calls raise explicit
-`NotImplementedError`s. The point is to validate the v0.0 API and logical plan
-construction, not runtime execution.
+`ClaudeMemory` includes operators beyond the current row-local runtime subset,
+so `add(...)` and `query(...)` still raise explicit errors. Use the HelloWorld
+smoke below for the minimal executable path.
 
-For a runnable smoke demo:
+For an interface-only smoke demo:
 
 ```bash
 uv run examples/claude/interface_smoke.py
 ```
+
+For a real LOTUS-backed HelloWorld e2e over a small LOCOMO dialogue slice, copy
+`.env.example` to `.env`, set `DEEPSEEK_API_KEY`, then run:
+
+```bash
+uv run examples/helloworld/helloworld_smoke.py
+```
+
+The default LOTUS model is `deepseek/deepseek-v4-pro`. Advanced users can
+override it by passing a custom `LotusAdapter(model=...)`.
+
+
+To include the same real LOTUS path in pytest, set
+`AGENT_MEMORY_RUN_LOTUS_E2E=1`. The default test suite does not call external
+model APIs.
 
 ## V0.0 File Structure
 
@@ -69,6 +83,9 @@ src/agent_memory/
 
 examples/claude/
   interface_smoke.py       inspectable v0.0 interface demo
+
+examples/helloworld/
+  helloworld_smoke.py      real LOCOMO + LOTUS sem_filter/sem_map/top-k smoke
 ```
 
 ## Design Documents
@@ -93,10 +110,22 @@ Run the interface smoke demo:
 uv run examples/claude/interface_smoke.py
 ```
 
+Run the real HelloWorld smoke:
+
+```bash
+uv run examples/helloworld/helloworld_smoke.py
+```
+
 Run tests:
 
 ```bash
 uv run --with pytest python -m pytest
+```
+
+Run tests including the real LOTUS e2e:
+
+```bash
+AGENT_MEMORY_RUN_LOTUS_E2E=1 uv run --with pytest python -m pytest
 ```
 
 Register the local Jupyter kernel if notebook exploration is needed:

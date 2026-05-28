@@ -9,6 +9,8 @@ authors = [
 requires-python = ">=3.13"
 dependencies = [
     "dspy>=3.2.0",
+    "lotus-ai>=1.1.4",
+    "pandas>=2.3.3",
     "python-dotenv>=1.2.2",
 ]
 

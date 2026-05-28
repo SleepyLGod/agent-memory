@@ -1,27 +1,40 @@
-"""Rule interfaces for future hardcoded Q -> DeltaQ rewrites."""
+"""Differential rules for hardcoded Q -> DeltaQ rewrites."""
 
 from __future__ import annotations
 
-from typing import Protocol
-
-from agent_memory.logical import MemoryView, QueryExpr
+from agent_memory.logical import QueryExpr
 
 
-class RewriteRule(Protocol):
-    """Protocol for a single differential rewrite rule.
+class DifferentialRules:
+    """Operator-level differential rules for the current v0.0 subset."""
 
-    Rules match expression patterns rather than only root operator names. This
-    leaves room for combined rules such as sem_groupby followed by sem_agg.
-    """
+    def differentiate(self, query: QueryExpr) -> QueryExpr:
+        """Derive DeltaQ for one query expression subtree."""
 
-    # Rules receive the current query subtree and the MemoryView being
-    # differentiated. DeltaD is not modeled as a v0 QueryExpr/operator here; it
-    # is the runtime changed rows for the relevant input relation when DeltaQ is
-    # eventually executed.
-    def matches(self, query: QueryExpr, view: MemoryView) -> bool:
-        """Return whether this rule can rewrite the expression."""
-        ...
+        match query.op:
+            case "log":
+                return query
+            case "select":
+                return self._differentiate_unary(query)
+            case "sem_filter":
+                return self._differentiate_unary(query)
+            case "sem_map":
+                return self._differentiate_unary(query)
+            case _:
+                raise NotImplementedError(
+                    f"No differential rule for QueryExpr op {query.op!r}."
+                )
 
-    def rewrite(self, query: QueryExpr, view: MemoryView) -> QueryExpr:
-        """Rewrite a query subtree for one memory view."""
-        ...
+    def _differentiate_unary(self, query: QueryExpr) -> QueryExpr:
+        """Differentiate a row-local unary operator and preserve its params."""
+
+        if len(query.inputs) != 1:
+            raise ValueError(
+                f"QueryExpr op {query.op!r} expects exactly one input; got {len(query.inputs)}."
+            )
+
+        return QueryExpr(
+            op=query.op,
+            inputs=(self.differentiate(query.inputs[0]),),
+            params=query.params,
+        )

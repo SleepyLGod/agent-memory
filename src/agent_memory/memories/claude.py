@@ -35,7 +35,7 @@ class ClaudeMemory(Memory):
         .select(["topic_name", "topic_content"])
         .sem_groupby(
             key=["topic_name"],
-            instruction="Find candidates related to the same durable memory topic.",
+            instruction="Rows whose {topic_name} values refer to the same durable memory topic belong in one group.",
         )
         .sem_agg(
             input_cols=["topic_name", "topic_content"],

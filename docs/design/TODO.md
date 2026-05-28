@@ -42,8 +42,8 @@ Status: the current golden line is `docs/optimization/incremental-semantic-view-
 - The first stateful differential rewrite rule must decide how executable `ΔQ`
   references current view state `V` and changed input rows `ΔD`. v0.0 keeps
   `ΔD` as a mathematical/runtime concept rather than modeling it as a current
-  `QueryExpr` operator; the current toy `sem_filter` rule works by binding the
-  source log to changed rows at runtime.
+  `QueryExpr` operator; the current toy row-local `sem_filter`/`sem_map` rules
+  work by binding the source log to changed rows at runtime.
 
 - Adapter capability and default adapter injection are still unresolved. Before
   adding non-LOTUS engines, decide what capability contract each execution

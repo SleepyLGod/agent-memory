@@ -1,5 +1,5 @@
 """Differential query planner interfaces."""
 
-from .maintenance import DifferentialQueryPlanner
+from .differential import DifferentialQueryPlanner
 
 __all__ = ["DifferentialQueryPlanner"]
