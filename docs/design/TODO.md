@@ -34,6 +34,12 @@ Status: the current golden line is `docs/optimization/incremental-semantic-view-
   We need a consistent schema inference helper before rules rely on expressions
   like `V.columns`.
 
+- Catalog identity currently keeps the topic view's `name` column instead of
+  asking a semantic operator to generate `topic_name`. Future work should decide
+  whether deterministic aliasing belongs in a `rename` / `select_as` operator,
+  in storage-side mapping such as `name -> topic_name/path`, or in a more
+  general materialization config.
+
 - `am.Log` currently subclasses `Relation`, which makes `.expr` visible through
   paths such as `Memory.log.expr`. v0.0 keeps this for collector simplicity, but
   v0.1 should decide whether to hide the expression behind `_expr` or promote a
@@ -44,6 +50,23 @@ Status: the current golden line is `docs/optimization/incremental-semantic-view-
   `ΔD` as a mathematical/runtime concept rather than modeling it as a current
   `QueryExpr` operator; the current toy row-local `sem_filter`/`sem_map` rules
   work by binding the source log to changed rows at runtime.
+
+- Stateful consolidation for `sem_groupby(...).sem_agg(...)` is not covered by
+  the current row-local rules. A future Claude-style maintenance rule may look
+  like:
+
+  ```text
+  ΔC = ΔD.sem_flat_map(...)
+  ΔT = ΔC.sem_groupby(...).sem_agg(...)
+  M = ΔT.sem_join(V, how="outer", instruction=<same topic identity instruction>)
+  V' = M.sem_map(instruction=<same consolidation instruction>)
+  ```
+
+  This should remain a query-structure rewrite, not a branch based on the
+  runtime row count of `ΔD`. Until `apply_delta` / upsert semantics exist,
+  `outer join + sem_map` is a candidate for computing the next full view `V'`.
+  If a later design computes `ΔV` instead, the same logical maintenance may
+  become `left join + upsert/delete/skip`.
 
 - Adapter capability and default adapter injection are still unresolved. Before
   adding non-LOTUS engines, decide what capability contract each execution
@@ -64,7 +87,8 @@ Later we may also add the 'context' fields to the semantic operator APIs
 
 - Sometimes computing only the matched pairs is not enough. Do we also need to know whether a pair is `matched`, `contradict`, `invalid`, `supersede`, `forget/delete`, or `uncertain`?
 - Should this be represented as one more column such as `match_type` in the  `sem_join` output?
-- If yes, who is responsible for producing it: `sem_join`, the rewrittenmaintenance instruction, a following `sem_map`, or runtime?
+- If yes, who is responsible for producing it: `sem_join`, the maintenance
+  instruction, a following `sem_map`, or runtime?
 
 ### Full `V'` vs `Delta V`
 
@@ -89,18 +113,40 @@ Later we may also add the 'context' fields to the semantic operator APIs
 - Do we need `merge_into`, `upsert`, or `apply_delta` operators, or can this beexpressed with `filter`, `minus/except`, `union`, `select`, and `sem_map`?
 - What is the essence of merge/upsert here: relational set replacement, semantic merge, storage API, or optimizer lowering?
 - Is `sem_union` enough for add/update cases, and what handles deletion?
+- For Claude-style topic consolidation, are `skip`, `keep`, `overwrite`,
+  `delete`, and `create` represented as `sem_map` output columns, runtime/store
+  effects, or a future explicit delta-application operator?
 
-### Differential Instruction Rewriting
+- Claude-style extraction prompts mention forget/remove behavior, but the
+  current `topics` view has no action, tombstone, or delete-target schema. If a
+  log row says "forget X", is that part of the view query, or a stateful
+  maintenance/store operation over existing `V`? A plain `sem_filter` is not
+  enough because deletion requires matching the request against materialized
+  topics before applying a store update.
 
-- The generated `ΔQ` may need different instructions from the original full query `Q`. Who rewrites those instructions?
-- Should groupby/join maintenance instructions explicitly include contradiction, supersession, invalidation, and forget/delete targets?
-- How do we inspect and test rewritten instructions?
+### Differential Predicate / Instruction Modification
+
+- The first stateful Claude-style maintenance rule should try direct reuse:
+  `sem_groupby -> sem_join` reuses the same topic identity predicate, and
+  `sem_agg -> sem_map` reuses the same consolidation instruction.
+- Should any predicate or instruction be modified during differentiation at
+  all? If yes, what concrete operator/input-output mismatch makes modification
+  necessary?
+- When is exact reuse acceptable, and when does the changed operator shape
+  require extra wording for existing rows, new rows, null sides, delete targets,
+  or contradictions?
+- If modification is needed later, design an automatic predicate/instruction
+  modification component and define how to inspect and test its outputs.
 
 ### Storage Backends
 
 - How should file, relational, vector, and graph stores affect the generated differential plan?
 - Which backend capabilities matter: overwrite, append, delete, exact key lookup, vector search, keyword search, graph traversal?
 - How do we keep the logical DataFrame query independent from physical storage behavior?
+- The first `MarkdownStorageBackend` can keep field-to-markdown mapping config
+  inside the backend. Future work should decide whether policy authors declare
+  materialization config on views, or whether storage remains an external
+  runtime configuration.
 
 ### Schema and DSPy-Style Typed Layer
 

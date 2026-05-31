@@ -190,10 +190,18 @@ class Relation:
             how=how,
         )
 
-    def sem_topk(self, instruction: str, k: int) -> "Relation":
+    def sem_topk(
+        self,
+        instruction: str,
+        k: int,
+    ) -> "Relation":
         """Add a semantic top-k expression."""
 
-        return self._derive("sem_topk", instruction=instruction, k=k)
+        return self._derive(
+            "sem_topk",
+            instruction=instruction,
+            k=k,
+        )
 
     def sem_agg(
         self,

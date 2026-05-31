@@ -44,7 +44,7 @@ class HelloWorldMemory(am.Memory):
     helloworld_tests = (
         log
         .sem_filter(
-            instruction="{message} is a coherent LOCOMO dialogue utterance that contains a concrete personal fact, preference, relationship, event, plan, or other memory-worthy information."
+            instruction="{message} is about LGBTQ."
         )
         .sem_map(
             output_cols={
