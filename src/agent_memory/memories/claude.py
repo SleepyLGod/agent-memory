@@ -180,7 +180,7 @@ class ClaudeMemory(Memory):
             ]
         )
         .sem_groupby(
-            key=["name", "description", "type"],
+            input_cols=["name", "description", "type"],
             instruction=_GROUP_INSTRUCTION,
         )
         .sem_agg(

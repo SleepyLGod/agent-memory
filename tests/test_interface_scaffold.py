@@ -45,7 +45,11 @@ from agent_memory.adapters.lotus.sem_filter import (
     execute_sem_filter,
     native_sem_filter_kwargs,
 )
-from agent_memory.adapters.lotus.sem_groupby import assign_semantic_group_ids
+import agent_memory.adapters.lotus.sem_groupby as sem_groupby_module
+from agent_memory.adapters.lotus.sem_groupby import (
+    assign_declared_labels,
+    assign_semantic_group_ids,
+)
 from agent_memory.adapters.lotus.sem_join import (
     assemble_join_frame,
     cascade_args_from_mapping,
@@ -232,7 +236,7 @@ def test_topics_expression_uses_chain_groupby_then_aggregation() -> None:
     )
     sem_groupby_expr = sem_agg_expr.inputs[0]
     assert sem_groupby_expr.op == "sem_groupby"
-    assert sem_groupby_expr.params["key"] == ("name", "description", "type")
+    assert sem_groupby_expr.params["input_cols"] == ("name", "description", "type")
     projection_expr = sem_groupby_expr.inputs[0]
     assert projection_expr.op == "select"
     sem_flat_map_expr = projection_expr.inputs[0]
@@ -298,7 +302,7 @@ def test_topics_expression_uses_chain_groupby_then_aggregation() -> None:
 
 def test_grouped_relation_sem_agg_returns_normal_relation() -> None:
     grouped = am.Log().sem_groupby(
-        key=["topic_name"],
+        input_cols=["topic_name"],
         instruction="Rows whose {topic_name} values refer to the same durable memory topic belong in one group.",
     )
     aggregated = grouped.sem_agg(
@@ -314,6 +318,46 @@ def test_grouped_relation_sem_agg_returns_normal_relation() -> None:
     assert isinstance(aggregated, Relation)
     assert aggregated.expr.op == "sem_agg"
     assert aggregated.expr.inputs[0].op == "sem_groupby"
+
+
+def test_sem_groupby_accepts_declared_labels() -> None:
+    grouped = am.Log().sem_groupby(
+        input_cols=["title", "abstract"],
+        instruction="Assign each paper to the best matching research area.",
+        labels={
+            "systems": "Systems and databases.",
+            "ml": "Machine learning.",
+        },
+    )
+
+    labels = grouped.expr.params["labels"]
+
+    assert grouped.expr.params["label_col"] == "_label"
+    assert tuple(label.name for label in labels) == ("systems", "ml")
+    assert tuple(label.description for label in labels) == (
+        "Systems and databases.",
+        "Machine learning.",
+    )
+
+
+def test_sem_groupby_accepts_explicit_label_column() -> None:
+    grouped = am.Log().sem_groupby(
+        input_cols=["title"],
+        instruction="Assign each paper to a label.",
+        labels={"systems": "Systems papers."},
+        label_col="paper_area",
+    )
+
+    assert grouped.expr.params["label_col"] == "paper_area"
+
+
+def test_sem_groupby_rejects_empty_labels() -> None:
+    with pytest.raises(ValueError, match="labels cannot be empty"):
+        am.Log().sem_groupby(
+            input_cols=["title"],
+            instruction="Assign each paper to a label.",
+            labels={},
+        )
 
 
 def test_semantic_instruction_argument_shapes() -> None:
@@ -381,7 +425,7 @@ def test_sem_filter_query_expr_keeps_only_logical_params() -> None:
 
 def test_differential_rules_reject_unsupported_operators() -> None:
     grouped = am.Log().sem_groupby(
-        key=["topic_name"],
+        input_cols=["topic_name"],
         instruction="Rows whose {topic_name} values refer to the same durable memory topic belong in one group.",
     )
     aggregated = grouped.sem_agg(
@@ -1245,11 +1289,95 @@ def test_sem_groupby_assigns_stable_group_ids_from_exact_and_semantic_matches() 
 
     result = assign_semantic_group_ids(
         source,
-        key_columns=("name", "description"),
+        input_cols=("name", "description"),
         matched_unique_pairs=[(1, 2)],
     )
 
     assert list(result[GROUP_ID_COLUMN]) == [0, 0, 1, 1]
+
+
+def test_sem_groupby_declared_labels_assign_label_column_and_group_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = pd.DataFrame(
+        {
+            "title": ["Fast storage", "Transformer evals"],
+            "abstract": ["Database cache design.", "Model benchmark study."],
+        }
+    )
+
+    class Executor:
+        def __init__(self, obj: pd.DataFrame) -> None:
+            self.obj = obj
+
+        def __call__(self, **kwargs: Any) -> StructuredGenerationResult:
+            assert kwargs["input_cols"] == ("title", "abstract")
+            assert kwargs["output_cols"] == (ColumnSpec("_label", "One of: systems, ml."),)
+            assert "Do not invent labels" in kwargs["instruction"]
+            return StructuredGenerationResult(
+                parsed_outputs=[{"_label": "systems"}, {"_label": "ml"}],
+                raw_outputs=['{"_label":"systems"}', '{"_label":"ml"}'],
+                explanations=[None, None],
+            )
+
+    monkeypatch.setattr(sem_groupby_module, "StructuredLMExecutor", Executor)
+
+    result = assign_declared_labels(
+        source,
+        input_cols=("title", "abstract"),
+        labels=(
+            ColumnSpec("systems", "Systems and databases."),
+            ColumnSpec("ml", "Machine learning."),
+        ),
+        label_col="_label",
+        instruction="Assign each paper to the best matching research area.",
+    )
+
+    assert list(result["_label"]) == ["systems", "ml"]
+    assert list(result[GROUP_ID_COLUMN]) == [0, 1]
+    assert result.attrs["agent_memory_groupby_labels"] == ("systems", "ml")
+    assert result.attrs["agent_memory_groupby_label_col"] == "_label"
+
+
+def test_sem_groupby_declared_labels_reject_invalid_label(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = pd.DataFrame({"title": ["Unknown paper"]})
+
+    class Executor:
+        def __init__(self, obj: pd.DataFrame) -> None:
+            self.obj = obj
+
+        def __call__(self, **kwargs: Any) -> StructuredGenerationResult:
+            return StructuredGenerationResult(
+                parsed_outputs=[{"_label": "other"}],
+                raw_outputs=['{"_label":"other"}'],
+                explanations=[None],
+            )
+
+    monkeypatch.setattr(sem_groupby_module, "StructuredLMExecutor", Executor)
+
+    with pytest.raises(ValueError, match="declare an 'other' label explicitly"):
+        assign_declared_labels(
+            source,
+            input_cols=("title",),
+            labels=(ColumnSpec("systems", "Systems and databases."),),
+            label_col="_label",
+            instruction="Assign each paper to the best matching research area.",
+        )
+
+
+def test_sem_groupby_declared_labels_reject_label_col_collision() -> None:
+    source = pd.DataFrame({"title": ["Fast storage"], "_label": ["existing"]})
+
+    with pytest.raises(ValueError, match="already exists"):
+        assign_declared_labels(
+            source,
+            input_cols=("title",),
+            labels=(ColumnSpec("systems", "Systems and databases."),),
+            label_col="_label",
+            instruction="Assign each paper to the best matching research area.",
+        )
 
 
 def test_sem_agg_resolves_input_columns_and_applies_structured_outputs() -> None:
@@ -1260,7 +1388,7 @@ def test_sem_agg_resolves_input_columns_and_applies_structured_outputs() -> None
             GROUP_ID_COLUMN: [0, 0],
         }
     )
-    source.attrs["agent_memory_groupby_key"] = ("topic",)
+    source.attrs["agent_memory_groupby_input_cols"] = ("topic",)
     output_cols = (
         ColumnSpec("topic", "Canonical topic."),
         ColumnSpec("body", "Merged body."),
@@ -1514,7 +1642,7 @@ def test_sem_agg_multi_output_default_uses_single_batch(
     import agent_memory.adapters.lotus.sem_agg as sem_agg_module
 
     class Context:
-        config = LotusExecutionConfig(sem_agg_structured_chunk_size=2)
+        config = LotusExecutionConfig()
 
         def configure(self) -> None:
             pass
@@ -1560,68 +1688,6 @@ def test_sem_agg_multi_output_default_uses_single_batch(
     assert len(Executor.calls) == 1
     assert all(f"row {index}" in Executor.calls[0] for index in range(5))
     assert result.to_dict("records") == [{"topic": "docs", "body": "all rows"}]
-
-
-def test_sem_agg_multi_output_fixed_chunked_strategy_uses_row_chunks(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import agent_memory.adapters.lotus.sem_agg as sem_agg_module
-
-    class Context:
-        config = LotusExecutionConfig(
-            sem_agg_structured_strategy="fixed_chunked",
-            sem_agg_structured_chunk_size=2,
-        )
-
-        def configure(self) -> None:
-            pass
-
-    class Executor:
-        calls: list[str] = []
-
-        def __init__(self, frame: pd.DataFrame) -> None:
-            self.frame = frame
-
-        def __call__(self, **kwargs: Any) -> StructuredGenerationResult:
-            context = self.frame.loc[0, "context"]
-            Executor.calls.append(context)
-            index = len(Executor.calls)
-            return StructuredGenerationResult(
-                raw_outputs=("{}",),
-                parsed_outputs=(
-                    {"topic": f"partial-{index}", "body": f"summary-{index}"},
-                ),
-                explanations=(None,),
-            )
-
-    monkeypatch.setattr(sem_agg_module, "StructuredLMExecutor", Executor)
-    query = QueryExpr(
-        op="sem_agg",
-        inputs=(QueryExpr(op="materialized_view", params={"name": "source"}),),
-        params={
-            "input_cols": ("body",),
-            "output_cols": (ColumnSpec("topic"), ColumnSpec("body")),
-            "instruction": "Merge {body}.",
-        },
-    )
-    inputs = {
-        "source": pd.DataFrame(
-            {
-                "body": [f"row {index}" for index in range(5)],
-                GROUP_ID_COLUMN: [0, 0, 0, 0, 0],
-            }
-        )
-    }
-
-    result = execute_sem_agg(query, inputs, LotusAdapter().execute, Context())
-
-    assert len(Executor.calls) == 6
-    assert not any(
-        all(f"row {index}" in context for index in range(5))
-        for context in Executor.calls
-    )
-    assert any("partial-1" in context and "partial-2" in context for context in Executor.calls)
-    assert result.to_dict("records") == [{"topic": "partial-6", "body": "summary-6"}]
 
 
 def test_sem_agg_multi_output_lotus_hierarchical_strategy_uses_native_summary(
@@ -1887,7 +1953,7 @@ def test_sem_groupby_sem_agg_real_lotus_e2e() -> None:
     source = Relation(QueryExpr(op="materialized_view", params={"name": "source"}))
     query = (
         source.sem_groupby(
-            key=["name", "description"],
+            input_cols=["name", "description"],
             instruction="Rows refer to the same durable topic when their {name} and {description} describe the same memory.",
         )
         .sem_agg(

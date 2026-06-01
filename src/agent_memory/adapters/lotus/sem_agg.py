@@ -129,7 +129,7 @@ def execute_structured_sem_agg_group(
     *,
     context_kind: str = "source rows",
 ) -> Mapping[str, str]:
-    """Aggregate one group with a structured tree fold."""
+    """Aggregate one group with the configured structured strategy."""
 
     strategy = structured_sem_agg_strategy(config)
     if strategy == "single_batch":
@@ -152,57 +152,8 @@ def execute_structured_sem_agg_group(
             context_kind=context_kind,
         )
 
-    return execute_fixed_chunked_structured_sem_agg_group(
-        query,
-        group,
-        input_cols,
-        output_cols,
-        config,
-        context_kind=context_kind,
-    )
-
-
-def execute_fixed_chunked_structured_sem_agg_group(
-    query: QueryExpr,
-    group: pd.DataFrame,
-    input_cols: Sequence[str],
-    output_cols: Sequence[ColumnSpec],
-    config: LotusExecutionConfig,
-    *,
-    context_kind: str = "source rows",
-) -> Mapping[str, str]:
-    """Aggregate one group with fixed row-count chunks."""
-
-    chunk_size = structured_sem_agg_chunk_size(config)
-    if len(group) <= chunk_size:
-        return execute_structured_sem_agg_leaf(
-            query,
-            group,
-            input_cols,
-            output_cols,
-            config,
-            context_kind=context_kind,
-        )
-
-    partial_outputs = [
-        execute_structured_sem_agg_group(
-            query,
-            chunk,
-            input_cols,
-            output_cols,
-            config,
-            context_kind=context_kind,
-        )
-        for chunk in chunk_frame(group, chunk_size)
-    ]
-    partial_frame = apply_structured_aggregate_outputs(partial_outputs, output_cols)
-    return execute_structured_sem_agg_group(
-        query,
-        partial_frame,
-        tuple(column.name for column in output_cols),
-        output_cols,
-        config,
-        context_kind="partial aggregate rows",
+    raise ValueError(
+        "sem_agg_structured_strategy must be 'single_batch' or 'lotus_hierarchical'"
     )
 
 
@@ -335,23 +286,14 @@ def structured_sem_agg_model_kwargs(
     return kwargs
 
 
-def structured_sem_agg_chunk_size(config: LotusExecutionConfig) -> int:
-    """Return validated structured aggregate chunk size."""
-
-    chunk_size = int(config.sem_agg_structured_chunk_size)
-    if chunk_size < 2:
-        raise ValueError("sem_agg_structured_chunk_size must be at least 2")
-    return chunk_size
-
-
 def structured_sem_agg_strategy(config: LotusExecutionConfig) -> str:
     """Return validated structured aggregate strategy."""
 
     strategy = str(config.sem_agg_structured_strategy)
-    if strategy not in {"single_batch", "fixed_chunked", "lotus_hierarchical"}:
+    if strategy not in {"single_batch", "lotus_hierarchical"}:
         raise ValueError(
             "sem_agg_structured_strategy must be 'single_batch', "
-            "'fixed_chunked', or 'lotus_hierarchical'"
+            "or 'lotus_hierarchical'"
         )
     return strategy
 
@@ -365,8 +307,8 @@ def aggregate_input_columns(
     if input_cols is not None:
         columns = tuple(str(column) for column in input_cols)
     else:
-        groupby_key = tuple(source.attrs.get("agent_memory_groupby_key", ()))
-        excluded = set(groupby_key).union({GROUP_ID_COLUMN})
+        groupby_input_cols = tuple(source.attrs.get("agent_memory_groupby_input_cols", ()))
+        excluded = set(groupby_input_cols).union({GROUP_ID_COLUMN})
         columns = tuple(
             str(column) for column in source.columns if column not in excluded
         )
@@ -405,15 +347,6 @@ def aggregate_context_frame(
         for group in aggregate_groups(source)
     ]
     return pd.DataFrame({"context": contexts})
-
-
-def chunk_frame(source: pd.DataFrame, chunk_size: int) -> list[pd.DataFrame]:
-    """Split a DataFrame into deterministic row chunks."""
-
-    return [
-        source.iloc[start : start + chunk_size].reset_index(drop=True).copy()
-        for start in range(0, len(source), chunk_size)
-    ]
 
 
 def aggregate_groups(source: pd.DataFrame) -> list[pd.DataFrame]:

@@ -476,33 +476,6 @@ def test_sem_agg_grouped_real_lotus_audit() -> None:
     _write_audit("sem_agg_grouped_multi_output", {"source": source}, multi_result)
 
 
-def test_sem_agg_fixed_chunked_strategy_real_lotus_audit() -> None:
-    _require_experimental_lotus()
-    adapter = LotusAdapter(
-        config=LotusExecutionConfig(
-            sem_agg_structured_strategy="fixed_chunked",
-            sem_agg_structured_chunk_size=2,
-        )
-    )
-    source = _locomo_audit_source(indices=(2, 4, 6, 8, 10))
-    query = _view("source").sem_agg(
-        input_cols=["speaker", "message"],
-        output_cols={
-            "memory_topic": "Short durable memory topic.",
-            "memory_summary": "Merged durable memory summary.",
-        },
-        instruction="Create a durable memory topic and merge the LOCOMO dialogue utterances into one concise memory summary.",
-    )
-
-    result = adapter.execute(query.expr, {"source": source})
-
-    assert set(result.columns) == {"memory_topic", "memory_summary"}
-    assert len(result) == 1
-    _assert_nonempty_text(result, "memory_topic")
-    _assert_nonempty_text(result, "memory_summary")
-    _write_audit("sem_agg_fixed_chunked_multi_output", {"source": source}, result)
-
-
 def test_sem_agg_lotus_hierarchical_strategy_real_lotus_audit() -> None:
     _require_experimental_lotus()
     adapter = LotusAdapter(
@@ -548,7 +521,7 @@ def test_sem_groupby_sem_agg_real_lotus_audit() -> None:
     query = (
         _view("source")
         .sem_groupby(
-            key=["name", "description"],
+            input_cols=["name", "description"],
             instruction="Rows refer to the same durable topic when their {name} and {description} describe the same memory.",
         )
         .sem_agg(
@@ -566,3 +539,40 @@ def test_sem_groupby_sem_agg_real_lotus_audit() -> None:
     assert not result.empty
     _assert_nonempty_text(result, "body")
     _write_audit("sem_groupby_sem_agg", {"source": source}, result)
+
+
+def test_sem_groupby_labels_real_lotus_audit() -> None:
+    _require_real_lotus()
+    adapter = LotusAdapter()
+    source = pd.DataFrame(
+        {
+            "title": [
+                "Distributed cache invalidation",
+                "Transformer benchmark suite",
+                "Museum visitor interviews",
+            ],
+            "abstract": [
+                "A systems paper about cache consistency and database-backed infrastructure.",
+                "A machine learning paper evaluating transformer models on benchmark datasets.",
+                "A user study paper about how museum visitors interact with audio guides.",
+            ],
+        }
+    )
+    query = _view("source").sem_groupby(
+        input_cols=["title", "abstract"],
+        instruction="Assign each paper to the best matching research area.",
+        labels={
+            "systems": "Systems, infrastructure, distributed systems, and databases.",
+            "ml": "Machine learning models, training, evaluation, and datasets.",
+            "hci": "Human-computer interaction, user studies, and interaction design.",
+            "other": "Papers that do not fit the other declared labels.",
+        },
+    )
+
+    result = adapter.execute(query.expr, {"source": source})
+
+    assert "_label" in result.columns
+    assert GROUP_ID_COLUMN in result.columns
+    assert len(result) == len(source)
+    assert set(result["_label"]).issubset({"systems", "ml", "hci", "other"})
+    _write_audit("sem_groupby_labels", {"source": source}, result)

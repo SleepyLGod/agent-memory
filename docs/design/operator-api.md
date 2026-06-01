@@ -38,7 +38,7 @@ topic_candidates = log.sem_flat_map(
 topics = (
     topic_candidates
     .sem_groupby(
-        key=["topic_name"],
+        input_cols=["topic_name"],
         instruction="Rows whose {topic_name} values refer to the same durable memory topic belong in one group.",
     )
     .sem_agg(
@@ -250,6 +250,15 @@ Unlike `sem_filter`, `sem_map` is a transformation. Its instruction should say
 what fields to produce, such as `"Produce catalog fields for this topic"`, not
 just name the target concept.
 
+LOTUS lowering uses native `df.sem_map(...)` when there is one output column.
+For multiple output columns, agent-memory uses structured sem_map lowering:
+the original instruction is preserved, the requested `output_cols` become an
+explicit JSON output contract, and the backend validates that all requested
+keys are present. Backend execution knobs such as examples, system prompts,
+reasoning strategies, raw outputs, and explanations are adapter/runtime
+configuration, not policy API fields. If an explanation is part of the logical
+memory view, declare it explicitly in `output_cols`.
+
 Example:
 
 ```python
@@ -283,6 +292,8 @@ df.sem_flat_map(
 columns. Use `select` afterward when only the extracted columns should remain.
 Like `sem_map`, its instruction should describe the extraction/transformation;
 for example, `"Extract zero or more durable memory topic candidates from {message}"`.
+LOTUS lowering expects one JSON array of objects per input row. Each object must
+include all declared `output_cols`; an empty array emits zero rows.
 
 Example:
 
@@ -308,15 +319,16 @@ Semantic grouping. In v0, grouped aggregation is expressed by chaining
 
 ```python
 df.sem_groupby(
-    key=[...],
+    input_cols=[...],
     instruction="...",
 ).sem_agg(...)
 ```
 
-`key` names the columns used as the grouping basis. The instruction determines
-semantic membership, for example whether two candidate topic names refer to the
-same durable memory. `sem_groupby(...)` partitions or assigns rows; the
-following `.sem_agg(...)` produces the output row for each group.
+`input_cols` names the columns used as evidence for semantic grouping. The
+instruction defines group membership, for example what makes candidate topic
+rows belong to the same durable memory topic. `sem_groupby(...)` partitions or
+assigns rows; the following `.sem_agg(...)` produces the output row for each
+group.
 
 Example:
 
@@ -324,7 +336,7 @@ Example:
 topics = (
     topic_candidates
     .sem_groupby(
-        key=["topic_name"],
+        input_cols=["topic_name"],
         instruction="Rows whose {topic_name} values refer to the same durable memory topic belong in one group.",
     )
     .sem_agg(
@@ -338,8 +350,32 @@ topics = (
 )
 ```
 
-`sem_groupby` does not by itself decide all final output columns. If the visible
-key should be canonicalized, include that key in the aggregate input and output.
+`sem_groupby` does not by itself decide all final output columns. If a visible
+grouping field should be canonicalized, include that field in the aggregate
+input and output.
+
+By default, `sem_groupby` is open-world grouping: groups are discovered from
+the rows using the membership condition.
+
+For closed-world grouping, policy authors may provide explicit `labels`.
+The model must assign each row to exactly one declared label; if an `other`
+bucket is desired, it must be declared explicitly. The assigned label is written
+to `label_col`, which defaults to `"_label"`, and the internal group id remains
+available for the following `.sem_agg(...)`.
+
+```python
+papers = rows.sem_groupby(
+    input_cols=["title", "abstract"],
+    instruction="Assign each paper to the best matching research area.",
+    labels={
+        "systems": "Systems, infrastructure, distributed systems, and databases.",
+        "ml": "Machine learning models, training, evaluation, and datasets.",
+        "other": "Papers that do not fit the other declared labels.",
+    },
+)
+```
+
+Multi-label and hierarchical labels are not part of the current contract.
 
 Future APIs may add ordinary deterministic grouped aggregates and mixed
 aggregate maps. They are not v0 primary syntax:
@@ -356,7 +392,7 @@ A future mapping form could look like:
 
 ```python
 topics = topic_candidates.sem_groupby(
-    key=["topic_name"],
+    input_cols=["topic_name"],
     instruction="Rows whose {topic_name} values refer to the same durable memory topic belong in one group.",
     agg={
         "topic_name": sem_agg(
@@ -389,7 +425,8 @@ sem_agg(
 Defaults:
 
 - In standalone aggregation, `input_cols=None` means all visible columns.
-- Inside `sem_groupby`, `input_cols=None` means all non-key visible columns.
+- In `GroupedRelation.sem_agg(...)`, `input_cols=None` means all non-grouping
+  visible columns from the grouped relation.
 - `output_cols=None` means output columns use the same names as `input_cols`.
 
 `input_cols` and `output_cols` are read/write sets, not positional rename lists.
@@ -452,6 +489,10 @@ left.sem_outer_join(right, instruction=instruction)
 The canonical documentation form is `sem_join(..., instruction=..., how=...)`,
 because it follows DataFrame style.
 
+Backend execution choices such as cascade, helper models, examples, and
+explanation tracing belong to the runtime/adapter layer. They should not appear
+in the policy author's logical join definition.
+
 Example:
 
 ```python
@@ -488,8 +529,9 @@ memories = topics.sem_topk(
 )
 ```
 
-`method`, hybrid retrieval, reranking, graph traversal, and BFS are runtime or
-optimizer concerns for now. When used inside a memory `query(...)` method, the
+Backend methods such as `naive`, `quick`, `heap`, `quick-sem`, cascade,
+hybrid retrieval, reranking, graph traversal, and BFS are runtime/adapter or
+optimizer concerns. When used inside a memory `query(...)` method, the
 `instruction` argument is typically the end-user query text, while `k` is the
 policy author's initial retrieval width.
 
@@ -530,13 +572,13 @@ rule:
 ```python
 V = (
     D
-    .sem_groupby(key=[...], instruction=group_instruction)
+    .sem_groupby(input_cols=[...], instruction=group_instruction)
     .sem_agg(...)
 )
 
 delta_groups = (
     delta_D
-    .sem_groupby(key=[...], instruction=group_instruction)
+    .sem_groupby(input_cols=[...], instruction=group_instruction)
     .sem_agg(...)
 )
 

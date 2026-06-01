@@ -9,7 +9,7 @@ The current v0 direction is:
 topics = (
     topic_candidates
     .sem_groupby(
-        key=["topic_name"],
+        input_cols=["topic_name"],
         instruction="Rows whose {topic_name} values refer to the same durable memory topic belong in one group.",
     )
     .sem_agg(
@@ -56,7 +56,7 @@ The following alternatives are possible, but they are not v0 primary syntax.
 from agent_memory import sem_agg, count, min
 
 topics = topic_candidates.sem_groupby(
-    key=["topic_name"],
+    input_cols=["topic_name"],
     instruction="Rows whose {topic_name} values refer to the same durable memory topic belong in one group.",
     agg=sem_agg(...),
 )
@@ -70,7 +70,7 @@ dataframe-style semantic query.
 
 ```python
 topics = topic_candidates.sem_groupby(
-    key=["topic_name"],
+    input_cols=["topic_name"],
     instruction="Rows whose {topic_name} values refer to the same durable memory topic belong in one group.",
     agg=[
         am.agg.sem_agg(...),
@@ -92,7 +92,7 @@ starting point.
 
 ```python
 topics = topic_candidates.sem_groupby(
-    key=["topic_name"],
+    input_cols=["topic_name"],
     instruction="Rows whose {topic_name} values refer to the same durable memory topic belong in one group.",
     agg=sem_agg(...),
 )
@@ -107,7 +107,7 @@ object. The chain form avoids that problem.
 
 ```python
 topics = topic_candidates.sem_groupby(
-    key=["topic_name"],
+    input_cols=["topic_name"],
     instruction="Rows whose {topic_name} values refer to the same durable memory topic belong in one group.",
     agg=[
         "count",
@@ -136,7 +136,7 @@ should not be the policy-author API in v0.
 
 ```python
 topics = topic_candidates.sem_groupby(
-    key=["topic_name"],
+    input_cols=["topic_name"],
     instruction="Rows whose {topic_name} values refer to the same durable memory topic belong in one group.",
     agg=topic_candidates.sem_agg(
         input_cols=["topic_name", "topic_content"],

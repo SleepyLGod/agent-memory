@@ -31,6 +31,18 @@ def _normalize_output_cols(output_cols: ColumnOutput | None) -> tuple[ColumnSpec
     return tuple(ColumnSpec(name=name) for name in output_cols)
 
 
+def _normalize_group_labels(
+    labels: Mapping[str, str] | None,
+) -> tuple[ColumnSpec, ...] | None:
+    """Normalize optional closed-world group labels into ColumnSpec tuples."""
+
+    if labels is None:
+        return None
+    if not labels:
+        raise ValueError("sem_groupby labels cannot be empty")
+    return tuple(ColumnSpec(name=name, description=desc) for name, desc in labels.items())
+
+
 def _require_relation(value: Any, *, argument: str) -> "Relation":
     """Validate inputs to binary relation operators."""
 
@@ -161,15 +173,22 @@ class Relation:
     def sem_groupby(
         self,
         *,
-        key: Sequence[str],
+        input_cols: Sequence[str],
         instruction: str,
+        labels: Mapping[str, str] | None = None,
+        label_col: str = "_label",
     ) -> "GroupedRelation":
         """Create a grouped semantic relation expression."""
 
         expr = QueryExpr(
             op="sem_groupby",
             inputs=(self.expr,),
-            params={"key": tuple(key), "instruction": instruction},
+            params={
+                "input_cols": _normalize_input_cols(input_cols),
+                "instruction": instruction,
+                "labels": _normalize_group_labels(labels),
+                "label_col": label_col,
+            },
         )
         return GroupedRelation(expr)
 

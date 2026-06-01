@@ -144,7 +144,7 @@ _topic_candidates = (
 topics = (
     _topic_candidates
     .sem_groupby(
-        key=["topic_name"],
+        input_cols=["topic_name"],
         instruction="Find candidates related to the same durable memory topic.",
     )
     .sem_agg(
@@ -338,17 +338,18 @@ chain aggregation:
 V = (
     D
     .sem_groupby(
-        key=[...],
+        input_cols=[...],
         instruction=group_instruction,
     )
     .sem_agg(...)
 )
 \end{verbatim}
 
-Here \texttt{key} names the columns used as the grouping basis, the instruction
-defines semantic membership, and \texttt{sem\_agg} produces the output row for
-each group. Future APIs may add deterministic grouped aggregates, but v0 uses
-the chain form \texttt{sem\_groupby(...).sem\_agg(...)}.
+Here \texttt{input\_cols} names the columns used as evidence for semantic
+grouping, the instruction defines semantic membership, and
+\texttt{sem\_agg} produces the output row for each group. Future APIs may add
+deterministic grouped aggregates, but v0 uses the chain form
+\texttt{sem\_groupby(...).sem\_agg(...)}.
 
 A coarse full-next-view maintenance rule is:
 
@@ -356,7 +357,7 @@ A coarse full-next-view maintenance rule is:
 delta_groups = (
     delta_D
     .sem_groupby(
-        key=[...],
+        input_cols=[...],
         instruction=group_instruction,
     )
     .sem_agg(...)
@@ -484,7 +485,7 @@ _topic_candidates = (
 topics = (
     _topic_candidates
     .sem_groupby(
-        key=["topic_name"],
+        input_cols=["topic_name"],
         instruction="Find candidates related to the same durable memory topic.",
     )
     .sem_agg(
@@ -521,7 +522,7 @@ delta_topic_candidates = (
 delta_groups = (
     delta_topic_candidates
     .sem_groupby(
-        key=["topic_name"],
+        input_cols=["topic_name"],
         instruction="Find candidates related to the same durable memory topic.",
     )
     .sem_agg(
@@ -575,7 +576,7 @@ entity_candidates = (
 entities = (
     entity_candidates
     .sem_groupby(
-        key=["entity_name"],
+        input_cols=["entity_name"],
         instruction="Find candidates that refer to the same real-world entity.",
     )
     .sem_agg(
@@ -608,7 +609,7 @@ fact_candidates = (
 facts = (
     fact_candidates
     .sem_groupby(
-        key=["fact", "subject"],
+        input_cols=["fact", "subject"],
         instruction="Find candidates that represent the same durable memory fact.",
     )
     .sem_agg(

@@ -42,7 +42,6 @@ class LotusExecutionConfig:
     sem_join_progress_bar_desc: str = "Join comparisons"
 
     sem_agg_structured_strategy: str = "single_batch"
-    sem_agg_structured_chunk_size: int = 8
     sem_agg_safe_mode: bool = False
     sem_agg_progress_bar_desc: str = "Aggregating"
     sem_agg_model_kwargs: Mapping[str, Any] = field(default_factory=dict)
