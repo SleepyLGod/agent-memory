@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 from agent_memory.api import Log, Memory
+from agent_memory.logical import UserQuery
 
 
 _EXTRACT_INSTRUCTION = """
@@ -217,11 +216,4 @@ class ClaudeMemory(Memory):
         ).select(["catalog_title", "name", "hook"])
     )
 
-    def query(self, query: str) -> Any:
-        """Run Claude-style retrieval.
-
-        Query is policy-owned semantic retrieval behavior. The current v0.0
-        interface records the boundary but does not execute the retrieval plan.
-        """
-
-        return self.catalog.sem_topk(query, 5)
+    retrieval_query = catalog.sem_topk(UserQuery(), 5)

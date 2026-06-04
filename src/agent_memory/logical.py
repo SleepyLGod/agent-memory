@@ -78,6 +78,13 @@ class QueryExpr:
 
 
 @dataclass(frozen=True)
+class UserQuery:
+    """Runtime-bound placeholder for end-user retrieval query text."""
+
+    name: str = "query"
+
+
+@dataclass(frozen=True)
 class MemoryView:
     """Named derived view declaration V = Q(D) collected from a Memory class."""
 
@@ -92,6 +99,7 @@ class MemorySpec:
     log: "Log"
     views: Mapping[str, MemoryView]
     private_relations: Mapping[str, QueryExpr]
+    retrieval_queries: Mapping[str, QueryExpr] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "views", MappingProxyType(dict(self.views)))
@@ -99,4 +107,9 @@ class MemorySpec:
             self,
             "private_relations",
             MappingProxyType(dict(self.private_relations)),
+        )
+        object.__setattr__(
+            self,
+            "retrieval_queries",
+            MappingProxyType(dict(self.retrieval_queries)),
         )

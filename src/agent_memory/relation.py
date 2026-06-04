@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from .logical import ColumnSpec, QueryExpr
+from .logical import ColumnSpec, QueryExpr, UserQuery
 
 ColumnInput = Sequence[str] | None
 ColumnOutput = Sequence[str] | Mapping[str, str]
@@ -211,7 +211,7 @@ class Relation:
 
     def sem_topk(
         self,
-        instruction: str,
+        instruction: str | UserQuery,
         k: int,
     ) -> "Relation":
         """Add a semantic top-k expression."""

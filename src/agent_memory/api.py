@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from functools import wraps
 from typing import Any
 
 from .logical import ColumnSpec, MemorySpec, MemoryView, QueryExpr
 from .message import MessageInput
+from .policy import DifferentiatedPolicy, DifferentialPolicyCompiler
 from .relation import Relation
 from .runtime import MemoryRuntime
 
@@ -39,24 +39,22 @@ class Memory:
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
-
-        # Policy query methods may return logical Relation plans; execute those
-        # plans implicitly so policy authors never call runtime internals.
-        user_query = cls.__dict__.get("query")
-        if user_query is None:
-            return
-
-        @wraps(user_query)
-        def wrapped_query(self: "Memory", *args: Any, **kwargs: Any) -> Any:
-            result = user_query(self, *args, **kwargs)
-            if isinstance(result, Relation):
-                return self._runtime.execute_query(result)
-            return result
-
-        cls.query = wrapped_query
+        if "query" in cls.__dict__:
+            raise TypeError(
+                f"{cls.__name__} must declare retrieval_query = ... instead of "
+                "overriding query(...)."
+            )
+        if "retrieval_query" in cls.__dict__ and not isinstance(
+            cls.__dict__["retrieval_query"],
+            Relation,
+        ):
+            raise TypeError("retrieval_query must be a Relation")
 
     def __init__(self, *, adapter: Any | None = None) -> None:
-        self._runtime = MemoryRuntime(self.__class__.spec(), adapter=adapter)
+        self._runtime = MemoryRuntime(
+            self.__class__.differentiate_policy(),
+            adapter=adapter,
+        )
 
     def add(self, message: MessageInput) -> None:
         """Append an end-user message or event to memory.
@@ -68,18 +66,10 @@ class Memory:
 
         return self._runtime.add(message)
 
-    def query(self, query: str) -> Any:
-        """Run this memory's policy-defined retrieval query.
+    def query(self, text: str) -> Any:
+        """Run the default policy-defined retrieval query."""
 
-        Base Memory does not choose a view automatically and runtime does not
-        route queries. Concrete memory policies must override this method to
-        define the semantic retrieval query they want to expose.
-        """
-
-        raise NotImplementedError(
-            f"{type(self).__name__} must override query(...) to define policy-owned "
-            "retrieval behavior."
-        )
+        return self._runtime.execute_retrieval_query("default", text)
 
     @classmethod
     def spec(cls) -> MemorySpec:
@@ -99,9 +89,22 @@ class Memory:
         return spec
 
     @classmethod
+    def differentiate_policy(cls) -> DifferentiatedPolicy:
+        """Return the in-memory differentiated policy artifact for this class."""
+
+        cached = cls.__dict__.get("_agent_memory_differentiated_policy")
+        if isinstance(cached, DifferentiatedPolicy):
+            return cached
+
+        policy = DifferentialPolicyCompiler().differentiate(cls.spec())
+        setattr(cls, "_agent_memory_differentiated_policy", policy)
+        return policy
+
+    @classmethod
     def _collect_spec(cls) -> MemorySpec:
         log: Log | None = None
         private_relations: dict[str, QueryExpr] = {}
+        retrieval_queries: dict[str, QueryExpr] = {}
         views: dict[str, MemoryView] = {}
 
         for name, value in vars(cls).items():
@@ -109,6 +112,12 @@ class Memory:
                 if log is not None:
                     raise ValueError(f"{cls.__name__} declares multiple Log relations")
                 log = value
+                continue
+
+            if name == "retrieval_query":
+                if not isinstance(value, Relation):
+                    raise TypeError("retrieval_query must be a Relation")
+                retrieval_queries["default"] = value.expr
                 continue
 
             if not isinstance(value, Relation):
@@ -137,4 +146,9 @@ class Memory:
                 )
             raise ValueError(f"{cls.__name__} must declare a Log relation")
 
-        return MemorySpec(log=log, views=views, private_relations=private_relations)
+        return MemorySpec(
+            log=log,
+            views=views,
+            private_relations=private_relations,
+            retrieval_queries=retrieval_queries,
+        )

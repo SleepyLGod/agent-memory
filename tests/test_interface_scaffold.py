@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pandas as pd
@@ -21,11 +22,14 @@ from agent_memory.adapters.lotus.relational import (
 )
 from agent_memory.adapters.lotus.sem_agg import (
     GROUP_ID_COLUMN,
-    aggregate_context_frame,
+    JSON_OBJECT_RESPONSE_FORMAT,
     aggregate_groups,
     aggregate_input_columns,
-    apply_structured_aggregate_outputs,
     execute_sem_agg,
+    lotus_style_sem_agg,
+    parse_structured_sem_agg_output,
+    structured_aggregate_instruction,
+    structured_sem_agg_model_kwargs,
 )
 from agent_memory.adapters.lotus.sem_map import (
     apply_sem_map_output,
@@ -33,6 +37,7 @@ from agent_memory.adapters.lotus.sem_map import (
     native_sem_map_kwargs,
     normalize_strategy,
     parse_structured_map_json,
+    resolve_input_cols as resolve_sem_map_input_cols,
     single_output_column,
     structured_instruction,
     temporary_map_column,
@@ -54,19 +59,22 @@ from agent_memory.adapters.lotus.sem_join import (
     assemble_join_frame,
     cascade_args_from_mapping,
     join_series,
+    renamed_columns,
 )
 from agent_memory.adapters.lotus.sem_topk import execute_sem_topk, topk_instruction
 from agent_memory.adapters.lotus.structured import (
     STRUCTURED_RESERVED_MODEL_KWARGS,
+    StructuredLMExecutor,
     StructuredGenerationResult,
     parse_structured_object_json,
+    structured_instruction as build_structured_instruction,
     validate_model_kwargs,
 )
-from agent_memory.logical import ColumnSpec, MemorySpec, QueryExpr
-from agent_memory.planner import DifferentialQueryPlanner
+from agent_memory.datasets.locomo import flatten_locomo_rows
+from agent_memory.logical import ColumnSpec, MemorySpec, QueryExpr, UserQuery
+from agent_memory.planner import DifferentialInstructionRewriter, DifferentialQueryPlanner
 from agent_memory.planner.rules import DifferentialRules
 from agent_memory.relation import GroupedRelation, Relation
-from examples.helloworld.helloworld_smoke import _flatten_locomo_rows
 
 
 def test_query_expr_params_are_deeply_frozen() -> None:
@@ -160,7 +168,10 @@ def test_claude_memory_spec_collects_views_and_private_relations() -> None:
     assert spec.log.expr.op == "log"
     assert sorted(spec.views) == ["catalog", "topics"]
     assert sorted(spec.private_relations) == []
+    assert sorted(spec.retrieval_queries) == ["default"]
+    assert spec.retrieval_queries["default"].op == "sem_topk"
     assert "log" not in spec.views
+    assert "retrieval_query" not in spec.views
 
 
 def test_claude_memory_log_schema_is_explicit() -> None:
@@ -423,6 +434,115 @@ def test_sem_filter_query_expr_keeps_only_logical_params() -> None:
         )
 
 
+def _differentiate_with_defaults(
+    query: QueryExpr,
+    *,
+    is_view_boundary: bool = False,
+) -> QueryExpr:
+    return DifferentialRules().differentiate(
+        query,
+        source_input=QueryExpr(op="log"),
+        current_view=QueryExpr(op="materialized_view", params={"name": "view"}),
+        is_view_boundary=is_view_boundary,
+        instruction_rewriter=DifferentialInstructionRewriter(),
+    )
+
+
+def _assert_materialized_view(
+    query: QueryExpr,
+    *,
+    name: str,
+    columns: tuple[str, ...] | None = None,
+) -> None:
+    assert query.op == "materialized_view"
+    assert query.params["name"] == name
+    if columns is not None:
+        assert query.params["columns"] == columns
+
+
+def test_differential_instruction_rewriter_groupby_to_join_rewrites_bare_inputs() -> None:
+    instruction = (
+        "Rows share a topic when {name} and {description} match. "
+        "Keep {name:left} side-aware placeholders."
+    )
+
+    rewritten = DifferentialInstructionRewriter().groupby_to_join(
+        instruction,
+        input_cols=("name", "description"),
+    )
+
+    assert "{name:left} and {name:right}" in rewritten
+    assert "{description:left} and {description:right}" in rewritten
+    assert "Keep {name:left} side-aware placeholders." in rewritten
+
+
+def test_differential_instruction_rewriter_agg_to_map_rewrites_overlapping_inputs() -> None:
+    instruction = (
+        "Output {name} and {body}. Use {timestamp} when deciding freshness."
+    )
+
+    rewritten = DifferentialInstructionRewriter().agg_to_map(
+        instruction,
+        input_cols=("name", "body", "timestamp"),
+        output_cols=(ColumnSpec("name"), ColumnSpec("body")),
+    )
+
+    assert "{name:left} and {name:right}" in rewritten
+    assert "{body:left} and {body:right}" in rewritten
+    assert "{timestamp:left} and {timestamp:right}" in rewritten
+
+
+def test_differential_instruction_rewriter_agg_to_map_preserves_output_only_placeholders() -> None:
+    instruction = "Produce {summary} from {name}. Keep {name:left} explicit."
+
+    rewritten = DifferentialInstructionRewriter().agg_to_map(
+        instruction,
+        input_cols=("name",),
+        output_cols=(ColumnSpec("summary"),),
+    )
+
+    assert "{summary}" in rewritten
+    assert "{name:left} and {name:right}" in rewritten
+    assert "Keep {name:left} explicit." in rewritten
+
+
+def test_differential_instruction_rewriter_matches_sem_join_suffix_convention() -> None:
+    left = pd.DataFrame({"name": ["docs"], "left_only": ["left"]})
+    right = pd.DataFrame({"name": ["documentation"], "right_only": ["right"]})
+    left_columns, right_columns = renamed_columns(left, right)
+
+    rewritten = DifferentialInstructionRewriter().agg_to_map(
+        "Merge {name} into {summary}.",
+        input_cols=("name",),
+        output_cols=(ColumnSpec("summary"),),
+    )
+
+    assert left_columns["name"] == "name:left"
+    assert right_columns["name"] == "name:right"
+    assert "{name:left} and {name:right}" in rewritten
+
+
+def test_differential_instruction_rewriter_rejects_unknown_placeholders() -> None:
+    with pytest.raises(ValueError, match="unknown"):
+        DifferentialInstructionRewriter().groupby_to_join(
+            "Rows share a topic when {unknown} matches.",
+            input_cols=("name",),
+        )
+
+
+def test_differential_instruction_rewriter_ignores_non_column_braces() -> None:
+    instruction = "Keep {{name}} and {not a column} untouched, rewrite {name}."
+
+    rewritten = DifferentialInstructionRewriter().groupby_to_join(
+        instruction,
+        input_cols=("name",),
+    )
+
+    assert "{{name}}" in rewritten
+    assert "{not a column}" in rewritten
+    assert "{name:left} and {name:right}" in rewritten
+
+
 def test_differential_rules_reject_unsupported_operators() -> None:
     grouped = am.Log().sem_groupby(
         input_cols=["topic_name"],
@@ -434,15 +554,18 @@ def test_differential_rules_reject_unsupported_operators() -> None:
         instruction="Merge topic rows.",
     )
 
-    with pytest.raises(NotImplementedError, match="No differential rule"):
-        DifferentialRules().differentiate(aggregated.expr)
+    with pytest.raises(
+        NotImplementedError,
+        match=r"sem_agg differential is only supported",
+    ):
+        _differentiate_with_defaults(aggregated.expr)
 
 
 def test_differential_rules_reject_malformed_unary_expr() -> None:
     query = QueryExpr(op="sem_filter")
 
     with pytest.raises(ValueError, match="expects exactly one input"):
-        DifferentialRules().differentiate(query)
+        _differentiate_with_defaults(query)
 
 
 def test_differential_rules_preserve_sem_filter_instruction() -> None:
@@ -453,18 +576,21 @@ def test_differential_rules_preserve_sem_filter_instruction() -> None:
         )
 
     view = FilterMemory.spec().views["helloworld_tests"]
-    differentiated = DifferentialRules().differentiate(view.query)
+    differentiated = _differentiate_with_defaults(view.query)
 
-    assert differentiated == view.query
+    assert differentiated.op == view.query.op
+    assert differentiated.inputs[0] == QueryExpr(op="log")
     assert differentiated.params["instruction"] == "{message} is a coherent sentence."
 
 
-def test_differential_query_planner_rejects_unsupported_operators() -> None:
-    planner = DifferentialQueryPlanner()
+def test_differential_rules_reject_grouped_aggregation_outside_view_boundary() -> None:
     view = am.ClaudeMemory.spec().views["topics"]
 
-    with pytest.raises(NotImplementedError, match="No differential rule"):
-        planner.differentiate(view)
+    with pytest.raises(
+        NotImplementedError,
+        match=r"sem_agg differential is only supported",
+    ):
+        _differentiate_with_defaults(view.query)
 
 
 def test_differential_query_planner_supports_sem_filter_views() -> None:
@@ -475,8 +601,18 @@ def test_differential_query_planner_supports_sem_filter_views() -> None:
         )
 
     view = FilterMemory.spec().views["helloworld_tests"]
+    differentiated = DifferentialQueryPlanner().differentiate(view)
 
-    assert DifferentialQueryPlanner().differentiate(view) == view.query
+    assert differentiated.op == "union"
+    _assert_materialized_view(
+        differentiated.inputs[0],
+        name="helloworld_tests",
+        columns=("message",),
+    )
+    fragment = differentiated.inputs[1]
+    assert fragment.op == "sem_filter"
+    assert fragment.inputs[0] == QueryExpr(op="log")
+    assert fragment.params == view.query.params
 
 
 def test_differential_query_planner_supports_sem_map_select_views() -> None:
@@ -491,8 +627,305 @@ def test_differential_query_planner_supports_sem_map_select_views() -> None:
         ).select(["message", "label", "summary"])
 
     view = MapMemory.spec().views["labels"]
+    differentiated = DifferentialQueryPlanner().differentiate(view)
 
-    assert DifferentialQueryPlanner().differentiate(view) == view.query
+    assert differentiated.op == "union"
+    _assert_materialized_view(
+        differentiated.inputs[0],
+        name="labels",
+        columns=("message", "label", "summary"),
+    )
+    fragment = differentiated.inputs[1]
+    assert fragment.op == "select"
+    assert fragment.params == view.query.params
+    sem_map_expr = fragment.inputs[0]
+    assert sem_map_expr.op == "sem_map"
+    assert sem_map_expr.inputs[0] == QueryExpr(op="log")
+    assert sem_map_expr.params == view.query.inputs[0].params
+
+
+def test_differential_query_planner_supports_standalone_sem_agg_views() -> None:
+    class SummaryMemory(am.Memory):
+        log = am.Log({"summary": "Memory summary.", "evidence": "Raw evidence."})
+        summary = log.sem_agg(
+            input_cols=["summary"],
+            output_cols=["summary"],
+            instruction="Merge summaries.",
+        )
+
+    view = SummaryMemory.spec().views["summary"]
+    differentiated = DifferentialQueryPlanner().differentiate(view)
+
+    assert differentiated.op == "sem_agg"
+    assert differentiated.params == view.query.params
+    compressed_input = differentiated.inputs[0]
+    assert compressed_input.op == "union"
+    current_state, changed_state = compressed_input.inputs
+    assert current_state.op == "select"
+    assert current_state.params["columns"] == ("summary",)
+    _assert_materialized_view(
+        current_state.inputs[0],
+        name="summary",
+        columns=("summary",),
+    )
+    assert changed_state.op == "select"
+    assert changed_state.params["columns"] == ("summary",)
+    assert changed_state.inputs[0] == QueryExpr(op="log")
+
+
+def test_differential_query_planner_supports_select_over_standalone_sem_agg_views() -> None:
+    class SummaryMemory(am.Memory):
+        log = am.Log({"summary": "Memory summary.", "evidence": "Raw evidence."})
+        summary = log.sem_agg(
+            input_cols=["summary"],
+            output_cols=["summary"],
+            instruction="Merge summaries.",
+        ).select(["summary"])
+
+    view = SummaryMemory.spec().views["summary"]
+    differentiated = DifferentialQueryPlanner().differentiate(view)
+
+    assert differentiated.op == "select"
+    assert differentiated.params["columns"] == ("summary",)
+    aggregate = differentiated.inputs[0]
+    assert aggregate.op == "sem_agg"
+    assert aggregate.params == view.query.inputs[0].params
+    compressed_input = aggregate.inputs[0]
+    assert compressed_input.op == "union"
+    current_state, changed_state = compressed_input.inputs
+    assert current_state.op == "select"
+    assert current_state.params["columns"] == ("summary",)
+    _assert_materialized_view(
+        current_state.inputs[0],
+        name="summary",
+        columns=("summary",),
+    )
+    assert changed_state.op == "select"
+    assert changed_state.params["columns"] == ("summary",)
+    assert changed_state.inputs[0] == QueryExpr(op="log")
+
+
+def test_differential_query_planner_supports_sem_agg_after_row_local_fragment() -> None:
+    class FilteredSummaryMemory(am.Memory):
+        log = am.Log({"summary": "Memory summary.", "kind": "Message kind."})
+        summary = (
+            log
+            .sem_filter(instruction="{summary} is durable.")
+            .sem_agg(
+                input_cols=["summary"],
+                output_cols=["summary"],
+                instruction="Merge durable summaries.",
+            )
+        )
+
+    view = FilteredSummaryMemory.spec().views["summary"]
+    differentiated = DifferentialQueryPlanner().differentiate(view)
+
+    changed_state = differentiated.inputs[0].inputs[1]
+    changed_fragment = changed_state.inputs[0]
+    assert changed_fragment.op == "sem_filter"
+    assert changed_fragment.inputs[0] == QueryExpr(op="log")
+    assert changed_state.params["columns"] == ("summary",)
+
+
+def test_differential_query_planner_rejects_sem_agg_without_input_cols() -> None:
+    class SummaryMemory(am.Memory):
+        log = am.Log({"summary": "Memory summary."})
+        summary = log.sem_agg(
+            output_cols=["summary"],
+            instruction="Merge summaries.",
+        )
+
+    view = SummaryMemory.spec().views["summary"]
+
+    with pytest.raises(NotImplementedError, match="requires explicit input_cols"):
+        DifferentialQueryPlanner().differentiate(view)
+
+
+def test_differential_query_planner_rejects_sem_agg_missing_current_view_columns() -> None:
+    query = QueryExpr(
+        op="sem_agg",
+        inputs=(QueryExpr(op="log", params={"columns": (ColumnSpec("summary"),)}),),
+        params={
+            "input_cols": ("summary", "timestamp"),
+            "output_cols": (ColumnSpec("summary"),),
+            "instruction": "Merge summaries.",
+        },
+    )
+
+    with pytest.raises(NotImplementedError, match="current view.*timestamp"):
+        DifferentialRules().differentiate(
+            query,
+            source_input=QueryExpr(op="log"),
+            current_view=QueryExpr(
+                op="materialized_view",
+                params={"name": "summary", "columns": ("summary",)},
+            ),
+            is_view_boundary=True,
+            instruction_rewriter=DifferentialInstructionRewriter(),
+        )
+
+
+def test_differential_query_planner_rejects_sem_agg_missing_changed_fragment_columns() -> None:
+    query = QueryExpr(
+        op="sem_agg",
+        inputs=(QueryExpr(op="log", params={"columns": (ColumnSpec("summary"),)}),),
+        params={
+            "input_cols": ("summary", "timestamp"),
+            "output_cols": (ColumnSpec("summary"), ColumnSpec("timestamp")),
+            "instruction": "Merge summaries.",
+        },
+    )
+
+    with pytest.raises(NotImplementedError, match="changed sem_agg input fragment.*timestamp"):
+        DifferentialRules().differentiate(
+            query,
+            source_input=QueryExpr(op="log"),
+            current_view=QueryExpr(
+                op="materialized_view",
+                params={"name": "summary", "columns": ("summary", "timestamp")},
+            ),
+            is_view_boundary=True,
+            instruction_rewriter=DifferentialInstructionRewriter(),
+        )
+
+
+def test_differential_rules_reject_standalone_sem_agg_outside_view_boundary() -> None:
+    query = am.Log({"summary": "Memory summary."}).sem_agg(
+        input_cols=["summary"],
+        output_cols=["summary"],
+        instruction="Merge summaries.",
+    ).expr
+
+    with pytest.raises(NotImplementedError, match="view boundary"):
+        _differentiate_with_defaults(query)
+
+
+def test_differential_rules_support_sem_flat_map_fragments() -> None:
+    query = am.Log({"message": "Raw input message."}).sem_flat_map(
+        output_cols={"fact": "Extracted fact."},
+        instruction="Extract facts from {message}.",
+    ).expr
+
+    differentiated = _differentiate_with_defaults(query)
+
+    assert differentiated.op == "sem_flat_map"
+    assert differentiated.inputs[0].op == "log"
+    assert differentiated.params["instruction"] == "Extract facts from {message}."
+    assert tuple(col.name for col in differentiated.params["output_cols"]) == ("fact",)
+
+
+def test_differential_query_planner_builds_claude_topics_full_next_view() -> None:
+    view = am.ClaudeMemory.spec().views["topics"]
+
+    differentiated = DifferentialQueryPlanner().differentiate(view)
+
+    assert differentiated.op == "select"
+    assert differentiated.params["columns"] == ("name", "description", "type", "body")
+    sem_map_expr = differentiated.inputs[0]
+    assert sem_map_expr.op == "sem_map"
+    assert tuple(col.name for col in sem_map_expr.params["output_cols"]) == (
+        "name",
+        "description",
+        "type",
+        "body",
+    )
+    sem_join_expr = sem_map_expr.inputs[0]
+    assert sem_join_expr.op == "sem_join"
+    assert sem_join_expr.params["how"] == "outer"
+    join_instruction = sem_join_expr.params["instruction"]
+    assert "{name:left} and {name:right}" in join_instruction
+    assert "{description:left} and {description:right}" in join_instruction
+    assert "{type:left} and {type:right}" in join_instruction
+    assert "{name}," not in join_instruction
+    _assert_materialized_view(
+        sem_join_expr.inputs[1],
+        name="topics",
+        columns=("name", "description", "type", "body"),
+    )
+    map_instruction = sem_map_expr.params["instruction"]
+    assert "{name:left} and {name:right}" in map_instruction
+    assert "{description:left} and {description:right}" in map_instruction
+    assert "{type:left} and {type:right}" in map_instruction
+    assert "{body:left} and {body:right}" in map_instruction
+    changed_aggregate = sem_join_expr.inputs[0]
+    assert changed_aggregate.op == "sem_agg"
+    assert changed_aggregate.inputs[0].op == "sem_groupby"
+
+
+def test_differential_query_planner_recomputes_views_from_materialized_dependencies() -> None:
+    spec = am.ClaudeMemory.spec()
+    catalog = spec.views["catalog"]
+
+    differentiated = DifferentialQueryPlanner().differentiate(
+        catalog,
+        views=spec.views,
+    )
+
+    assert differentiated.op == "select"
+    sem_map_expr = differentiated.inputs[0]
+    assert sem_map_expr.op == "sem_map"
+    _assert_materialized_view(
+        sem_map_expr.inputs[0],
+        name="topics",
+    )
+
+
+def test_differential_rules_reject_mixed_log_and_materialized_view_fragments() -> None:
+    query = QueryExpr(
+        op="union",
+        inputs=(
+            QueryExpr(
+                op="sem_filter",
+                inputs=(QueryExpr(op="log"),),
+                params={"instruction": "{message} is memory-worthy."},
+            ),
+            QueryExpr(
+                op="sem_map",
+                inputs=(QueryExpr(op="materialized_view", params={"name": "topics"}),),
+                params={
+                    "output_cols": (ColumnSpec("summary"),),
+                    "instruction": "Summarize {body}.",
+                },
+            ),
+        ),
+    )
+
+    with pytest.raises(
+        NotImplementedError,
+        match=r"Mixed log \+ upstream materialized view",
+    ):
+        _differentiate_with_defaults(query)
+
+
+def test_differential_rules_reject_generic_inner_sem_join() -> None:
+    log = am.Log({"message": "Raw message."})
+    query = log.sem_join(
+        log,
+        instruction="{message:left} and {message:right} describe the same memory.",
+        how="inner",
+    ).expr
+
+    with pytest.raises(
+        NotImplementedError,
+        match=r"requires materialized old L/R state",
+    ):
+        _differentiate_with_defaults(query)
+
+
+def test_differential_rules_reject_non_inner_sem_join() -> None:
+    log = am.Log({"message": "Raw message."})
+    query = log.sem_join(
+        log,
+        instruction="{message:left} and {message:right} describe the same memory.",
+        how="outer",
+    ).expr
+
+    with pytest.raises(
+        NotImplementedError,
+        match=r"supports only how='inner'",
+    ):
+        _differentiate_with_defaults(query)
 
 
 def test_claude_memory_has_no_private_topic_candidates() -> None:
@@ -530,6 +963,24 @@ def test_catalog_expression_maps_from_topics() -> None:
     assert "Do not generate filesystem paths" in catalog_instruction
 
 
+def test_differentiated_policy_compiles_views_and_retrieval_templates() -> None:
+    policy = am.ClaudeMemory.differentiate_policy()
+
+    assert policy.spec is am.ClaudeMemory.spec()
+    assert policy.view_execution_order == ("topics", "catalog")
+    assert policy.view_dependencies == {
+        "topics": (),
+        "catalog": ("topics",),
+    }
+    assert sorted(policy.view_queries) == ["catalog", "topics"]
+
+    retrieval_query = policy.retrieval_queries["default"]
+    assert retrieval_query.op == "sem_topk"
+    _assert_materialized_view(retrieval_query.inputs[0], name="catalog")
+    assert retrieval_query.params["instruction"] == UserQuery()
+    assert retrieval_query.params["k"] == 5
+
+
 @pytest.mark.parametrize(
     "message",
     [
@@ -538,11 +989,62 @@ def test_catalog_expression_maps_from_topics() -> None:
         {"message": "Please remember that I prefer concise docs."},
     ],
 )
-def test_claude_add_inputs_reach_unsupported_differential_rule(message: object) -> None:
-    memory = am.ClaudeMemory()
+def test_claude_add_executes_differentiated_queries(message: object) -> None:
+    class RecordingAdapter:
+        def __init__(self) -> None:
+            self.calls: list[tuple[QueryExpr, dict[str, pd.DataFrame]]] = []
 
-    with pytest.raises(NotImplementedError, match="No differential rule"):
-        memory.add(message)
+        def execute(
+            self,
+            query: QueryExpr,
+            inputs: dict[str, pd.DataFrame],
+        ) -> pd.DataFrame:
+            self.calls.append((query, inputs))
+            if query.op == "select":
+                columns = [str(column) for column in query.params["columns"]]
+            else:
+                columns = ["value"]
+            return pd.DataFrame(
+                [{column: f"{column}-{len(self.calls)}" for column in columns}]
+            )
+
+    adapter = RecordingAdapter()
+    memory = am.ClaudeMemory(adapter=adapter)
+
+    memory.add(message)
+
+    assert [query.op for query, _ in adapter.calls] == ["select", "select"]
+    topics_query, topics_inputs = adapter.calls[0]
+    catalog_query, catalog_inputs = adapter.calls[1]
+
+    assert topics_query.params["columns"] == ("name", "description", "type", "body")
+    assert "log" in topics_inputs
+    assert list(topics_inputs["topics"].columns) == [
+        "name",
+        "description",
+        "type",
+        "body",
+    ]
+    assert topics_inputs["topics"].empty
+
+    assert catalog_query.params["columns"] == ("catalog_title", "name", "hook")
+    assert catalog_query.inputs[0].inputs[0] == QueryExpr(
+        op="materialized_view",
+        params={"name": "topics"},
+    )
+    assert catalog_inputs["topics"].equals(memory._runtime._state["topics"])
+
+    assert list(memory._runtime._state["topics"].columns) == [
+        "name",
+        "description",
+        "type",
+        "body",
+    ]
+    assert list(memory._runtime._state["catalog"].columns) == [
+        "catalog_title",
+        "name",
+        "hook",
+    ]
 
 
 class HelloWorldTestMemory(am.Memory):
@@ -570,8 +1072,7 @@ class HelloWorldTestMemory(am.Memory):
         .select(["memory_summary"])
     )
 
-    def query(self, query: str) -> Relation:
-        return self.helloworld_tests.sem_topk(query, 2)
+    retrieval_query = helloworld_tests.sem_topk(am.UserQuery(), 2)
 
 
 def test_lotus_adapter_wraps_plain_topk_query_with_columns() -> None:
@@ -623,6 +1124,12 @@ def test_sem_topk_query_expr_keeps_only_logical_params() -> None:
             3,
             method="quick",
         )
+
+
+def test_sem_topk_accepts_user_query_placeholder() -> None:
+    relation = am.Log({"message": "Raw message."}).sem_topk(am.UserQuery(), 3)
+
+    assert relation.expr.params == {"instruction": am.UserQuery(), "k": 3}
 
 
 def test_lotus_adapter_forwards_topk_lotus_options() -> None:
@@ -780,7 +1287,7 @@ def test_helloworld_locomo_loader_flattens_dialogue_rows() -> None:
         }
     ]
 
-    rows = _flatten_locomo_rows(dataset, sample_limit=1, turn_limit=1)
+    rows = flatten_locomo_rows(dataset, sample_limit=1, turn_limit=1)
 
     assert rows == [
         {
@@ -925,6 +1432,56 @@ def test_structured_sem_map_instruction_preserves_instruction_and_schema() -> No
     assert '"memory_type"' in instruction
     assert '"summary"' in instruction
     assert "valid JSON object" in instruction
+    assert "Output shape example" in instruction
+    assert '{"memory_type": "string", "summary": "string"}' in instruction
+
+
+def test_structured_flat_map_instruction_uses_rows_wrapper_shape_hint() -> None:
+    instruction = build_structured_instruction(
+        "Extract memory facts from {message}.",
+        (
+            ColumnSpec("memory_fact", "Atomic memory fact."),
+            ColumnSpec("fact_type", "Short type label."),
+        ),
+        shape="array",
+    )
+
+    assert "Extract memory facts from {message}." in instruction
+    assert 'a "rows" field containing an array' in instruction
+    assert '{"rows": [{"memory_fact": "string", "fact_type": "string"}]}' in instruction
+
+
+def test_structured_sem_map_uses_all_columns_when_instruction_has_no_placeholders() -> None:
+    query = QueryExpr(
+        op="sem_map",
+        params={
+            "input_cols": None,
+            "output_cols": (ColumnSpec("summary"),),
+            "instruction": "Merge rows into one summary.",
+        },
+    )
+    source = pd.DataFrame({"name:left": ["docs"], "name:right": [pd.NA]})
+
+    assert resolve_sem_map_input_cols(source, query) == ("name:left", "name:right")
+
+
+def test_structured_input_inference_ignores_declared_output_placeholders() -> None:
+    query = QueryExpr(
+        op="sem_flat_map",
+        params={
+            "input_cols": None,
+            "output_cols": (
+                ColumnSpec("name"),
+                ColumnSpec("description"),
+            ),
+            "instruction": (
+                "Extract candidates from {message}, filling {name} and {description}."
+            ),
+        },
+    )
+    source = pd.DataFrame({"message": ["remember concise docs"]})
+
+    assert resolve_sem_map_input_cols(source, query) == ("message",)
 
 
 def test_structured_sem_map_parses_and_applies_multiple_outputs() -> None:
@@ -1044,14 +1601,50 @@ def test_structured_sem_map_executor_call_does_not_receive_writeback_flags(
     assert list(result.columns) == ["message", "label", "summary"]
 
 
-def test_sem_flat_map_parses_and_explodes_json_array_outputs() -> None:
+def test_structured_executor_array_shape_uses_json_object_response_format(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import lotus
+
+    class Output:
+        outputs = ['{"rows": [{"topic": "docs"}]}']
+
+    class FakeLM:
+        def __init__(self) -> None:
+            self.kwargs: dict[str, Any] | None = None
+
+        def __call__(self, prompts: object, **kwargs: Any) -> Output:
+            self.kwargs = kwargs
+            return Output()
+
+    fake_lm = FakeLM()
+    monkeypatch.setattr(lotus.settings, "lm", fake_lm)
+    monkeypatch.setattr(lotus.settings, "enable_cache", False)
+    source = pd.DataFrame({"message": ["prefers concise docs"]})
+
+    result = StructuredLMExecutor(source)(
+        input_cols=("message",),
+        output_cols=(ColumnSpec("topic", "Candidate topic."),),
+        instruction="Extract topics from {message}.",
+        shape="array",
+        progress_bar_desc="Flat mapping",
+        model_kwargs={},
+        operator="sem_flat_map",
+    )
+
+    assert fake_lm.kwargs is not None
+    assert fake_lm.kwargs["response_format"] == {"type": "json_object"}
+    assert result.parsed_outputs == [[{"topic": "docs"}]]
+
+
+def test_sem_flat_map_parses_and_explodes_json_rows_wrapper_outputs() -> None:
     output_cols = (
         ColumnSpec("topic", "Candidate topic."),
         ColumnSpec("summary", "Candidate summary."),
     )
     parsed = [
         parse_structured_flat_map_json(
-            '[{"topic": "docs", "summary": "Prefers concise docs."}, {"topic": "meetings", "summary": "Plans a meeting."}]',
+            '{"rows": [{"topic": "docs", "summary": "Prefers concise docs."}, {"topic": "meetings", "summary": "Plans a meeting."}]}',
             output_cols,
         )
     ]
@@ -1069,7 +1662,7 @@ def test_sem_flat_map_parses_and_explodes_json_array_outputs() -> None:
 
 def test_sem_flat_map_empty_array_emits_zero_rows_with_columns() -> None:
     output_cols = (ColumnSpec("topic"),)
-    parsed = [parse_structured_flat_map_json("[]", output_cols)]
+    parsed = [parse_structured_flat_map_json('{"rows": []}', output_cols)]
     source = pd.DataFrame({"message": ["nothing durable"]})
 
     result = apply_flat_map_outputs(source, parsed, output_cols)
@@ -1083,12 +1676,16 @@ def test_sem_flat_map_rejects_invalid_json_shapes() -> None:
 
     with pytest.raises(ValueError, match="invalid JSON"):
         parse_structured_flat_map_json("not json", output_cols)
-    with pytest.raises(ValueError, match="non-array JSON"):
+    with pytest.raises(ValueError, match="non-object JSON wrapper"):
+        parse_structured_flat_map_json("[]", output_cols)
+    with pytest.raises(ValueError, match="missing required key"):
         parse_structured_flat_map_json('{"topic": "docs"}', output_cols)
+    with pytest.raises(ValueError, match="not an array"):
+        parse_structured_flat_map_json('{"rows": {"topic": "docs"}}', output_cols)
     with pytest.raises(ValueError, match="not an object"):
-        parse_structured_flat_map_json('["docs"]', output_cols)
+        parse_structured_flat_map_json('{"rows": ["docs"]}', output_cols)
     with pytest.raises(ValueError, match="missing required keys"):
-        parse_structured_flat_map_json('[{"summary": "docs"}]', output_cols)
+        parse_structured_flat_map_json('{"rows": [{"summary": "docs"}]}', output_cols)
 
 
 def test_lotus_adapter_dispatches_sem_flat_map(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1239,6 +1836,52 @@ def test_sem_join_assembles_inner_left_right_and_outer_rows() -> None:
     assert pd.isna(outer.loc[2, "message"])
 
 
+def test_sem_join_empty_input_uses_unmatched_rows_without_lotus_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import agent_memory.adapters.lotus.sem_join as sem_join_module
+
+    class Context:
+        config = LotusExecutionConfig()
+
+        def configure(self) -> None:
+            pass
+
+    def execute(query: QueryExpr, inputs: dict[str, pd.DataFrame]) -> pd.DataFrame:
+        return inputs[str(query.params["name"])]
+
+    def evaluate_semantic_join(*args: object) -> list[tuple[int, int, None]]:
+        raise AssertionError("semantic join should not run for empty inputs")
+
+    monkeypatch.setattr(
+        sem_join_module,
+        "evaluate_semantic_join",
+        evaluate_semantic_join,
+    )
+    query = QueryExpr(
+        op="sem_join",
+        inputs=(
+            QueryExpr(op="materialized_view", params={"name": "left"}),
+            QueryExpr(op="materialized_view", params={"name": "right"}),
+        ),
+        params={"instruction": "same topic", "how": "outer"},
+    )
+
+    result = sem_join_module.execute_sem_join(
+        query,
+        {
+            "left": pd.DataFrame({"topic": ["docs"]}),
+            "right": pd.DataFrame(columns=["topic"]),
+        },
+        execute,
+        Context(),
+    )
+
+    assert list(result.columns) == ["topic:left", "topic:right"]
+    assert result.loc[0, "topic:left"] == "docs"
+    assert pd.isna(result.loc[0, "topic:right"])
+
+
 def test_sem_join_series_supports_explicit_and_fallback_formats() -> None:
     left = pd.DataFrame(
         {"message": ["Alice prefers concise docs."], "speaker": ["Alice"]}
@@ -1380,7 +2023,7 @@ def test_sem_groupby_declared_labels_reject_label_col_collision() -> None:
         )
 
 
-def test_sem_agg_resolves_input_columns_and_applies_structured_outputs() -> None:
+def test_sem_agg_resolves_input_columns_and_builds_structured_instruction() -> None:
     source = pd.DataFrame(
         {
             "topic": ["docs", "meetings"],
@@ -1389,21 +2032,68 @@ def test_sem_agg_resolves_input_columns_and_applies_structured_outputs() -> None
         }
     )
     source.attrs["agent_memory_groupby_input_cols"] = ("topic",)
-    output_cols = (
-        ColumnSpec("topic", "Canonical topic."),
-        ColumnSpec("body", "Merged body."),
-    )
 
     assert aggregate_input_columns(source, None) == ("body",)
-
-    result = apply_structured_aggregate_outputs(
-        [{"topic": "docs", "body": "Prefers concise docs and weekly syncs."}],
-        output_cols,
+    query = QueryExpr(
+        op="sem_agg",
+        params={"instruction": "Merge {body} into durable memory."},
+    )
+    instruction = structured_aggregate_instruction(
+        query,
+        ("body",),
+        (
+            ColumnSpec("topic", "Short topic."),
+            ColumnSpec("body", "Durable memory summary."),
+        ),
     )
 
-    assert list(result.columns) == ["topic", "body"]
-    assert result.loc[0, "topic"] == "docs"
-    assert result.loc[0, "body"] == "Prefers concise docs and weekly syncs."
+    assert "Return exactly one valid JSON object" in instruction
+    assert "- topic: Short topic." in instruction
+    assert "- body: Durable memory summary." in instruction
+    assert 'Expected JSON shape: {"topic": "string", "body": "string"}' in instruction
+
+
+def test_lotus_style_sem_agg_passes_response_format_only_on_final_pass() -> None:
+    calls: list[dict[str, Any]] = []
+
+    class Model:
+        max_ctx_len = 10
+        max_tokens = 1
+
+        def count_tokens(self, value: Any) -> int:
+            text = str(value)
+            if "doc two" in text:
+                return 100
+            return 1
+
+        def __call__(self, batch: list[Any], **kwargs: Any) -> Any:
+            calls.append(dict(kwargs))
+            if len(calls) == 1:
+                return SimpleNamespace(outputs=("partial one", "partial two"))
+            return SimpleNamespace(outputs=('{"topic": "docs", "body": "summary"}',))
+
+    output = lotus_style_sem_agg(
+        ["doc one", "doc two"],
+        Model(),
+        "Merge documents.",
+        [0, 0],
+        response_format=JSON_OBJECT_RESPONSE_FORMAT,
+        final_model_kwargs={"max_tokens": 1024},
+    )
+
+    assert output == '{"topic": "docs", "body": "summary"}'
+    assert "response_format" not in calls[0]
+    assert calls[1]["response_format"] == JSON_OBJECT_RESPONSE_FORMAT
+    assert calls[1]["max_tokens"] == 1024
+
+
+def test_sem_agg_model_kwargs_cannot_override_response_format() -> None:
+    config = LotusExecutionConfig(
+        sem_agg_model_kwargs={"response_format": {"type": "text"}},
+    )
+
+    with pytest.raises(ValueError, match="cannot override response_format"):
+        structured_sem_agg_model_kwargs(config)
 
 
 def test_sem_agg_groups_rows_by_internal_group_id() -> None:
@@ -1422,22 +2112,6 @@ def test_sem_agg_groups_rows_by_internal_group_id() -> None:
         ["cooking"],
     ]
     assert all(GROUP_ID_COLUMN not in group.columns for group in groups)
-
-
-def test_sem_agg_context_frame_has_one_row_per_group() -> None:
-    source = pd.DataFrame(
-        {
-            "body": ["Prefers concise docs.", "Likes short docs.", "Plans cooking."],
-            GROUP_ID_COLUMN: [0, 0, 1],
-        }
-    )
-
-    context = aggregate_context_frame(source, ("body",))
-
-    assert len(context) == 2
-    assert "Prefers concise docs." in context.loc[0, "context"]
-    assert "Likes short docs." in context.loc[0, "context"]
-    assert "Plans cooking." in context.loc[1, "context"]
 
 
 def test_sem_agg_grouped_single_output_returns_one_row_per_group(
@@ -1542,29 +2216,33 @@ def test_sem_agg_grouped_multi_output_returns_one_row_per_group(
         def configure(self) -> None:
             pass
 
-    class Executor:
-        calls: list[str] = []
+    structured_calls: list[tuple[list[str], tuple[str, ...], tuple[str, ...]]] = []
 
-        def __init__(self, frame: pd.DataFrame) -> None:
-            self.frame = frame
-
-        def __call__(self, **kwargs: Any) -> StructuredGenerationResult:
-            assert list(self.frame.columns) == ["context"]
-            assert len(self.frame) == 1
-            assert kwargs["model_kwargs"]["max_tokens"] >= 1024
-            Executor.calls.append(self.frame.loc[0, "context"])
-            index = len(Executor.calls) - 1
-            parsed = (
-                {"topic": "docs", "body": "doc one and doc two"},
-                {"topic": "cooking", "body": "cooking"},
-            )[index]
-            return StructuredGenerationResult(
-                raw_outputs=("{}",),
-                parsed_outputs=(parsed,),
-                explanations=(None,),
+    def execute_lotus_style_structured_sem_agg_group(
+        query: QueryExpr,
+        group: pd.DataFrame,
+        input_cols: tuple[str, ...],
+        output_cols: tuple[ColumnSpec, ...],
+        config: LotusExecutionConfig,
+    ) -> str:
+        structured_calls.append(
+            (
+                list(group["body"]),
+                tuple(input_cols),
+                tuple(column.name for column in output_cols),
             )
+        )
+        index = len(structured_calls) - 1
+        return (
+            '{"topic": "docs", "body": "doc one and doc two"}',
+            '{"topic": "cooking", "body": "cooking"}',
+        )[index]
 
-    monkeypatch.setattr(sem_agg_module, "StructuredLMExecutor", Executor)
+    monkeypatch.setattr(
+        sem_agg_module,
+        "execute_lotus_style_structured_sem_agg_group",
+        execute_lotus_style_structured_sem_agg_group,
+    )
     query = QueryExpr(
         op="sem_agg",
         inputs=(QueryExpr(op="materialized_view", params={"name": "source"}),),
@@ -1588,7 +2266,10 @@ def test_sem_agg_grouped_multi_output_returns_one_row_per_group(
     assert list(result.columns) == ["topic", "body"]
     assert len(result) == 2
     assert list(result["topic"]) == ["docs", "cooking"]
-    assert len(Executor.calls) == 2
+    assert structured_calls == [
+        (["doc one", "doc two"], ("body",), ("topic", "body")),
+        (["cooking"], ("body",), ("topic", "body")),
+    ]
 
 
 def test_sem_agg_whole_multi_output_returns_one_row(
@@ -1602,22 +2283,23 @@ def test_sem_agg_whole_multi_output_returns_one_row(
         def configure(self) -> None:
             pass
 
-    class Executor:
-        def __init__(self, frame: pd.DataFrame) -> None:
-            self.frame = frame
+    structured_calls: list[list[str]] = []
 
-        def __call__(self, **kwargs: Any) -> StructuredGenerationResult:
-            assert len(self.frame) == 1
-            assert kwargs["model_kwargs"]["max_tokens"] >= 1024
-            return StructuredGenerationResult(
-                raw_outputs=("{}",),
-                parsed_outputs=(
-                    {"topic": "docs", "body": "doc one and doc two"},
-                ),
-                explanations=(None,),
-            )
+    def execute_lotus_style_structured_sem_agg_group(
+        query: QueryExpr,
+        group: pd.DataFrame,
+        input_cols: tuple[str, ...],
+        output_cols: tuple[ColumnSpec, ...],
+        config: LotusExecutionConfig,
+    ) -> str:
+        structured_calls.append(list(group["body"]))
+        return '{"topic": "docs", "body": "doc one and doc two"}'
 
-    monkeypatch.setattr(sem_agg_module, "StructuredLMExecutor", Executor)
+    monkeypatch.setattr(
+        sem_agg_module,
+        "execute_lotus_style_structured_sem_agg_group",
+        execute_lotus_style_structured_sem_agg_group,
+    )
     query = QueryExpr(
         op="sem_agg",
         inputs=(QueryExpr(op="materialized_view", params={"name": "source"}),),
@@ -1634,155 +2316,27 @@ def test_sem_agg_whole_multi_output_returns_one_row(
     assert list(result.columns) == ["topic", "body"]
     assert len(result) == 1
     assert result.loc[0, "topic"] == "docs"
+    assert structured_calls == [["doc one", "doc two"]]
 
 
-def test_sem_agg_multi_output_default_uses_single_batch(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import agent_memory.adapters.lotus.sem_agg as sem_agg_module
+def test_sem_agg_rejects_invalid_structured_json() -> None:
+    output_cols = (ColumnSpec("topic"), ColumnSpec("body"))
 
-    class Context:
-        config = LotusExecutionConfig()
+    with pytest.raises(ValueError, match="invalid JSON"):
+        parse_structured_sem_agg_output("not json", output_cols)
 
-        def configure(self) -> None:
-            pass
+    with pytest.raises(ValueError, match="invalid JSON"):
+        parse_structured_sem_agg_output("", output_cols)
 
-    class Executor:
-        calls: list[str] = []
-
-        def __init__(self, frame: pd.DataFrame) -> None:
-            self.frame = frame
-
-        def __call__(self, **kwargs: Any) -> StructuredGenerationResult:
-            context = self.frame.loc[0, "context"]
-            Executor.calls.append(context)
-            return StructuredGenerationResult(
-                raw_outputs=("{}",),
-                parsed_outputs=(
-                    {"topic": "docs", "body": "all rows"},
-                ),
-                explanations=(None,),
-            )
-
-    monkeypatch.setattr(sem_agg_module, "StructuredLMExecutor", Executor)
-    query = QueryExpr(
-        op="sem_agg",
-        inputs=(QueryExpr(op="materialized_view", params={"name": "source"}),),
-        params={
-            "input_cols": ("body",),
-            "output_cols": (ColumnSpec("topic"), ColumnSpec("body")),
-            "instruction": "Merge {body}.",
-        },
-    )
-    inputs = {
-        "source": pd.DataFrame(
-            {
-                "body": [f"row {index}" for index in range(5)],
-                GROUP_ID_COLUMN: [0, 0, 0, 0, 0],
-            }
-        )
-    }
-
-    result = execute_sem_agg(query, inputs, LotusAdapter().execute, Context())
-
-    assert len(Executor.calls) == 1
-    assert all(f"row {index}" in Executor.calls[0] for index in range(5))
-    assert result.to_dict("records") == [{"topic": "docs", "body": "all rows"}]
+    with pytest.raises(ValueError, match="non-object JSON"):
+        parse_structured_sem_agg_output("[]", output_cols)
 
 
-def test_sem_agg_multi_output_lotus_hierarchical_strategy_uses_native_summary(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import agent_memory.adapters.lotus.sem_agg as sem_agg_module
+def test_sem_agg_rejects_missing_structured_key() -> None:
+    output_cols = (ColumnSpec("topic"), ColumnSpec("body"))
 
-    class Context:
-        config = LotusExecutionConfig(sem_agg_structured_strategy="lotus_hierarchical")
-
-        def configure(self) -> None:
-            pass
-
-    class Executor:
-        calls: list[tuple[str, str]] = []
-
-        def __init__(self, frame: pd.DataFrame) -> None:
-            self.frame = frame
-
-        def __call__(self, **kwargs: Any) -> StructuredGenerationResult:
-            context = self.frame.loc[0, "context"]
-            instruction = kwargs["instruction"]
-            Executor.calls.append((instruction, context))
-            index = len(Executor.calls)
-            return StructuredGenerationResult(
-                raw_outputs=("{}",),
-                parsed_outputs=(
-                    {"topic": f"final-{index}", "body": f"summary-{index}"},
-                ),
-                explanations=(None,),
-            )
-
-    native_calls: list[tuple[str, tuple[str, ...], list[str]]] = []
-
-    def execute_native_sem_agg_group(
-        query: QueryExpr,
-        group: pd.DataFrame,
-        input_cols: tuple[str, ...],
-        config: LotusExecutionConfig | None = None,
-    ) -> str:
-        native_calls.append(
-            (
-                str(query.params["instruction"]),
-                tuple(input_cols),
-                list(group["body"]),
-            )
-        )
-        return "LOTUS native hierarchical intermediate summary."
-
-    monkeypatch.setattr(sem_agg_module, "StructuredLMExecutor", Executor)
-    monkeypatch.setattr(
-        sem_agg_module,
-        "execute_native_sem_agg_group",
-        execute_native_sem_agg_group,
-    )
-    query = QueryExpr(
-        op="sem_agg",
-        inputs=(QueryExpr(op="materialized_view", params={"name": "source"}),),
-        params={
-            "input_cols": ("body",),
-            "output_cols": (ColumnSpec("topic"), ColumnSpec("body")),
-            "instruction": "Merge {body}.",
-        },
-    )
-    inputs = {
-        "source": pd.DataFrame(
-            {
-                "body": [
-                    "alpha beta gamma delta epsilon",
-                    "zeta eta theta iota kappa",
-                    "lambda mu nu xi omicron",
-                    "pi rho sigma tau upsilon",
-                ]
-            }
-        )
-    }
-
-    result = execute_sem_agg(query, inputs, LotusAdapter().execute, Context())
-
-    assert len(native_calls) == 1
-    assert "final output fields later: topic, body" in native_calls[0][0]
-    assert native_calls[0][1] == ("body",)
-    assert native_calls[0][2] == [
-        "alpha beta gamma delta epsilon",
-        "zeta eta theta iota kappa",
-        "lambda mu nu xi omicron",
-        "pi rho sigma tau upsilon",
-    ]
-    assert Executor.calls == [
-        (
-            "Merge {body}.\n\nUse the LOTUS hierarchical aggregate in {context} and produce one aggregate object.",
-            "LOTUS native hierarchical intermediate summary.",
-        )
-    ]
-    assert result.to_dict("records") == [{"topic": "final-1", "body": "summary-1"}]
+    with pytest.raises(ValueError, match="missing required keys"):
+        parse_structured_sem_agg_output('{"topic": "docs"}', output_cols)
 
 
 def test_lotus_adapter_dispatches_sem_join_groupby_and_agg(
@@ -1827,6 +2381,86 @@ def test_runtime_log_append_and_view_union_semantics() -> None:
 
     assert list(log_state["message"]) == ["hello", "hello"]
     assert list(view_state["message"]) == ["hello", "world"]
+
+
+def test_runtime_executes_q_prime_and_stores_adapter_result() -> None:
+    class FilterMemory(am.Memory):
+        log = am.Log({"message": "Raw input message."})
+        helloworld_tests = log.sem_filter(
+            instruction="{message} is a coherent sentence."
+        ).select(["message"])
+
+    class RecordingAdapter:
+        def __init__(self) -> None:
+            self.calls: list[tuple[QueryExpr, dict[str, pd.DataFrame]]] = []
+
+        def execute(
+            self,
+            query: QueryExpr,
+            inputs: dict[str, pd.DataFrame],
+        ) -> pd.DataFrame:
+            self.calls.append((query, inputs))
+            return pd.DataFrame({"message": ["next view row"]})
+
+    adapter = RecordingAdapter()
+    memory = FilterMemory(adapter=adapter)
+
+    memory.add("hello")
+
+    assert not hasattr(memory._runtime, "_planner")
+    query, inputs = adapter.calls[0]
+    assert query.op == "union"
+    _assert_materialized_view(
+        query.inputs[0],
+        name="helloworld_tests",
+        columns=("message",),
+    )
+    assert list(inputs["helloworld_tests"].columns) == ["message"]
+    assert inputs["helloworld_tests"].empty
+    assert memory._runtime._state["helloworld_tests"].to_dict("records") == [
+        {"message": "next view row"}
+    ]
+
+
+def test_runtime_executes_standalone_sem_agg_q_prime_and_stores_result() -> None:
+    class SummaryMemory(am.Memory):
+        log = am.Log({"summary": "Memory summary.", "evidence": "Raw evidence."})
+        summary = log.sem_agg(
+            input_cols=["summary"],
+            output_cols=["summary"],
+            instruction="Merge summaries.",
+        )
+
+    class RecordingAdapter:
+        def __init__(self) -> None:
+            self.calls: list[tuple[QueryExpr, dict[str, pd.DataFrame]]] = []
+
+        def execute(
+            self,
+            query: QueryExpr,
+            inputs: dict[str, pd.DataFrame],
+        ) -> pd.DataFrame:
+            self.calls.append((query, inputs))
+            return pd.DataFrame({"summary": ["next aggregate"]})
+
+    adapter = RecordingAdapter()
+    memory = SummaryMemory(adapter=adapter)
+
+    memory.add({"summary": "new summary", "evidence": "raw"})
+
+    query, inputs = adapter.calls[0]
+    assert query.op == "sem_agg"
+    assert query.inputs[0].op == "union"
+    _assert_materialized_view(
+        query.inputs[0].inputs[0].inputs[0],
+        name="summary",
+        columns=("summary",),
+    )
+    assert inputs["summary"].empty
+    assert list(inputs["summary"].columns) == ["summary"]
+    assert memory._runtime._state["summary"].to_dict("records") == [
+        {"summary": "next aggregate"}
+    ]
 
 
 def test_helloworld_memory_real_lotus_e2e() -> None:
@@ -1989,50 +2623,68 @@ def test_sem_groupby_sem_agg_real_lotus_e2e() -> None:
     assert not result.empty
 
 
-def test_claude_memory_query_is_policy_owned_placeholder() -> None:
-    memory = am.ClaudeMemory()
-    captured: dict[str, Any] = {}
+def test_claude_memory_query_binds_user_query_placeholder() -> None:
+    class RecordingAdapter:
+        def __init__(self) -> None:
+            self.calls: list[tuple[QueryExpr, dict[str, pd.DataFrame]]] = []
 
-    def execute_query(plan: Relation) -> Any:
-        captured["plan"] = plan
-        raise NotImplementedError("query plan execution")
+        def execute(
+            self,
+            query: QueryExpr,
+            inputs: dict[str, pd.DataFrame],
+        ) -> str:
+            self.calls.append((query, inputs))
+            return "ranked"
 
-    memory._runtime.execute_query = execute_query
+    adapter = RecordingAdapter()
+    memory = am.ClaudeMemory(adapter=adapter)
+    catalog = pd.DataFrame({"catalog_title": ["Docs"], "name": ["docs"], "hook": ["docs"]})
+    memory._runtime._state["catalog"] = catalog
 
-    with pytest.raises(NotImplementedError, match="query plan execution"):
-        memory.query("design docs")
+    assert memory.query("design docs") == "ranked"
 
-    plan = captured["plan"]
-    assert isinstance(plan, Relation)
-    assert plan.expr.op == "sem_topk"
-    assert plan.expr.params["instruction"] == "design docs"
-    assert plan.expr.params["k"] == 5
-
-
-def test_query_wrapper_returns_plain_python_objects_without_runtime() -> None:
-    class PlainQueryMemory(am.Memory):
-        log = am.Log()
-
-        def query(self, query: str) -> dict[str, str]:
-            return {"query": query}
-
-    memory = PlainQueryMemory()
-
-    def execute_query(plan: Relation) -> Any:
-        raise AssertionError("plain query return should not execute a Relation plan")
-
-    memory._runtime.execute_query = execute_query
-
-    assert memory.query("design docs") == {"query": "design docs"}
+    query, inputs = adapter.calls[0]
+    assert query.op == "sem_topk"
+    assert query.inputs[0] == QueryExpr(
+        op="materialized_view",
+        params={"name": "catalog"},
+    )
+    assert query.params["instruction"] == "design docs"
+    assert query.params["k"] == 5
+    assert inputs["catalog"].equals(catalog)
 
 
-def test_base_memory_query_requires_policy_override() -> None:
+def test_memory_subclass_rejects_query_override() -> None:
+    with pytest.raises(TypeError, match="retrieval_query"):
+
+        class PlainQueryMemory(am.Memory):
+            log = am.Log()
+
+            def query(self, query: str) -> dict[str, str]:
+                return {"query": query}
+
+
+def test_memory_subclass_rejects_invalid_retrieval_query_at_definition_time() -> None:
+    with pytest.raises(TypeError, match="retrieval_query must be a Relation"):
+
+        class InvalidRetrievalQueryMemory(am.Memory):
+            log = am.Log()
+            retrieval_query = "design docs"
+
+    with pytest.raises(TypeError, match="retrieval_query must be a Relation"):
+
+        class EmptyRetrievalQueryMemory(am.Memory):
+            log = am.Log()
+            retrieval_query = None
+
+
+def test_base_memory_query_requires_retrieval_query() -> None:
     class MinimalMemory(am.Memory):
         log = am.Log()
 
     memory = MinimalMemory()
 
-    with pytest.raises(NotImplementedError, match="must override query"):
+    with pytest.raises(NotImplementedError, match="retrieval query"):
         memory.query("design docs")
 
 
@@ -2041,8 +2693,45 @@ def test_runtime_owns_empty_materialized_state_placeholder() -> None:
 
     assert memory._runtime._state == {}
     assert not hasattr(memory._runtime, "query")
+    assert not hasattr(memory._runtime, "execute_query")
     with pytest.raises(KeyError, match="Missing adapter input 'catalog'"):
-        memory._runtime.execute_query(memory.catalog.sem_topk("design docs", 5))
+        memory.query("design docs")
+
+
+def test_runtime_query_output_columns_support_materialized_view_refs() -> None:
+    memory = am.ClaudeMemory()
+    query = QueryExpr(op="materialized_view", params={"name": "catalog"})
+
+    assert memory._runtime._query_output_columns(query) == [
+        "catalog_title",
+        "name",
+        "hook",
+    ]
+
+
+def test_runtime_query_output_columns_pass_through_groupby_and_topk() -> None:
+    memory = HelloWorldTestMemory()
+    view_query = HelloWorldTestMemory.spec().views["helloworld_tests"].query
+    groupby_query = QueryExpr(
+        op="sem_groupby",
+        inputs=(view_query,),
+        params={"input_cols": ("memory_summary",), "instruction": "same memory"},
+    )
+    topk_query = QueryExpr(
+        op="sem_topk",
+        inputs=(view_query,),
+        params={"instruction": "plans", "k": 2},
+    )
+
+    assert memory._runtime._query_output_columns(groupby_query) == ["memory_summary"]
+    assert memory._runtime._query_output_columns(topk_query) == ["memory_summary"]
+
+
+def test_runtime_query_output_columns_reject_unknown_ops() -> None:
+    memory = HelloWorldTestMemory()
+
+    with pytest.raises(NotImplementedError, match="Cannot infer output columns"):
+        memory._runtime._query_output_columns(QueryExpr(op="unknown"))
 
 
 def test_relation_is_not_top_level_public_api() -> None:
