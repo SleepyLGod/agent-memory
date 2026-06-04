@@ -5,7 +5,7 @@
 topic view 如何对齐 markdown memory 文件。
 
 其中 LOTUS 部分讨论的是 `QueryExpr -> LOTUS-backed execution`，不是
-`Q -> ΔQ` 的 differential rewrite。
+`Q -> Q'` 的 differential rewrite。
 
 核心原则：
 
@@ -25,17 +25,17 @@ storage。推荐里程碑如下：
 1. **Complete `QueryExpr -> LOTUS-backed execution`**：先让当前 public
    operators 都能从 `QueryExpr` 执行到 dataframe result。没有完整 execution
    layer，differential rules 和 Claude policy 都没有可靠执行目标。
-2. **Implement `Q -> ΔQ` differential rules**：在 full-query operator
+2. **Implement `Q -> Q'` differential rules**：在 full-query operator
    execution 完整后，再扩展 `DifferentialQueryPlanner`。Rules 只负责 query
    rewrite，不负责 backend lowering。
 3. **Claude policy full-query and differential comparison**：用同一批 log
    rows 比较 `Q(D ∪ ΔD)` 和 differential maintenance 的结果，验证 Claude
-   policy 的语义和 `Q -> ΔQ` 是否对齐。
+   policy 的语义和 `Q -> Q'` 是否对齐。
 4. **StorageBackend + MarkdownStorageBackend**：最后接 durable
    materialization。Storage 持久化 materialized views，不定义 logical
    query 语义，也不替代 operator/rule correctness。
 
-这个顺序避免把四个问题混在一起：operator 是否能执行、`Q -> ΔQ` 是否正确、
+这个顺序避免把四个问题混在一起：operator 是否能执行、`Q -> Q'` 是否正确、
 Claude policy 是否合理、view 是否能持久化。
 
 ## 2. Operator Implementation Strategy
@@ -67,11 +67,11 @@ Operator 实现要分清两类：
 - `sem_groupby`：baseline 使用 pairwise semantic same-topic matching，加
   deterministic union-find group assignment。第一版优先 correctness /
   inspectability，不优先成本。
-- `sem_agg`：single-output 复用 LOTUS lower-level `sem_agg`；multi-output
-  默认用 one group -> one structured LM call 的 single-batch lowering。
-  `lotus_hierarchical` 是 adapter-internal opt-in optimization strategy，不是
-  默认路径；grouped input 每个 group 产出一行，whole-relation aggregation 视为
-  一个 synthetic group。
+- `sem_agg`：single-output 复用 LOTUS lower-level `sem_agg`。multi-output
+  使用 agent-memory compatibility helper，复刻 LOTUS main-style hierarchical
+  aggregate，并只在 final LM pass 应用 JSON object `response_format` 写入
+  declared `output_cols`。grouped input 每个 group 产出一行，whole-relation
+  aggregation 视为一个 synthetic group。
 
 后续 operator work 不是继续扩 public policy API，而是补 execution parity：
 native LOTUS options 进入 adapter/runtime config，custom lowering 补 pruning、
@@ -96,10 +96,10 @@ safe mode、stats、trace 等不进入 policy class，也不进入 query tree。
 Differential rules、Claude policy validation 和 storage 要保持顺序和分层：
 
 - Storage 负责持久化 materialized views，不定义 logical query。
-- `DifferentialQueryPlanner` 负责 `Q -> ΔQ`，不关心 markdown 文件怎么写。
+- `DifferentialQueryPlanner` 负责 `Q -> Q'`，不关心 markdown 文件怎么写。
 - `ExecutionAdapter` 负责执行 `QueryExpr`，不负责 durable persistence。
 - `DifferentialQueryPlanner` 必须在 operator execution 完整后再扩展，否则
-  rewrite 出来的 `ΔQ` 没有完整 execution target。
+  rewrite 出来的 `Q'` 没有完整 execution target。
 - Claude policy validation 必须在 operator execution 和 rules 之后；它是
   full-query 与 differential result 的对照实验，不是 operator layer 的替代。
 - Storage 排在 Claude operator/rule correctness 之后；它只决定 durable
@@ -131,7 +131,7 @@ QueryExpr
   op="sem_filter", op="sem_map", ...
 
 Differential planner
-  Q -> ΔQ
+  Q -> Q'
 
 Execution adapter
   QueryExpr -> backend execution
@@ -141,7 +141,7 @@ Execution adapter
 LOTUS-backed execution。
 
 `DifferentialQueryPlanner` 负责把 view definition query `Q` 变成
-differential query template `ΔQ`。它不应该知道 LOTUS 的 pandas accessor
+differentiated maintenance query `Q'`。它不应该知道 LOTUS 的 pandas accessor
 细节。`LotusAdapter` 负责执行已经生成好的 `QueryExpr`，它不应该修改
 operator 的逻辑语义。
 
@@ -361,14 +361,11 @@ partition ids 的 tree fold。因此：
 - 单输出 whole-relation aggregation：lower 到 LOTUS lower-level `sem_agg(...)`。
 - 单输出 grouped aggregation：每个 generated group 独立调用 LOTUS lower-level
   `sem_agg(...)`，输出 `G groups -> G rows`。
-- 多输出 aggregation：不是 LOTUS 原生能力。当前使用 agent-memory structured
-  aggregate lowering，schema contract 来自 declared `output_cols`。
-- 默认 multi-output execution 是 single batch：一个 group 一次 structured LM
-  call，最容易 audit。
-- opt-in strategy `lotus_hierarchical`：先调用 LOTUS lower-level `sem_agg`
-  做原生 hierarchical text aggregation，再把中间 aggregate 转成 declared
-  multi-output schema；它复用了 LOTUS native tree fold，但仍然不是 LOTUS
-  native multi-output operator。
+- 多输出 aggregation：当前 active lowering 是 agent-memory structured
+  hierarchical aggregate。它在 adapter 内部使用 compatibility helper 复刻
+  LOTUS main-style tree fold，并只在 final LM pass 应用 JSON object
+  `response_format` 生成 declared `output_cols`。这不是当前 PyPI LOTUS 的
+  native multi-output capability，也不 monkeypatch LOTUS 或 pandas accessor。
 
 固定 row-count chunking 曾作为实验策略出现过，但它不是 LOTUS 原生
 `sem_agg` 的思路，真实 LOCOMO audit 也暴露过 structured JSON 空输出问题。

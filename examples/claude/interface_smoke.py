@@ -13,6 +13,16 @@ path.insert(0, str(PROJECT_ROOT / "src"))
 import agent_memory as am  # noqa: E402
 from agent_memory.logical import QueryExpr  # noqa: E402
 
+VISIBLE_PARAM_KEYS = {
+    "columns",
+    "input_cols",
+    "output_cols",
+    "key",
+    "instruction",
+    "k",
+    "name",
+}
+
 
 def _format_value(value: Any) -> Any:
     if isinstance(value, tuple) and all(hasattr(item, "name") for item in value):
@@ -24,7 +34,7 @@ def _format_params(params: Mapping[str, Any]) -> str:
     visible = {
         key: _format_value(value)
         for key, value in params.items()
-        if key in {"columns", "input_cols", "output_cols", "key", "instruction", "k"}
+        if key in VISIBLE_PARAM_KEYS
     }
     if not visible:
         return ""
@@ -55,17 +65,16 @@ def main() -> None:
         print(f"\nview: {name}")
         print_expr(view.query)
 
-    memory = am.ClaudeMemory()
+    policy = am.ClaudeMemory.differentiate_policy()
+    print(f"\nview execution order: {policy.view_execution_order}")
 
-    try:
-        memory.add(am.Message(content="Please remember concise design docs."))
-    except NotImplementedError as error:
-        print(f"\nadd: {error}")
+    for name in policy.view_execution_order:
+        print(f"\ndifferentiated view query: {name}")
+        print_expr(policy.view_queries[name])
 
-    try:
-        memory.query("design docs")
-    except NotImplementedError as error:
-        print(f"query: {error}")
+    for name, query in policy.retrieval_queries.items():
+        print(f"\nretrieval query: {name}")
+        print_expr(query)
 
 
 if __name__ == "__main__":

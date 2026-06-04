@@ -16,17 +16,20 @@ It can:
 - collect a `MemorySpec` from a policy class
 - inspect logical `QueryExpr` trees
 - instantiate the built-in `ClaudeMemory` policy
-- run the minimal LOTUS e2e path for row-local `sem_filter`, `sem_map`, and `sem_topk`
+- build an in-memory `DifferentiatedPolicy`
+- run the current LOTUS-backed operator execution path
 
 It does not yet:
 
-- run general differential rules beyond row-local `sem_filter` and `sem_map`
-- execute general semantic view maintenance beyond the current narrow LOTUS path
+- persist differentiated policies as durable JSON/YAML artifacts
+- run optimizer passes
 - persist views to storage
 
-Runtime and adapter execution are intentionally narrow: v0.0 can append rows,
-maintain row-local `sem_filter`/`sem_map` views, and query materialized views
-with `sem_topk`. Unsupported policies still raise `NotImplementedError`.
+Runtime and adapter execution are intentionally in-memory: v0.0 can append rows,
+execute compiled differentiated queries over the supported LOTUS adapter
+operators, and query materialized views with compiled retrieval templates.
+Unsupported expression operators such as arbitrary `filter(predicate=...)` and
+`assign(...)` still raise explicit errors.
 
 ## Quick Start
 
@@ -36,15 +39,19 @@ import agent_memory as am
 
 spec = am.ClaudeMemory.spec()
 print(sorted(spec.views))
+policy = am.ClaudeMemory.differentiate_policy()
+print(policy.view_execution_order)
 
 memory = am.ClaudeMemory()
 memory.add(am.Message(content="Please remember concise design docs."))
 memory.query("design docs")
 ```
 
-`ClaudeMemory` includes operators beyond the current row-local runtime subset,
-so `add(...)` and `query(...)` still raise explicit errors. Use the HelloWorld
-smoke below for the minimal executable path.
+`ClaudeMemory` declares materialized views plus a parameterized
+`retrieval_query = catalog.sem_topk(am.UserQuery(), 5)`. The in-memory
+`DifferentiatedPolicy` stores differentiated view queries and retrieval query
+templates; durable artifact IO and storage are still future work. Use the
+HelloWorld smoke below for the minimal executable path.
 
 For an interface-only smoke demo:
 
@@ -72,12 +79,13 @@ model APIs.
 ```text
 src/agent_memory/
   __init__.py              public package exports
-  api.py                   Memory, Log, class-body spec collection, query wrapper
+  api.py                   Memory, Log, class-body spec/retrieval collection
   message.py               normalized append input object
   relation.py              DataFrame-style Relation and GroupedRelation operators
-  logical.py               immutable QueryExpr, MemoryView, MemorySpec
+  logical.py               immutable QueryExpr, UserQuery, MemoryView, MemorySpec
+  policy.py                DifferentialPolicyCompiler and DifferentiatedPolicy
   memories/claude.py       built-in ClaudeMemory policy
-  planner/                 future Q-to-ΔQ differential query planner interfaces
+  planner/                 Q-to-Q' differential query planner interfaces
   runtime/                 runtime state and future execution shell
   adapters/                execution adapter protocol and LotusAdapter shell
 

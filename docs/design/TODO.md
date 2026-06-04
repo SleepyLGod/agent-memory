@@ -47,13 +47,12 @@ Status: the current golden line is `docs/optimization/incremental-semantic-view-
 
 - The first stateful differential rewrite rule must decide how executable `ΔQ`
   references current view state `V` and changed input rows `ΔD`. v0.0 keeps
-  `ΔD` as a mathematical/runtime concept rather than modeling it as a current
-  `QueryExpr` operator; the current toy row-local `sem_filter`/`sem_map` rules
-  work by binding the source log to changed rows at runtime.
+  `ΔD` as a mathematical/runtime concept rather than modeling it as a
+  `QueryExpr` operator; current row-local fragment rules work by binding the
+  source log to changed rows at runtime.
 
-- Stateful consolidation for `sem_groupby(...).sem_agg(...)` is not covered by
-  the current row-local rules. A future Claude-style maintenance rule may look
-  like:
+- The first `sem_groupby(...).sem_agg(...)` view-boundary rule is implemented as
+  a Claude-style full-next-view query shape:
 
   ```text
   ΔC = ΔD.sem_flat_map(...)
@@ -62,11 +61,11 @@ Status: the current golden line is `docs/optimization/incremental-semantic-view-
   V' = M.sem_map(instruction=<same consolidation instruction>)
   ```
 
-  This should remain a query-structure rewrite, not a branch based on the
-  runtime row count of `ΔD`. Until `apply_delta` / upsert semantics exist,
-  `outer join + sem_map` is a candidate for computing the next full view `V'`.
-  If a later design computes `ΔV` instead, the same logical maintenance may
-  become `left join + upsert/delete/skip`.
+  Current limits: it only applies at a public view boundary, returns full `V'`
+  rather than minimal `DeltaV`, and is not a generic exact `sem_agg`
+  maintenance proof. Deterministic placeholder rewrite is separate from future
+  semantic prompt rewriting. If a later design computes `DeltaV` instead, the
+  same logical maintenance may become `left join + upsert/delete/skip`.
 
 - Adapter capability and default adapter injection are still unresolved. Before
   adding non-LOTUS engines, decide what capability contract each execution

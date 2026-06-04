@@ -41,8 +41,30 @@
 | `sem_join left/right/outer` | 可用 | inner + 本地 unmatched rows | 继续验证 column shape / metadata |
 | `sem_groupby` | baseline 可用 | custom pairwise lowering | 加 candidate pruning / indexing |
 | `sem_agg` 单输出 | 可用 | lower-level LOTUS `sem_agg` | adapter config 接入/验证 aggregation controls |
-| `sem_agg` 多输出 | baseline 可用 | custom structured lowering；默认 `single_batch`，可选 `lotus_hierarchical` | 补 large-group real audit / tree strategy tuning |
+| `sem_agg` 多输出 | 可用 | agent-memory structured hierarchical lowering | large-group audit；等 PyPI LOTUS 支持 native response_format 后可重新评估 |
 | `sem_topk` | 可用 | native LOTUS `sem_topk(...)`，adapter config 控制 execution method | 继续补 hybrid / index path |
+
+Multi-output `sem_map` 未来可以有两条 optimizer-selectable lowering：
+
+- structured one-call：一次 structured generation 同时写多个 output columns，成本低，
+  字段一致性更好，但不是 LOTUS native `df.sem_map` 的原始 one-column shape。
+- native per-column：每个 output column 调一次 LOTUS native `df.sem_map`，可以更
+  直接复用 LOTUS 原生 execution options，但成本变成 N 倍，字段之间也可能不一致。
+
+`sem_flat_map` 当前要求每个 input row 返回 top-level JSON array。未来可以改成
+`{"rows": [...]}` wrapper 来提高 JSON-mode 稳定性，例如：
+
+```json
+{
+  "rows": [
+    {"topic": "support group", "summary": "Caroline attended an LGBTQ support group."},
+    {"topic": "self acceptance", "summary": "The group helped Caroline feel accepted."}
+  ]
+}
+```
+
+这属于 lowering format / optimizer 设计，不改变 `sem_flat_map` 的 logical 语义：
+一行输入仍然产生 zero or more output rows。
 
 ## 3. `sem_filter` TODO
 
@@ -229,19 +251,22 @@ rows -> aggregate row(s) with declared output schema
 single-output 当前复用 LOTUS lower-level `sem_agg`，因此继承了 LOTUS 的
 hierarchical aggregation / tree fold 能力。
 
-multi-output 当前是 agent-memory structured JSON lowering。默认执行路径是
-`single_batch`：
+multi-output 当前使用 agent-memory structured hierarchical lowering：
 
 ```text
 group rows
--> one structured aggregate call
+-> LOTUS-main-style hierarchical aggregate
+-> final LM pass with JSON object response_format
 -> final JSON object with multiple output fields
 ```
 
-这个默认最直接、最容易 audit。`lotus_hierarchical` 只是后续处理大 group 的
-opt-in optimization strategy，不应该默认影响 correctness audit。
+这参考 LOTUS main branch 的方向：hierarchical aggregation 过程中先保持普通文本
+aggregate，最后一轮再应用 structured output contract。区别是当前 PyPI LOTUS 还没
+暴露 lower-level `sem_agg(response_format=...)`，所以 agent-memory 在 adapter
+内部保留一个 compatibility helper，而不是 monkeypatch LOTUS 或覆盖 pandas
+accessor。
 
-可选 tree fold 路径如下：
+更完整的 tree fold 路径未来可以是：
 
 ```text
 group rows
@@ -250,31 +275,28 @@ group rows
 -> final JSON object with multiple output fields
 ```
 
-adapter config 暂时只支持一个内部优化策略：
+当前 active runtime 不保留 `single_batch` / `lotus_hierarchical` backend
+strategy。后续如果要恢复多个 lowering 选择，应该作为 optimizer/lowering 选择重新
+设计，并用 real audit 证明比当前 structured hierarchical baseline 更稳。
 
-- `lotus_hierarchical`：先调用 LOTUS lower-level `sem_agg` 做原生
-  hierarchical text aggregation，再把中间 aggregate 转成 agent-memory
-  declared output schema。注意它复用了 LOTUS native tree fold，但仍然不是
-  LOTUS native multi-output `sem_agg`。
+`sem_agg_model_kwargs` 是 adapter execution knob，只用于 multi-output final LM
+pass。当前 final pass 默认保证 `max_tokens >= 1024`，然后再合并
+`sem_agg_model_kwargs`；调用方可以通过 adapter config 覆盖普通 model kwargs，
+但不能覆盖 `response_format`。这个字段不是 public `sem_agg(...)` 参数，也不属于
+logical query semantics。
 
-当前三条路径的状态要分开看：
-
-- `single_batch` 是默认 correctness baseline。
-- `lotus_hierarchical` 已实现，并通过 LOCOMO 小样本 gated real audit；它仍是
-  opt-in optimization strategy。
-- 这不等于 large-group 稳定，也不等于 LOTUS 已经有 native multi-output
-  aggregation。multi-output schema structuring 仍然属于 agent-memory 的
-  lowering contract。
-
-tree fold 在大 group 下可能比 single batch 更稳，但和 LOTUS native `sem_agg`
-的优化仍有差距：
+tree fold 在大 group 下可能更稳，但要和 LOTUS native `sem_agg` 的优化明确区分：
 
 - LOTUS native `sem_agg` 会把大 group 分 batch 聚合，再逐层 fold，避免超出
   context window。
-- 当前 multi-output structured agg 的 opt-in strategies 还没有做真实
-  large-group audit、cost model、失败重试或 trace。
-- 默认 single batch 在 group 很大时可能超出 context；opt-in tree fold 在 group
-  很大时可能出现 partial summary drift、JSON 被截断、输出不稳定等问题。
+- 当前 multi-output path 依赖 final JSON object response_format。DeepSeek /
+  LiteLLM 如果结构化输出不稳定，real audit 应该直接失败，不做 retry/fallback
+  掩盖问题。
+- 未来 tree fold 在 group 很大时可能出现 partial summary drift、JSON 被截断、
+  输出不稳定等问题，必须有 trace 和 audit 才能进入 active runtime。
+- 暂不把 LOTUS `operator_cache` 直接套到 compatibility helper 上。当前 LOTUS
+  decorator 面向 pandas accessor method，依赖 `self._obj` 参与 cache key；
+  plain helper 需要单独设计 hash-safe cache key，不能直接照搬。
 
 你说“差距就是 output 行数的多少”只对了一部分。更准确地说：
 
@@ -285,13 +307,12 @@ tree fold 在大 group 下可能比 single batch 更稳，但和 LOTUS native `s
 
 待办：
 
-- 保留 LOCOMO 小样本 real audit 对 `single_batch` 和 `lotus_hierarchical` 的
-  覆盖。因为后者不是默认 correctness path，这类 audit 应该继续单独 opt-in，例如通过
-  `AGENT_MEMORY_RUN_LOTUS_EXPERIMENTAL_E2E=1`。
+- 保留 LOCOMO 小样本 real audit 对 whole/grouped、single/multi output 的覆盖。
 - 固定 row-count chunking 暂时不需要做。它不是 LOTUS 原生 `sem_agg` 的
   token-budget hierarchy，而是 agent-memory 曾考虑过的 structured tree-fold
-  experiment；真实 LOCOMO audit 已暴露中间或最终 structured aggregate call 返回
-  空字符串的问题。除非后续有明确 large-group 需求，否则不恢复为 runtime strategy。
+  experiment。当前 runtime 已采用 LOTUS-main-style token-budget hierarchy；额外
+  long-context chunking 只作为后续 large-group optimization/audit，不混入本次
+  reliability fix。
 - 单独增加 large-group optimization audit。当前真实 LOCOMO audit 曾暴露
   experimental tree-fold path 会出现空 JSON / 空 intermediate summary；不要在没有
   trace / retry / cost model 前宣称 large-group path 稳定。

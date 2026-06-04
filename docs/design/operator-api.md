@@ -5,7 +5,7 @@ a design target, not an implementation guarantee.
 
 The current direction is DataFrame-first. Logs, memory views, and intermediate
 results are dataframe-like relations. Users write a full view definition query
-`Q`; the system derives differential maintenance queries `ΔQ` and chooses
+`Q`; the system derives differentiated maintenance queries `Q'` and chooses
 runtime plans for cost, latency, and freshness.
 
 ## 1. Mental Model
@@ -16,7 +16,7 @@ runtime plans for cost, latency, and freshness.
   rows.
 - `View definition query`: the full logical query `Q` that defines what memory
   should contain.
-- `Differential query`: the derived maintenance query `ΔQ` that updates the view
+- `Differential query`: the derived maintenance query `Q'` that updates the view
   from new data without recomputing the full history.
 - `Ordinary operator`: deterministic dataframe or relational operation such as
   `select`, `filter`, `assign`, `concat`, `union`, or `subtract`.
@@ -189,6 +189,13 @@ output_cols={
 ```
 
 The dictionary form is preferred when column descriptions improve the prompt.
+
+During differentiation, instruction strings are parsed for simple column
+placeholders. A single-brace token such as `{topic}` must refer to a declared
+input or output column in the current operator scope. If the text should contain
+literal braces rather than a column reference, escape it with double braces such
+as `{{topic}}`. This strict rule is intentional: it catches misspelled column
+placeholders before a backend executes an invalid prompt.
 
 ### Instruction Wording Convention
 
@@ -432,6 +439,22 @@ Defaults:
 `input_cols` and `output_cols` are read/write sets, not positional rename lists.
 They do not need to be one-to-one.
 
+Operator execution correctness is schema-level: `sem_agg(...)` requires every
+declared `input_cols` column to exist in its input DataFrame, ignores extra
+columns unless referenced by the lowering, and produces the declared
+`output_cols`. Whether an incremental aggregate rule matches full recompute is
+a planner / policy accuracy question, not an operator execution precondition.
+
+LOTUS lowering uses lower-level `sem_agg(...)` for aggregation. Single-output
+aggregation directly returns the LOTUS aggregate string. Multi-output
+aggregation uses an agent-memory compatibility helper that follows the LOTUS
+main-branch hierarchical aggregate shape and applies JSON object
+`response_format` only on the final LM pass. This is not native support in the
+current PyPI LOTUS backend, and it does not monkeypatch LOTUS or pandas
+accessors. Execution knobs for this final pass live in adapter config, not in
+`sem_agg(...)`; `sem_agg_model_kwargs` cannot override `response_format`, so
+the logical query contract remains structured JSON output.
+
 Examples:
 
 ```python
@@ -524,16 +547,16 @@ Example:
 
 ```python
 memories = topics.sem_topk(
-    "Find the memory rows most useful for the current user query.",
+    am.UserQuery(),
     5,
 )
 ```
 
 Backend methods such as `naive`, `quick`, `heap`, `quick-sem`, cascade,
 hybrid retrieval, reranking, graph traversal, and BFS are runtime/adapter or
-optimizer concerns. When used inside a memory `query(...)` method, the
-`instruction` argument is typically the end-user query text, while `k` is the
-policy author's initial retrieval width.
+optimizer concerns. When used as a memory retrieval template, the `instruction`
+argument is typically `am.UserQuery()`, which runtime binds to the end-user
+query text. `k` is the policy author's initial retrieval width.
 
 ## 5. Differential Maintenance Notes
 
@@ -651,7 +674,7 @@ This API follows the LOTUS direction closely:
 - `union` and `subtract` are explicit ordinary relational operators because
   incremental view maintenance needs exact set effects.
 - The system-level problem is not only semantic processing, but deriving and
-  executing `ΔQ` from user-authored memory view query `Q`.
+  executing `Q'` from user-authored memory view query `Q`.
 
 References:
 
