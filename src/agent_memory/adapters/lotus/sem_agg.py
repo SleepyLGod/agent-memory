@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+import json
 from typing import Any
 
 import pandas as pd
@@ -12,8 +13,12 @@ from agent_memory.adapters.lotus.context import (
     LotusExecutionContext,
 )
 from agent_memory.adapters.lotus.sem_groupby import GROUP_ID_COLUMN
-from agent_memory.adapters.lotus.structured import StructuredLMExecutor
+from agent_memory.adapters.lotus.structured import (
+    parse_structured_object_json,
+)
 from agent_memory.logical import ColumnSpec, QueryExpr
+
+JSON_OBJECT_RESPONSE_FORMAT = {"type": "json_object"}
 
 
 def execute_sem_agg(
@@ -81,13 +86,16 @@ def execute_native_sem_agg_group(
         str(query.params["instruction"]),
         list(input_cols),
     )
+    kwargs: dict[str, Any] = {
+        "safe_mode": config.sem_agg_safe_mode,
+        "progress_bar_desc": config.sem_agg_progress_bar_desc,
+    }
     output = sem_agg(
         docs,
         lotus.settings.lm,
         instruction,
         [0] * len(docs),
-        safe_mode=config.sem_agg_safe_mode,
-        progress_bar_desc=config.sem_agg_progress_bar_desc,
+        **kwargs,
     )
     if not output.outputs:
         return ""
@@ -101,7 +109,7 @@ def execute_structured_sem_agg(
     output_cols: Sequence[ColumnSpec],
     config: LotusExecutionConfig | None = None,
 ) -> pd.DataFrame:
-    """Execute multi-output aggregation with structured JSON objects."""
+    """Execute multi-output aggregation with LOTUS-style structured final output."""
 
     if source.empty:
         return pd.DataFrame(columns=[column.name for column in output_cols])
@@ -126,176 +134,246 @@ def execute_structured_sem_agg_group(
     input_cols: Sequence[str],
     output_cols: Sequence[ColumnSpec],
     config: LotusExecutionConfig,
-    *,
-    context_kind: str = "source rows",
 ) -> Mapping[str, str]:
-    """Aggregate one group with the configured structured strategy."""
+    """Aggregate one group into declared structured fields."""
 
-    strategy = structured_sem_agg_strategy(config)
-    if strategy == "single_batch":
-        return execute_structured_sem_agg_leaf(
-            query,
-            group,
-            input_cols,
-            output_cols,
-            config,
-            context_kind=context_kind,
-        )
-
-    if strategy == "lotus_hierarchical":
-        return execute_lotus_hierarchical_structured_sem_agg_group(
-            query,
-            group,
-            input_cols,
-            output_cols,
-            config,
-            context_kind=context_kind,
-        )
-
-    raise ValueError(
-        "sem_agg_structured_strategy must be 'single_batch' or 'lotus_hierarchical'"
-    )
-
-
-def execute_lotus_hierarchical_structured_sem_agg_group(
-    query: QueryExpr,
-    group: pd.DataFrame,
-    input_cols: Sequence[str],
-    output_cols: Sequence[ColumnSpec],
-    config: LotusExecutionConfig,
-    *,
-    context_kind: str = "source rows",
-) -> Mapping[str, str]:
-    """Aggregate one group through LOTUS native hierarchy, then structure it."""
-
-    summary_query = QueryExpr(
-        op=query.op,
-        inputs=query.inputs,
-        params={
-            **dict(query.params),
-            "instruction": lotus_hierarchical_summary_instruction(
-                query,
-                output_cols,
-            ),
-        },
-    )
-    intermediate_summary = execute_native_sem_agg_group(
-        summary_query,
+    raw_output = execute_lotus_style_structured_sem_agg_group(
+        query,
         group,
         input_cols,
-        config,
-    )
-    if not intermediate_summary.strip():
-        raise ValueError("sem_agg lotus_hierarchical returned an empty intermediate summary")
-
-    summary_frame = pd.DataFrame({"context": [intermediate_summary]})
-    generation = execute_structured_sem_agg_context(
-        query,
-        summary_frame,
         output_cols,
         config,
-        context_kind="LOTUS hierarchical aggregate",
     )
-    if not generation.parsed_outputs:
-        return {column.name: "" for column in output_cols}
-    return generation.parsed_outputs[0]
+    return parse_structured_sem_agg_output(raw_output, output_cols)
 
 
-def execute_structured_sem_agg_leaf(
+def execute_lotus_style_structured_sem_agg_group(
     query: QueryExpr,
     group: pd.DataFrame,
     input_cols: Sequence[str],
     output_cols: Sequence[ColumnSpec],
     config: LotusExecutionConfig,
-    *,
-    context_kind: str,
-) -> Mapping[str, str]:
-    """Aggregate one tree-fold leaf into one structured object."""
+) -> str:
+    """Run a LOTUS-main-style hierarchical aggregate with final JSON output."""
 
-    context_frame = aggregate_context_frame(group, input_cols)
-    generation = execute_structured_sem_agg_context(
-        query,
-        context_frame,
-        output_cols,
-        config,
-        context_kind=context_kind,
-    )
-    if not generation.parsed_outputs:
-        return {column.name: "" for column in output_cols}
-    return generation.parsed_outputs[0]
+    import lotus
 
-
-def execute_structured_sem_agg_context(
-    query: QueryExpr,
-    context_frame: pd.DataFrame,
-    output_cols: Sequence[ColumnSpec],
-    config: LotusExecutionConfig | None = None,
-    *,
-    context_kind: str = "grouped rows",
-) -> Any:
-    """Execute one structured aggregate context row."""
-
-    config = config or LotusExecutionConfig()
-    executor = StructuredLMExecutor(context_frame)
-    return executor(
-        input_cols=("context",),
-        output_cols=tuple(output_cols),
-        instruction=structured_sem_agg_instruction(query, context_kind=context_kind),
-        shape="object",
+    docs = aggregate_group_text(group, input_cols)
+    instruction = structured_aggregate_instruction(query, input_cols, output_cols)
+    return lotus_style_sem_agg(
+        docs,
+        lotus.settings.lm,
+        instruction,
+        [0] * len(docs),
         safe_mode=config.sem_agg_safe_mode,
         progress_bar_desc=config.sem_agg_progress_bar_desc,
-        model_kwargs=structured_sem_agg_model_kwargs(config),
-        operator="sem_agg",
+        response_format=JSON_OBJECT_RESPONSE_FORMAT,
+        final_model_kwargs=structured_sem_agg_model_kwargs(config),
     )
 
 
-def structured_sem_agg_instruction(query: QueryExpr, *, context_kind: str) -> str:
-    """Return structured aggregate instruction for raw or partial rows."""
-
-    return (
-        f"{query.params['instruction']}\n\n"
-        f"Use the {context_kind} in {{context}} and produce one aggregate object."
-    )
-
-
-def lotus_hierarchical_summary_instruction(
+def structured_aggregate_instruction(
     query: QueryExpr,
+    input_cols: Sequence[str],
     output_cols: Sequence[ColumnSpec],
 ) -> str:
-    """Return the intermediate instruction for LOTUS native hierarchy."""
+    """Build a structured aggregate instruction after resolving input placeholders."""
 
-    field_names = ", ".join(column.name for column in output_cols)
-    return (
-        f"{query.params['instruction']}\n\n"
-        "Produce an intermediate aggregate that preserves all information needed "
-        f"to fill these final output fields later: {field_names}."
+    import lotus
+
+    instruction = lotus.nl_expression.nle2str(
+        str(query.params["instruction"]),
+        list(input_cols),
     )
+    field_lines = "\n".join(
+        f"- {column.name}: {column.description or 'string'}"
+        for column in output_cols
+    )
+    shape = json.dumps(
+        {column.name: "string" for column in output_cols},
+        ensure_ascii=True,
+    )
+    return (
+        f"{instruction}\n\n"
+        "Return exactly one valid JSON object for the aggregate result.\n"
+        "Required output fields:\n"
+        f"{field_lines}\n"
+        "All values must be strings. Do not include extra keys.\n"
+        f"Expected JSON shape: {shape}"
+    )
+
+
+def lotus_style_sem_agg(
+    docs: Sequence[str],
+    model: Any,
+    user_instruction: str,
+    partition_ids: Sequence[int],
+    *,
+    safe_mode: bool = False,
+    progress_bar_desc: str = "Aggregating",
+    response_format: Any = None,
+    final_model_kwargs: Mapping[str, Any] | None = None,
+) -> str:
+    """Compatibility copy of LOTUS main sem_agg structured-final-pass behavior."""
+
+    import lotus
+
+    if safe_mode:
+        lotus.logger.warning("Safe mode is not implemented yet")
+
+    doc_list = [str(doc) for doc in docs]
+    current_partition_ids = list(partition_ids)
+    if not doc_list:
+        return ""
+
+    tree_level = 0
+    summaries: list[str] = []
+    while len(doc_list) != 1 or summaries == []:
+        current_partition_id = current_partition_ids[0]
+        do_fold = len(current_partition_ids) == len(set(current_partition_ids))
+        context_str = ""
+        batch = []
+        template = (
+            leaf_instruction_template(user_instruction)
+            if tree_level == 0
+            else node_instruction_template(user_instruction)
+        )
+        template_tokens = model.count_tokens(template)
+        context_tokens = 0
+        doc_counter = 1
+        new_partition_ids: list[int] = []
+
+        for idx, doc in enumerate(doc_list):
+            partition_id = current_partition_ids[idx]
+            formatted_doc = format_aggregate_doc(tree_level, doc, doc_counter)
+            new_tokens = model.count_tokens(formatted_doc)
+
+            if (
+                new_tokens + context_tokens + template_tokens
+                > model.max_ctx_len - model.max_tokens
+            ) or (partition_id != current_partition_id and not do_fold):
+                prompt = template.replace("{{docs_str}}", context_str)
+                lotus.logger.debug(f"Prompt added to batch: {prompt}")
+                batch.append([{"role": "user", "content": prompt}])
+                new_partition_ids.append(current_partition_id)
+                current_partition_id = partition_id
+                doc_counter = 1
+
+                formatted_doc = format_aggregate_doc(tree_level, doc, doc_counter)
+                context_str = formatted_doc
+                context_tokens = new_tokens
+                doc_counter += 1
+            else:
+                context_str += formatted_doc
+                context_tokens += new_tokens
+                doc_counter += 1
+
+        if doc_counter > 1 or len(doc_list) == 1:
+            prompt = template.replace("{{docs_str}}", context_str)
+            lotus.logger.debug(f"Prompt added to batch: {prompt}")
+            batch.append([{"role": "user", "content": prompt}])
+            new_partition_ids.append(current_partition_id)
+
+        model_kwargs: dict[str, Any] = {}
+        is_final_pass = len(batch) == 1
+        if is_final_pass:
+            model_kwargs.update(final_model_kwargs or {})
+        if is_final_pass and response_format is not None:
+            model_kwargs["response_format"] = response_format
+
+        lm_output = model(
+            batch,
+            progress_bar_desc=progress_bar_desc,
+            **model_kwargs,
+        )
+        summaries = [str(output) for output in lm_output.outputs]
+        doc_list = summaries
+        current_partition_ids = new_partition_ids
+        lotus.logger.debug(f"Model outputs from tree level {tree_level}: {summaries}")
+        tree_level += 1
+        if safe_mode:
+            model.print_total_usage()
+
+    if not summaries:
+        return ""
+    return summaries[0]
 
 
 def structured_sem_agg_model_kwargs(
     config: LotusExecutionConfig | None = None,
 ) -> dict[str, Any]:
-    """Return conservative generation kwargs for structured aggregate JSON."""
+    """Return final-pass model kwargs for structured aggregate JSON."""
 
     import lotus
 
     config = config or LotusExecutionConfig()
-    current = int(getattr(lotus.settings.lm, "max_tokens", 512))
-    kwargs = {"max_tokens": max(current, 1024)}
-    kwargs.update(dict(config.sem_agg_model_kwargs))
-    return kwargs
+    kwargs = dict(config.sem_agg_model_kwargs)
+    if "response_format" in kwargs:
+        raise ValueError("sem_agg_model_kwargs cannot override response_format")
+
+    current = int(getattr(lotus.settings.lm, "max_tokens", 512) or 512)
+    return {"max_tokens": max(current, 1024), **kwargs}
 
 
-def structured_sem_agg_strategy(config: LotusExecutionConfig) -> str:
-    """Return validated structured aggregate strategy."""
+def leaf_instruction_template(user_instruction: str) -> str:
+    """Return the LOTUS leaf-level semantic aggregation prompt template."""
 
-    strategy = str(config.sem_agg_structured_strategy)
-    if strategy not in {"single_batch", "lotus_hierarchical"}:
-        raise ValueError(
-            "sem_agg_structured_strategy must be 'single_batch', "
-            "or 'lotus_hierarchical'"
-        )
-    return strategy
+    return (
+        "Your job is to provide an answer to the user's instruction given the context below from multiple documents.\n"
+        "Remember that your job is to answer the user's instruction by combining all relevant information from all provided documents, into a single coherent answer.\n"
+        "Do NOT copy the format of the sources! Instead output your answer in a coherent, well-structured manner that best answers the user instruction.\n"
+        "You have limited space to provide your answer, so be concise and to the point.\n\n---\n\n"
+        "Follow the following format.\n\nContext: relevant facts from multiple documents\n\n"
+        "Instruction: the instruction provided by the user\n\nAnswer: Write your answer\n\n---\n\n"
+        "Context: {{docs_str}}\n\n"
+        f"Instruction: {user_instruction}\n\nAnswer:\n"
+    )
+
+
+def node_instruction_template(user_instruction: str) -> str:
+    """Return the LOTUS intermediate-node semantic aggregation prompt template."""
+
+    return (
+        "Your job is to provide an answer to the user's instruction given the context below from multiple sources.\n"
+        "Note that each source may be formatted differently and contain information about several different documents.\n"
+        "Remember that your job is to answer the user's instruction by combining all relevant information from all provided sources, into a single coherent answer.\n"
+        "The sources may provide opposing viewpoints or complementary information.\n"
+        "Be sure to include information from ALL relevant sources in your answer.\n"
+        "Do NOT copy the format of the sources, instead output your answer in a coherent, well-structured manner that best answers the user instruction.\n"
+        "You have limited space to provide your answer, so be concise and to the point.\n"
+        "You may need to draw connections between sources to provide a complete answer.\n\n---\n\n"
+        "Follow the following format.\n\nContext: relevant facts from multiple sources\n\n"
+        "Instruction: the instruction provided by the user\n\nAnswer: Write your answer\n\n---\n\n"
+        "Context: {{docs_str}}\n\n"
+        f"Instruction: {user_instruction}\n\nAnswer:\n"
+    )
+
+
+def format_aggregate_doc(tree_level: int, doc: str, counter: int) -> str:
+    """Format a leaf document or intermediate summary for aggregation."""
+
+    label = "Document" if tree_level == 0 else "Source"
+    return f"\n\t{label} {counter}: {doc}"
+
+
+def parse_structured_sem_agg_output(
+    raw_output: Any,
+    output_cols: Sequence[ColumnSpec],
+) -> dict[str, str]:
+    """Parse and validate one structured LOTUS sem_agg output."""
+
+    if isinstance(raw_output, Mapping):
+        missing = [column.name for column in output_cols if column.name not in raw_output]
+        if missing:
+            raise ValueError(f"sem_agg JSON output is missing required keys: {missing}")
+        return {column.name: str(raw_output[column.name]) for column in output_cols}
+
+    parsed, _explanation = parse_structured_object_json(
+        str(raw_output),
+        output_cols,
+        operator="sem_agg",
+    )
+    return parsed
 
 
 def aggregate_input_columns(
@@ -331,22 +409,6 @@ def aggregate_output_columns(
     if output_cols is None:
         return tuple(ColumnSpec(name=column) for column in input_cols)
     return tuple(output_cols)
-
-
-def aggregate_context_frame(
-    source: pd.DataFrame,
-    input_cols: Sequence[str],
-) -> pd.DataFrame:
-    """Build one text context row per aggregate group."""
-
-    if source.empty:
-        return pd.DataFrame({"context": []})
-
-    contexts = [
-        "\n".join(aggregate_group_text(group, input_cols))
-        for group in aggregate_groups(source)
-    ]
-    return pd.DataFrame({"context": contexts})
 
 
 def aggregate_groups(source: pd.DataFrame) -> list[pd.DataFrame]:

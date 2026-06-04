@@ -1,9 +1,8 @@
 """Gated real LOTUS operator audit tests.
 
 These tests intentionally call real LOTUS/DeepSeek execution only when
-AGENT_MEMORY_RUN_LOTUS_E2E=1 is set. Experimental optimization audits require
-AGENT_MEMORY_RUN_LOTUS_EXPERIMENTAL_E2E=1 as well. They write input/output CSV
-files to /private/tmp so semantic behavior can be inspected manually after a run.
+AGENT_MEMORY_RUN_LOTUS_E2E=1 is set. They write input/output CSV files to
+/private/tmp so semantic behavior can be inspected manually after a run.
 """
 
 from __future__ import annotations
@@ -18,17 +17,16 @@ import pandas as pd
 import pytest
 from dotenv import load_dotenv
 
+import agent_memory as am
 from agent_memory.adapters import LotusAdapter
 from agent_memory.adapters.lotus.context import LotusExecutionConfig
 from agent_memory.adapters.lotus.sem_groupby import GROUP_ID_COLUMN
+from agent_memory.datasets.locomo import ensure_locomo_dataset, load_locomo_rows
 from agent_memory.logical import QueryExpr
 from agent_memory.relation import Relation
-from examples.helloworld.helloworld_smoke import (
-    _ensure_locomo_dataset,
-    _load_locomo_rows,
-)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+LOCOMO_CACHE_PATH = PROJECT_ROOT / ".cache" / "agent-memory" / "locomo10.json"
 AUDIT_DIR = Path("/private/tmp/agent-memory-lotus-operator-audit/latest")
 _AUDIT_DIR_CLEANED = False
 
@@ -42,17 +40,6 @@ def _require_real_lotus() -> None:
     if not os.getenv("DEEPSEEK_API_KEY"):
         pytest.skip("DEEPSEEK_API_KEY is required for real LOTUS audit tests")
     _clean_audit_dir_once()
-
-
-def _require_experimental_lotus() -> None:
-    """Skip experimental LOTUS optimization audits unless explicitly enabled."""
-
-    _require_real_lotus()
-    if os.getenv("AGENT_MEMORY_RUN_LOTUS_EXPERIMENTAL_E2E") != "1":
-        pytest.skip(
-            "set AGENT_MEMORY_RUN_LOTUS_EXPERIMENTAL_E2E=1 to run experimental "
-            "LOTUS optimization audits"
-        )
 
 
 def _clean_audit_dir_once() -> None:
@@ -115,6 +102,36 @@ def _assert_nonempty_text(frame: pd.DataFrame, column: str) -> None:
     assert frame[column].astype(str).str.strip().ne("").all()
 
 
+class _DifferentialAuditMemory(am.Memory):
+    """Small Claude-like view used to audit full query vs Q' execution."""
+
+    log = am.Log({"message": "Raw memory event text."})
+
+    topics = (
+        log
+        .sem_flat_map(
+            output_cols={
+                "name": "Short durable memory topic name.",
+                "body": "One durable memory fact or summary.",
+            },
+            instruction="Extract zero or more durable memory facts from {message}.",
+        )
+        .sem_groupby(
+            input_cols=["name", "body"],
+            instruction="Rows describe the same durable memory topic.",
+        )
+        .sem_agg(
+            input_cols=["name", "body"],
+            output_cols={
+                "name": "Canonical durable memory topic name.",
+                "body": "Consolidated durable memory body.",
+            },
+            instruction="Merge topic candidates into canonical durable memory rows.",
+        )
+        .select(["name", "body"])
+    )
+
+
 def _locomo_audit_source(
     *,
     row_limit: int = 6,
@@ -122,9 +139,9 @@ def _locomo_audit_source(
 ) -> pd.DataFrame:
     """Load official LOCOMO rows for semantic audit tests."""
 
-    dataset_path = _ensure_locomo_dataset()
+    dataset_path = ensure_locomo_dataset(LOCOMO_CACHE_PATH)
     load_limit = max(indices) + 1 if indices else row_limit
-    rows = _load_locomo_rows(dataset_path, sample_limit=1, turn_limit=load_limit)
+    rows = load_locomo_rows(dataset_path, sample_limit=1, turn_limit=load_limit)
     if indices is not None:
         rows = [rows[index] for index in indices if index < len(rows)]
     if not rows:
@@ -476,30 +493,6 @@ def test_sem_agg_grouped_real_lotus_audit() -> None:
     _write_audit("sem_agg_grouped_multi_output", {"source": source}, multi_result)
 
 
-def test_sem_agg_lotus_hierarchical_strategy_real_lotus_audit() -> None:
-    _require_experimental_lotus()
-    adapter = LotusAdapter(
-        config=LotusExecutionConfig(sem_agg_structured_strategy="lotus_hierarchical")
-    )
-    source = _locomo_audit_source(indices=(2, 4, 6, 8, 10))
-    query = _view("source").sem_agg(
-        input_cols=["speaker", "message"],
-        output_cols={
-            "memory_topic": "Short durable memory topic.",
-            "memory_summary": "Merged durable memory summary.",
-        },
-        instruction="Create a durable memory topic and merge the LOCOMO dialogue utterances into one concise memory summary.",
-    )
-
-    result = adapter.execute(query.expr, {"source": source})
-
-    assert set(result.columns) == {"memory_topic", "memory_summary"}
-    assert len(result) == 1
-    _assert_nonempty_text(result, "memory_topic")
-    _assert_nonempty_text(result, "memory_summary")
-    _write_audit("sem_agg_lotus_hierarchical_multi_output", {"source": source}, result)
-
-
 def test_sem_groupby_sem_agg_real_lotus_audit() -> None:
     _require_real_lotus()
     adapter = LotusAdapter()
@@ -539,6 +532,40 @@ def test_sem_groupby_sem_agg_real_lotus_audit() -> None:
     assert not result.empty
     _assert_nonempty_text(result, "body")
     _write_audit("sem_groupby_sem_agg", {"source": source}, result)
+
+
+def test_differential_q_prime_real_lotus_audit() -> None:
+    _require_real_lotus()
+    adapter = LotusAdapter()
+    source = pd.DataFrame(
+        {
+            "message": [
+                "Alice prefers concise architecture documents.",
+                "Alice likes short design docs and dislikes long specifications.",
+            ]
+        }
+    )
+    spec = _DifferentialAuditMemory.spec()
+
+    full_result = adapter.execute(spec.views["topics"].query, {"log": source})
+    assert set(full_result.columns) == {"name", "body"}
+    assert not full_result.empty
+    _assert_nonempty_text(full_result, "body")
+    _write_audit("differential_q_prime_full_query", {"log": source}, full_result)
+
+    memory = _DifferentialAuditMemory(adapter=adapter)
+    for row in source.to_dict("records"):
+        memory.add(row)
+    stepwise_result = memory._runtime._state["topics"]
+
+    assert set(stepwise_result.columns) == {"name", "body"}
+    assert not stepwise_result.empty
+    _assert_nonempty_text(stepwise_result, "body")
+    _write_audit(
+        "differential_q_prime_stepwise",
+        {"log": memory._runtime._state["log"]},
+        stepwise_result,
+    )
 
 
 def test_sem_groupby_labels_real_lotus_audit() -> None:

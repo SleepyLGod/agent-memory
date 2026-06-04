@@ -23,7 +23,7 @@ def execute_sem_flat_map(
     execute: Callable[[QueryExpr, Mapping[str, Any]], Any],
     context: LotusExecutionContext,
 ) -> Any:
-    """Execute sem_flat_map as structured JSON array generation."""
+    """Execute sem_flat_map as structured JSON rows-wrapper generation."""
 
     context.configure()
     source = execute(query.inputs[0], inputs)
@@ -46,7 +46,7 @@ def parse_structured_flat_map_json(
     raw_output: str,
     output_cols: Sequence[ColumnSpec],
 ) -> list[dict[str, str]]:
-    """Parse one sem_flat_map JSON array output."""
+    """Parse one sem_flat_map JSON rows-wrapper output."""
 
     return parse_structured_array_json(
         raw_output,

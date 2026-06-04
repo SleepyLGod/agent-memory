@@ -13,7 +13,9 @@ from lotus.cache import operator_cache
 from agent_memory.logical import ColumnSpec, QueryExpr
 
 EXPLANATION_FIELD = "_explanation"
+FLAT_MAP_ROWS_FIELD = "rows"
 STRUCTURED_RESERVED_MODEL_KWARGS = {"progress_bar_desc", "response_format"}
+RAW_OUTPUT_PREVIEW_CHARS = 240
 
 
 @dataclass(frozen=True)
@@ -87,8 +89,19 @@ def resolve_input_cols(source: Any, query: QueryExpr, *, operator: str) -> tuple
     else:
         import lotus
 
-        parsed = tuple(lotus.nl_expression.parse_cols(str(query.params["instruction"])))
-        columns = parsed or tuple(str(column) for column in getattr(source, "columns", ()))
+        try:
+            parsed = tuple(
+                column
+                for column in lotus.nl_expression.parse_cols(
+                    str(query.params["instruction"])
+                )
+                if column in source.columns
+            )
+        except ValueError:
+            parsed = ()
+        columns = parsed or tuple(
+            str(column) for column in getattr(source, "columns", ())
+        )
 
     if not columns:
         raise ValueError(f"{operator} requires at least one input column")
@@ -127,6 +140,10 @@ def structured_instruction(
 
     field_text = ", ".join(fields)
     schema_text = json.dumps(schema, ensure_ascii=False)
+    object_example = json.dumps(
+        {column.name: "string" for column in output_cols},
+        ensure_ascii=False,
+    )
     if shape == "object":
         return (
             f"{instruction}\n\n"
@@ -134,16 +151,24 @@ def structured_instruction(
             "comments, or extra prose.\n"
             f"The JSON object must include these fields: {field_text}.\n"
             f"Field descriptions: {schema_text}.\n"
+            f"Output shape example: {object_example}.\n"
             "Use string values for every field."
         )
 
+    rows_example = json.dumps(
+        {FLAT_MAP_ROWS_FIELD: [{column.name: "string" for column in output_cols}]},
+        ensure_ascii=False,
+    )
     return (
         f"{instruction}\n\n"
-        "Return only a valid JSON array of objects. Do not include markdown "
-        "fences, comments, or extra prose. Return [] when there are no output "
-        "rows.\n"
-        f"Every object must include these fields: {field_text}.\n"
+        "Return only a valid JSON object. Do not include markdown fences, "
+        "comments, or extra prose.\n"
+        f'The JSON object must include a "{FLAT_MAP_ROWS_FIELD}" field containing '
+        "an array of output row objects. Return an empty rows array when there "
+        "are no output rows.\n"
+        f"Every object in rows must include these fields: {field_text}.\n"
         f"Field descriptions: {schema_text}.\n"
+        f"Output shape example: {rows_example}.\n"
         "Use string values for every field."
     )
 
@@ -157,10 +182,11 @@ def parse_structured_object_json(
 ) -> tuple[dict[str, str], str | None]:
     """Parse one JSON object output and return columns plus optional explanation."""
 
-    try:
-        parsed = json.loads(raw_output)
-    except json.JSONDecodeError as error:
-        raise ValueError(f"{operator} returned invalid JSON: {raw_output!r}") from error
+    parsed = _load_structured_json(
+        raw_output,
+        operator=operator,
+        expected_shape="JSON object",
+    )
 
     if not isinstance(parsed, Mapping):
         raise ValueError(f"{operator} returned non-object JSON: {raw_output!r}")
@@ -185,16 +211,32 @@ def parse_structured_array_json(
 ) -> list[dict[str, str]]:
     """Parse one JSON array output for flat-map style row expansion."""
 
-    try:
-        parsed = json.loads(raw_output)
-    except json.JSONDecodeError as error:
-        raise ValueError(f"{operator} returned invalid JSON: {raw_output!r}") from error
+    expected_shape = f'JSON object with "{FLAT_MAP_ROWS_FIELD}" array'
+    parsed = _load_structured_json(
+        raw_output,
+        operator=operator,
+        expected_shape=expected_shape,
+    )
 
-    if not isinstance(parsed, list):
-        raise ValueError(f"{operator} returned non-array JSON: {raw_output!r}")
+    if not isinstance(parsed, Mapping):
+        raise ValueError(
+            f"{operator} returned non-object JSON wrapper; expected {expected_shape}; "
+            f"raw_output={_preview_raw_output(raw_output)!r}"
+        )
+    if FLAT_MAP_ROWS_FIELD not in parsed:
+        raise ValueError(
+            f"{operator} JSON output is missing required key {FLAT_MAP_ROWS_FIELD!r}; "
+            f"expected {expected_shape}; raw_output={_preview_raw_output(raw_output)!r}"
+        )
+    emitted_rows = parsed[FLAT_MAP_ROWS_FIELD]
+    if not isinstance(emitted_rows, list):
+        raise ValueError(
+            f"{operator} JSON {FLAT_MAP_ROWS_FIELD!r} value is not an array; "
+            f"expected {expected_shape}; raw_output={_preview_raw_output(raw_output)!r}"
+        )
 
     rows: list[dict[str, str]] = []
-    for index, item in enumerate(parsed):
+    for index, item in enumerate(emitted_rows):
         if not isinstance(item, Mapping):
             raise ValueError(f"{operator} JSON item {index} is not an object: {item!r}")
 
@@ -205,6 +247,26 @@ def parse_structured_array_json(
             )
         rows.append({column.name: str(item[column.name]) for column in output_cols})
     return rows
+
+
+def _load_structured_json(raw_output: str, *, operator: str, expected_shape: str) -> Any:
+    """Parse JSON with concise operator diagnostics."""
+
+    try:
+        return json.loads(raw_output)
+    except json.JSONDecodeError as error:
+        raise ValueError(
+            f"{operator} returned invalid JSON; expected {expected_shape}; "
+            f"raw_output={_preview_raw_output(raw_output)!r}"
+        ) from error
+
+
+def _preview_raw_output(raw_output: str) -> str:
+    """Return a bounded raw output preview for errors."""
+
+    if len(raw_output) <= RAW_OUTPUT_PREVIEW_CHARS:
+        return raw_output
+    return raw_output[:RAW_OUTPUT_PREVIEW_CHARS] + "..."
 
 
 def example_answers(
@@ -336,9 +398,8 @@ class StructuredLMExecutor:
         lm_kwargs: dict[str, Any] = {
             "progress_bar_desc": progress_bar_desc,
             **dict(model_kwargs),
+            "response_format": {"type": "json_object"},
         }
-        if shape == "object":
-            lm_kwargs["response_format"] = {"type": "json_object"}
         lm_output: LMOutput = lotus.settings.lm(prompts, **lm_kwargs)
 
         if shape == "object":

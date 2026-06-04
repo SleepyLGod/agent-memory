@@ -23,6 +23,13 @@ def execute_sem_join(
     context.configure()
     left = execute(query.inputs[0], inputs)
     right = execute(query.inputs[1], inputs)
+    if left.empty or right.empty:
+        return assemble_join_frame(
+            left,
+            right,
+            (),
+            how=str(query.params.get("how", "inner")),
+        )
     join_results = evaluate_semantic_join(query, left, right, context.config)
     return assemble_join_frame(
         left,
