@@ -37,6 +37,7 @@ def execute_sem_flat_map(
         shape="array",
         progress_bar_desc="Flat mapping",
         model_kwargs={},
+        structured_max_tokens=context.config.structured_max_tokens,
         operator="sem_flat_map",
     )
     return apply_flat_map_outputs(source, generation.parsed_outputs, cols)

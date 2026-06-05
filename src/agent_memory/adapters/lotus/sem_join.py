@@ -113,6 +113,52 @@ def join_series(
         cols = lotus.nl_expression.parse_cols(instruction)
     except ValueError:
         cols = []
+
+    side_aware_pairs = _find_side_aware_join_column_pairs(cols, left, right)
+    if len(side_aware_pairs) == 1:
+        left_label, left_column, right_label, right_column = side_aware_pairs[0]
+        return (
+            left[left_column],
+            right[right_column],
+            left_label,
+            right_label,
+            instruction,
+        )
+    if len(side_aware_pairs) > 1:
+        left_label = "left"
+        right_label = "right"
+        return (
+            record_text_series(
+                left,
+                [
+                    left_column
+                    for (
+                        _left_label,
+                        left_column,
+                        _right_label,
+                        _right_column,
+                    ) in side_aware_pairs
+                ],
+                left_label,
+            ),
+            record_text_series(
+                right,
+                [
+                    right_column
+                    for (
+                        _left_label,
+                        _left_column,
+                        _right_label,
+                        right_column,
+                    ) in side_aware_pairs
+                ],
+                right_label,
+            ),
+            left_label,
+            right_label,
+            f"{{{left_label}}} and {{{right_label}}} satisfy this semantic join condition: {instruction}",
+        )
+
     left_on, right_on = _find_join_columns(cols, left, right)
     if left_on is not None and right_on is not None:
         return (
@@ -232,9 +278,19 @@ def example_reasoning(examples: Any) -> list[str] | None:
 def row_text_series(frame: pd.DataFrame, name: str) -> pd.Series:
     """Serialize complete rows for ambiguous join instructions."""
 
+    return record_text_series(frame, tuple(frame.columns), name)
+
+
+def record_text_series(
+    frame: pd.DataFrame,
+    columns: Sequence[Any],
+    name: str,
+) -> pd.Series:
+    """Serialize selected row fields for composite semantic comparisons."""
+
     return pd.Series(
         [
-            "\n".join(f"{column}: {row[column]}" for column in frame.columns)
+            "\n".join(f"{column}: {row[column]}" for column in columns)
             for _index, row in frame.iterrows()
         ],
         index=frame.index,
@@ -324,3 +380,43 @@ def _find_join_columns(
                 right_on = (column, column)
                 break
     return left_on, right_on
+
+
+def _find_side_aware_join_column_pairs(
+    parsed_columns: Sequence[str],
+    left: pd.DataFrame,
+    right: pd.DataFrame,
+) -> tuple[tuple[str, str, str, str], ...]:
+    """Find side-aware left/right column pairs referenced by a join instruction."""
+
+    left_by_name: dict[str, str] = {}
+    right_by_name: dict[str, str] = {}
+    order: list[str] = []
+
+    for column in parsed_columns:
+        side: str | None = None
+        base = column
+        if column.endswith(":left"):
+            side = "left"
+            base = column[:-5]
+        elif column.endswith(":right"):
+            side = "right"
+            base = column[:-6]
+
+        if side is None or base in order:
+            continue
+        order.append(base)
+
+    for column in parsed_columns:
+        if column.endswith(":left") and column[:-5] in left.columns:
+            left_by_name[column[:-5]] = column
+        elif column.endswith(":right") and column[:-6] in right.columns:
+            right_by_name[column[:-6]] = column
+
+    pairs: list[tuple[str, str, str, str]] = []
+    for base in order:
+        left_label = left_by_name.get(base)
+        right_label = right_by_name.get(base)
+        if left_label is not None and right_label is not None:
+            pairs.append((left_label, base, right_label, base))
+    return tuple(pairs)

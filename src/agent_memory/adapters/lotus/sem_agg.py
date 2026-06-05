@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 import json
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
@@ -15,6 +16,7 @@ from agent_memory.adapters.lotus.context import (
 from agent_memory.adapters.lotus.sem_groupby import GROUP_ID_COLUMN
 from agent_memory.adapters.lotus.structured import (
     parse_structured_object_json,
+    write_structured_failure_artifacts,
 )
 from agent_memory.logical import ColumnSpec, QueryExpr
 
@@ -122,8 +124,9 @@ def execute_structured_sem_agg(
             input_cols,
             output_cols,
             config,
+            group_index=group_index,
         )
-        for group in aggregate_groups(source)
+        for group_index, group in enumerate(aggregate_groups(source))
     ]
     return apply_structured_aggregate_outputs(parsed_outputs, output_cols)
 
@@ -134,9 +137,12 @@ def execute_structured_sem_agg_group(
     input_cols: Sequence[str],
     output_cols: Sequence[ColumnSpec],
     config: LotusExecutionConfig,
+    *,
+    group_index: int = 0,
 ) -> Mapping[str, str]:
     """Aggregate one group into declared structured fields."""
 
+    instruction = structured_aggregate_instruction(query, input_cols, output_cols)
     raw_output = execute_lotus_style_structured_sem_agg_group(
         query,
         group,
@@ -144,7 +150,19 @@ def execute_structured_sem_agg_group(
         output_cols,
         config,
     )
-    return parse_structured_sem_agg_output(raw_output, output_cols)
+    try:
+        return parse_structured_sem_agg_output(raw_output, output_cols)
+    except ValueError as error:
+        artifact_path = write_sem_agg_failure_artifact(
+            raw_output,
+            group,
+            output_cols,
+            instruction=instruction,
+            group_index=group_index,
+        )
+        raise ValueError(
+            f"{error}; structured failure artifact: {artifact_path}"
+        ) from error
 
 
 def execute_lotus_style_structured_sem_agg_group(
@@ -310,9 +328,40 @@ def structured_sem_agg_model_kwargs(
     kwargs = dict(config.sem_agg_model_kwargs)
     if "response_format" in kwargs:
         raise ValueError("sem_agg_model_kwargs cannot override response_format")
+    if "progress_bar_desc" in kwargs:
+        raise ValueError("sem_agg_model_kwargs cannot override progress_bar_desc")
 
     current = int(getattr(lotus.settings.lm, "max_tokens", 512) or 512)
-    return {"max_tokens": max(current, 1024), **kwargs}
+    return {"max_tokens": max(current, config.structured_max_tokens), **kwargs}
+
+
+def write_sem_agg_failure_artifact(
+    raw_output: Any,
+    group: pd.DataFrame,
+    output_cols: Sequence[ColumnSpec],
+    *,
+    instruction: str,
+    group_index: int,
+) -> Path:
+    """Write a structured sem_agg failure artifact and return its path."""
+
+    paths = write_structured_failure_artifacts(
+        [instruction],
+        [[str(raw_output)]],
+        [0],
+        output_cols=output_cols,
+        shape="object",
+        require_explanation=False,
+        operator="sem_agg",
+        extra_by_index={
+            0: {
+                "group_index": group_index,
+                "final_instruction": instruction,
+                "group_row_preview": group.head(5).astype(str).to_dict(orient="records"),
+            }
+        },
+    )
+    return paths[0]
 
 
 def leaf_instruction_template(user_instruction: str) -> str:

@@ -78,6 +78,7 @@ def execute_structured_sem_map(
         return_explanations=False,
         progress_bar_desc=config.sem_map_progress_bar_desc,
         model_kwargs=dict(config.sem_map_model_kwargs),
+        structured_max_tokens=config.structured_max_tokens,
     )
     return apply_structured_map_outputs(
         source,

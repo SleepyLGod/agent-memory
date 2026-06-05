@@ -41,6 +41,7 @@ def execute_sem_groupby(
         unique_rows,
         input_cols=input_cols,
         instruction=str(query.params["instruction"]),
+        default=context.config.sem_groupby_default,
     )
     result = assign_semantic_group_ids(
         source,
@@ -211,6 +212,7 @@ def evaluate_group_matches(
     *,
     input_cols: Sequence[str],
     instruction: str,
+    default: bool = False,
 ) -> list[tuple[int, int]]:
     """Evaluate candidate row pairs with LOTUS sem_filter."""
 
@@ -231,6 +233,7 @@ def evaluate_group_matches(
         docs,
         lotus.settings.lm,
         user_instruction,
+        default=default,
         progress_bar_desc="Grouping comparisons",
     )
     return [

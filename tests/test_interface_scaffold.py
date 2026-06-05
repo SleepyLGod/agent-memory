@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,7 +14,10 @@ from dotenv import load_dotenv
 
 import agent_memory as am
 from agent_memory.adapters import LotusAdapter
-from agent_memory.adapters.lotus.context import LotusExecutionConfig
+from agent_memory.adapters.lotus.context import (
+    DEFAULT_STRUCTURED_MAX_TOKENS,
+    LotusExecutionConfig,
+)
 from agent_memory.adapters.lotus.relational import (
     execute_concat,
     execute_drop_duplicates,
@@ -54,6 +58,7 @@ import agent_memory.adapters.lotus.sem_groupby as sem_groupby_module
 from agent_memory.adapters.lotus.sem_groupby import (
     assign_declared_labels,
     assign_semantic_group_ids,
+    evaluate_group_matches,
 )
 from agent_memory.adapters.lotus.sem_join import (
     assemble_join_frame,
@@ -62,10 +67,13 @@ from agent_memory.adapters.lotus.sem_join import (
     renamed_columns,
 )
 from agent_memory.adapters.lotus.sem_topk import execute_sem_topk, topk_instruction
+import agent_memory.adapters.lotus.structured as structured_module
 from agent_memory.adapters.lotus.structured import (
     STRUCTURED_RESERVED_MODEL_KWARGS,
     StructuredLMExecutor,
     StructuredGenerationResult,
+    execute_structured_lm_with_retries,
+    escape_structured_formatter_placeholders,
     parse_structured_object_json,
     structured_instruction as build_structured_instruction,
     validate_model_kwargs,
@@ -853,6 +861,48 @@ def test_differential_query_planner_builds_claude_topics_full_next_view() -> Non
     assert changed_aggregate.inputs[0].op == "sem_groupby"
 
 
+def test_claude_topics_join_instruction_lowers_to_composite_records() -> None:
+    view = am.ClaudeMemory.spec().views["topics"]
+    differentiated = DifferentialQueryPlanner().differentiate(view)
+    sem_map_expr = differentiated.inputs[0]
+    sem_join_expr = sem_map_expr.inputs[0]
+
+    left = pd.DataFrame(
+        {
+            "name": ["adoption_goal"],
+            "description": ["Caroline wants to adopt children."],
+            "type": ["user"],
+            "body": ["Caroline is researching adoption agencies."],
+        }
+    )
+    right = pd.DataFrame(
+        {
+            "name": ["caroline_adoption_journey"],
+            "description": ["Caroline is pursuing single-parent adoption."],
+            "type": ["user"],
+            "body": ["Caroline values LGBTQ+ inclusive adoption agencies."],
+        }
+    )
+
+    left_series, right_series, left_label, right_label, instruction = join_series(
+        left,
+        right,
+        str(sem_join_expr.params["instruction"]),
+    )
+
+    assert left_label == "left"
+    assert right_label == "right"
+    assert "satisfy this semantic join condition" in instruction
+    assert "name: adoption_goal" in left_series.iloc[0]
+    assert "description: Caroline wants to adopt children." in left_series.iloc[0]
+    assert "type: user" in left_series.iloc[0]
+    assert "body:" not in left_series.iloc[0]
+    assert "name: caroline_adoption_journey" in right_series.iloc[0]
+    assert "description: Caroline is pursuing single-parent adoption." in right_series.iloc[0]
+    assert "type: user" in right_series.iloc[0]
+    assert "body:" not in right_series.iloc[0]
+
+
 def test_differential_query_planner_recomputes_views_from_materialized_dependencies() -> None:
     spec = am.ClaudeMemory.spec()
     catalog = spec.views["catalog"]
@@ -1484,6 +1534,28 @@ def test_structured_input_inference_ignores_declared_output_placeholders() -> No
     assert resolve_sem_map_input_cols(source, query) == ("message",)
 
 
+def test_structured_instruction_escapes_non_input_output_placeholders() -> None:
+    instruction = escape_structured_formatter_placeholders(
+        "Extract candidates from {message}, filling {name} and {description}.",
+        input_cols=("message",),
+        output_cols=(ColumnSpec("name"), ColumnSpec("description")),
+    )
+
+    assert instruction == (
+        "Extract candidates from {message}, filling {{name}} and {{description}}."
+    )
+
+
+def test_structured_instruction_escapes_side_aware_placeholders() -> None:
+    instruction = escape_structured_formatter_placeholders(
+        "Merge {name:left} with {name:right}, filling {name}.",
+        input_cols=("name:left", "name:right"),
+        output_cols=(ColumnSpec("name"),),
+    )
+
+    assert instruction == "Merge {{name:left}} with {{name:right}}, filling {{name}}."
+
+
 def test_structured_sem_map_parses_and_applies_multiple_outputs() -> None:
     output_cols = (
         ColumnSpec("label", "Short label."),
@@ -1634,7 +1706,120 @@ def test_structured_executor_array_shape_uses_json_object_response_format(
 
     assert fake_lm.kwargs is not None
     assert fake_lm.kwargs["response_format"] == {"type": "json_object"}
+    assert fake_lm.kwargs["max_tokens"] >= DEFAULT_STRUCTURED_MAX_TOKENS
     assert result.parsed_outputs == [[{"topic": "docs"}]]
+
+
+def test_structured_executor_model_kwargs_can_override_max_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import lotus
+
+    class Output:
+        outputs = ['{"label": "docs"}']
+
+    class FakeLM:
+        max_tokens = 512
+
+        def __init__(self) -> None:
+            self.kwargs: dict[str, Any] | None = None
+
+        def __call__(self, prompts: object, **kwargs: Any) -> Output:
+            self.kwargs = kwargs
+            return Output()
+
+    fake_lm = FakeLM()
+    monkeypatch.setattr(lotus.settings, "lm", fake_lm)
+    monkeypatch.setattr(lotus.settings, "enable_cache", False)
+
+    StructuredLMExecutor(pd.DataFrame({"message": ["prefers docs"]}))(
+        input_cols=("message",),
+        output_cols=(ColumnSpec("label"),),
+        instruction="Label {message}.",
+        shape="object",
+        progress_bar_desc="Mapping",
+        model_kwargs={"max_tokens": 2048},
+        operator="sem_map",
+    )
+
+    assert fake_lm.kwargs is not None
+    assert fake_lm.kwargs["max_tokens"] == 2048
+
+
+def test_structured_lm_retries_only_invalid_json_rows() -> None:
+    class Output:
+        def __init__(self, outputs: list[str]) -> None:
+            self.outputs = outputs
+
+    class FakeLM:
+        def __init__(self) -> None:
+            self.calls: list[object] = []
+
+        def __call__(self, prompts: object, **_kwargs: Any) -> Output:
+            self.calls.append(prompts)
+            if len(self.calls) == 1:
+                return Output(['{"rows": [{"topic": "docs"}]}', ""])
+            return Output(['{"rows": [{"topic": "meetings"}]}'])
+
+    fake_lm = FakeLM()
+
+    raw_outputs = execute_structured_lm_with_retries(
+        fake_lm,
+        ["prompt 1", "prompt 2"],
+        lm_kwargs={"progress_bar_desc": "Flat mapping"},
+        output_cols=(ColumnSpec("topic"),),
+        shape="array",
+        require_explanation=False,
+        operator="sem_flat_map",
+        max_retries=1,
+    )
+
+    assert raw_outputs == [
+        '{"rows": [{"topic": "docs"}]}',
+        '{"rows": [{"topic": "meetings"}]}',
+    ]
+    assert fake_lm.calls == [["prompt 1", "prompt 2"], ["prompt 2"]]
+
+
+def test_structured_lm_retry_failure_writes_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(structured_module, "STRUCTURED_FAILURE_DIR", tmp_path)
+
+    class Output:
+        def __init__(self, outputs: list[str]) -> None:
+            self.outputs = outputs
+
+    class FakeLM:
+        def __call__(self, prompts: object, **_kwargs: Any) -> Output:
+            return Output(["" for _prompt in prompts])
+
+    with pytest.raises(ValueError, match="structured failure artifact") as error:
+        execute_structured_lm_with_retries(
+            FakeLM(),
+            ["bad prompt"],
+            lm_kwargs={"progress_bar_desc": "Mapping"},
+            output_cols=(ColumnSpec("summary", "One-line summary."),),
+            shape="object",
+            require_explanation=False,
+            operator="sem_map",
+            max_retries=1,
+        )
+
+    assert str(tmp_path) in str(error.value)
+    artifacts = list(tmp_path.glob("*.json"))
+    assert len(artifacts) == 1
+    artifact = json.loads(artifacts[0].read_text(encoding="utf-8"))
+    assert artifact["operator"] == "sem_map"
+    assert artifact["shape"] == "object"
+    assert artifact["row_index"] == 0
+    assert artifact["expected_output_columns"] == [
+        {"name": "summary", "description": "One-line summary."}
+    ]
+    assert artifact["prompt"] == "bad prompt"
+    assert artifact["raw_outputs"] == ["", ""]
+    assert "invalid JSON" in artifact["parse_error"]
 
 
 def test_sem_flat_map_parses_and_explodes_json_rows_wrapper_outputs() -> None:
@@ -1913,6 +2098,51 @@ def test_sem_join_series_supports_explicit_and_fallback_formats() -> None:
     assert "category: documentation preference" in fallback_right.iloc[0]
 
 
+def test_sem_join_series_uses_composite_records_for_multi_column_side_aware_join() -> None:
+    left = pd.DataFrame(
+        {
+            "name": ["adoption_goal"],
+            "description": ["Caroline wants to adopt children."],
+            "type": ["user"],
+            "body": ["left body should not be included"],
+        }
+    )
+    right = pd.DataFrame(
+        {
+            "name": ["caroline_adoption_journey"],
+            "description": ["Caroline is pursuing single-parent adoption."],
+            "type": ["user"],
+            "body": ["right body should not be included"],
+        }
+    )
+
+    left_series, right_series, left_label, right_label, instruction = join_series(
+        left,
+        right,
+        (
+            "Rows refer to the same topic when {name:left} and {name:right}, "
+            "{description:left} and {description:right}, and {type:left} and "
+            "{type:right} match."
+        ),
+    )
+
+    assert left_label == "left"
+    assert right_label == "right"
+    assert "satisfy this semantic join condition" in instruction
+    assert "name: adoption_goal" in left_series.iloc[0]
+    assert "description: Caroline wants to adopt children." in left_series.iloc[0]
+    assert "type: user" in left_series.iloc[0]
+    assert "body:" not in left_series.iloc[0]
+    assert "name: caroline_adoption_journey" in right_series.iloc[0]
+    assert "description: Caroline is pursuing single-parent adoption." in right_series.iloc[0]
+    assert "type: user" in right_series.iloc[0]
+    assert "body:" not in right_series.iloc[0]
+
+
+def test_lotus_sem_join_parse_default_is_false() -> None:
+    assert LotusExecutionConfig().sem_join_default is False
+
+
 def test_sem_join_converts_mapping_to_lotus_cascade_args() -> None:
     cascade_args = cascade_args_from_mapping(
         {"recall_target": 0.95, "precision_target": 0.9}
@@ -1937,6 +2167,75 @@ def test_sem_groupby_assigns_stable_group_ids_from_exact_and_semantic_matches() 
     )
 
     assert list(result[GROUP_ID_COLUMN]) == [0, 0, 1, 1]
+
+
+def test_sem_groupby_pairwise_default_is_false(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import lotus.sem_ops.sem_filter as sem_filter_module
+
+    captured: dict[str, Any] = {}
+
+    class Output:
+        outputs = [True]
+
+    def sem_filter(*args: Any, **kwargs: Any) -> Output:
+        captured["default"] = kwargs["default"]
+        captured["progress_bar_desc"] = kwargs["progress_bar_desc"]
+        return Output()
+
+    monkeypatch.setattr(sem_filter_module, "sem_filter", sem_filter)
+    source = pd.DataFrame(
+        {
+            "name": ["adoption", "inclusive adoption"],
+            "description": ["adoption goal", "LGBTQ+ adoption support"],
+        }
+    )
+
+    matches = evaluate_group_matches(
+        source,
+        input_cols=("name", "description"),
+        instruction="Rows describe the same durable memory topic.",
+    )
+
+    assert matches == [(0, 1)]
+    assert captured == {
+        "default": False,
+        "progress_bar_desc": "Grouping comparisons",
+    }
+
+
+def test_sem_groupby_pairwise_default_can_be_overridden(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import lotus.sem_ops.sem_filter as sem_filter_module
+
+    captured: dict[str, Any] = {}
+
+    class Output:
+        outputs = [False]
+
+    def sem_filter(*args: Any, **kwargs: Any) -> Output:
+        captured["default"] = kwargs["default"]
+        return Output()
+
+    monkeypatch.setattr(sem_filter_module, "sem_filter", sem_filter)
+    source = pd.DataFrame(
+        {
+            "name": ["adoption", "inclusive adoption"],
+            "description": ["adoption goal", "LGBTQ+ adoption support"],
+        }
+    )
+
+    matches = evaluate_group_matches(
+        source,
+        input_cols=("name", "description"),
+        instruction="Rows describe the same durable memory topic.",
+        default=True,
+    )
+
+    assert matches == []
+    assert captured["default"] is True
 
 
 def test_sem_groupby_declared_labels_assign_label_column_and_group_ids(
@@ -2087,12 +2386,35 @@ def test_lotus_style_sem_agg_passes_response_format_only_on_final_pass() -> None
     assert calls[1]["max_tokens"] == 1024
 
 
+def test_sem_agg_model_kwargs_use_structured_max_tokens_by_default() -> None:
+    kwargs = structured_sem_agg_model_kwargs(LotusExecutionConfig())
+
+    assert kwargs["max_tokens"] >= DEFAULT_STRUCTURED_MAX_TOKENS
+
+
+def test_sem_agg_model_kwargs_can_override_max_tokens() -> None:
+    kwargs = structured_sem_agg_model_kwargs(
+        LotusExecutionConfig(sem_agg_model_kwargs={"max_tokens": 2048})
+    )
+
+    assert kwargs["max_tokens"] == 2048
+
+
 def test_sem_agg_model_kwargs_cannot_override_response_format() -> None:
     config = LotusExecutionConfig(
         sem_agg_model_kwargs={"response_format": {"type": "text"}},
     )
 
     with pytest.raises(ValueError, match="cannot override response_format"):
+        structured_sem_agg_model_kwargs(config)
+
+
+def test_sem_agg_model_kwargs_cannot_override_progress_bar_desc() -> None:
+    config = LotusExecutionConfig(
+        sem_agg_model_kwargs={"progress_bar_desc": "Bad"},
+    )
+
+    with pytest.raises(ValueError, match="cannot override progress_bar_desc"):
         structured_sem_agg_model_kwargs(config)
 
 
@@ -2337,6 +2659,67 @@ def test_sem_agg_rejects_missing_structured_key() -> None:
 
     with pytest.raises(ValueError, match="missing required keys"):
         parse_structured_sem_agg_output('{"topic": "docs"}', output_cols)
+
+
+def test_sem_agg_structured_failure_writes_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import agent_memory.adapters.lotus.sem_agg as sem_agg_module
+
+    class Context:
+        config = LotusExecutionConfig()
+
+        def configure(self) -> None:
+            pass
+
+    def execute_lotus_style_structured_sem_agg_group(
+        query: QueryExpr,
+        group: pd.DataFrame,
+        input_cols: tuple[str, ...],
+        output_cols: tuple[ColumnSpec, ...],
+        config: LotusExecutionConfig,
+    ) -> str:
+        return ""
+
+    monkeypatch.setattr(structured_module, "STRUCTURED_FAILURE_DIR", tmp_path)
+    monkeypatch.setattr(
+        sem_agg_module,
+        "execute_lotus_style_structured_sem_agg_group",
+        execute_lotus_style_structured_sem_agg_group,
+    )
+
+    query = QueryExpr(
+        op="sem_agg",
+        inputs=(QueryExpr(op="materialized_view", params={"name": "source"}),),
+        params={
+            "input_cols": ("body",),
+            "output_cols": (ColumnSpec("topic"), ColumnSpec("body")),
+            "instruction": "Merge {body}.",
+        },
+    )
+    inputs = {"source": pd.DataFrame({"body": ["doc one", "doc two"]})}
+
+    with pytest.raises(ValueError, match="structured failure artifact") as error:
+        execute_sem_agg(query, inputs, LotusAdapter().execute, Context())
+
+    assert str(tmp_path) in str(error.value)
+    artifacts = list(tmp_path.glob("*.json"))
+    assert len(artifacts) == 1
+    artifact = json.loads(artifacts[0].read_text(encoding="utf-8"))
+    assert artifact["operator"] == "sem_agg"
+    assert artifact["shape"] == "object"
+    assert artifact["group_index"] == 0
+    assert artifact["expected_output_columns"] == [
+        {"name": "topic", "description": None},
+        {"name": "body", "description": None},
+    ]
+    assert artifact["raw_outputs"] == [""]
+    assert "Return exactly one valid JSON object" in artifact["final_instruction"]
+    assert artifact["group_row_preview"] == [
+        {"body": "doc one"},
+        {"body": "doc two"},
+    ]
 
 
 def test_lotus_adapter_dispatches_sem_join_groupby_and_agg(

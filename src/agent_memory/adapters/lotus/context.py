@@ -6,10 +6,14 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+DEFAULT_STRUCTURED_MAX_TOKENS = 8192
+
 
 @dataclass(frozen=True)
 class LotusExecutionConfig:
     """Backend execution knobs that are not part of policy query semantics."""
+
+    structured_max_tokens: int = DEFAULT_STRUCTURED_MAX_TOKENS
 
     sem_filter_examples: Sequence[Mapping[str, Any]] | None = None
     sem_filter_helper_examples: Sequence[Mapping[str, Any]] | None = None
@@ -36,10 +40,12 @@ class LotusExecutionConfig:
 
     sem_join_examples: Sequence[Mapping[str, Any]] | None = None
     sem_join_strategy: Any | None = None
-    sem_join_default: bool = True
+    sem_join_default: bool = False
     sem_join_cascade_args: Mapping[str, Any] | None = None
     sem_join_safe_mode: bool = False
     sem_join_progress_bar_desc: str = "Join comparisons"
+
+    sem_groupby_default: bool = False
 
     sem_agg_safe_mode: bool = False
     sem_agg_progress_bar_desc: str = "Aggregating"

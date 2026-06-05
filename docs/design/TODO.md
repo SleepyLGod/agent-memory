@@ -88,6 +88,14 @@ Later we may also add the 'context' fields to the semantic operator APIs
 - Should this be represented as one more column such as `match_type` in the  `sem_join` output?
 - If yes, who is responsible for producing it: `sem_join`, the maintenance
   instruction, a following `sem_map`, or runtime?
+- The Claude-style grouped aggregate rule makes this concrete:
+  `changed_topic.outer_join(current_topics)` produces at least three branches:
+  `matched` means both sides exist and should be semantically merged,
+  `unmatched_delta` means only the changed topic exists and should be created,
+  and `unmatched_existing` means only the existing topic exists and should be
+  kept. Today these branches are not tagged, so the following `sem_map` must
+  infer create/keep/merge behavior from null side columns. That is a quality
+  limitation, not an implemented action schema.
 
 ### Full `V'` vs `Delta V`
 
@@ -158,6 +166,37 @@ Later we may also add the 'context' fields to the semantic operator APIs
 - Can the same logical operators run on different semantic processing engines?
 - Possible engines include LOTUS-style DataFrame operators, Palimpzest-style lazy datasets, DSPy modules, custom LLM pipelines, vector DB execution, graph DB traversal, or hybrid planners.
 - What common contract must each engine satisfy?
+
+### Backend Reliability and LOTUS Ownership
+
+- Provider transport failures, for example LiteLLM / DeepSeek returning an
+  incomplete chunked response, are backend reliability failures. They are not
+  Claude policy, `DifferentialRules`, or runtime correctness bugs by
+  themselves.
+- The preferred owner for generic provider retry, transport recovery, and
+  rate-limit handling is LOTUS, LiteLLM, or the provider-native client layer.
+  `agent-memory` should not broadly wrap every LOTUS operator with its own
+  retry policy unless there is a concrete adapter-level reason.
+- A minimal local stopgap may be acceptable only for custom structured lowering
+  paths that call `lotus.settings.lm(...)` directly. Such retry must be bounded,
+  must not change prompts or schemas, must not produce fake fallback rows, and
+  must still raise with observable artifacts when all attempts fail.
+- Do not treat semantic parse/default failures as transport failures. For
+  example, join/groupby parser failures should use correctness-biased defaults,
+  not provider retry.
+- Native LOTUS operators should prefer LOTUS-owned retry and observability. A
+  broad adapter retry around whole native operators can multiply cost and repeat
+  side effects, so it needs a separate design decision.
+- `structured_max_tokens=8192` is an adapter execution knob for custom
+  structured lowering. It is not part of policy semantics, view definitions, or
+  differential rules.
+- `sem_join_default=False` and `sem_groupby_default=False` are
+  correctness-biased defaults. They reduce false-positive memory merges when
+  parsing fails, but may cause conservative topic splits.
+- `lotus_style_sem_agg` is a compatibility copy of LOTUS main-style hierarchical
+  aggregation for multi-output structured aggregation. Future work should prefer
+  an upstream LOTUS hook, or replace the copy when LOTUS exposes an equivalent
+  reusable API.
 
 ### Window, Refresh, and Background Consolidation
 
