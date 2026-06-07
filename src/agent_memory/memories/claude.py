@@ -7,8 +7,7 @@ from agent_memory.logical import UserQuery
 
 
 _EXTRACT_INSTRUCTION = """
-Extract zero or more Claude-style durable memory topic candidates from
-{message}, filling {name}, {description}, {type}, and {body}.
+Extract zero or more Claude-style durable memory topic candidates from the full dialogue or log row, filling {name}, {description}, {type}, and {body}. 
 
 If the user explicitly asks you to remember something, save it immediately as whichever type fits best. If they ask you to forget something, find and remove the relevant entry.
 
@@ -157,6 +156,9 @@ class ClaudeMemory(Memory):
     topics = (
         log
         .sem_flat_map(
+            # Future explicit form:
+            # input_cols=["role", "message", "timestamp", "session_id", "metadata"]
+            # prompt should describe role as speaker and message as utterance.
             output_cols={
                 "name": "Candidate Claude memory name.",
                 "description": "One-line description used to decide relevance.",
