@@ -237,4 +237,4 @@ docs/optimization/*.out
 docs/optimization/*.run.xml
 docs/optimization/*.synctex.gz
 docs/optimization/*.toc
-docs/optimization/*.pdf
+# docs/optimization/*.pdf
