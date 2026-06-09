@@ -222,6 +222,8 @@ __marimo__/
 .streamlit/secrets.toml
 
 docs/design/history/
+!docs/design/history/history-public-api-demos.md
+
 .DS_Store
 
 # LaTeX build artifacts
