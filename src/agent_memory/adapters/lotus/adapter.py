@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
+from uuid import uuid4
 
 from agent_memory.adapters.lotus.context import LotusExecutionConfig, LotusExecutionContext
 from agent_memory.adapters.lotus.relational import (
@@ -21,6 +22,11 @@ from agent_memory.adapters.lotus.sem_groupby import execute_sem_groupby
 from agent_memory.adapters.lotus.sem_join import execute_sem_join
 from agent_memory.adapters.lotus.sem_map import execute_sem_map
 from agent_memory.adapters.lotus.sem_topk import execute_sem_topk
+from agent_memory.tracing.semantic import (
+    query_digest,
+    semantic_trace_scope,
+    write_compact_operator_trace,
+)
 from agent_memory.adapters.lotus.sources import execute_log, execute_materialized_view
 from agent_memory.logical import QueryExpr
 
@@ -49,30 +55,69 @@ class LotusAdapter:
             case "materialized_view":
                 return execute_materialized_view(query, inputs)
             case "select":
-                return execute_select(query, inputs, self.execute)
+                return self._execute_traced_relational(query, inputs, execute_select)
             case "concat":
-                return execute_concat(query, inputs, self.execute)
+                return self._execute_traced_relational(query, inputs, execute_concat)
             case "union":
-                return execute_union(query, inputs, self.execute)
+                return self._execute_traced_relational(query, inputs, execute_union)
             case "subtract":
-                return execute_subtract(query, inputs, self.execute)
+                return self._execute_traced_relational(query, inputs, execute_subtract)
             case "drop_duplicates":
-                return execute_drop_duplicates(query, inputs, self.execute)
+                return self._execute_traced_relational(query, inputs, execute_drop_duplicates)
             case "sem_filter":
-                return execute_sem_filter(query, inputs, self.execute, self._context)
+                return self._execute_traced_semantic(query, inputs, execute_sem_filter)
             case "sem_flat_map":
-                return execute_sem_flat_map(query, inputs, self.execute, self._context)
+                return self._execute_traced_semantic(query, inputs, execute_sem_flat_map)
             case "sem_join":
-                return execute_sem_join(query, inputs, self.execute, self._context)
+                return self._execute_traced_semantic(query, inputs, execute_sem_join)
             case "sem_groupby":
-                return execute_sem_groupby(query, inputs, self.execute, self._context)
+                return self._execute_traced_semantic(query, inputs, execute_sem_groupby)
             case "sem_agg":
-                return execute_sem_agg(query, inputs, self.execute, self._context)
+                return self._execute_traced_semantic(query, inputs, execute_sem_agg)
             case "sem_map":
-                return execute_sem_map(query, inputs, self.execute, self._context)
+                return self._execute_traced_semantic(query, inputs, execute_sem_map)
             case "sem_topk":
-                return execute_sem_topk(query, inputs, self.execute, self._context)
+                return self._execute_traced_semantic(query, inputs, execute_sem_topk)
             case _:
                 raise NotImplementedError(
                     f"LOTUS adapter does not support QueryExpr op {query.op!r}."
                 )
+
+    def _execute_traced_relational(
+        self,
+        query: QueryExpr,
+        inputs: Mapping[str, Any],
+        executor: Any,
+    ) -> Any:
+        """Execute a deterministic relational op and emit compact trace metadata."""
+
+        result = executor(query, inputs, self.execute)
+        write_compact_operator_trace(
+            self.config.trace_dir(),
+            operator=query.op,
+            event_type="operator_result",
+            output_frame=result,
+            payload={
+                "query_digest": query_digest(query),
+                "params": dict(query.params),
+                "input_count": len(query.inputs),
+            },
+        )
+        return result
+
+    def _execute_traced_semantic(
+        self,
+        query: QueryExpr,
+        inputs: Mapping[str, Any],
+        executor: Any,
+    ) -> Any:
+        """Execute a semantic op under a trace scope shared with LLM calls."""
+
+        digest = query_digest(query)
+        operator_call_id = f"{query.op}-{digest}-{uuid4().hex[:8]}"
+        with semantic_trace_scope(
+            semantic_operator=query.op,
+            operator_call_id=operator_call_id,
+            query_digest=digest,
+        ):
+            return executor(query, inputs, self.execute, self._context)

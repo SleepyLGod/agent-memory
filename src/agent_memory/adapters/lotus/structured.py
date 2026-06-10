@@ -14,18 +14,51 @@ from uuid import uuid4
 import pandas as pd
 from lotus.cache import operator_cache
 
-from agent_memory.adapters.lotus.context import DEFAULT_STRUCTURED_MAX_TOKENS
+from agent_memory.adapters.lotus.context import (
+    DEFAULT_STRUCTURED_MAX_TOKENS,
+    DEFAULT_STRUCTURED_PARSE_RETRIES,
+)
+from agent_memory.tracing.semantic import write_structured_generation_trace
 from agent_memory.logical import ColumnSpec, QueryExpr
 
 EXPLANATION_FIELD = "_explanation"
 FLAT_MAP_ROWS_FIELD = "rows"
 STRUCTURED_RESERVED_MODEL_KWARGS = {"progress_bar_desc", "response_format"}
 RAW_OUTPUT_PREVIEW_CHARS = 240
-STRUCTURED_MAX_RETRIES = 3
 STRUCTURED_FAILURE_DIR = Path(".memory-test") / "structured-failures" / "latest"
 PLACEHOLDER_PATTERN = re.compile(
     r"(?<!\{)\{([A-Za-z_][A-Za-z0-9_]*)(?::(left|right))?\}(?!\})"
 )
+
+
+@dataclass
+class StructuredRetryStats:
+    """Process-local counters for custom structured JSON retry observability."""
+
+    retry_batches: int = 0
+    retry_rows: int = 0
+    failure_artifacts: int = 0
+
+
+_STRUCTURED_RETRY_STATS = StructuredRetryStats()
+
+
+def structured_retry_stats() -> StructuredRetryStats:
+    """Return current process-local structured retry counters."""
+
+    return StructuredRetryStats(
+        retry_batches=_STRUCTURED_RETRY_STATS.retry_batches,
+        retry_rows=_STRUCTURED_RETRY_STATS.retry_rows,
+        failure_artifacts=_STRUCTURED_RETRY_STATS.failure_artifacts,
+    )
+
+
+def reset_structured_retry_stats() -> None:
+    """Reset process-local structured retry counters."""
+
+    _STRUCTURED_RETRY_STATS.retry_batches = 0
+    _STRUCTURED_RETRY_STATS.retry_rows = 0
+    _STRUCTURED_RETRY_STATS.failure_artifacts = 0
 
 
 @dataclass(frozen=True)
@@ -35,6 +68,17 @@ class StructuredGenerationResult:
     parsed_outputs: Sequence[Any]
     raw_outputs: Sequence[str]
     explanations: Sequence[str | None]
+    raw_output_attempts: Sequence[Sequence[str]] = ()
+
+
+@dataclass(frozen=True)
+class StructuredLMRetryResult:
+    """Raw structured LM outputs plus retry and validation metadata."""
+
+    raw_outputs: Sequence[str]
+    raw_output_attempts: Sequence[Sequence[str]]
+    invalid_indices: Sequence[int]
+    failure_artifact_paths: Sequence[Path]
 
 
 def normalize_strategy(strategy: Any) -> Any:
@@ -362,6 +406,9 @@ class StructuredLMExecutor:
         progress_bar_desc: str,
         model_kwargs: Mapping[str, Any],
         structured_max_tokens: int = DEFAULT_STRUCTURED_MAX_TOKENS,
+        structured_parse_retries: int = DEFAULT_STRUCTURED_PARSE_RETRIES,
+        semantic_trace_dir: Any = None,
+        semantic_audit_dir: Any = None,
         operator: str = "sem_map",
     ) -> StructuredGenerationResult:
         """Run a structured LOTUS-backed LM batch and parse JSON outputs."""
@@ -444,7 +491,7 @@ class StructuredLMExecutor:
             **dict(model_kwargs),
             "response_format": {"type": "json_object"},
         }
-        raw_outputs = execute_structured_lm_with_retries(
+        retry_result = execute_structured_lm_retry_result(
             lotus.settings.lm,
             prompts,
             lm_kwargs=lm_kwargs,
@@ -452,8 +499,40 @@ class StructuredLMExecutor:
             shape=shape,
             require_explanation=require_explanation and shape == "object",
             operator=operator,
-            max_retries=STRUCTURED_MAX_RETRIES,
+            max_retries=structured_parse_retries,
         )
+        audit_rows = structured_generation_audit_rows(
+            source=self._obj,
+            input_cols=input_cols,
+            output_cols=output_cols,
+            instruction=instruction,
+            formatted_instruction=formatted_instruction,
+            final_instruction=user_instruction,
+            raw_outputs=retry_result.raw_outputs,
+            raw_output_attempts=retry_result.raw_output_attempts,
+            shape=shape,
+            require_explanation=require_explanation and shape == "object",
+            invalid_indices=retry_result.invalid_indices,
+            failure_artifact_paths=retry_result.failure_artifact_paths,
+            operator=operator,
+        )
+        effective_trace_dir = semantic_trace_dir or semantic_audit_dir
+        write_structured_generation_trace(
+            effective_trace_dir,
+            operator=operator,
+            rows=audit_rows,
+            snapshots={"input": self._obj.loc[:, list(input_cols)].copy()},
+        )
+        if retry_result.invalid_indices:
+            raise_structured_lm_retry_error(
+                retry_result,
+                output_cols=output_cols,
+                shape=shape,
+                require_explanation=require_explanation and shape == "object",
+                operator=operator,
+            )
+
+        raw_outputs = list(retry_result.raw_outputs)
         parsed_outputs, explanations = parse_structured_outputs(
             raw_outputs,
             output_cols=output_cols,
@@ -469,6 +548,7 @@ class StructuredLMExecutor:
             parsed_outputs=parsed_outputs,
             raw_outputs=raw_outputs,
             explanations=explanations,
+            raw_output_attempts=retry_result.raw_output_attempts,
         )
 
 
@@ -484,6 +564,40 @@ def execute_structured_lm_with_retries(
     max_retries: int,
 ) -> list[str]:
     """Call the LM and retry only rows with invalid structured JSON."""
+
+    result = execute_structured_lm_retry_result(
+        model,
+        prompts,
+        lm_kwargs=lm_kwargs,
+        output_cols=output_cols,
+        shape=shape,
+        require_explanation=require_explanation,
+        operator=operator,
+        max_retries=max_retries,
+    )
+    if result.invalid_indices:
+        raise_structured_lm_retry_error(
+            result,
+            output_cols=output_cols,
+            shape=shape,
+            require_explanation=require_explanation,
+            operator=operator,
+        )
+    return list(result.raw_outputs)
+
+
+def execute_structured_lm_retry_result(
+    model: Any,
+    prompts: Sequence[Any],
+    *,
+    lm_kwargs: Mapping[str, Any],
+    output_cols: Sequence[ColumnSpec],
+    shape: Literal["object", "array"],
+    require_explanation: bool,
+    operator: str,
+    max_retries: int,
+) -> StructuredLMRetryResult:
+    """Call the LM and return retry metadata without hiding parse failures."""
 
     from lotus.types import LMOutput
 
@@ -501,6 +615,8 @@ def execute_structured_lm_with_retries(
     retries_left = max_retries
     while invalid and retries_left > 0:
         retry_prompts = [prompts[index] for index in invalid]
+        _STRUCTURED_RETRY_STATS.retry_batches += 1
+        _STRUCTURED_RETRY_STATS.retry_rows += len(retry_prompts)
         retry_kwargs = dict(lm_kwargs)
         retry_kwargs["progress_bar_desc"] = (
             f"{lm_kwargs.get('progress_bar_desc', 'Structured generation')} retry"
@@ -528,19 +644,117 @@ def execute_structured_lm_with_retries(
             require_explanation=require_explanation,
             operator=operator,
         )
-        first = invalid[0]
-        parse_error = structured_parse_error(
-            raw_outputs[first],
-            output_cols=output_cols,
-            shape=shape,
-            require_explanation=require_explanation,
-            operator=operator,
-        )
-        raise ValueError(
-            f"{parse_error}; structured failure artifact: {artifact_paths[0]}"
-        )
+        _STRUCTURED_RETRY_STATS.failure_artifacts += len(artifact_paths)
+    else:
+        artifact_paths = []
 
-    return raw_outputs
+    return StructuredLMRetryResult(
+        raw_outputs=raw_outputs,
+        raw_output_attempts=tuple(tuple(attempts) for attempts in raw_output_attempts),
+        invalid_indices=tuple(invalid),
+        failure_artifact_paths=tuple(artifact_paths),
+    )
+
+
+def raise_structured_lm_retry_error(
+    result: StructuredLMRetryResult,
+    *,
+    output_cols: Sequence[ColumnSpec],
+    shape: Literal["object", "array"],
+    require_explanation: bool,
+    operator: str,
+) -> None:
+    """Raise the original structured parse failure after audit has run."""
+
+    if not result.invalid_indices:
+        return
+
+    first = result.invalid_indices[0]
+    parse_error = structured_parse_error(
+        result.raw_outputs[first],
+        output_cols=output_cols,
+        shape=shape,
+        require_explanation=require_explanation,
+        operator=operator,
+    )
+    artifact = result.failure_artifact_paths[0]
+    raise ValueError(f"{parse_error}; structured failure artifact: {artifact}")
+
+
+def structured_generation_audit_rows(
+    *,
+    source: pd.DataFrame,
+    input_cols: Sequence[str],
+    output_cols: Sequence[ColumnSpec],
+    instruction: str,
+    formatted_instruction: str,
+    final_instruction: str,
+    raw_outputs: Sequence[str],
+    raw_output_attempts: Sequence[Sequence[str]],
+    shape: Literal["object", "array"],
+    require_explanation: bool,
+    invalid_indices: Sequence[int],
+    failure_artifact_paths: Sequence[Path],
+    operator: str,
+) -> list[dict[str, Any]]:
+    """Build structured generation audit rows without mutating source data."""
+
+    invalid = set(invalid_indices)
+    artifact_by_index = {
+        index: str(path)
+        for index, path in zip(invalid_indices, failure_artifact_paths)
+    }
+    input_records = source.loc[:, list(input_cols)].astype(str).to_dict(orient="records")
+    rows: list[dict[str, Any]] = []
+    for index, raw_output in enumerate(raw_outputs):
+        parse_error = ""
+        parsed_output: Any = None
+        if index in invalid:
+            parse_error = structured_parse_error(
+                raw_output,
+                output_cols=output_cols,
+                shape=shape,
+                require_explanation=require_explanation,
+                operator=operator,
+            )
+        else:
+            parsed, _explanations = parse_structured_outputs(
+                [raw_output],
+                output_cols=output_cols,
+                shape=shape,
+                require_explanation=require_explanation,
+                operator=operator,
+            )
+            parsed_output = parsed[0] if parsed else None
+
+        attempts = (
+            list(raw_output_attempts[index])
+            if index < len(raw_output_attempts)
+            else [raw_output]
+        )
+        rows.append(
+            {
+                "operator": operator,
+                "row_index": index,
+                "shape": shape,
+                "input_cols": list(input_cols),
+                "input_preview": input_records[index] if index < len(input_records) else {},
+                "instruction": instruction,
+                "formatted_instruction": formatted_instruction,
+                "final_instruction": final_instruction,
+                "required_output_cols": [
+                    {"name": column.name, "description": column.description}
+                    for column in output_cols
+                ],
+                "raw_output": raw_output,
+                "raw_output_attempts": attempts,
+                "parse_retry_attempts": max(len(attempts) - 1, 0),
+                "parsed_output": parsed_output,
+                "parse_error": parse_error,
+                "failure_artifact": artifact_by_index.get(index, ""),
+            }
+        )
+    return rows
 
 
 def write_structured_failure_artifacts(

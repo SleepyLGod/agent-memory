@@ -6,6 +6,7 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from agent_memory.adapters.lotus.context import LotusExecutionConfig, LotusExecutionContext
+from agent_memory.tracing.semantic import write_compact_operator_trace
 from agent_memory.adapters.lotus.structured import (
     StructuredLMExecutor,
     examples_dataframe,
@@ -48,12 +49,25 @@ def execute_native_sem_map(
         str(query.params["instruction"]),
         **native_sem_map_kwargs(config, suffix=map_column),
     )
-    return apply_sem_map_output(
+    result = apply_sem_map_output(
         source,
         mapped,
         map_column,
         output_col,
     )
+    write_compact_operator_trace(
+        config.trace_dir(),
+        operator="sem_map",
+        event_type="operator_result",
+        input_frame=source,
+        output_frame=result,
+        payload={
+            "instruction": str(query.params["instruction"]),
+            "output_col": output_col.name,
+            "native_lotus": True,
+        },
+    )
+    return result
 
 
 def execute_structured_sem_map(
@@ -79,6 +93,8 @@ def execute_structured_sem_map(
         progress_bar_desc=config.sem_map_progress_bar_desc,
         model_kwargs=dict(config.sem_map_model_kwargs),
         structured_max_tokens=config.structured_max_tokens,
+        structured_parse_retries=config.structured_parse_retries,
+        semantic_trace_dir=config.trace_dir(),
     )
     return apply_structured_map_outputs(
         source,

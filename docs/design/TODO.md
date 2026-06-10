@@ -76,128 +76,27 @@ Status: the current golden line is `docs/optimization/incremental-semantic-view-
   on the adapter dataclass or are delegated to LOTUS/provider-native
   configuration.
 
+
 ## Claude Code native memory path alignment
 
-Native Claude Code has multiple memory write and consolidation paths. They share
-the same file-level memory contract, but they do not have the same execution
-wrapper, trigger timing, or granularity. Current `agent-memory` Claude policy
-work should keep these paths separate when claiming native parity.
+Detailed native Claude Code memory analysis now lives in
+`docs/design/native-claude-memory-audit.zh.md`. Keep that document as the
+canonical design note instead of duplicating long native-path analysis here.
 
-### Shared memory contract
+Current TODOs:
 
-The main-agent inline path, `extractMemories`, and `autoDream` all rely on the
-same durable memory contract:
-
-- Topic markdown files use frontmatter fields `name`, `description`, `type`,
-  followed by a markdown body.
-- `MEMORY.md` is a concise index, not a memory body.
-- Memories are organized by semantic topic, not chronological log order.
-- Stale, wrong, contradicted, or superseded memories should be updated or
-  removed.
-- Duplicate memories should be avoided by checking existing memory first.
-- The paths share the same memory type taxonomy and `What NOT to save` rules.
-
-### Native paths
-
-1. **Main-agent inline write**
-
-   The main Claude agent receives memory mechanics in its normal system prompt.
-   This gives it a memory-writing capability during the user-facing assistant
-   turn.
-
-   Its save/no-save decision is implicit in normal agent reasoning: the model
-   decides whether the current turn contains durable information worth saving
-   using the memory type taxonomy, `What NOT to save`, explicit remember/forget
-   instructions, and broader task context.
-
-   This is not a per-message extraction query. It is a memory-capable
-   conversational agent that may directly `Read`, `Glob`, `Write`, or `Edit`
-   memory files while answering the user.
-
-2. **`extractMemories` background extraction**
-
-   `extractMemories` runs as a forked extraction subagent after a turn. It shares
-   the main system prompt and message prefix, but adds an explicit extraction
-   wrapper:
-
-   - "You are now acting as the memory extraction subagent";
-   - analyze the most recent `N` messages;
-   - use only those recent messages as new evidence;
-   - inspect an existing memory manifest before writing;
-   - operate under restricted tools and a limited turn budget.
-
-   Its save/no-save decision is also implicit, but it is scoped by the
-   extraction wrapper plus the shared memory taxonomy and `What NOT to save`
-   rules. It is closer to:
-
-   ```text
-   sem_flat_map(recent_message_chunk -> zero_or_more_memory_updates)
-   ```
-
-   than to:
-
-   ```text
-   sem_filter(each_message) -> sem_map(each_message)
-   ```
-
-   Native Claude Code skips this forked extraction when the main agent already
-   wrote memory files in the same turn. Main inline writes and background
-   extraction are mutually exclusive for that turn.
-
-3. **`autoDream` background consolidation**
-
-   `autoDream` is a delayed consolidation pass gated by time, session count, and
-   lock state. It reads existing memory files and recent transcript evidence,
-   then merges, prunes, fixes contradictions, and updates `MEMORY.md`.
-
-   This is closer to semantic consolidation and canonicalization than raw
-   extraction.
-
-### Current `ClaudeMemory` mapping
-
-Current `agent-memory` `ClaudeMemory` models the background
-extraction/consolidation direction, not native main-agent inline writing:
-
-```text
-log
-  -> sem_flat_map(...)                 # extract-style candidate generation
-  -> sem_groupby(...).sem_agg(...)     # dream/consolidation-style canonicalization
-  -> sem_map(...)                      # MEMORY.md catalog/index projection
-```
-
-The current `_EXTRACT_INSTRUCTION` reuses the shared Claude memory contract and
-type taxonomy, but it does not yet model native `extractMemories` as a true
-chunk-level forked extraction wrapper. In particular, it does not explicitly
-encode:
-
-- recent-message windowing;
-- "only use the last N messages" evidence scope;
-- existing memory manifest injection;
-- restricted tool and limited turn-budget behavior;
-- mutual exclusion with main-agent inline memory writes.
-
-The current `_CONSOLIDATE_INSTRUCTION` is closer to native `autoDream`
-consolidation language than to native extraction.
-
-### TODOs
-
-- Keep native comparison experiments separated by path:
-  - main-agent inline write baseline;
-  - `extractMemories` background extraction baseline;
-  - `autoDream` consolidation baseline.
-- Do not use a main-agent inline write smoke as evidence that `extractMemories`
-  or `autoDream` ran.
-- Decide whether `agent-memory` should model main-agent inline writes at all. If
-  yes, it likely needs a different abstraction from declarative view queries,
-  because native inline writes are tool-using agent behavior.
-- Revisit whether `ClaudeMemory` extraction should operate on message chunks or
-  turn windows rather than independent log rows.
-- Revisit whether extraction should receive an explicit existing-memory manifest
-  or whether deduplication should remain entirely in
-  `sem_groupby(...).sem_agg(...)`.
-- Treat current LOCOMO E2E comparisons as `agent-memory` policy audits, not
-  definitive native Claude Code parity, until the native path being compared is
-  explicitly identified.
+- Keep native comparison experiments separated by path: main-agent inline write,
+  `extractMemories` background extraction, and `autoDream` consolidation.
+- Do not use a CLI `-p` LOCOMO replay as evidence that `extractMemories` or
+  `autoDream` ran; it is only a native CLI / main-agent behavior audit unless
+  debug artifacts prove otherwise.
+- Add an extract-only component harness before claiming parity with
+  `agent-memory` `sem_flat_map -> sem_groupby.sem_agg`.
+- Treat `--turn-size 1` native CLI runs as one-row-per-turn behavior, not strict
+  one-message extractor tests.
+- If comparing consolidation, prefer an extract-only + seeded `autoDream` gate
+  experiment so native `autoDream` itself runs while the scheduler conditions are
+  explicit.
 
 ## Open Research Questions
 

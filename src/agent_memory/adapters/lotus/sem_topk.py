@@ -6,6 +6,7 @@ from collections.abc import Callable, Mapping
 from typing import Any
 
 from agent_memory.adapters.lotus.context import LotusExecutionContext
+from agent_memory.tracing.semantic import write_compact_operator_trace
 from agent_memory.adapters.lotus.structured import normalize_strategy
 from agent_memory.logical import QueryExpr
 
@@ -36,7 +37,7 @@ def execute_sem_topk(
     source = execute(query.inputs[0], inputs)
     instruction = topk_instruction(source, str(query.params["instruction"]))
     config = context.config
-    return source.sem_topk(
+    result = source.sem_topk(
         instruction,
         K=query.params["k"],
         method=config.sem_topk_method,
@@ -46,3 +47,17 @@ def execute_sem_topk(
         safe_mode=config.sem_topk_safe_mode,
         return_explanations=config.sem_topk_return_explanations,
     )
+    write_compact_operator_trace(
+        config.trace_dir(),
+        operator="sem_topk",
+        event_type="operator_result",
+        input_frame=source,
+        output_frame=result,
+        payload={
+            "instruction": str(query.params["instruction"]),
+            "lowered_instruction": instruction,
+            "k": query.params["k"],
+            "method": config.sem_topk_method,
+        },
+    )
+    return result

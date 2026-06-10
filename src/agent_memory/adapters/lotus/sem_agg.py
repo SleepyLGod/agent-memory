@@ -13,6 +13,7 @@ from agent_memory.adapters.lotus.context import (
     LotusExecutionConfig,
     LotusExecutionContext,
 )
+from agent_memory.tracing.semantic import write_structured_generation_trace
 from agent_memory.adapters.lotus.sem_groupby import GROUP_ID_COLUMN
 from agent_memory.adapters.lotus.structured import (
     parse_structured_object_json,
@@ -64,10 +65,22 @@ def execute_native_sem_agg(
     if source.empty:
         return pd.DataFrame(columns=[output_col.name])
 
-    outputs = [
-        execute_native_sem_agg_group(query, group, input_cols, config)
-        for group in aggregate_groups(source)
-    ]
+    config = config or LotusExecutionConfig()
+    groups = aggregate_groups(source)
+    outputs: list[str] = []
+    for group_index, group in enumerate(groups):
+        raw_output = execute_native_sem_agg_group(query, group, input_cols, config)
+        outputs.append(raw_output)
+        write_sem_agg_audit(
+            config,
+            query=query,
+            group=group,
+            input_cols=input_cols,
+            output_cols=(output_col,),
+            group_index=group_index,
+            raw_output=raw_output,
+            parsed_output={output_col.name: raw_output},
+        )
     return pd.DataFrame({output_col.name: outputs})
 
 
@@ -84,10 +97,7 @@ def execute_native_sem_agg_group(
 
     config = config or LotusExecutionConfig()
     docs = aggregate_group_text(group, input_cols)
-    instruction = lotus.nl_expression.nle2str(
-        str(query.params["instruction"]),
-        list(input_cols),
-    )
+    instruction = aggregate_instruction(query, input_cols)
     kwargs: dict[str, Any] = {
         "safe_mode": config.sem_agg_safe_mode,
         "progress_bar_desc": config.sem_agg_progress_bar_desc,
@@ -151,7 +161,18 @@ def execute_structured_sem_agg_group(
         config,
     )
     try:
-        return parse_structured_sem_agg_output(raw_output, output_cols)
+        parsed = parse_structured_sem_agg_output(raw_output, output_cols)
+        write_sem_agg_audit(
+            config,
+            query=query,
+            group=group,
+            input_cols=input_cols,
+            output_cols=output_cols,
+            group_index=group_index,
+            raw_output=raw_output,
+            parsed_output=parsed,
+        )
+        return parsed
     except ValueError as error:
         artifact_path = write_sem_agg_failure_artifact(
             raw_output,
@@ -159,6 +180,18 @@ def execute_structured_sem_agg_group(
             output_cols,
             instruction=instruction,
             group_index=group_index,
+        )
+        write_sem_agg_audit(
+            config,
+            query=query,
+            group=group,
+            input_cols=input_cols,
+            output_cols=output_cols,
+            group_index=group_index,
+            raw_output=raw_output,
+            parsed_output=None,
+            parse_error=str(error),
+            failure_artifact=artifact_path,
         )
         raise ValueError(
             f"{error}; structured failure artifact: {artifact_path}"
@@ -199,10 +232,7 @@ def structured_aggregate_instruction(
 
     import lotus
 
-    instruction = lotus.nl_expression.nle2str(
-        str(query.params["instruction"]),
-        list(input_cols),
-    )
+    instruction = aggregate_instruction(query, input_cols)
     field_lines = "\n".join(
         f"- {column.name}: {column.description or 'string'}"
         for column in output_cols
@@ -218,6 +248,70 @@ def structured_aggregate_instruction(
         f"{field_lines}\n"
         "All values must be strings. Do not include extra keys.\n"
         f"Expected JSON shape: {shape}"
+    )
+
+
+def aggregate_instruction(query: QueryExpr, input_cols: Sequence[str]) -> str:
+    """Resolve semantic aggregate placeholders against aggregate input columns."""
+
+    import lotus
+
+    return lotus.nl_expression.nle2str(
+        str(query.params["instruction"]),
+        list(input_cols),
+    )
+
+
+def write_sem_agg_audit(
+    config: LotusExecutionConfig,
+    *,
+    query: QueryExpr,
+    group: pd.DataFrame,
+    input_cols: Sequence[str],
+    output_cols: Sequence[ColumnSpec],
+    group_index: int,
+    raw_output: Any,
+    parsed_output: Mapping[str, Any] | None,
+    parse_error: str = "",
+    failure_artifact: Path | str | None = None,
+) -> None:
+    """Write a structured audit row for one semantic aggregate group."""
+
+    instruction = str(query.params["instruction"])
+    formatted_instruction = aggregate_instruction(query, input_cols)
+    final_instruction = (
+        structured_aggregate_instruction(query, input_cols, output_cols)
+        if len(output_cols) > 1
+        else formatted_instruction
+    )
+    input_preview = group.loc[:, list(input_cols)].head(20).astype(str).to_dict(
+        orient="records"
+    )
+    audit_row = {
+        "operator": "sem_agg",
+        "group_index": group_index,
+        "shape": "object" if len(output_cols) > 1 else "string",
+        "input_cols": list(input_cols),
+        "input_preview": input_preview,
+        "instruction": instruction,
+        "formatted_instruction": formatted_instruction,
+        "final_instruction": final_instruction,
+        "required_output_cols": [
+            {"name": column.name, "description": column.description}
+            for column in output_cols
+        ],
+        "raw_output": str(raw_output),
+        "raw_output_attempts": [str(raw_output)],
+        "parse_retry_attempts": 0,
+        "parsed_output": parsed_output,
+        "parse_error": parse_error,
+        "failure_artifact": "" if failure_artifact is None else str(failure_artifact),
+    }
+    write_structured_generation_trace(
+        config.trace_dir(),
+        operator="sem_agg",
+        rows=[audit_row],
+        snapshots={"group": group.loc[:, list(input_cols)].copy()},
     )
 
 

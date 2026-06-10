@@ -9,6 +9,7 @@ import pandas as pd
 
 from agent_memory.adapters.lotus.context import LotusExecutionContext
 from agent_memory.adapters.lotus.sem_join import row_text_series
+from agent_memory.tracing.semantic import write_compact_operator_trace, write_pair_trace
 from agent_memory.adapters.lotus.structured import StructuredLMExecutor
 from agent_memory.logical import ColumnSpec, QueryExpr
 
@@ -42,6 +43,7 @@ def execute_sem_groupby(
         input_cols=input_cols,
         instruction=str(query.params["instruction"]),
         default=context.config.sem_groupby_default,
+        trace_dir=context.config.trace_dir(),
     )
     result = assign_semantic_group_ids(
         source,
@@ -50,6 +52,17 @@ def execute_sem_groupby(
         row_to_unique=row_to_unique,
     )
     result.attrs["agent_memory_groupby_input_cols"] = input_cols
+    write_compact_operator_trace(
+        context.config.trace_dir(),
+        operator="sem_groupby",
+        event_type="operator_result",
+        input_frame=source,
+        output_frame=result,
+        payload={
+            "instruction": str(query.params["instruction"]),
+            "input_cols": list(input_cols),
+        },
+    )
     return result
 
 
@@ -213,6 +226,8 @@ def evaluate_group_matches(
     input_cols: Sequence[str],
     instruction: str,
     default: bool = False,
+    audit_dir: Any = None,
+    trace_dir: Any = None,
 ) -> list[tuple[int, int]]:
     """Evaluate candidate row pairs with LOTUS sem_filter."""
 
@@ -236,11 +251,54 @@ def evaluate_group_matches(
         default=default,
         progress_bar_desc="Grouping comparisons",
     )
+    write_groupby_pair_trace(
+        trace_dir or audit_dir,
+        pairs,
+        instruction=user_instruction,
+        output=output,
+        default=default,
+    )
     return [
         (int(row["_left_unique_id"]), int(row["_right_unique_id"]))
         for (_index, row), keep in zip(pairs.iterrows(), output.outputs)
         if keep
     ]
+
+
+def write_groupby_pair_trace(
+    trace_dir: Any,
+    pairs: pd.DataFrame,
+    *,
+    instruction: str,
+    output: Any,
+    default: bool,
+) -> None:
+    """Write one sem_groupby trace row per evaluated pair."""
+
+    raw_outputs = list(getattr(output, "raw_outputs", ()))
+    explanations = list(getattr(output, "explanations", ()))
+    rows: list[dict[str, Any]] = []
+    for index, (_row_index, pair) in enumerate(pairs.iterrows()):
+        rows.append(
+            {
+                "operator": "sem_groupby",
+                "instruction": instruction,
+                "left_unique_id": int(pair["_left_unique_id"]),
+                "right_unique_id": int(pair["_right_unique_id"]),
+                "left": pair["left"],
+                "right": pair["right"],
+                "parsed_output": bool(output.outputs[index]),
+                "raw_output": raw_outputs[index] if index < len(raw_outputs) else "",
+                "explanation": explanations[index] if index < len(explanations) else "",
+                "default": default,
+            }
+        )
+    write_pair_trace(
+        trace_dir,
+        operator="sem_groupby",
+        rows=rows,
+        snapshots={"pairs": pairs},
+    )
 
 
 def semantic_pair_candidates(

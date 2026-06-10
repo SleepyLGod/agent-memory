@@ -38,6 +38,8 @@ def execute_sem_flat_map(
         progress_bar_desc="Flat mapping",
         model_kwargs={},
         structured_max_tokens=context.config.structured_max_tokens,
+        structured_parse_retries=context.config.structured_parse_retries,
+        semantic_trace_dir=context.config.trace_dir(),
         operator="sem_flat_map",
     )
     return apply_flat_map_outputs(source, generation.parsed_outputs, cols)

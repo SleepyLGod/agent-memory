@@ -8,6 +8,11 @@ from typing import Any
 import pandas as pd
 
 from agent_memory.adapters.lotus.context import LotusExecutionConfig, LotusExecutionContext
+from agent_memory.tracing.semantic import (
+    query_digest,
+    write_pair_trace,
+    write_trace_event,
+)
 from agent_memory.adapters.lotus.structured import examples_dataframe, normalize_strategy
 from agent_memory.logical import QueryExpr
 
@@ -24,18 +29,76 @@ def execute_sem_join(
     left = execute(query.inputs[0], inputs)
     right = execute(query.inputs[1], inputs)
     if left.empty or right.empty:
-        return assemble_join_frame(
+        result = assemble_join_frame(
             left,
             right,
             (),
             how=str(query.params.get("how", "inner")),
         )
+        write_sem_join_result_trace(
+            context.config.trace_dir(),
+            query=query,
+            left=left,
+            right=right,
+            result=result,
+            payload={
+                "skipped_pairwise": True,
+            },
+        )
+        return result
     join_results = evaluate_semantic_join(query, left, right, context.config)
-    return assemble_join_frame(
+    result = assemble_join_frame(
         left,
         right,
         join_results,
         how=str(query.params.get("how", "inner")),
+    )
+    write_sem_join_result_trace(
+        context.config.trace_dir(),
+        query=query,
+        left=left,
+        right=right,
+        result=result,
+        payload={
+            "skipped_pairwise": False,
+        },
+    )
+    return result
+
+
+def write_sem_join_result_trace(
+    trace_dir: Any,
+    *,
+    query: QueryExpr,
+    left: pd.DataFrame,
+    right: pd.DataFrame,
+    result: pd.DataFrame,
+    payload: Mapping[str, Any] | None = None,
+) -> None:
+    """Write sem_join result trace with explicit left/right/output snapshots."""
+
+    event_payload: dict[str, Any] = {
+        "query_digest": query_digest(query),
+        "how": str(query.params.get("how", "inner")),
+        "instruction": str(query.params["instruction"]),
+        "left_rows": len(left),
+        "left_columns": [str(column) for column in left.columns],
+        "right_rows": len(right),
+        "right_columns": [str(column) for column in right.columns],
+        "output_rows": len(result),
+        "output_columns": [str(column) for column in result.columns],
+    }
+    event_payload.update(dict(payload or {}))
+    write_trace_event(
+        trace_dir,
+        operator="sem_join",
+        event_type="operator_result",
+        payload=event_payload,
+        snapshots={
+            "left": left,
+            "right": right,
+            "output": result,
+        },
     )
 
 
@@ -97,7 +160,62 @@ def evaluate_semantic_join(
             progress_bar_desc=config.sem_join_progress_bar_desc,
             **common_kwargs,
         )
+    write_join_pair_trace(
+        config.trace_dir(),
+        left_series,
+        right_series,
+        instruction=instruction,
+        output=output,
+        default=config.sem_join_default,
+    )
     return list(output.join_results)
+
+
+def write_join_pair_trace(
+    trace_dir: Any,
+    left_series: pd.Series,
+    right_series: pd.Series,
+    *,
+    instruction: str,
+    output: Any,
+    default: bool,
+) -> None:
+    """Write one sem_join trace row per evaluated pair when available."""
+
+    parsed_outputs = list(getattr(output, "filter_outputs", ()))
+    if len(parsed_outputs) != len(left_series) * len(right_series):
+        return
+
+    raw_outputs = list(getattr(output, "all_raw_outputs", ()))
+    explanations = list(getattr(output, "all_explanations", ()))
+    rows: list[dict[str, Any]] = []
+    index = 0
+    for left_id, left_value in left_series.items():
+        for right_id, right_value in right_series.items():
+            rows.append(
+                {
+                    "operator": "sem_join",
+                    "instruction": instruction,
+                    "left_id": left_id,
+                    "right_id": right_id,
+                    "left": left_value,
+                    "right": right_value,
+                    "parsed_output": bool(parsed_outputs[index]),
+                    "raw_output": raw_outputs[index] if index < len(raw_outputs) else "",
+                    "explanation": explanations[index] if index < len(explanations) else "",
+                    "default": default,
+                }
+            )
+            index += 1
+    write_pair_trace(
+        trace_dir,
+        operator="sem_join",
+        rows=rows,
+        snapshots={
+            "left": left_series.to_frame(left_series.name or "left"),
+            "right": right_series.to_frame(right_series.name or "right"),
+        },
+    )
 
 
 def join_series(

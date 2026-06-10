@@ -6,6 +6,7 @@ from collections.abc import Callable, Mapping
 from typing import Any
 
 from agent_memory.adapters.lotus.context import LotusExecutionConfig, LotusExecutionContext
+from agent_memory.tracing.semantic import write_compact_operator_trace
 from agent_memory.adapters.lotus.structured import examples_dataframe, normalize_strategy
 from agent_memory.logical import QueryExpr
 
@@ -20,10 +21,19 @@ def execute_sem_filter(
 
     context.configure()
     source = execute(query.inputs[0], inputs)
-    return source.sem_filter(
+    result = source.sem_filter(
         query.params["instruction"],
         **native_sem_filter_kwargs(context.config),
     )
+    write_compact_operator_trace(
+        context.config.trace_dir(),
+        operator="sem_filter",
+        event_type="operator_result",
+        input_frame=source,
+        output_frame=result,
+        payload={"instruction": str(query.params["instruction"])},
+    )
+    return result
 
 
 def native_sem_filter_kwargs(config: LotusExecutionConfig) -> dict[str, Any]:

@@ -16,7 +16,9 @@ import agent_memory as am
 from agent_memory.adapters import LotusAdapter
 from agent_memory.adapters.lotus.context import (
     DEFAULT_STRUCTURED_MAX_TOKENS,
+    DEFAULT_STRUCTURED_PARSE_RETRIES,
     LotusExecutionConfig,
+    LotusExecutionContext,
 )
 from agent_memory.adapters.lotus.relational import (
     execute_concat,
@@ -63,6 +65,8 @@ from agent_memory.adapters.lotus.sem_groupby import (
 from agent_memory.adapters.lotus.sem_join import (
     assemble_join_frame,
     cascade_args_from_mapping,
+    evaluate_semantic_join,
+    execute_sem_join,
     join_series,
     renamed_columns,
 )
@@ -75,14 +79,44 @@ from agent_memory.adapters.lotus.structured import (
     execute_structured_lm_with_retries,
     escape_structured_formatter_placeholders,
     parse_structured_object_json,
+    reset_structured_retry_stats,
+    structured_retry_stats,
     structured_instruction as build_structured_instruction,
     validate_model_kwargs,
 )
+from agent_memory.adapters.lotus.traced_lm import TracedLM
 from agent_memory.datasets.locomo import flatten_locomo_rows
 from agent_memory.logical import ColumnSpec, MemorySpec, QueryExpr, UserQuery
 from agent_memory.planner import DifferentialInstructionRewriter, DifferentialQueryPlanner
 from agent_memory.planner.rules import DifferentialRules
 from agent_memory.relation import GroupedRelation, Relation
+from agent_memory.tracing.semantic import semantic_trace_scope, write_compact_operator_trace
+
+
+def trace_events(trace_dir: Path) -> list[dict[str, Any]]:
+    """Read trace JSONL events from a test trace directory."""
+
+    events_path = trace_dir / "events.jsonl"
+    if not events_path.exists():
+        return []
+    return [
+        json.loads(line)
+        for line in events_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
+def trace_artifact(trace_dir: Path, path_value: str) -> Any:
+    """Read one JSON trace artifact referenced by an event."""
+
+    path = trace_dir_from_event(trace_dir, path_value)
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def trace_dir_from_event(trace_dir: Path, path_value: str) -> Path:
+    """Resolve one trace artifact path from an event field."""
+
+    return trace_dir / path_value.removeprefix("trace/")
 
 
 def test_query_expr_params_are_deeply_frozen() -> None:
@@ -1182,6 +1216,188 @@ def test_sem_topk_accepts_user_query_placeholder() -> None:
     assert relation.expr.params == {"instruction": am.UserQuery(), "k": 3}
 
 
+def test_lotus_execution_context_passes_backend_lm_options(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import lotus
+    import lotus.models
+
+    captured: dict[str, Any] = {}
+
+    class FakeLM:
+        def __init__(self, **kwargs: Any) -> None:
+            captured["lm_kwargs"] = kwargs
+
+    def configure(**kwargs: Any) -> None:
+        captured["configure_kwargs"] = kwargs
+
+    monkeypatch.setattr(lotus.models, "LM", FakeLM)
+    monkeypatch.setattr(lotus.settings, "configure", configure)
+
+    context = LotusExecutionContext(
+        model="deepseek/example",
+        config=LotusExecutionConfig(
+            lm_num_retries=2,
+            lm_timeout=120,
+            lm_max_batch_size=4,
+            lm_rate_limit=10,
+        ),
+    )
+    context.configure()
+
+    assert captured["lm_kwargs"] == {
+        "model": "deepseek/example",
+        "max_batch_size": 4,
+        "num_retries": 2,
+        "timeout": 120,
+        "rate_limit": 10,
+    }
+    assert isinstance(captured["configure_kwargs"]["lm"], FakeLM)
+
+
+def test_lotus_execution_context_wraps_lm_only_when_trace_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import lotus
+    import lotus.models
+
+    captured: dict[str, Any] = {}
+
+    class FakeLM:
+        def __init__(self, **kwargs: Any) -> None:
+            self.kwargs = kwargs
+
+    def configure(**kwargs: Any) -> None:
+        captured["configure_kwargs"] = kwargs
+
+    monkeypatch.setattr(lotus.models, "LM", FakeLM)
+    monkeypatch.setattr(lotus.settings, "configure", configure)
+
+    context = LotusExecutionContext(
+        model="deepseek/example",
+        config=LotusExecutionConfig(semantic_trace_dir=tmp_path / "trace"),
+    )
+    context.configure()
+
+    configured_lm = captured["configure_kwargs"]["lm"]
+    assert isinstance(configured_lm, TracedLM)
+    assert configured_lm.kwargs == {
+        "model": "deepseek/example",
+        "max_batch_size": 64,
+    }
+
+
+def test_traced_lm_writes_actual_prompt_and_raw_output(tmp_path: Path) -> None:
+    class Output:
+        outputs = ["Answer: True"]
+        logprobs = None
+
+    class FakeLM:
+        model = "deepseek/test"
+        max_tokens = 512
+        max_ctx_len = 128000
+
+        def __init__(self) -> None:
+            self.stats = _fake_lm_stats(prompt_tokens=0, completion_tokens=0)
+            self.messages: Any = None
+            self.kwargs: dict[str, Any] | None = None
+
+        def __call__(self, messages: Any, **kwargs: Any) -> Output:
+            self.messages = messages
+            self.kwargs = kwargs
+            self.stats = _fake_lm_stats(prompt_tokens=7, completion_tokens=3)
+            return Output()
+
+        def count_tokens(self, _messages: Any) -> int:
+            return 42
+
+        def is_deepseek(self) -> bool:
+            return True
+
+    trace_dir = tmp_path / "trace"
+    lm = TracedLM(FakeLM(), trace_dir)
+    messages = [[{"role": "system", "content": "sys"}, {"role": "user", "content": "hello"}]]
+
+    result = lm(messages, progress_bar_desc="Testing")
+
+    assert result.outputs == ["Answer: True"]
+    assert lm.count_tokens(messages[0]) == 42
+    assert lm.is_deepseek() is True
+    events = [
+        json.loads(line)
+        for line in (trace_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert len(events) == 1
+    assert events[0]["event_type"] == "llm_call"
+    assert events[0]["model"] == "deepseek/test"
+    assert events[0]["llm_item_index"] == 0
+    assert events[0]["usage_physical_total_tokens"] == 10
+    assert "-llm-" in events[0]["prompt_path"]
+    prompt_path = trace_dir / events[0]["prompt_path"].removeprefix("trace/")
+    raw_path = trace_dir / events[0]["raw_output_path"].removeprefix("trace/")
+    assert json.loads(prompt_path.read_text(encoding="utf-8")) == messages[0]
+    assert json.loads(raw_path.read_text(encoding="utf-8")) == {"output": "Answer: True"}
+
+
+def test_traced_lm_records_error_and_reraises(tmp_path: Path) -> None:
+    class FakeLM:
+        model = "deepseek/test"
+
+        def __init__(self) -> None:
+            self.stats = _fake_lm_stats(prompt_tokens=0, completion_tokens=0)
+
+        def __call__(self, _messages: Any, **_kwargs: Any) -> Any:
+            raise RuntimeError("transport failed")
+
+    trace_dir = tmp_path / "trace"
+    lm = TracedLM(FakeLM(), trace_dir)
+
+    with pytest.raises(RuntimeError, match="transport failed"):
+        lm([[{"role": "user", "content": "hello"}]])
+
+    events = [
+        json.loads(line)
+        for line in (trace_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert len(events) == 1
+    assert events[0]["event_type"] == "llm_batch_error"
+    assert events[0]["error_type"] == "RuntimeError"
+    error_path = trace_dir / events[0]["error_output_path"].removeprefix("trace/")
+    assert json.loads(error_path.read_text(encoding="utf-8")) == {
+        "type": "RuntimeError",
+        "message": "transport failed",
+    }
+
+
+def _fake_lm_stats(*, prompt_tokens: int, completion_tokens: int) -> SimpleNamespace:
+    """Return a minimal LOTUS LMStats-like object for trace tests."""
+
+    total = prompt_tokens + completion_tokens
+    usage = SimpleNamespace(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=total,
+    )
+    return SimpleNamespace(
+        physical_usage=usage,
+        virtual_usage=usage,
+        cache_hits=0,
+    )
+
+
+def test_lotus_execution_config_keeps_retry_defaults_disabled() -> None:
+    config = LotusExecutionConfig()
+
+    assert config.lm_num_retries is None
+    assert config.lm_timeout is None
+    assert config.lm_max_batch_size == 64
+    assert config.lm_rate_limit is None
+    assert config.semantic_trace_dir is None
+    assert config.semantic_audit_dir is None
+    assert config.structured_parse_retries == DEFAULT_STRUCTURED_PARSE_RETRIES
+
+
 def test_lotus_adapter_forwards_topk_lotus_options() -> None:
     class Source:
         columns = ["message"]
@@ -1710,6 +1926,205 @@ def test_structured_executor_array_shape_uses_json_object_response_format(
     assert result.parsed_outputs == [[{"topic": "docs"}]]
 
 
+def test_structured_executor_audit_disabled_writes_no_files(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import lotus
+
+    class Output:
+        outputs = ['{"label": "docs"}']
+
+    class FakeLM:
+        max_tokens = 512
+
+        def __call__(self, prompts: object, **kwargs: Any) -> Output:
+            return Output()
+
+    monkeypatch.setattr(lotus.settings, "lm", FakeLM())
+    monkeypatch.setattr(lotus.settings, "enable_cache", False)
+
+    StructuredLMExecutor(pd.DataFrame({"message": ["prefers docs"]}))(
+        input_cols=("message",),
+        output_cols=(ColumnSpec("label"),),
+        instruction="Label {message}.",
+        shape="object",
+        progress_bar_desc="Mapping",
+        model_kwargs={},
+        operator="sem_map",
+    )
+
+    assert trace_events(tmp_path) == []
+
+
+def test_structured_executor_audit_writes_input_raw_and_parsed_output(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import lotus
+
+    class Output:
+        outputs = ['{"label": "docs"}']
+
+    class FakeLM:
+        max_tokens = 512
+
+        def __call__(self, prompts: object, **kwargs: Any) -> Output:
+            return Output()
+
+    monkeypatch.setattr(lotus.settings, "lm", FakeLM())
+    monkeypatch.setattr(lotus.settings, "enable_cache", False)
+
+    result = StructuredLMExecutor(pd.DataFrame({"message": ["prefers docs"]}))(
+        input_cols=("message",),
+        output_cols=(ColumnSpec("label", "Short label."),),
+        instruction="Label {message}.",
+        shape="object",
+        progress_bar_desc="Mapping",
+        model_kwargs={},
+        semantic_audit_dir=tmp_path,
+        operator="sem_map",
+    )
+
+    assert result.parsed_outputs == [{"label": "docs"}]
+    [event] = trace_events(tmp_path)
+    assert event["operator"] == "sem_map"
+    assert event["event_type"] == "structured_generation"
+    assert event["row_index"] == 0
+    assert event["input_preview"] == '{ "message": "prefers docs" }'
+    input_snapshot = pd.read_csv(trace_dir_from_event(tmp_path, event["input_snapshot_path"]))
+    assert input_snapshot.to_dict("records") == [{"message": "prefers docs"}]
+    assert trace_artifact(tmp_path, event["raw_output_path"]) == ['{"label": "docs"}']
+    assert trace_artifact(tmp_path, event["parsed_output_path"]) == {"label": "docs"}
+    assert event["required_output_cols"] == [
+        {"name": "label", "description": "Short label."}
+    ]
+    assert event["parse_retry_attempts"] == 0
+    assert event["parse_error"] == ""
+
+
+def test_structured_executor_audit_records_retry_attempts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import lotus
+
+    class Output:
+        def __init__(self, outputs: list[str]) -> None:
+            self.outputs = outputs
+
+    class FakeLM:
+        max_tokens = 512
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def __call__(self, prompts: object, **kwargs: Any) -> Output:
+            self.calls += 1
+            if self.calls == 1:
+                return Output([""])
+            return Output(['{"label": "docs"}'])
+
+    fake_lm = FakeLM()
+    monkeypatch.setattr(lotus.settings, "lm", fake_lm)
+    monkeypatch.setattr(lotus.settings, "enable_cache", False)
+
+    result = StructuredLMExecutor(pd.DataFrame({"message": ["prefers docs"]}))(
+        input_cols=("message",),
+        output_cols=(ColumnSpec("label"),),
+        instruction="Label {message}.",
+        shape="object",
+        progress_bar_desc="Mapping",
+        model_kwargs={},
+        structured_parse_retries=1,
+        semantic_audit_dir=tmp_path,
+        operator="sem_map",
+    )
+
+    assert result.raw_output_attempts == (("", '{"label": "docs"}'),)
+    [event] = trace_events(tmp_path)
+    assert trace_artifact(tmp_path, event["raw_output_path"]) == ["", '{"label": "docs"}']
+    assert event["parse_retry_attempts"] == 1
+    assert trace_artifact(tmp_path, event["parsed_output_path"]) == {"label": "docs"}
+
+
+def test_structured_executor_trace_writes_output_and_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import lotus
+
+    class Output:
+        outputs = ['{"label": "docs"}']
+
+    class FakeLM:
+        max_tokens = 512
+
+        def __call__(self, prompts: object, **kwargs: Any) -> Output:
+            return Output()
+
+    monkeypatch.setattr(lotus.settings, "lm", FakeLM())
+    monkeypatch.setattr(lotus.settings, "enable_cache", False)
+    trace_dir = tmp_path / "trace"
+
+    StructuredLMExecutor(pd.DataFrame({"message": ["prefers docs"]}))(
+        input_cols=("message",),
+        output_cols=(ColumnSpec("label", "Short label."),),
+        instruction="Label {message}.",
+        shape="object",
+        progress_bar_desc="Mapping",
+        model_kwargs={},
+        semantic_trace_dir=trace_dir,
+        operator="sem_map",
+    )
+
+    events = [
+        json.loads(line)
+        for line in (trace_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert len(events) == 1
+    assert events[0]["operator"] == "sem_map"
+    assert events[0]["event_type"] == "structured_generation"
+    assert "parsed_output" not in events[0]
+    assert "raw_output" not in events[0]
+    assert "prompt_path" not in events[0]
+    raw_path = trace_dir / events[0]["raw_output_path"].removeprefix("trace/")
+    parsed_path = trace_dir / events[0]["parsed_output_path"].removeprefix("trace/")
+    snapshot_path = trace_dir / events[0]["input_snapshot_path"].removeprefix("trace/")
+    assert raw_path.exists()
+    assert parsed_path.exists()
+    assert snapshot_path.exists()
+    assert json.loads(parsed_path.read_text(encoding="utf-8")) == {"label": "docs"}
+    assert list(tmp_path.glob("*sem_map*structured*.jsonl")) == []
+
+
+def test_trace_writer_routes_differential_and_view_run_kinds(
+    tmp_path: Path,
+) -> None:
+    trace_dir = tmp_path / "trace"
+    frame = pd.DataFrame({"name": ["docs"]})
+
+    with semantic_trace_scope(run_kind="differential", phase="add"):
+        write_compact_operator_trace(
+            trace_dir,
+            operator="select",
+            event_type="operator_result",
+            output_frame=frame,
+        )
+    with semantic_trace_scope(run_kind="view", phase="view_topics"):
+        write_compact_operator_trace(
+            trace_dir,
+            operator="select",
+            event_type="operator_result",
+            output_frame=frame,
+        )
+
+    assert (trace_dir / "differential" / "events.jsonl").exists()
+    assert (trace_dir / "view" / "events.jsonl").exists()
+    assert (trace_dir / "differential" / "snapshots").is_dir()
+    assert (trace_dir / "view" / "snapshots").is_dir()
+
+
 def test_structured_executor_model_kwargs_can_override_max_tokens(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1747,6 +2162,8 @@ def test_structured_executor_model_kwargs_can_override_max_tokens(
 
 
 def test_structured_lm_retries_only_invalid_json_rows() -> None:
+    reset_structured_retry_stats()
+
     class Output:
         def __init__(self, outputs: list[str]) -> None:
             self.outputs = outputs
@@ -1779,12 +2196,17 @@ def test_structured_lm_retries_only_invalid_json_rows() -> None:
         '{"rows": [{"topic": "meetings"}]}',
     ]
     assert fake_lm.calls == [["prompt 1", "prompt 2"], ["prompt 2"]]
+    stats = structured_retry_stats()
+    assert stats.retry_batches == 1
+    assert stats.retry_rows == 1
+    assert stats.failure_artifacts == 0
 
 
 def test_structured_lm_retry_failure_writes_artifact(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    reset_structured_retry_stats()
     monkeypatch.setattr(structured_module, "STRUCTURED_FAILURE_DIR", tmp_path)
 
     class Output:
@@ -1820,6 +2242,10 @@ def test_structured_lm_retry_failure_writes_artifact(
     assert artifact["prompt"] == "bad prompt"
     assert artifact["raw_outputs"] == ["", ""]
     assert "invalid JSON" in artifact["parse_error"]
+    stats = structured_retry_stats()
+    assert stats.retry_batches == 1
+    assert stats.retry_rows == 1
+    assert stats.failure_artifacts == 1
 
 
 def test_sem_flat_map_parses_and_explodes_json_rows_wrapper_outputs() -> None:
@@ -2143,6 +2569,194 @@ def test_lotus_sem_join_parse_default_is_false() -> None:
     assert LotusExecutionConfig().sem_join_default is False
 
 
+def test_sem_join_pairwise_audit_writes_all_pairs(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import lotus.sem_ops.sem_join as sem_join_module
+
+    class Output:
+        join_results = [(10, 200, None)]
+        filter_outputs = [False, True, False, False]
+        all_raw_outputs = ["False", "True", "No", "False"]
+        all_explanations = [None, "same topic", None, None]
+
+    def sem_join(*args: Any, **kwargs: Any) -> Output:
+        return Output()
+
+    monkeypatch.setattr(sem_join_module, "sem_join", sem_join)
+    left = pd.DataFrame(
+        {"message": ["likes tea", "adoption goal"]},
+        index=[10, 20],
+    )
+    right = pd.DataFrame(
+        {"summary": ["coffee preference", "family planning"]},
+        index=[100, 200],
+    )
+    query = QueryExpr(
+        op="sem_join",
+        params={
+            "instruction": "{message:left} and {summary:right} describe the same memory topic."
+        },
+    )
+
+    matches = evaluate_semantic_join(
+        query,
+        left,
+        right,
+        LotusExecutionConfig(semantic_audit_dir=tmp_path),
+    )
+
+    assert matches == [(10, 200, None)]
+    events = trace_events(tmp_path)
+    assert list(event["operator"] for event in events) == ["sem_join"] * 4
+    assert list(event["left_id"] for event in events) == [10, 10, 20, 20]
+    assert list(event["right_id"] for event in events) == [100, 200, 100, 200]
+    assert [trace_artifact(tmp_path, event["parsed_output_path"]) for event in events] == [
+        False,
+        True,
+        False,
+        False,
+    ]
+    assert [trace_artifact(tmp_path, event["raw_output_path"]) for event in events] == [
+        "False",
+        "True",
+        "No",
+        "False",
+    ]
+    assert {event["default"] for event in events} == {False}
+
+
+def test_sem_join_pairwise_audit_disabled_writes_no_files(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import lotus.sem_ops.sem_join as sem_join_module
+
+    class Output:
+        join_results = []
+        filter_outputs = [False]
+        all_raw_outputs = ["False"]
+        all_explanations = [None]
+
+    def sem_join(*args: Any, **kwargs: Any) -> Output:
+        return Output()
+
+    monkeypatch.setattr(sem_join_module, "sem_join", sem_join)
+    query = QueryExpr(
+        op="sem_join",
+        params={
+            "instruction": "{message:left} and {summary:right} describe the same memory topic."
+        },
+    )
+
+    matches = evaluate_semantic_join(
+        query,
+        pd.DataFrame({"message": ["likes tea"]}),
+        pd.DataFrame({"summary": ["coffee preference"]}),
+        LotusExecutionConfig(),
+    )
+
+    assert matches == []
+    assert trace_events(tmp_path) == []
+
+
+def test_sem_join_pairwise_trace_writes_events_and_snapshots(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import lotus
+    import lotus.sem_ops.sem_join as sem_join_module
+
+    class FakeLM:
+        pass
+
+    class Output:
+        join_results = [(10, 200, None)]
+        filter_outputs = [False, True, False, False]
+        all_raw_outputs = ["False", "True", "No", "False"]
+        all_explanations = [None, "same topic", None, None]
+
+    def sem_join(*args: Any, **kwargs: Any) -> Output:
+        return Output()
+
+    monkeypatch.setattr(lotus.settings, "lm", FakeLM())
+    monkeypatch.setattr(sem_join_module, "sem_join", sem_join)
+    trace_dir = tmp_path / "trace"
+    query = QueryExpr(
+        op="sem_join",
+        params={
+            "instruction": "{message:left} and {summary:right} describe the same memory topic."
+        },
+    )
+
+    matches = evaluate_semantic_join(
+        query,
+        pd.DataFrame({"message": ["likes tea", "adoption goal"]}, index=[10, 20]),
+        pd.DataFrame({"summary": ["coffee preference", "family planning"]}, index=[100, 200]),
+        LotusExecutionConfig(semantic_trace_dir=trace_dir),
+    )
+
+    assert matches == [(10, 200, None)]
+    events = [
+        json.loads(line)
+        for line in (trace_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert len(events) == 4
+    assert {event["event_type"] for event in events} == {"pair_decision"}
+    assert list(event["operator"] for event in events) == ["sem_join"] * 4
+    parsed_path = trace_dir / events[1]["parsed_output_path"].removeprefix("trace/")
+    assert json.loads(parsed_path.read_text(encoding="utf-8")) is True
+    assert "prompt_path" not in events[0]
+    assert (trace_dir / events[0]["left_snapshot_path"].removeprefix("trace/")).exists()
+    assert (trace_dir / events[0]["right_snapshot_path"].removeprefix("trace/")).exists()
+
+
+def test_sem_join_empty_side_trace_writes_left_right_and_output_snapshots(
+    tmp_path: Path,
+) -> None:
+    class Context:
+        config = LotusExecutionConfig(semantic_trace_dir=tmp_path)
+
+        def configure(self) -> None:
+            pass
+
+    query = QueryExpr(
+        op="sem_join",
+        inputs=(
+            QueryExpr(op="materialized_view", params={"name": "left"}),
+            QueryExpr(op="materialized_view", params={"name": "right"}),
+        ),
+        params={
+            "how": "outer",
+            "instruction": "{name:left} and {name:right} describe the same memory topic.",
+        },
+    )
+    inputs = {
+        "left": pd.DataFrame({"name": ["adoption"], "body": ["family goal"]}),
+        "right": pd.DataFrame({"name": pd.Series(dtype="object"), "body": pd.Series(dtype="object")}),
+    }
+
+    result = execute_sem_join(query, inputs, LotusAdapter().execute, Context())
+
+    assert len(result) == 1
+    [event] = trace_events(tmp_path)
+    assert event["operator"] == "sem_join"
+    assert event["event_type"] == "operator_result"
+    assert event["skipped_pairwise"] is True
+    assert event["left_rows"] == 1
+    assert event["right_rows"] == 0
+    assert event["output_rows"] == 1
+    assert "prompt_path" not in event
+    left_snapshot = pd.read_csv(trace_dir_from_event(tmp_path, event["left_snapshot_path"]))
+    right_snapshot = pd.read_csv(trace_dir_from_event(tmp_path, event["right_snapshot_path"]))
+    output_snapshot = pd.read_csv(trace_dir_from_event(tmp_path, event["output_snapshot_path"]))
+    assert left_snapshot.to_dict("records") == [{"name": "adoption", "body": "family goal"}]
+    assert list(right_snapshot.columns) == ["name", "body"]
+    assert right_snapshot.empty
+    assert len(output_snapshot) == 1
+
+
 def test_sem_join_converts_mapping_to_lotus_cascade_args() -> None:
     cascade_args = cascade_args_from_mapping(
         {"recall_target": 0.95, "precision_target": 0.9}
@@ -2203,6 +2817,87 @@ def test_sem_groupby_pairwise_default_is_false(
         "default": False,
         "progress_bar_desc": "Grouping comparisons",
     }
+
+
+def test_sem_groupby_pairwise_audit_writes_all_pairs(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import lotus.sem_ops.sem_filter as sem_filter_module
+
+    class Output:
+        outputs = [True, False, True]
+        raw_outputs = ["True", "False", "True because same preference"]
+        explanations = ["same", None, "same"]
+
+    def sem_filter(*args: Any, **kwargs: Any) -> Output:
+        return Output()
+
+    monkeypatch.setattr(sem_filter_module, "sem_filter", sem_filter)
+    source = pd.DataFrame(
+        {
+            "name": ["adoption", "tea", "adoption agencies"],
+            "description": ["family goal", "drink preference", "family planning"],
+        }
+    )
+
+    matches = evaluate_group_matches(
+        source,
+        input_cols=("name", "description"),
+        instruction="Rows describe the same durable memory topic.",
+        audit_dir=tmp_path,
+    )
+
+    assert matches == [(0, 1), (1, 2)]
+    events = trace_events(tmp_path)
+    assert list(event["operator"] for event in events) == [
+        "sem_groupby",
+        "sem_groupby",
+        "sem_groupby",
+    ]
+    assert list(event["left_unique_id"] for event in events) == [0, 0, 1]
+    assert list(event["right_unique_id"] for event in events) == [1, 2, 2]
+    assert [trace_artifact(tmp_path, event["parsed_output_path"]) for event in events] == [
+        True,
+        False,
+        True,
+    ]
+    assert [trace_artifact(tmp_path, event["raw_output_path"]) for event in events] == [
+        "True",
+        "False",
+        "True because same preference",
+    ]
+    assert {event["default"] for event in events} == {False}
+
+
+def test_sem_groupby_pairwise_audit_disabled_writes_no_files(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import lotus.sem_ops.sem_filter as sem_filter_module
+
+    class Output:
+        outputs = [False]
+
+    def sem_filter(*args: Any, **kwargs: Any) -> Output:
+        return Output()
+
+    monkeypatch.setattr(sem_filter_module, "sem_filter", sem_filter)
+    source = pd.DataFrame(
+        {
+            "name": ["adoption", "adoption agencies"],
+            "description": ["family goal", "family planning"],
+        }
+    )
+
+    matches = evaluate_group_matches(
+        source,
+        input_cols=("name", "description"),
+        instruction="Rows describe the same durable memory topic.",
+    )
+
+    assert matches == []
+    assert trace_events(tmp_path) == []
 
 
 def test_sem_groupby_pairwise_default_can_be_overridden(
@@ -2639,6 +3334,63 @@ def test_sem_agg_whole_multi_output_returns_one_row(
     assert len(result) == 1
     assert result.loc[0, "topic"] == "docs"
     assert structured_calls == [["doc one", "doc two"]]
+
+
+def test_sem_agg_structured_audit_writes_group_raw_and_parsed_output(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import agent_memory.adapters.lotus.sem_agg as sem_agg_module
+
+    class Context:
+        config = LotusExecutionConfig(semantic_audit_dir=tmp_path)
+
+        def configure(self) -> None:
+            pass
+
+    def execute_lotus_style_structured_sem_agg_group(
+        query: QueryExpr,
+        group: pd.DataFrame,
+        input_cols: tuple[str, ...],
+        output_cols: tuple[ColumnSpec, ...],
+        config: LotusExecutionConfig,
+    ) -> str:
+        return '{"topic": "docs", "body": "doc one and doc two"}'
+
+    monkeypatch.setattr(
+        sem_agg_module,
+        "execute_lotus_style_structured_sem_agg_group",
+        execute_lotus_style_structured_sem_agg_group,
+    )
+    query = QueryExpr(
+        op="sem_agg",
+        inputs=(QueryExpr(op="materialized_view", params={"name": "source"}),),
+        params={
+            "input_cols": ("body",),
+            "output_cols": (ColumnSpec("topic"), ColumnSpec("body")),
+            "instruction": "Merge {body}.",
+        },
+    )
+    inputs = {"source": pd.DataFrame({"body": ["doc one", "doc two"]})}
+
+    result = execute_sem_agg(query, inputs, LotusAdapter().execute, Context())
+
+    assert list(result["topic"]) == ["docs"]
+    [event] = trace_events(tmp_path)
+    assert event["operator"] == "sem_agg"
+    assert event["event_type"] == "structured_generation"
+    assert event["group_index"] == 0
+    assert event["input_preview"] == '[ { "body": "doc one" }, { "body": "doc two" } ]'
+    group_snapshot = pd.read_csv(trace_dir_from_event(tmp_path, event["group_snapshot_path"]))
+    assert group_snapshot.to_dict("records") == [{"body": "doc one"}, {"body": "doc two"}]
+    assert trace_artifact(tmp_path, event["raw_output_path"]) == [
+        '{"topic": "docs", "body": "doc one and doc two"}'
+    ]
+    assert trace_artifact(tmp_path, event["parsed_output_path"]) == {
+        "topic": "docs",
+        "body": "doc one and doc two",
+    }
+    assert event["parse_error"] == ""
 
 
 def test_sem_agg_rejects_invalid_structured_json() -> None:
