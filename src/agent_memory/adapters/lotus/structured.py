@@ -408,7 +408,6 @@ class StructuredLMExecutor:
         structured_max_tokens: int = DEFAULT_STRUCTURED_MAX_TOKENS,
         structured_parse_retries: int = DEFAULT_STRUCTURED_PARSE_RETRIES,
         semantic_trace_dir: Any = None,
-        semantic_audit_dir: Any = None,
         operator: str = "sem_map",
     ) -> StructuredGenerationResult:
         """Run a structured LOTUS-backed LM batch and parse JSON outputs."""
@@ -516,9 +515,8 @@ class StructuredLMExecutor:
             failure_artifact_paths=retry_result.failure_artifact_paths,
             operator=operator,
         )
-        effective_trace_dir = semantic_trace_dir or semantic_audit_dir
         write_structured_generation_trace(
-            effective_trace_dir,
+            semantic_trace_dir,
             operator=operator,
             rows=audit_rows,
             snapshots={"input": self._obj.loc[:, list(input_cols)].copy()},

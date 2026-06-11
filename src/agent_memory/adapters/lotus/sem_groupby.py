@@ -226,7 +226,6 @@ def evaluate_group_matches(
     input_cols: Sequence[str],
     instruction: str,
     default: bool = False,
-    audit_dir: Any = None,
     trace_dir: Any = None,
 ) -> list[tuple[int, int]]:
     """Evaluate candidate row pairs with LOTUS sem_filter."""
@@ -252,7 +251,7 @@ def evaluate_group_matches(
         progress_bar_desc="Grouping comparisons",
     )
     write_groupby_pair_trace(
-        trace_dir or audit_dir,
+        trace_dir,
         pairs,
         instruction=user_instruction,
         output=output,

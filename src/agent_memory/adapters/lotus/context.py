@@ -24,7 +24,6 @@ class LotusExecutionConfig:
     structured_max_tokens: int = DEFAULT_STRUCTURED_MAX_TOKENS
     structured_parse_retries: int = DEFAULT_STRUCTURED_PARSE_RETRIES
     semantic_trace_dir: Path | str | None = None
-    semantic_audit_dir: Path | str | None = None
 
     sem_filter_examples: Sequence[Mapping[str, Any]] | None = None
     sem_filter_helper_examples: Sequence[Mapping[str, Any]] | None = None
@@ -63,9 +62,9 @@ class LotusExecutionConfig:
     sem_agg_model_kwargs: Mapping[str, Any] = field(default_factory=dict)
 
     def trace_dir(self) -> Path | str | None:
-        """Return the configured semantic trace directory, with audit as a legacy alias."""
+        """Return the configured semantic trace directory."""
 
-        return self.semantic_trace_dir or self.semantic_audit_dir
+        return self.semantic_trace_dir
 
 
 @dataclass

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
-import csv
 import json
 from pathlib import Path
 import re
@@ -13,9 +12,6 @@ from typing import Any
 import pandas as pd
 
 TOKEN_PATTERN = re.compile(r"[A-Za-z0-9]+")
-AUDIT_FILE_PATTERN = re.compile(
-    r"^(?P<timestamp>\d{8}T\d+Z)-(?P<operator>sem_[a-z_]+)-(?P<kind>structured|pairs)-(?P<uid>[^.]+)\.(?P<extension>jsonl|csv)$"
-)
 TEXT_PREVIEW_CHARS = 180
 
 DUPLICATE_NAME_COLUMNS = (
@@ -27,8 +23,8 @@ DUPLICATE_NAME_COLUMNS = (
 )
 STRUCTURED_NAME_COLUMNS = (
     "event_order",
-    "audit_timestamp",
-    "audit_file",
+    "trace_timestamp",
+    "trace_id",
     "operator",
     "row_index",
     "parsed_item_index",
@@ -45,8 +41,8 @@ STRUCTURED_NAME_COLUMNS = (
 )
 PAIRWISE_DECISION_COLUMNS = (
     "event_order",
-    "audit_timestamp",
-    "audit_file",
+    "trace_timestamp",
+    "trace_id",
     "operator",
     "left_id",
     "right_id",
@@ -63,8 +59,8 @@ PAIRWISE_DECISION_COLUMNS = (
 )
 NAME_LINEAGE_COLUMNS = (
     "event_order",
-    "audit_timestamp",
-    "audit_file",
+    "trace_timestamp",
+    "trace_id",
     "boundary",
     "operator",
     "output_name",
@@ -211,7 +207,7 @@ def print_frame(name: str, frame: Any) -> None:
 
 
 def text_preview(value: Any, *, limit: int = TEXT_PREVIEW_CHARS) -> str:
-    """Return a one-line text preview for audit CSVs."""
+    """Return a one-line text preview for diagnosis CSVs."""
 
     text = " ".join(str(value).split())
     if len(text) <= limit:
@@ -231,7 +227,7 @@ def row_text(row: pd.Series) -> str:
 
 
 def token_set(text: str) -> set[str]:
-    """Tokenize text for deterministic audit matching."""
+    """Tokenize text for deterministic diagnosis matching."""
 
     return set(TOKEN_PATTERN.findall(text.lower()))
 
@@ -257,37 +253,13 @@ def row_name(row: pd.Series) -> str:
 
 
 def serialized_field(text: Any, field: str) -> str:
-    """Extract a simple `field: value` line from an audit row preview."""
+    """Extract a simple `field: value` line from a trace row preview."""
 
     prefix = f"{field}:"
     for line in str(text).splitlines():
         if line.startswith(prefix):
             return line[len(prefix) :].strip()
     return ""
-
-
-def audit_file_metadata(path: Path) -> dict[str, str] | None:
-    """Parse audit metadata encoded in a semantic audit filename."""
-
-    match = AUDIT_FILE_PATTERN.match(path.name)
-    if not match:
-        return None
-    return match.groupdict()
-
-
-def ordered_audit_files(output_dir: Path) -> list[tuple[Path, dict[str, str]]]:
-    """Return audit files sorted by encoded timestamp and filename."""
-
-    audit_dir = output_dir / "audit"
-    if not audit_dir.exists():
-        return []
-
-    files: list[tuple[Path, dict[str, str]]] = []
-    for path in audit_dir.iterdir():
-        metadata = audit_file_metadata(path)
-        if metadata is not None:
-            files.append((path, metadata))
-    return sorted(files, key=lambda item: (item[1]["timestamp"], item[0].name))
 
 
 def read_trace_events(output_dir: Path) -> list[dict[str, Any]]:
@@ -326,14 +298,14 @@ def trace_artifact_value(output_dir: Path, event: dict[str, Any], key: str) -> A
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def derived_output_dir(output_dir: Path, *, use_trace: bool) -> Path:
+def derived_output_dir(output_dir: Path) -> Path:
     """Return the directory for derived diagnosis artifacts."""
 
     return output_dir / "diagnosis"
 
 
 def parsed_output_items(value: Any) -> list[tuple[int, dict[str, Any]]]:
-    """Normalize structured audit parsed output into named object items."""
+    """Normalize structured trace parsed output into named object items."""
 
     if isinstance(value, dict):
         return [(0, value)]
@@ -408,12 +380,12 @@ def diagnosis_summary_frame(
         "name": "",
         "operator": "",
         "boundary": "",
-        "audit_file": "",
+        "trace_id": "",
         "event_order": "",
     }
     if duplicate_names and not structured_events.empty:
         duplicate_events = structured_events[structured_events["name"].isin(duplicate_names)]
-        for audit_file, group in duplicate_events.groupby("audit_file", sort=False):
+        for trace_id, group in duplicate_events.groupby("trace_id", sort=False):
             name_counts = Counter(str(value) for value in group["name"])
             repeated_names = [name for name, count in name_counts.items() if count > 1]
             if repeated_names:
@@ -422,7 +394,7 @@ def diagnosis_summary_frame(
                     "name": repeated_names[0],
                     "operator": str(row.get("operator") or ""),
                     "boundary": "structured_generation",
-                    "audit_file": str(audit_file),
+                    "trace_id": str(trace_id),
                     "event_order": str(row.get("event_order") or ""),
                 }
                 break
@@ -454,142 +426,10 @@ def diagnosis_summary_frame(
         {"metric": "first_exact_duplicate_name", "value": first_duplicate["name"]},
         {"metric": "first_exact_duplicate_operator", "value": first_duplicate["operator"]},
         {"metric": "first_exact_duplicate_boundary", "value": first_duplicate["boundary"]},
-        {"metric": "first_exact_duplicate_audit_file", "value": first_duplicate["audit_file"]},
+        {"metric": "first_exact_duplicate_trace_id", "value": first_duplicate["trace_id"]},
         {"metric": "first_exact_duplicate_event_order", "value": first_duplicate["event_order"]},
     ]
     return pd.DataFrame(rows, columns=DIAGNOSIS_SUMMARY_COLUMNS)
-
-
-def build_audit_diagnosis(
-    output_dir: Path,
-    *,
-    ivm_topics: pd.DataFrame,
-    ivm_catalog: pd.DataFrame,
-) -> dict[str, pd.DataFrame]:
-    """Build diagnosis artifacts from semantic audit side-channel files."""
-
-    duplicates = duplicate_names_frame(ivm_topics=ivm_topics, ivm_catalog=ivm_catalog)
-    final_names = final_ivm_names(ivm_topics, ivm_catalog)
-    duplicate_final_names = set(duplicates["name"]) if not duplicates.empty else set()
-    structured_rows: list[dict[str, Any]] = []
-    pairwise_rows: list[dict[str, Any]] = []
-    lineage_rows: list[dict[str, Any]] = []
-    event_order = 0
-
-    for path, metadata in ordered_audit_files(output_dir):
-        operator = metadata["operator"]
-        audit_timestamp = metadata["timestamp"]
-        if metadata["kind"] == "structured":
-            with path.open(encoding="utf-8") as handle:
-                for line in handle:
-                    record = json.loads(line)
-                    for parsed_item_index, item in parsed_output_items(record.get("parsed_output")):
-                        name = str(item.get("name") or "")
-                        if not name:
-                            continue
-                        event_order += 1
-                        row = {
-                            "event_order": event_order,
-                            "audit_timestamp": audit_timestamp,
-                            "audit_file": path.name,
-                            "operator": operator,
-                            "row_index": record.get("row_index", record.get("group_index")),
-                            "parsed_item_index": parsed_item_index,
-                            "shape": record.get("shape", ""),
-                            "name": name,
-                            "description": item.get("description", ""),
-                            "type": item.get("type", ""),
-                            "body_preview": text_preview(item.get("body", ""), limit=260),
-                            "input_preview": text_preview(
-                                record.get("input_preview", record.get("group_preview", "")),
-                                limit=260,
-                            ),
-                            "raw_output_preview": text_preview(record.get("raw_output", ""), limit=260),
-                            "parse_retry_attempts": record.get("parse_retry_attempts", 0),
-                            "parse_error": record.get("parse_error", ""),
-                            "failure_artifact": record.get("failure_artifact", ""),
-                        }
-                        structured_rows.append(row)
-                        lineage_rows.append(
-                            {
-                                "event_order": event_order,
-                                "audit_timestamp": audit_timestamp,
-                                "audit_file": path.name,
-                                "boundary": "structured_generation",
-                                "operator": operator,
-                                "output_name": name,
-                                "left_name": "",
-                                "right_name": "",
-                                "parsed_output": "",
-                                "raw_output_preview": row["raw_output_preview"],
-                                "input_preview": row["input_preview"],
-                                "final_ivm_name_exact": name in final_names,
-                                "final_duplicate_name_exact": name in duplicate_final_names,
-                            }
-                        )
-        elif metadata["kind"] == "pairs":
-            with path.open(encoding="utf-8", newline="") as handle:
-                for pair in csv_dict_rows(handle):
-                    event_order += 1
-                    left = pair.get("left", "")
-                    right = pair.get("right", "")
-                    raw_output = str(pair.get("raw_output") or "")
-                    parsed_output = str(pair.get("parsed_output") or "")
-                    empty_raw_output = not raw_output.strip()
-                    default_false = empty_raw_output and parsed_output == "False"
-                    row = {
-                        "event_order": event_order,
-                        "audit_timestamp": audit_timestamp,
-                        "audit_file": path.name,
-                        "operator": operator,
-                        "left_id": pair.get("left_id", ""),
-                        "right_id": pair.get("right_id", ""),
-                        "left_name": serialized_field(left, "name"),
-                        "right_name": serialized_field(right, "name"),
-                        "left_description": serialized_field(left, "description"),
-                        "right_description": serialized_field(right, "description"),
-                        "parsed_output": parsed_output,
-                        "raw_output_preview": text_preview(raw_output, limit=260),
-                        "empty_raw_output": empty_raw_output,
-                        "default": pair.get("default", ""),
-                        "default_false": default_false,
-                        "instruction_preview": text_preview(pair.get("instruction", ""), limit=260),
-                    }
-                    pairwise_rows.append(row)
-                    lineage_rows.append(
-                        {
-                            "event_order": event_order,
-                            "audit_timestamp": audit_timestamp,
-                            "audit_file": path.name,
-                            "boundary": "pairwise_decision",
-                            "operator": operator,
-                            "output_name": "",
-                            "left_name": row["left_name"],
-                            "right_name": row["right_name"],
-                            "parsed_output": parsed_output,
-                            "raw_output_preview": row["raw_output_preview"],
-                            "input_preview": f"left: {text_preview(left, limit=120)} || right: {text_preview(right, limit=120)}",
-                            "final_ivm_name_exact": row["left_name"] in final_names or row["right_name"] in final_names,
-                            "final_duplicate_name_exact": row["left_name"] in duplicate_final_names or row["right_name"] in duplicate_final_names,
-                        }
-                    )
-
-    structured_events = pd.DataFrame(structured_rows, columns=STRUCTURED_NAME_COLUMNS)
-    pairwise_decisions = pd.DataFrame(pairwise_rows, columns=PAIRWISE_DECISION_COLUMNS)
-    name_lineage = pd.DataFrame(lineage_rows, columns=NAME_LINEAGE_COLUMNS)
-    diagnosis_summary = diagnosis_summary_frame(
-        duplicates=duplicates,
-        structured_events=structured_events,
-        pairwise_decisions=pairwise_decisions,
-        name_lineage=name_lineage,
-    )
-    return {
-        "duplicate_names": duplicates,
-        "structured_name_events": structured_events,
-        "pairwise_decisions": pairwise_decisions,
-        "name_lineage": name_lineage,
-        "summary": diagnosis_summary,
-    }
 
 
 def build_trace_diagnosis(
@@ -623,8 +463,8 @@ def build_trace_diagnosis(
                 structured_rows.append(
                     {
                         "event_order": event_order,
-                        "audit_timestamp": event.get("timestamp", ""),
-                        "audit_file": event.get("trace_id", ""),
+                        "trace_timestamp": event.get("timestamp", ""),
+                        "trace_id": event.get("trace_id", ""),
                         "operator": operator,
                         "row_index": event.get("row_index", event.get("group_index")),
                         "parsed_item_index": parsed_item_index,
@@ -655,8 +495,8 @@ def build_trace_diagnosis(
             pairwise_rows.append(
                 {
                     "event_order": event_order,
-                    "audit_timestamp": event.get("timestamp", ""),
-                    "audit_file": event.get("trace_id", ""),
+                    "trace_timestamp": event.get("timestamp", ""),
+                    "trace_id": event.get("trace_id", ""),
                     "operator": operator,
                     "left_id": event.get("left_id", event.get("left_unique_id", "")),
                     "right_id": event.get("right_id", event.get("right_unique_id", "")),
@@ -765,7 +605,7 @@ def duplicate_identity_events_frame(
             {
                 **duplicate.to_dict(),
                 "first_operator": first_row.get("operator", ""),
-                "first_trace_id": first_row.get("trace_id", first_row.get("audit_file", "")),
+                "first_trace_id": first_row.get("trace_id", ""),
                 "first_phase": first_row.get("phase", ""),
                 "first_add_index": first_row.get("add_index", ""),
             }
@@ -924,12 +764,6 @@ def trace_summary_frame(
         {"metric": "llm_operators_covered", "value": llm_operators},
     ]
     return pd.DataFrame(rows, columns=DIAGNOSIS_SUMMARY_COLUMNS)
-
-
-def csv_dict_rows(handle: Any) -> list[dict[str, str]]:
-    """Read CSV rows as dictionaries."""
-
-    return list(csv.DictReader(handle))
 
 
 def best_match_rows(
@@ -1221,22 +1055,13 @@ def main() -> None:
         ivm_catalog=ivm_catalog,
         full_catalog=full_catalog,
     )
-    trace_events = read_trace_events(output_dir)
-    use_trace = bool(trace_events)
-    if use_trace:
-        diagnosis = build_trace_diagnosis(
-            output_dir,
-            ivm_topics=ivm_topics,
-            ivm_catalog=ivm_catalog,
-            comparison_summary=comparison_summary,
-            comparison_matches=comparison_matches,
-        )
-    else:
-        diagnosis = build_audit_diagnosis(
-            output_dir,
-            ivm_topics=ivm_topics,
-            ivm_catalog=ivm_catalog,
-        )
+    diagnosis = build_trace_diagnosis(
+        output_dir,
+        ivm_topics=ivm_topics,
+        ivm_catalog=ivm_catalog,
+        comparison_summary=comparison_summary,
+        comparison_matches=comparison_matches,
+    )
     print_comparison(comparison_summary, comparison_matches)
     print_frame("diagnosis summary", diagnosis["summary"])
     duplicate_print = diagnosis.get(
@@ -1252,7 +1077,7 @@ def main() -> None:
     for name, matches in comparison_matches.items():
         written[f"comparison/{name}"] = write_csv(name, matches, comparison_dir)
 
-    diagnosis_dir = derived_output_dir(output_dir, use_trace=use_trace)
+    diagnosis_dir = derived_output_dir(output_dir)
     for name, frame in diagnosis.items():
         prefix = "diagnosis"
         written[f"{prefix}/{name}"] = write_csv(name, frame, diagnosis_dir)

@@ -1394,7 +1394,6 @@ def test_lotus_execution_config_keeps_retry_defaults_disabled() -> None:
     assert config.lm_max_batch_size == 64
     assert config.lm_rate_limit is None
     assert config.semantic_trace_dir is None
-    assert config.semantic_audit_dir is None
     assert config.structured_parse_retries == DEFAULT_STRUCTURED_PARSE_RETRIES
 
 
@@ -1926,7 +1925,7 @@ def test_structured_executor_array_shape_uses_json_object_response_format(
     assert result.parsed_outputs == [[{"topic": "docs"}]]
 
 
-def test_structured_executor_audit_disabled_writes_no_files(
+def test_structured_executor_trace_disabled_writes_no_files(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -1957,7 +1956,7 @@ def test_structured_executor_audit_disabled_writes_no_files(
     assert trace_events(tmp_path) == []
 
 
-def test_structured_executor_audit_writes_input_raw_and_parsed_output(
+def test_structured_executor_trace_writes_input_raw_and_parsed_output(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -1982,7 +1981,7 @@ def test_structured_executor_audit_writes_input_raw_and_parsed_output(
         shape="object",
         progress_bar_desc="Mapping",
         model_kwargs={},
-        semantic_audit_dir=tmp_path,
+        semantic_trace_dir=tmp_path,
         operator="sem_map",
     )
 
@@ -2003,7 +2002,7 @@ def test_structured_executor_audit_writes_input_raw_and_parsed_output(
     assert event["parse_error"] == ""
 
 
-def test_structured_executor_audit_records_retry_attempts(
+def test_structured_executor_trace_records_retry_attempts(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -2037,7 +2036,7 @@ def test_structured_executor_audit_records_retry_attempts(
         progress_bar_desc="Mapping",
         model_kwargs={},
         structured_parse_retries=1,
-        semantic_audit_dir=tmp_path,
+        semantic_trace_dir=tmp_path,
         operator="sem_map",
     )
 
@@ -2569,7 +2568,7 @@ def test_lotus_sem_join_parse_default_is_false() -> None:
     assert LotusExecutionConfig().sem_join_default is False
 
 
-def test_sem_join_pairwise_audit_writes_all_pairs(
+def test_sem_join_pairwise_trace_writes_all_pairs(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -2604,7 +2603,7 @@ def test_sem_join_pairwise_audit_writes_all_pairs(
         query,
         left,
         right,
-        LotusExecutionConfig(semantic_audit_dir=tmp_path),
+        LotusExecutionConfig(semantic_trace_dir=tmp_path),
     )
 
     assert matches == [(10, 200, None)]
@@ -2627,7 +2626,7 @@ def test_sem_join_pairwise_audit_writes_all_pairs(
     assert {event["default"] for event in events} == {False}
 
 
-def test_sem_join_pairwise_audit_disabled_writes_no_files(
+def test_sem_join_pairwise_trace_disabled_writes_no_files(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -2819,7 +2818,7 @@ def test_sem_groupby_pairwise_default_is_false(
     }
 
 
-def test_sem_groupby_pairwise_audit_writes_all_pairs(
+def test_sem_groupby_pairwise_trace_writes_all_pairs(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -2845,7 +2844,7 @@ def test_sem_groupby_pairwise_audit_writes_all_pairs(
         source,
         input_cols=("name", "description"),
         instruction="Rows describe the same durable memory topic.",
-        audit_dir=tmp_path,
+        trace_dir=tmp_path,
     )
 
     assert matches == [(0, 1), (1, 2)]
@@ -2870,7 +2869,7 @@ def test_sem_groupby_pairwise_audit_writes_all_pairs(
     assert {event["default"] for event in events} == {False}
 
 
-def test_sem_groupby_pairwise_audit_disabled_writes_no_files(
+def test_sem_groupby_pairwise_trace_disabled_writes_no_files(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -3336,14 +3335,14 @@ def test_sem_agg_whole_multi_output_returns_one_row(
     assert structured_calls == [["doc one", "doc two"]]
 
 
-def test_sem_agg_structured_audit_writes_group_raw_and_parsed_output(
+def test_sem_agg_structured_trace_writes_group_raw_and_parsed_output(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     import agent_memory.adapters.lotus.sem_agg as sem_agg_module
 
     class Context:
-        config = LotusExecutionConfig(semantic_audit_dir=tmp_path)
+        config = LotusExecutionConfig(semantic_trace_dir=tmp_path)
 
         def configure(self) -> None:
             pass

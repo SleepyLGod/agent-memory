@@ -39,10 +39,10 @@ def _require_real_lotus() -> None:
         pytest.skip("set AGENT_MEMORY_RUN_LOTUS_E2E=1 to run real LOTUS audit tests")
     if not os.getenv("DEEPSEEK_API_KEY"):
         pytest.skip("DEEPSEEK_API_KEY is required for real LOTUS audit tests")
-    _clean_audit_dir_once()
+    _clean_output_dir_once()
 
 
-def _clean_audit_dir_once() -> None:
+def _clean_output_dir_once() -> None:
     """Remove stale CSV artifacts before a real audit run."""
 
     global _AUDIT_DIR_CLEANED
