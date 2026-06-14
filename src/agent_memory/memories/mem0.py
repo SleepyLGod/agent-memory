@@ -180,25 +180,25 @@ New Messages:
  {"role": "assistant", "content": "Congratulations on everything, Marcus! What exciting times."}]
 
 Output:
-{"memory": [
-  {"text": "User's name is Marcus and was promoted to Senior Engineer at Shopify around August 12, 2025 after working toward it for two years"},
-  {"text": "Marcus has a wife named Elena and they celebrate special occasions at Osteria Francescana, their go-to restaurant"},
-  {"text": "Marcus and his wife Elena are expecting their first baby in March 2026"}
-]}
+[
+  {"fact": "User's name is Marcus and was promoted to Senior Engineer at Shopify around August 12, 2025 after working toward it for two years", "attributed_to": "user"},
+  {"fact": "Marcus has a wife named Elena and they celebrate special occasions at Osteria Francescana, their go-to restaurant", "attributed_to": "user"},
+  {"fact": "Marcus and his wife Elena are expecting their first baby in March 2026", "attributed_to": "user"}
+]
 
-Three distinct topics — career, relationship/dining, family milestone — each get their own memory with full context.
+Three distinct topics -- career, relationship/dining, family milestone -- each get their own fact with full context.
 
 ## Example 2: Extracting from Assistant Recommendations
 
 New Messages:
-[{"role": "user", "content": "Can you recommend some sports documentaries on Netflix with strong storytelling? I love \"The Last Dance\" by Michael Jordan."},
- {"role": "assistant", "content": "Great taste! Here are some Netflix documentaries known for their storytelling: 1) \"Formula 1: Drive to Survive\" (behind the scenes of Formula 1 racing) 2) \"Athlete A\" (investigative look at USA Gymnastics) 3) \"The Battered Bastards of Baseball\" (independent baseball story). All focus on powerful, narrative-driven sports stories."}]
+[{"role": "user", "content": "Can you recommend some sports documentaries on Netflix with strong storytelling? I love The Last Dance by Michael Jordan."},
+ {"role": "assistant", "content": "Great taste! Here are some Netflix documentaries known for their storytelling: 1) Formula 1: Drive to Survive (behind the scenes of Formula 1 racing) 2) Athlete A (investigative look at USA Gymnastics) 3) The Battered Bastards of Baseball (independent baseball story). All focus on powerful, narrative-driven sports stories."}]
 
 Output:
-{"memory": [
-  {"text": "User enjoys watching sports documentaries on Netflix with strong storytelling, such as 'The Last Dance' featuring Michael Jordan"},
-  {"text": "User was recommended the following sports documentaries on Netflix for storytelling: 'Formula 1: Drive to Survive', 'Athlete A', and 'The Battered Bastards of Baseball'"}
-]}
+[
+  {"fact": "User enjoys watching sports documentaries on Netflix with strong storytelling, such as The Last Dance featuring Michael Jordan", "attributed_to": "user"},
+  {"fact": "User was recommended the following sports documentaries on Netflix for storytelling: Formula 1: Drive to Survive, Athlete A, and The Battered Bastards of Baseball", "attributed_to": "assistant"}
+]
 
 The user's viewing preference is extracted alongside the assistant's specific recommendations. Both are valuable for future personalization.
 
@@ -208,196 +208,65 @@ New Messages:
 [{"role": "user", "content": "Hey, good morning!"},
  {"role": "assistant", "content": "Good morning, David! How can I help you today?"}]
 
-Output: {"memory": []}
+Output: []
 
-## Example 4: Extract ALL Dimensions — Don't Miss Secondary Info
+## Example 4: Extract ALL Dimensions -- Don't Miss Secondary Info
 
 New Messages:
-[{"role": "user", "content": "As an aspiring actor, I'm looking for advice on improving my craft. Can you recommend some films on Netflix with strong acting performances like Daniel Day-Lewis in 'There Will Be Blood'? I also want to find online resources for acting techniques."},
- {"role": "assistant", "content": "For Netflix films with great acting, check out 'Marriage Story' and 'The Irishman'. For acting techniques, I'd recommend 'An Actor Prepares' by Stanislavski and the MasterClass by Helen Mirren."}]
+[{"role": "user", "content": "As an aspiring actor, I'm looking for advice on improving my craft. Can you recommend some films on Netflix with strong acting performances like Daniel Day-Lewis in There Will Be Blood? I also want to find online resources for acting techniques."},
+ {"role": "assistant", "content": "For Netflix films with great acting, check out Marriage Story and The Irishman. For acting techniques, I'd recommend An Actor Prepares by Stanislavski and the MasterClass by Helen Mirren."}]
 
 Output:
-{"memory": [
-  {"text": "User is an aspiring actor seeking to improve their craft through studying films with strong performances and acting technique resources"},
-  {"text": "User enjoys watching films on Netflix with outstanding acting, especially performances like Daniel Day-Lewis in 'There Will Be Blood'"},
-  {"text": "User was recommended 'Marriage Story' and 'The Irishman' for performance study, 'An Actor Prepares' by Stanislavski, and Helen Mirren's MasterClass for acting techniques"}
-]}
+[
+  {"fact": "User is an aspiring actor seeking to improve their craft through studying films with strong performances and acting technique resources", "attributed_to": "user"},
+  {"fact": "User enjoys watching films on Netflix with outstanding acting, especially performances like Daniel Day-Lewis in There Will Be Blood", "attributed_to": "user"},
+  {"fact": "User was recommended Marriage Story and The Irishman for performance study, An Actor Prepares by Stanislavski, and Helen Mirren's MasterClass for acting techniques", "attributed_to": "assistant"}
+]
 
 Three dimensions: (1) career aspiration, (2) entertainment viewing preference, (3) specific recommendations. Each extracted separately.
 
-## Example 5: Document / Reference Material — Extract Content, Not Actions
+## Example 5: Document / Reference Material -- Extract Content, Not Actions
 
 New Messages:
-[{"role": "user", "content": "I want you to remember this case. If you understand, just say acknowledged. Bajimaya v Reward Homes Pty Ltd [2021] NSWCATAP 297 — The construction began in 2014, contract signed in 2015 with completion due by October 2015. The plaintiff received keys in December 2016 and found defects including incomplete works, poor workmanship, and non-compliance with the building code. The tribunal found the builder breached contract."},
+[{"role": "user", "content": "I want you to remember this case. If you understand, just say acknowledged. Bajimaya v Reward Homes Pty Ltd [2021] NSWCATAP 297 -- The construction began in 2014, contract signed in 2015 with completion due by October 2015. The plaintiff received keys in December 2016 and found defects including incomplete works, poor workmanship, and non-compliance with the building code. The tribunal found the builder breached contract."},
  {"role": "assistant", "content": "Acknowledged."}]
 
 Output:
-{"memory": [
-  {"text": "Bajimaya v Reward Homes Pty Ltd [2021] NSWCATAP 297: construction of the home began in 2014, contract signed in 2015, with completion due by October 2015. Keys were delivered in December 2016."},
-  {"text": "In Bajimaya v Reward Homes, the plaintiff found defects including incomplete works, poor workmanship, and non-compliance with the Building Code of Australia after receiving the home in December 2016."},
-  {"text": "The tribunal found Reward Homes Pty Ltd breached its contract with Mr. Bajimaya by failing to complete work in a proper and workmanlike manner and failing to comply with plans, specifications, and the Building Code."}
-]}
+[
+  {"fact": "Bajimaya v Reward Homes Pty Ltd [2021] NSWCATAP 297: construction of the home began in 2014, contract signed in 2015, with completion due by October 2015. Keys were delivered in December 2016.", "attributed_to": "user"},
+  {"fact": "In Bajimaya v Reward Homes, the plaintiff found defects including incomplete works, poor workmanship, and non-compliance with the Building Code of Australia after receiving the home in December 2016.", "attributed_to": "user"},
+  {"fact": "The tribunal found Reward Homes Pty Ltd breached its contract with Mr. Bajimaya by failing to complete work in a proper and workmanlike manner and failing to comply with plans, specifications, and the Building Code.", "attributed_to": "user"}
+]
 
-The user shared reference material to be remembered. Extract the actual factual content — dates, parties, findings — NOT "User shared a case summary" or "User asked to remember a case."
+The user shared reference material to be remembered. Extract the actual factual content -- dates, parties, findings -- NOT "User shared a case summary" or "User asked to remember a case."
 
-Output each extracted fact with {fact} and {attributed_to}.
+Output a flat JSON array of objects with {fact} and {attributed_to} keys.
 """.strip()
 
 _GROUP_INSTRUCTION = """
-Rows refer to the same durable memory topic when their {name},
-{description}, and {type} indicate they should update the same future markdown
-memory row. Use semantic topic identity, not chronology, filename, exact field
-equality, or surface wording alone.
+Rows refer to the same durable memory fact when their {fact}
+expresses information about the same subject, entity, event, or topic. Use
+semantic identity — same person, same event, same preference, same plan —
+not surface wording, chronology, or exact string equality. Facts may disagree
+or contradict and still belong in the same group; the downstream consolidation
+step will resolve the conflict.
 """.strip()
 
-_CONSOLIDATE_INSTRUCTION = """You are a smart memory manager which controls the memory of a system.
-You can perform four operations: (1) add into the memory, (2) update the memory, (3) delete from the memory, and (4) no change.
+_CONSOLIDATE_INSTRUCTION = """
+You are a memory consolidation assistant. Your task is to merge a group of semantically related facts into a single canonical factual statement.
 
-Based on the above four operations, the memory will change.
+The group contains one or more rows that refer to the same subject, entity, event, or topic. Produce one consolidated fact that represents the canonical state of this memory.
 
-Compare newly retrieved facts with the existing memory. For each new fact, decide whether to:
-- ADD: Add it to the memory as a new element
-- UPDATE: Update an existing memory element
-- DELETE: Delete an existing memory element
-- NONE: Make no change (if the fact is already present or irrelevant)
+Guidelines:
+1. Merge complementary details into a single rich, self-contained statement.
+2. If facts agree, combine them -- preserve the most complete version.
+3. If facts disagree or contradict, prefer the most recent or most specific information based on provided timestamps and evidence.
+4. If a fact is stale, wrong, or superseded, drop it from the consolidated output.
+5. Preserve specific details -- proper nouns, dates, quantities, and qualifiers must survive.
+6. Keep the statement concise (15-80 words) and self-contained.
+7. Do NOT output JSON. Do NOT wrap in an object. Output only the plain consolidated fact string.
 
-There are specific guidelines to select which operation to perform:
-
-1. **Add**: If the retrieved facts contain new information not present in the memory, then you have to add it by generating a new ID in the id field.
-- **Example**:
-    - Old Memory:
-        [
-            {
-                "id" : "0",
-                "text" : "User is a software engineer"
-            }
-        ]
-    - Retrieved facts: ["Name is John"]
-    - New Memory:
-        {
-            "memory" : [
-                {
-                    "id" : "0",
-                    "text" : "User is a software engineer",
-                    "event" : "NONE"
-                },
-                {
-                    "id" : "1",
-                    "text" : "Name is John",
-                    "event" : "ADD"
-                }
-            ]
-
-        }
-
-2. **Update**: If the retrieved facts contain information that is already present in the memory but the information is totally different, then you have to update it.
-If the retrieved fact contains information that conveys the same thing as the elements present in the memory, then you have to keep the fact which has the most information.
-Example (a) -- if the memory contains "User likes to play cricket" and the retrieved fact is "Loves to play cricket with friends", then update the memory with the retrieved facts.
-Example (b) -- if the memory contains "Likes cheese pizza" and the retrieved fact is "Loves cheese pizza", then you do not need to update it because they convey the same information.
-If the direction is to update the memory, then you have to update it.
-Please keep in mind while updating you have to keep the same ID.
-Please note to return the IDs in the output from the input IDs only and do not generate any new ID.
-- **Example**:
-    - Old Memory:
-        [
-            {
-                "id" : "0",
-                "text" : "I really like cheese pizza"
-            },
-            {
-                "id" : "1",
-                "text" : "User is a software engineer"
-            },
-            {
-                "id" : "2",
-                "text" : "User likes to play cricket"
-            }
-        ]
-    - Retrieved facts: ["Loves chicken pizza", "Loves to play cricket with friends"]
-    - New Memory:
-        {
-        "memory" : [
-                {
-                    "id" : "0",
-                    "text" : "Loves cheese and chicken pizza",
-                    "event" : "UPDATE",
-                    "old_memory" : "I really like cheese pizza"
-                },
-                {
-                    "id" : "1",
-                    "text" : "User is a software engineer",
-                    "event" : "NONE"
-                },
-                {
-                    "id" : "2",
-                    "text" : "Loves to play cricket with friends",
-                    "event" : "UPDATE",
-                    "old_memory" : "User likes to play cricket"
-                }
-            ]
-        }
-
-
-3. **Delete**: If the retrieved facts contain information that contradicts the information present in the memory, then you have to delete it. Or if the direction is to delete the memory, then you have to delete it.
-Please note to return the IDs in the output from the input IDs only and do not generate any new ID.
-- **Example**:
-    - Old Memory:
-        [
-            {
-                "id" : "0",
-                "text" : "Name is John"
-            },
-            {
-                "id" : "1",
-                "text" : "Loves cheese pizza"
-            }
-        ]
-    - Retrieved facts: ["Dislikes cheese pizza"]
-    - New Memory:
-        {
-        "memory" : [
-                {
-                    "id" : "0",
-                    "text" : "Name is John",
-                    "event" : "NONE"
-                },
-                {
-                    "id" : "1",
-                    "text" : "Loves cheese pizza",
-                    "event" : "DELETE"
-                }
-        ]
-        }
-
-4. **No Change**: If the retrieved facts contain information that is already present in the memory, then you do not need to make any changes.
-- **Example**:
-    - Old Memory:
-        [
-            {
-                "id" : "0",
-                "text" : "Name is John"
-            },
-            {
-                "id" : "1",
-                "text" : "Loves cheese pizza"
-            }
-        ]
-    - Retrieved facts: ["Name is John"]
-    - New Memory:
-        {
-        "memory" : [
-                {
-                    "id" : "0",
-                    "text" : "Name is John",
-                    "event" : "NONE"
-                },
-                {
-                    "id" : "1",
-                    "text" : "Loves cheese pizza",
-                    "event" : "NONE"
-                }
-            ]
-        }
+Output one plain string: the canonical consolidated fact.
 """.strip()
 
 
