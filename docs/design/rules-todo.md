@@ -101,7 +101,12 @@ Policy writer 应声明 class-body retrieval query：
 ```python
 class ClaudeMemory(am.Memory):
     ...
-    retrieval_query = catalog.sem_topk(am.UserQuery(), 5)
+    retrieval_query = (
+        topics.select(["name", "description", "type"])
+        .sem_topk(am.UserQuery(), 5)
+        .join(topics, on="name")
+        .select(["name", "description:right", "type:right", "body"])
+    )
 ```
 
 `Memory.query(...)` 是 framework 内置的 end-user method，policy writer 不需要
@@ -119,7 +124,11 @@ Offline 阶段保存：
 
 ```text
 retrieval_queries["default"] =
-  materialized_view("catalog").sem_topk(UserQuery("query"), 5)
+  materialized_view("topics")
+    .select(["name", "description", "type"])
+    .sem_topk(UserQuery("query"), 5)
+    .join(materialized_view("topics"), on="name")
+    .select(["name", "description:right", "type:right", "body"])
 ```
 
 Runtime 阶段再绑定：
@@ -128,10 +137,11 @@ Runtime 阶段再绑定：
 UserQuery("query") -> "design docs"
 ```
 
-Retrieval query 不做 view maintenance rule，也不产生 `V'`。它属于 query-time
-retrieval template，可以被 offline optimizer 改写 template，也可以被 online
-optimizer 在绑定 user text 后做 batching、cascade、cache、model choice 或 index
-相关优化。
+Retrieval query 不做 view maintenance rule，也不产生 `V'`。Retrieval-time
+exact `join(on=...)` 是确定性 lookup / body fetch，不需要 differential rule。
+它属于 query-time retrieval template，可以被 offline optimizer 改写 template，
+也可以被 online optimizer 在绑定 user text 后做 batching、cascade、cache、
+model choice 或 index 相关优化。
 
 ## 4. Planner / Rules 职责边界
 
@@ -539,8 +549,8 @@ compile 阶段做 topological ordering 和 cycle detection。Runtime load artifa
 7. 已实现：增加 in-memory policy-level differentiation surface：
    `Memory.differentiate_policy() -> DifferentiatedPolicy`。
 8. 已实现：支持 declarative retrieval query：policy writer 写
-   `retrieval_query = catalog.sem_topk(am.UserQuery(), 5)`，runtime 内置
-   `Memory.query(...)`。
+   native-like `topics` manifest selection + deterministic `join(on="name")`
+   body fetch，runtime 内置 `Memory.query(...)`。
 9. 已实现：给 `DifferentialInstructionRewriter` 加 deterministic placeholder
    rewrite，先不做 semantic prompt rewrite。
 10. 已实现：给 standalone `sem_agg` 加 approximate compressed-state view rule；

@@ -163,6 +163,8 @@ class MemoryRuntime:
                 return columns
             case "sem_filter" | "sem_groupby" | "sem_topk" | "drop_duplicates":
                 return self._query_output_columns(query.inputs[0])
+            case "join":
+                return self._join_output_columns(query)
             case "union" | "concat" | "subtract" | "sem_join":
                 columns: list[str] = []
                 for input_query in query.inputs:
@@ -174,6 +176,31 @@ class MemoryRuntime:
                 raise NotImplementedError(
                     f"Cannot infer output columns for QueryExpr op {query.op!r}."
                 )
+
+    def _join_output_columns(self, query: QueryExpr) -> list[str]:
+        """Infer pandas merge output columns for same-key relational joins."""
+
+        left_columns = self._query_output_columns(query.inputs[0])
+        right_columns = self._query_output_columns(query.inputs[1])
+        keys = tuple(str(column) for column in query.params["on"])
+        overlapping = (
+            set(left_columns).intersection(right_columns).difference(keys)
+        )
+
+        columns: list[str] = []
+        for column in left_columns:
+            if column in overlapping:
+                columns.append(f"{column}:left")
+            else:
+                columns.append(column)
+        for column in right_columns:
+            if column in keys:
+                continue
+            if column in overlapping:
+                columns.append(f"{column}:right")
+            else:
+                columns.append(column)
+        return columns
 
     def _append_log_frame(self, current: Any | None, delta: Any) -> Any:
         """Append changed rows to the source log state."""

@@ -218,4 +218,9 @@ class ClaudeMemory(Memory):
         ).select(["catalog_title", "name", "hook"])
     )
 
-    retrieval_query = catalog.sem_topk(UserQuery(), 5)
+    retrieval_query = (
+        topics.select(["name", "description", "type"])
+        .sem_topk(UserQuery(), 5)
+        .join(topics, on="name")
+        .select(["name", "description:right", "type:right", "body"])
+    )

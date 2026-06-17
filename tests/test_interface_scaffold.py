@@ -23,6 +23,7 @@ from agent_memory.adapters.lotus.context import (
 from agent_memory.adapters.lotus.relational import (
     execute_concat,
     execute_drop_duplicates,
+    execute_join,
     execute_subtract,
     execute_union,
 )
@@ -211,7 +212,7 @@ def test_claude_memory_spec_collects_views_and_private_relations() -> None:
     assert sorted(spec.views) == ["catalog", "topics"]
     assert sorted(spec.private_relations) == []
     assert sorted(spec.retrieval_queries) == ["default"]
-    assert spec.retrieval_queries["default"].op == "sem_topk"
+    assert spec.retrieval_queries["default"].op == "select"
     assert "log" not in spec.views
     assert "retrieval_query" not in spec.views
 
@@ -434,6 +435,24 @@ def test_semantic_instruction_argument_shapes() -> None:
         log.sem_filter("{message} contains a durable memory fact.")
     with pytest.raises(TypeError):
         log.sem_join(log, "The left row and right row describe the same memory fact.")
+
+
+def test_join_query_expr_keeps_only_logical_params() -> None:
+    log = am.Log({"name": "Topic identity.", "body": "Topic body."})
+
+    joined = log.join(log, on="name", how="left")
+
+    assert joined.expr.op == "join"
+    assert joined.expr.params == {"on": ("name",), "how": "left"}
+    assert joined.expr.inputs == (log.expr, log.expr)
+
+    multi_key = log.join(log, on=["name", "body"])
+    assert multi_key.expr.params == {"on": ("name", "body"), "how": "inner"}
+
+    with pytest.raises(ValueError, match="at least one key"):
+        log.join(log, on=[])
+    with pytest.raises(TypeError):
+        log.join("not a relation", on="name")
 
 
 def test_sem_join_query_expr_keeps_only_logical_params() -> None:
@@ -1059,10 +1078,25 @@ def test_differentiated_policy_compiles_views_and_retrieval_templates() -> None:
     assert sorted(policy.view_queries) == ["catalog", "topics"]
 
     retrieval_query = policy.retrieval_queries["default"]
-    assert retrieval_query.op == "sem_topk"
-    _assert_materialized_view(retrieval_query.inputs[0], name="catalog")
-    assert retrieval_query.params["instruction"] == UserQuery()
-    assert retrieval_query.params["k"] == 5
+    assert retrieval_query.op == "select"
+    assert retrieval_query.params["columns"] == (
+        "name",
+        "description:right",
+        "type:right",
+        "body",
+    )
+    join_query = retrieval_query.inputs[0]
+    assert join_query.op == "join"
+    assert join_query.params == {"on": ("name",), "how": "inner"}
+    topk_query, topics_query = join_query.inputs
+    _assert_materialized_view(topics_query, name="topics")
+    assert topk_query.op == "sem_topk"
+    assert topk_query.params["instruction"] == UserQuery()
+    assert topk_query.params["k"] == 5
+    manifest_query = topk_query.inputs[0]
+    assert manifest_query.op == "select"
+    assert manifest_query.params["columns"] == ("name", "description", "type")
+    _assert_materialized_view(manifest_query.inputs[0], name="topics")
 
 
 @pytest.mark.parametrize(
@@ -2361,6 +2395,127 @@ def test_relational_execution_ops_follow_dataframe_semantics() -> None:
     assert list(deduped["message"]) == ["hello"]
 
 
+def test_relational_join_executes_exact_key_merge_semantics() -> None:
+    left = QueryExpr(op="materialized_view", params={"name": "left"})
+    right = QueryExpr(op="materialized_view", params={"name": "right"})
+    inputs = {
+        "left": pd.DataFrame(
+            {
+                "name": ["a", "b", "c"],
+                "description": ["left a", "left b", "left c"],
+                "rank": [1, 2, 3],
+            }
+        ),
+        "right": pd.DataFrame(
+            {
+                "name": ["a", "b", "d"],
+                "description": ["right a", "right b", "right d"],
+                "body": ["A", "B", "D"],
+            }
+        ),
+    }
+    execute = LotusAdapter().execute
+
+    inner = execute_join(
+        QueryExpr(
+            op="join",
+            inputs=(left, right),
+            params={"on": ("name",), "how": "inner"},
+        ),
+        inputs,
+        execute,
+    )
+    left_join = execute_join(
+        QueryExpr(
+            op="join",
+            inputs=(left, right),
+            params={"on": ("name",), "how": "left"},
+        ),
+        inputs,
+        execute,
+    )
+    right_join = execute_join(
+        QueryExpr(
+            op="join",
+            inputs=(left, right),
+            params={"on": ("name",), "how": "right"},
+        ),
+        inputs,
+        execute,
+    )
+    outer = execute_join(
+        QueryExpr(
+            op="join",
+            inputs=(left, right),
+            params={"on": ("name",), "how": "outer"},
+        ),
+        inputs,
+        execute,
+    )
+
+    assert list(inner.columns) == [
+        "name",
+        "description:left",
+        "rank",
+        "description:right",
+        "body",
+    ]
+    assert list(inner["name"]) == ["a", "b"]
+    assert list(inner["description:left"]) == ["left a", "left b"]
+    assert list(inner["description:right"]) == ["right a", "right b"]
+    assert list(left_join["name"]) == ["a", "b", "c"]
+    assert list(right_join["name"]) == ["a", "b", "d"]
+    assert list(outer["name"]) == ["a", "b", "c", "d"]
+
+
+def test_relational_join_rejects_missing_or_null_keys() -> None:
+    left = QueryExpr(op="materialized_view", params={"name": "left"})
+    right = QueryExpr(op="materialized_view", params={"name": "right"})
+    execute = LotusAdapter().execute
+
+    with pytest.raises(ValueError, match="must exist"):
+        execute_join(
+            QueryExpr(
+                op="join",
+                inputs=(left, right),
+                params={"on": ("name",), "how": "inner"},
+            ),
+            {
+                "left": pd.DataFrame({"name": ["a"]}),
+                "right": pd.DataFrame({"topic": ["a"]}),
+            },
+            execute,
+        )
+
+    with pytest.raises(ValueError, match="cannot contain null"):
+        execute_join(
+            QueryExpr(
+                op="join",
+                inputs=(left, right),
+                params={"on": ("name",), "how": "inner"},
+            ),
+            {
+                "left": pd.DataFrame({"name": ["a", None]}),
+                "right": pd.DataFrame({"name": ["a"]}),
+            },
+            execute,
+        )
+
+    with pytest.raises(ValueError, match="join how"):
+        execute_join(
+            QueryExpr(
+                op="join",
+                inputs=(left, right),
+                params={"on": ("name",), "how": "cross"},
+            ),
+            {
+                "left": pd.DataFrame({"name": ["a"]}),
+                "right": pd.DataFrame({"name": ["a"]}),
+            },
+            execute,
+        )
+
+
 def test_subtract_requires_matching_columns() -> None:
     left = QueryExpr(op="materialized_view", params={"name": "left"})
     right = QueryExpr(op="materialized_view", params={"name": "right"})
@@ -2387,8 +2542,22 @@ def test_lotus_adapter_dispatches_relational_execution_ops() -> None:
     adapter = LotusAdapter()
 
     result = adapter.execute(QueryExpr(op="concat", inputs=(left, right)), inputs)
+    joined = adapter.execute(
+        QueryExpr(
+            op="join",
+            inputs=(left, right),
+            params={"on": ("message",), "how": "inner"},
+        ),
+        {
+            "left": pd.DataFrame({"message": ["hello"], "left_value": [1]}),
+            "right": pd.DataFrame({"message": ["hello"], "right_value": [2]}),
+        },
+    )
 
     assert list(result["message"]) == ["hello", "world"]
+    assert joined.to_dict("records") == [
+        {"message": "hello", "left_value": 1, "right_value": 2}
+    ]
 
 
 def test_sem_join_assembles_outer_shape_with_overlapping_columns_and_explanations() -> None:
@@ -3772,20 +3941,41 @@ def test_claude_memory_query_binds_user_query_placeholder() -> None:
 
     adapter = RecordingAdapter()
     memory = am.ClaudeMemory(adapter=adapter)
-    catalog = pd.DataFrame({"catalog_title": ["Docs"], "name": ["docs"], "hook": ["docs"]})
-    memory._runtime._state["catalog"] = catalog
+    topics = pd.DataFrame(
+        {
+            "name": ["docs"],
+            "description": ["Design docs."],
+            "type": ["reference"],
+            "body": ["Use the design docs for architecture context."],
+        }
+    )
+    memory._runtime._state["topics"] = topics
 
     assert memory.query("design docs") == "ranked"
 
     query, inputs = adapter.calls[0]
-    assert query.op == "sem_topk"
-    assert query.inputs[0] == QueryExpr(
-        op="materialized_view",
-        params={"name": "catalog"},
+    assert query.op == "select"
+    join_query = query.inputs[0]
+    assert join_query.op == "join"
+    topk_query, topics_query = join_query.inputs
+    assert topk_query.op == "sem_topk"
+    assert topk_query.params["instruction"] == "design docs"
+    assert topk_query.params["k"] == 5
+    assert topk_query.inputs[0] == QueryExpr(
+        op="select",
+        inputs=(
+            QueryExpr(
+                op="materialized_view",
+                params={"name": "topics"},
+            ),
+        ),
+        params={"columns": ("name", "description", "type")},
     )
-    assert query.params["instruction"] == "design docs"
-    assert query.params["k"] == 5
-    assert inputs["catalog"].equals(catalog)
+    assert topics_query == QueryExpr(
+        op="materialized_view",
+        params={"name": "topics"},
+    )
+    assert inputs["topics"].equals(topics)
 
 
 def test_memory_subclass_rejects_query_override() -> None:
@@ -3828,7 +4018,7 @@ def test_runtime_owns_empty_materialized_state_placeholder() -> None:
     assert memory._runtime._state == {}
     assert not hasattr(memory._runtime, "query")
     assert not hasattr(memory._runtime, "execute_query")
-    with pytest.raises(KeyError, match="Missing adapter input 'catalog'"):
+    with pytest.raises(KeyError, match="Missing adapter input 'topics'"):
         memory.query("design docs")
 
 
@@ -3859,6 +4049,38 @@ def test_runtime_query_output_columns_pass_through_groupby_and_topk() -> None:
 
     assert memory._runtime._query_output_columns(groupby_query) == ["memory_summary"]
     assert memory._runtime._query_output_columns(topk_query) == ["memory_summary"]
+
+
+def test_runtime_query_output_columns_infers_relational_join_suffixes() -> None:
+    memory = am.ClaudeMemory()
+    query = QueryExpr(
+        op="join",
+        inputs=(
+            QueryExpr(
+                op="materialized_view",
+                params={"name": "topics"},
+            ),
+            QueryExpr(
+                op="select",
+                inputs=(
+                    QueryExpr(
+                        op="materialized_view",
+                        params={"name": "topics"},
+                    ),
+                ),
+                params={"columns": ("name", "description")},
+            ),
+        ),
+        params={"on": ("name",), "how": "inner"},
+    )
+
+    assert memory._runtime._query_output_columns(query) == [
+        "name",
+        "description:left",
+        "type",
+        "body",
+        "description:right",
+    ]
 
 
 def test_runtime_query_output_columns_reject_unknown_ops() -> None:

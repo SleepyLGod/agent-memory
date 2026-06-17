@@ -128,6 +128,29 @@ class Relation:
         other = _require_relation(other, argument="other")
         return self._derive("subtract", inputs=(self.expr, other.expr))
 
+    def join(
+        self,
+        other: "Relation",
+        *,
+        on: str | Sequence[str],
+        how: str = "inner",
+    ) -> "Relation":
+        """Join two relations on same-named deterministic key columns."""
+
+        other = _require_relation(other, argument="other")
+        if isinstance(on, str):
+            keys = (on,)
+        else:
+            keys = tuple(on)
+        if not keys:
+            raise ValueError("join requires at least one key column")
+        return self._derive(
+            "join",
+            inputs=(self.expr, other.expr),
+            on=keys,
+            how=how,
+        )
+
     def drop_duplicates(self) -> "Relation":
         """Remove exact duplicate rows."""
 

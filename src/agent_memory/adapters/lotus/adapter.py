@@ -11,6 +11,7 @@ from agent_memory.adapters.lotus.context import LotusExecutionConfig, LotusExecu
 from agent_memory.adapters.lotus.relational import (
     execute_concat,
     execute_drop_duplicates,
+    execute_join,
     execute_select,
     execute_subtract,
     execute_union,
@@ -62,6 +63,8 @@ class LotusAdapter:
                 return self._execute_traced_relational(query, inputs, execute_union)
             case "subtract":
                 return self._execute_traced_relational(query, inputs, execute_subtract)
+            case "join":
+                return self._execute_traced_relational(query, inputs, execute_join)
             case "drop_duplicates":
                 return self._execute_traced_relational(query, inputs, execute_drop_duplicates)
             case "sem_filter":

@@ -47,8 +47,10 @@ memory.add(am.Message(content="Please remember concise design docs."))
 memory.query("design docs")
 ```
 
-`ClaudeMemory` declares materialized views plus a parameterized
-`retrieval_query = catalog.sem_topk(am.UserQuery(), 5)`. The in-memory
+`ClaudeMemory` declares materialized `topics` and `catalog` views plus a
+parameterized retrieval template. Retrieval selects from a lightweight topic
+manifest, then joins back to `topics` by identity to return the memory body;
+`catalog` remains the MEMORY.md index projection. The in-memory
 `DifferentiatedPolicy` stores differentiated view queries and retrieval query
 templates; durable artifact IO and storage are still future work. Use the
 HelloWorld smoke below for the minimal executable path.

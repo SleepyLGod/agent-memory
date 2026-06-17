@@ -63,6 +63,30 @@ def execute_subtract(
     return result.loc[:, list(left.columns)].reset_index(drop=True)
 
 
+def execute_join(
+    query: QueryExpr,
+    inputs: Mapping[str, Any],
+    execute: Callable[[QueryExpr, Mapping[str, Any]], Any],
+) -> Any:
+    """Execute deterministic same-key relational join semantics."""
+
+    left, right = _execute_binary_inputs(query, inputs, execute)
+    keys = tuple(str(column) for column in query.params["on"])
+    how = str(query.params.get("how", "inner"))
+    _require_supported_join_how(how)
+    _require_join_keys(left, right, keys)
+    _require_non_null_join_keys(left, keys, side="left")
+    _require_non_null_join_keys(right, keys, side="right")
+
+    return left.merge(
+        right,
+        how=how,
+        on=list(keys),
+        suffixes=(":left", ":right"),
+        sort=False,
+    ).reset_index(drop=True)
+
+
 def execute_drop_duplicates(
     query: QueryExpr,
     inputs: Mapping[str, Any],
@@ -91,3 +115,31 @@ def _require_matching_columns(left: Any, right: Any, *, op: str) -> None:
 
     if list(left.columns) != list(right.columns):
         raise ValueError(f"{op} requires matching columns")
+
+
+def _require_supported_join_how(how: str) -> None:
+    """Require a pandas relational join mode supported by the public API."""
+
+    if how not in {"inner", "left", "right", "outer"}:
+        raise ValueError("join how must be one of: inner, left, right, outer")
+
+
+def _require_join_keys(left: Any, right: Any, keys: tuple[str, ...]) -> None:
+    """Require join key columns to exist on both sides."""
+
+    missing_left = [key for key in keys if key not in left.columns]
+    missing_right = [key for key in keys if key not in right.columns]
+    if missing_left or missing_right:
+        details = []
+        if missing_left:
+            details.append(f"left missing {missing_left}")
+        if missing_right:
+            details.append(f"right missing {missing_right}")
+        raise ValueError(f"join key columns must exist on both sides: {', '.join(details)}")
+
+
+def _require_non_null_join_keys(frame: Any, keys: tuple[str, ...], *, side: str) -> None:
+    """Reject null join keys to avoid pandas null-null matching surprises."""
+
+    if frame.loc[:, list(keys)].isna().any().any():
+        raise ValueError(f"join key columns cannot contain null values on {side} side")

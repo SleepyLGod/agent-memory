@@ -156,6 +156,20 @@ remaining = rows.subtract(rows_to_remove)
 `subtract` removes rows using exact equality or an implementation-defined exact
 key. It is not a semantic delete.
 
+### `join`
+
+Deterministic relational join on same-named key columns.
+
+```python
+joined = selected.join(topics, on="name", how="inner")
+```
+
+`join(on=...)` is pandas-backed exact lookup / merge. It does not call an LLM.
+Overlapping non-key columns use the `:left` / `:right` suffix convention. This
+operator is not interchangeable with `sem_join(...)`: `sem_join` asks an LLM
+whether two rows semantically match, while `join(on=...)` requires exact key
+identity.
+
 ## 3. Instruction And Column Conventions
 
 Semantic operators use an `instruction` string. The string may refer to columns
@@ -549,6 +563,19 @@ Example:
 memories = topics.sem_topk(
     am.UserQuery(),
     5,
+)
+```
+
+Claude-style retrieval uses `sem_topk` only for relevance selection over a
+lightweight topic manifest, then uses deterministic `join(on="name")` to fetch
+the full body:
+
+```python
+retrieval_query = (
+    topics.select(["name", "description", "type"])
+    .sem_topk(am.UserQuery(), 5)
+    .join(topics, on="name")
+    .select(["name", "description:right", "type:right", "body"])
 )
 ```
 
