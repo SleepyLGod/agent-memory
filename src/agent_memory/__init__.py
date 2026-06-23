@@ -3,7 +3,7 @@
 from .api import Log, Memory
 from .logical import UserQuery
 from .message import Message
-from .memories import ClaudeMemory
+from .memories import ClaudeMemory, Mem0Memory
 from .policy import DifferentiatedPolicy, DifferentialPolicyCompiler
 
 __version__ = "0.0.1"
@@ -13,6 +13,7 @@ __all__ = [
     "DifferentialPolicyCompiler",
     "DifferentiatedPolicy",
     "Log",
+    "Mem0Memory",
     "Memory",
     "Message",
     "UserQuery",
