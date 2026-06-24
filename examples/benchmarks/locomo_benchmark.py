@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import argparse
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
+import json
 import os
 from pathlib import Path
 import shutil
@@ -238,20 +239,15 @@ def questions_frame(questions: Sequence[BenchmarkQuestion]) -> pd.DataFrame:
 
 
 def run_memory_ingest(
+    memory: am.ClaudeMemory,
     events: Sequence[BenchmarkEvent],
     *,
-    model: str,
-    trace_dir: Path | None,
-) -> tuple[am.ClaudeMemory, list[dict[str, Any]]]:
+    step_metrics: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     """Append selected benchmark events into ClaudeMemory."""
 
-    memory = am.ClaudeMemory(
-        adapter=LotusAdapter(
-            model=model,
-            config=LotusExecutionConfig(semantic_trace_dir=trace_dir),
-        )
-    )
-    step_metrics: list[dict[str, Any]] = []
+    if step_metrics is None:
+        step_metrics = []
     for index, event in enumerate(events, start=1):
         row = event_to_claude_log_row(event)
         before = usage_snapshot()
@@ -274,7 +270,18 @@ def run_memory_ingest(
                 **memory_row_counts(memory),
             }
         )
-    return memory, step_metrics
+    return step_metrics
+
+
+def create_memory(*, model: str, trace_dir: Path | None) -> am.ClaudeMemory:
+    """Create the ClaudeMemory instance used by one benchmark run."""
+
+    return am.ClaudeMemory(
+        adapter=LotusAdapter(
+            model=model,
+            config=LotusExecutionConfig(semantic_trace_dir=trace_dir),
+        )
+    )
 
 
 def memory_row_counts(memory: am.ClaudeMemory) -> dict[str, int]:
@@ -293,11 +300,15 @@ def run_questions(
     questions: Sequence[BenchmarkQuestion],
     *,
     answer: bool,
+    result_rows: list[dict[str, Any]] | None = None,
+    metric_rows: list[dict[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Run retrieval and optional answer generation for selected questions."""
 
-    result_rows: list[dict[str, Any]] = []
-    metric_rows: list[dict[str, Any]] = []
+    if result_rows is None:
+        result_rows = []
+    if metric_rows is None:
+        metric_rows = []
     for question in questions:
         before = usage_snapshot()
         retrieval_start = time.perf_counter()
@@ -433,6 +444,8 @@ def summary_frame(
     )
     row = {
         "run_mode": run_mode,
+        "input_rendering": "message_with_event_context",
+        "bookkeeping_metadata_excluded_from_semantic_input": True,
         "qa_accuracy_available": run_mode == "answer",
         "official_score_available": False,
         "strict_evidence_recall_available": False,
@@ -493,6 +506,158 @@ def write_memory_tables(memory: am.ClaudeMemory, output_dir: Path) -> dict[str, 
     }
 
 
+def write_run_artifacts(
+    *,
+    output_dir: Path,
+    run_mode: str,
+    model: str,
+    sample_index: int,
+    events: Sequence[BenchmarkEvent],
+    questions: Sequence[BenchmarkQuestion],
+    memory: am.ClaudeMemory | None,
+    result_rows: Sequence[Mapping[str, Any]],
+    metric_rows: Sequence[Mapping[str, Any]],
+    step_metrics: Sequence[Mapping[str, Any]],
+    trace_dir: Path | None,
+    llm_anomaly_rows: Sequence[Mapping[str, Any]] | None,
+    ingested_event_ids: Iterable[str],
+    include_summary: bool,
+) -> dict[str, Path]:
+    """Write all artifacts that are available for the current run state."""
+
+    written: dict[str, Path] = {}
+    if memory is not None:
+        written.update(write_memory_tables(memory, output_dir))
+    if result_rows:
+        written["retrieval/results"] = write_csv(
+            "results",
+            pd.DataFrame(result_rows),
+            output_dir / "retrieval",
+        )
+    if metric_rows:
+        written["metrics/questions"] = write_csv(
+            "questions",
+            pd.DataFrame(metric_rows),
+            output_dir / "metrics",
+        )
+    if include_summary and memory is not None:
+        written["metrics/summary"] = write_csv(
+            "summary",
+            summary_frame(
+                run_mode=run_mode,
+                model=model,
+                sample_index=sample_index,
+                events=events,
+                questions=questions,
+                memory=memory,
+                question_metrics=metric_rows,
+                question_results=result_rows,
+                step_metrics=step_metrics,
+                llm_anomaly_rows=llm_anomaly_rows,
+            ),
+            output_dir / "metrics",
+        )
+    if trace_dir is not None:
+        written.update(
+            write_trace_diagnostics(
+                output_dir=output_dir,
+                trace_dir=trace_dir,
+                questions=questions,
+                ingested_event_ids=ingested_event_ids,
+                llm_anomaly_rows=llm_anomaly_rows or [],
+            )
+        )
+        written["trace"] = trace_dir
+    return written
+
+
+def write_trace_diagnostics(
+    *,
+    output_dir: Path,
+    trace_dir: Path,
+    questions: Sequence[BenchmarkQuestion],
+    ingested_event_ids: Iterable[str],
+    llm_anomaly_rows: Sequence[Mapping[str, Any]],
+) -> dict[str, Path]:
+    """Write trace-derived diagnostic CSV artifacts."""
+
+    return {
+        "diagnostics/cause_trace": write_csv(
+            "cause_trace",
+            pd.DataFrame(
+                build_cause_trace_rows(
+                    questions=questions,
+                    ingested_event_ids=set(ingested_event_ids),
+                    trace_dir=trace_dir,
+                )
+            ),
+            output_dir / "diagnostics",
+        ),
+        "diagnostics/llm_anomalies": write_csv(
+            "llm_anomalies",
+            pd.DataFrame(llm_anomaly_rows, columns=LLM_ANOMALY_COLUMNS),
+            output_dir / "diagnostics",
+        ),
+    }
+
+
+def write_failure_metadata(
+    *,
+    output_dir: Path,
+    error: BaseException,
+    events: Sequence[BenchmarkEvent],
+    questions: Sequence[BenchmarkQuestion],
+    step_metrics: Sequence[Mapping[str, Any]],
+    result_rows: Sequence[Mapping[str, Any]],
+    trace_dir: Path | None,
+) -> Path:
+    """Write one JSON failure summary without swallowing the original error."""
+
+    completed_events = len(step_metrics)
+    completed_questions = len(result_rows)
+    failed_event_id = ""
+    failed_question_id = ""
+    failed_phase = "unknown"
+    if completed_events < len(events):
+        failed_phase = "add"
+        failed_event_id = events[completed_events].event_id
+    elif completed_questions < len(questions):
+        failed_phase = "question"
+        failed_question_id = questions[completed_questions].question_id
+
+    diagnostics_dir = output_dir / "diagnostics"
+    diagnostics_dir.mkdir(parents=True, exist_ok=True)
+    failure_path = diagnostics_dir / "failure.json"
+    failure = {
+        "error_type": type(error).__name__,
+        "error_message": str(error),
+        "failed_phase": failed_phase,
+        "failed_event_id": failed_event_id,
+        "failed_question_id": failed_question_id,
+        "completed_events": completed_events,
+        "total_events": len(events),
+        "completed_questions": completed_questions,
+        "total_questions": len(questions),
+        "output_dir": str(output_dir),
+        "trace_dir": "" if trace_dir is None else str(trace_dir),
+    }
+    failure_path.write_text(
+        json.dumps(failure, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return failure_path
+
+
+def completed_event_ids(step_metrics: Sequence[Mapping[str, Any]]) -> tuple[str, ...]:
+    """Return event ids for successfully completed add steps."""
+
+    return tuple(
+        str(row["event_id"])
+        for row in step_metrics
+        if row.get("phase") == "add" and row.get("event_id")
+    )
+
+
 def main() -> None:
     """Run one LOCOMO benchmark slice and write CSV artifacts."""
 
@@ -526,58 +691,84 @@ def main() -> None:
             output_dir / "input",
         ),
     }
-    memory, step_metrics = run_memory_ingest(
-        events,
-        model=args.model,
-        trace_dir=trace_dir,
+    memory: am.ClaudeMemory | None = None
+    step_metrics: list[dict[str, Any]] = []
+    result_rows: list[dict[str, Any]] = []
+    metric_rows: list[dict[str, Any]] = []
+    try:
+        memory = create_memory(model=args.model, trace_dir=trace_dir)
+        run_memory_ingest(memory, events, step_metrics=step_metrics)
+        result_rows, metric_rows = run_questions(
+            memory,
+            questions,
+            answer=args.answer,
+            result_rows=result_rows,
+            metric_rows=metric_rows,
+        )
+    except Exception as error:
+        try:
+            llm_anomaly_rows = (
+                build_llm_anomaly_rows(trace_dir=trace_dir)
+                if trace_dir is not None
+                else None
+            )
+            written.update(
+                write_run_artifacts(
+                    output_dir=output_dir,
+                    run_mode=run_mode,
+                    model=args.model,
+                    sample_index=args.sample_index,
+                    events=events,
+                    questions=questions,
+                    memory=memory,
+                    result_rows=result_rows,
+                    metric_rows=metric_rows,
+                    step_metrics=step_metrics,
+                    trace_dir=trace_dir,
+                    llm_anomaly_rows=llm_anomaly_rows,
+                    ingested_event_ids=completed_event_ids(step_metrics),
+                    include_summary=False,
+                )
+            )
+            written["diagnostics/failure"] = write_failure_metadata(
+                output_dir=output_dir,
+                error=error,
+                events=events,
+                questions=questions,
+                step_metrics=step_metrics,
+                result_rows=result_rows,
+                trace_dir=trace_dir,
+            )
+        except Exception as artifact_error:
+            print(f"warning: failed to write partial artifacts: {artifact_error}")
+        print("\nwrote partial benchmark artifacts before failure:")
+        for name, path_value in written.items():
+            print(f"- {name}: {path_value}")
+        raise
+
+    llm_anomaly_rows = (
+        build_llm_anomaly_rows(trace_dir=trace_dir)
+        if trace_dir is not None
+        else None
     )
-    result_rows, metric_rows = run_questions(memory, questions, answer=args.answer)
-    llm_anomaly_rows = build_llm_anomaly_rows(trace_dir=trace_dir) if trace_dir is not None else None
-    written.update(write_memory_tables(memory, output_dir))
-    written["retrieval/results"] = write_csv(
-        "results",
-        pd.DataFrame(result_rows),
-        output_dir / "retrieval",
-    )
-    written["metrics/questions"] = write_csv(
-        "questions",
-        pd.DataFrame(metric_rows),
-        output_dir / "metrics",
-    )
-    written["metrics/summary"] = write_csv(
-        "summary",
-        summary_frame(
+    written.update(
+        write_run_artifacts(
+            output_dir=output_dir,
             run_mode=run_mode,
             model=args.model,
             sample_index=args.sample_index,
             events=events,
             questions=questions,
             memory=memory,
-            question_metrics=metric_rows,
-            question_results=result_rows,
+            result_rows=result_rows,
+            metric_rows=metric_rows,
             step_metrics=step_metrics,
+            trace_dir=trace_dir,
             llm_anomaly_rows=llm_anomaly_rows,
-        ),
-        output_dir / "metrics",
+            ingested_event_ids=completed_event_ids(step_metrics),
+            include_summary=True,
+        )
     )
-    if trace_dir is not None:
-        written["diagnostics/cause_trace"] = write_csv(
-            "cause_trace",
-            pd.DataFrame(
-                build_cause_trace_rows(
-                    questions=questions,
-                    ingested_event_ids={event.event_id for event in events},
-                    trace_dir=trace_dir,
-                )
-            ),
-            output_dir / "diagnostics",
-        )
-        written["diagnostics/llm_anomalies"] = write_csv(
-            "llm_anomalies",
-            pd.DataFrame(llm_anomaly_rows or [], columns=LLM_ANOMALY_COLUMNS),
-            output_dir / "diagnostics",
-        )
-        written["trace"] = trace_dir
 
     print("\nwrote benchmark artifacts:")
     for name, path_value in written.items():

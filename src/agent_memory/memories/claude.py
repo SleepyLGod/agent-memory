@@ -156,9 +156,7 @@ class ClaudeMemory(Memory):
     topics = (
         log
         .sem_flat_map(
-            # Future explicit form:
-            # input_cols=["role", "message", "timestamp", "session_id", "metadata"]
-            # prompt should describe role as speaker and message as utterance.
+            input_cols=["role", "message", "timestamp", "session_id"],
             output_cols={
                 "name": "Candidate Claude memory name.",
                 "description": "One-line description used to decide relevance.",
@@ -177,7 +175,6 @@ class ClaudeMemory(Memory):
                 "role",
                 "timestamp",
                 "session_id",
-                "metadata",
             ]
         )
         .sem_groupby(
@@ -194,7 +191,6 @@ class ClaudeMemory(Memory):
                 "role",
                 "timestamp",
                 "session_id",
-                "metadata",
             ],
             output_cols={
                 "name": "Canonical Claude memory name.",

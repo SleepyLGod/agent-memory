@@ -87,13 +87,6 @@ def event_to_claude_log_row(event: BenchmarkEvent) -> dict[str, Any]:
         "role": event.speaker,
         "timestamp": event.timestamp,
         "session_id": event.session_id,
-        "metadata": {
-            "benchmark": "locomo",
-            "sample_id": event.sample_id,
-            "event_id": event.event_id,
-            "speaker": event.speaker,
-            **dict(event.metadata),
-        },
     }
 
 

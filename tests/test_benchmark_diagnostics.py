@@ -335,3 +335,34 @@ def test_llm_anomaly_preserves_answer_question_id(tmp_path: Path) -> None:
     assert rows[0]["operator"] == "answer"
     assert rows[0]["question_id"] == "conv-26:q5"
     assert rows[0]["issue"] == "empty_output"
+
+
+def test_llm_anomaly_marks_batch_error(tmp_path: Path) -> None:
+    trace_dir = tmp_path / "trace"
+    write_events(
+        trace_dir,
+        [
+            {
+                "trace_id": "t1",
+                "phase": "retrieval",
+                "question_id": "conv-26:q3",
+                "operator": "sem_topk",
+                "event_type": "llm_batch_error",
+                "prompt_path": "trace/prompts/topk-prompt.json",
+                "error_type": "InternalServerError",
+                "error_message": "SSL EOF",
+                "model": "test-model",
+            }
+        ],
+    )
+
+    rows = build_llm_anomaly_rows(trace_dir=trace_dir)
+
+    assert len(rows) == 1
+    assert rows[0]["phase"] == "retrieval"
+    assert rows[0]["operator"] == "sem_topk"
+    assert rows[0]["question_id"] == "conv-26:q3"
+    assert rows[0]["issue"] == "llm_batch_error"
+    assert rows[0]["prompt_path"] == "trace/prompts/topk-prompt.json"
+    assert rows[0]["error_type"] == "InternalServerError"
+    assert rows[0]["error_message"] == "SSL EOF"

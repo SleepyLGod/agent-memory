@@ -280,7 +280,6 @@ def test_topics_expression_uses_chain_groupby_then_aggregation() -> None:
         "role",
         "timestamp",
         "session_id",
-        "metadata",
     )
     assert tuple(col.name for col in sem_agg_expr.params["output_cols"]) == (
         "name",
@@ -295,7 +294,12 @@ def test_topics_expression_uses_chain_groupby_then_aggregation() -> None:
     assert projection_expr.op == "select"
     sem_flat_map_expr = projection_expr.inputs[0]
     assert sem_flat_map_expr.op == "sem_flat_map"
-    assert sem_flat_map_expr.params["input_cols"] is None
+    assert sem_flat_map_expr.params["input_cols"] == (
+        "role",
+        "message",
+        "timestamp",
+        "session_id",
+    )
     assert tuple(col.name for col in sem_flat_map_expr.params["output_cols"]) == (
         "name",
         "description",

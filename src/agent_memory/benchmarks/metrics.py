@@ -174,7 +174,7 @@ def question_metric_row(
         "gold_answer": _gold_answer_csv_value(gold_answer),
         "retrieved_row_count": len(retrieved_frame) if hasattr(retrieved_frame, "__len__") else 0,
         "retrieved_text": retrieved_text,
-        "gold_answer_in_retrieved_text": retrieval_hit(retrieved_text, gold_answer),
+        "proxy_answer_string_hit": retrieval_hit(retrieved_text, gold_answer),
     }
     if category is not None:
         row["category"] = category
@@ -202,17 +202,17 @@ def summarize_question_metrics(rows: Sequence[Mapping[str, Any]]) -> dict[str, A
     if total == 0:
         return {
             "questions_evaluated": 0,
-            "retrieval_gold_answer_hit_rate": "",
+            "proxy_answer_string_hit_rate": "",
             "answer_exact_match_rate": "",
             "answer_contains_rate": "",
             "answer_f1_mean": "",
             "locomo_answer_score_mean": "",
         }
-    retrieval_hits = sum(bool(row.get("gold_answer_in_retrieved_text")) for row in rows)
+    retrieval_hits = sum(bool(row.get("proxy_answer_string_hit")) for row in rows)
     answer_rows = [row for row in rows if "generated_answer" in row]
     summary: dict[str, Any] = {
         "questions_evaluated": total,
-        "retrieval_gold_answer_hit_rate": round(retrieval_hits / total, 6),
+        "proxy_answer_string_hit_rate": round(retrieval_hits / total, 6),
     }
     if answer_rows:
         summary.update(

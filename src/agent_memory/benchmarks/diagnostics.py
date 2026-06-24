@@ -18,8 +18,11 @@ LLM_ANOMALY_COLUMNS = (
     "question_id",
     "event_id",
     "issue",
+    "prompt_path",
     "raw_output_path",
     "raw_output_preview",
+    "error_type",
+    "error_message",
     "model",
 )
 
@@ -58,7 +61,11 @@ def build_llm_anomaly_rows(*, trace_dir: Path) -> list[dict[str, Any]]:
 
     rows: list[dict[str, Any]] = []
     for event in load_trace_events(trace_dir):
-        if event.get("event_type") != "llm_call":
+        event_type = event.get("event_type")
+        if event_type == "llm_batch_error":
+            rows.append(_llm_anomaly_row(event, issue="llm_batch_error", raw_output=event))
+            continue
+        if event_type != "llm_call":
             continue
         raw_path = event.get("raw_output_path")
         if not isinstance(raw_path, str) or not raw_path:
@@ -138,8 +145,11 @@ def _llm_anomaly_row(
         "question_id": event.get("question_id", ""),
         "event_id": event.get("event_id", ""),
         "issue": issue,
+        "prompt_path": event.get("prompt_path", ""),
         "raw_output_path": raw_output_path,
         "raw_output_preview": _preview(raw_output),
+        "error_type": event.get("error_type", ""),
+        "error_message": event.get("error_message", event.get("error", "")),
         "model": event.get("model", ""),
     }
 

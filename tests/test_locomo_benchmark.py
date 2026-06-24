@@ -7,7 +7,9 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
+import pytest
 
+from agent_memory.benchmarks.types import BenchmarkEvent, BenchmarkQuestion
 from agent_memory.benchmarks.locomo import (
     eligible_questions,
     event_to_claude_log_row,
@@ -27,6 +29,12 @@ from agent_memory.benchmarks.metrics import (
     retrieval_hit,
     summarize_question_metrics,
     token_f1,
+)
+from examples.benchmarks.locomo_benchmark import (
+    run_questions,
+    summary_frame,
+    write_failure_metadata,
+    write_run_artifacts,
 )
 
 
@@ -173,12 +181,6 @@ def test_event_to_claude_log_row_matches_current_schema() -> None:
         "role": "Caroline",
         "timestamp": "2026-01-01",
         "session_id": "session_1",
-        "metadata": {
-            "benchmark": "locomo",
-            "sample_id": "conv-test",
-            "event_id": "D1:1",
-            "speaker": "Caroline",
-        },
     }
 
 
@@ -249,7 +251,7 @@ def test_question_metric_row_handles_empty_retrieval() -> None:
     )
 
     assert row["retrieved_row_count"] == 0
-    assert row["gold_answer_in_retrieved_text"] is False
+    assert row["proxy_answer_string_hit"] is False
     assert "generated_answer" not in row
     assert "locomo_answer_score" not in row
 
@@ -283,18 +285,34 @@ def test_question_metric_row_scores_empty_generated_answer() -> None:
     assert row["locomo_answer_score"] == 0.0
 
 
+def test_proxy_answer_string_hit_does_not_imply_answer_score() -> None:
+    row = question_metric_row(
+        question_id="q1",
+        question="What did the race raise awareness for?",
+        gold_answer="mental health",
+        retrieved_frame=pd.DataFrame(
+            [{"body": "Caroline wants to work in mental health."}]
+        ),
+        generated_answer="I don't know.",
+        category=4,
+    )
+
+    assert row["proxy_answer_string_hit"] is True
+    assert row["locomo_answer_score"] == 0.0
+
+
 def test_summarize_question_metrics_handles_no_eligible_questions() -> None:
     summary = summarize_question_metrics([])
 
     assert summary["questions_evaluated"] == 0
-    assert summary["retrieval_gold_answer_hit_rate"] == ""
+    assert summary["proxy_answer_string_hit_rate"] == ""
 
 
 def test_summarize_question_metrics_reports_locomo_category_means() -> None:
     rows = [
         {
             "category": "2",
-            "gold_answer_in_retrieved_text": True,
+            "proxy_answer_string_hit": True,
             "generated_answer": "",
             "answer_exact_match": False,
             "answer_contains_gold": False,
@@ -303,7 +321,7 @@ def test_summarize_question_metrics_reports_locomo_category_means() -> None:
         },
         {
             "category": "5",
-            "gold_answer_in_retrieved_text": False,
+            "proxy_answer_string_hit": False,
             "generated_answer": "No information available.",
             "answer_exact_match": False,
             "answer_contains_gold": False,
@@ -319,3 +337,188 @@ def test_summarize_question_metrics_reports_locomo_category_means() -> None:
     assert summary["category_2_count"] == 1
     assert summary["category_2_locomo_answer_score_mean"] == 0.0
     assert summary["category_5_locomo_answer_score_mean"] == 1.0
+
+
+def test_summary_frame_records_input_rendering_contract() -> None:
+    frame = summary_frame(
+        run_mode="answer",
+        model="test-model",
+        sample_index=0,
+        events=(),
+        questions=(),
+        memory=FakeBenchmarkMemory(),
+        question_metrics=(),
+        question_results=(),
+        step_metrics=(),
+    )
+    row = frame.iloc[0]
+
+    assert row["input_rendering"] == "message_with_event_context"
+    assert bool(row["bookkeeping_metadata_excluded_from_semantic_input"]) is True
+
+
+class FakeBenchmarkMemory:
+    """Minimal memory object for runner helper tests."""
+
+    def __init__(self) -> None:
+        self._runtime = type(
+            "Runtime",
+            (),
+            {
+                "_state": {
+                    "log": pd.DataFrame([{"message": "I researched adoption agencies."}]),
+                    "topics": pd.DataFrame(
+                        [{"name": "adoption", "body": "Caroline researched adoption agencies."}]
+                    ),
+                    "catalog": pd.DataFrame(
+                        [{"catalog_title": "Adoption", "name": "adoption", "hook": "adoption"}]
+                    ),
+                }
+            },
+        )()
+        self.calls = 0
+
+    def query(self, question: str) -> pd.DataFrame:
+        """Return one retrieval result, then fail on the next query."""
+
+        self.calls += 1
+        if self.calls > 1:
+            raise RuntimeError("query failed")
+        return pd.DataFrame(
+            [{"name": "adoption", "body": "Caroline researched adoption agencies."}]
+        )
+
+
+def benchmark_questions() -> tuple[BenchmarkQuestion, BenchmarkQuestion]:
+    """Return two tiny benchmark questions."""
+
+    return (
+        BenchmarkQuestion(
+            question_id="q1",
+            sample_id="sample",
+            question="What did Caroline research?",
+            gold_answer="adoption agencies",
+            evidence_event_ids=("D1:1",),
+            category="2",
+        ),
+        BenchmarkQuestion(
+            question_id="q2",
+            sample_id="sample",
+            question="Who helped?",
+            gold_answer="Melanie",
+            evidence_event_ids=("D1:2",),
+            category="2",
+        ),
+    )
+
+
+def test_run_questions_preserves_completed_rows_when_later_question_fails() -> None:
+    result_rows: list[dict[str, Any]] = []
+    metric_rows: list[dict[str, Any]] = []
+
+    with pytest.raises(RuntimeError, match="query failed"):
+        run_questions(
+            FakeBenchmarkMemory(),
+            benchmark_questions(),
+            answer=False,
+            result_rows=result_rows,
+            metric_rows=metric_rows,
+        )
+
+    assert len(result_rows) == 1
+    assert len(metric_rows) == 1
+    assert result_rows[0]["question_id"] == "q1"
+    assert result_rows[0]["proxy_answer_string_hit"] is True
+
+
+def test_failed_run_helpers_write_partial_artifacts(tmp_path: Path) -> None:
+    output_dir = tmp_path / "run"
+    trace_dir = output_dir / "trace"
+    trace_dir.mkdir(parents=True)
+    (trace_dir / "events.jsonl").write_text(
+        json.dumps(
+            {
+                "trace_id": "t1",
+                "phase": "retrieval",
+                "question_id": "q2",
+                "operator": "sem_topk",
+                "event_type": "llm_batch_error",
+                "error_type": "InternalServerError",
+                "error_message": "SSL EOF",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    questions = benchmark_questions()
+    events = (
+        BenchmarkEvent(
+            sample_id="sample",
+            event_id="D1:1",
+            speaker="Caroline",
+            text="I researched adoption agencies.",
+        ),
+        BenchmarkEvent(
+            sample_id="sample",
+            event_id="D1:2",
+            speaker="Melanie",
+            text="I helped.",
+        ),
+    )
+
+    written = write_run_artifacts(
+        output_dir=output_dir,
+        run_mode="answer",
+        model="test-model",
+        sample_index=0,
+        events=events,
+        questions=questions,
+        memory=FakeBenchmarkMemory(),
+        result_rows=[{"question_id": "q1", "retrieved_text": "adoption agencies"}],
+        metric_rows=[{"question_id": "q1", "proxy_answer_string_hit": True}],
+        step_metrics=[{"event_id": "D1:1"}],
+        trace_dir=trace_dir,
+        llm_anomaly_rows=[
+            {
+                "phase": "retrieval",
+                "operator": "sem_topk",
+                "event_type": "llm_batch_error",
+                "trace_id": "t1",
+                "question_id": "q2",
+                "event_id": "",
+                "issue": "llm_batch_error",
+                "prompt_path": "",
+                "raw_output_path": "",
+                "raw_output_preview": "",
+                "error_type": "InternalServerError",
+                "error_message": "SSL EOF",
+                "model": "",
+            }
+        ],
+        ingested_event_ids=("D1:1",),
+        include_summary=False,
+    )
+    failure_path = write_failure_metadata(
+        output_dir=output_dir,
+        error=RuntimeError("query failed"),
+        events=events,
+        questions=questions,
+        step_metrics=[{"event_id": "D1:1"}, {"event_id": "D1:2"}],
+        result_rows=[{"question_id": "q1"}],
+        trace_dir=trace_dir,
+    )
+
+    assert (output_dir / "memory" / "topics.csv").exists()
+    assert (output_dir / "retrieval" / "results.csv").exists()
+    assert (output_dir / "metrics" / "questions.csv").exists()
+    assert (output_dir / "diagnostics" / "cause_trace.csv").exists()
+    assert (output_dir / "diagnostics" / "llm_anomalies.csv").exists()
+    assert written["trace"] == trace_dir
+    cause_trace = pd.read_csv(output_dir / "diagnostics" / "cause_trace.csv")
+    q2_trace = cause_trace[cause_trace["question_id"] == "q2"].iloc[0]
+    assert q2_trace["source_status"] == "not_ingested"
+    failure = json.loads(failure_path.read_text(encoding="utf-8"))
+    assert failure["error_type"] == "RuntimeError"
+    assert failure["failed_phase"] == "question"
+    assert failure["failed_question_id"] == "q2"
+    assert failure["completed_questions"] == 1
