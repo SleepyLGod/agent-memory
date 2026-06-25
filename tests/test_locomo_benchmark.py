@@ -9,6 +9,7 @@ from typing import Any
 import pandas as pd
 import pytest
 
+from agent_memory.benchmarks.diagnostics import build_llm_anomaly_rows
 from agent_memory.benchmarks.types import BenchmarkEvent, BenchmarkQuestion
 from agent_memory.benchmarks.locomo import (
     eligible_questions,
@@ -31,10 +32,21 @@ from agent_memory.benchmarks.metrics import (
     token_f1,
 )
 from examples.benchmarks.locomo_benchmark import (
+    ANSWER_SYSTEM_PROMPT,
+    BENCHMARK_CONTRACT,
+    POLICY_CONTRACT,
+    checkpoint_contract_digest,
+    checkpoint_manifest_path,
+    checkpoint_snapshots_dir,
+    current_checkpoint_snapshot_dir,
+    load_checkpoint,
     run_questions,
+    save_checkpoint,
     summary_frame,
     write_failure_metadata,
+    write_recovery_metadata,
     write_run_artifacts,
+    write_jsonl_atomic,
 )
 
 
@@ -217,7 +229,13 @@ def test_locomo_category_three_uses_answer_before_semicolon() -> None:
 
 def test_locomo_category_five_checks_no_info_answers() -> None:
     assert locomo_answer_score("No information available in the memory.", "anything", 5) == 1.0
+    assert locomo_answer_score("I don't know.", "anything", 5) == 0.0
     assert locomo_answer_score("Caroline went yesterday.", "anything", 5) == 0.0
+
+
+def test_answer_prompt_uses_locomo_category_five_no_info_phrase() -> None:
+    assert "No information available" in ANSWER_SYSTEM_PROMPT
+    assert "I don't know" not in ANSWER_SYSTEM_PROMPT
 
 
 def test_locomo_smoke_date_case_gets_partial_f1_not_contains() -> None:
@@ -412,6 +430,25 @@ def benchmark_questions() -> tuple[BenchmarkQuestion, BenchmarkQuestion]:
     )
 
 
+def benchmark_events() -> tuple[BenchmarkEvent, BenchmarkEvent]:
+    """Return two tiny benchmark events."""
+
+    return (
+        BenchmarkEvent(
+            sample_id="sample",
+            event_id="D1:1",
+            speaker="Caroline",
+            text="I researched adoption agencies.",
+        ),
+        BenchmarkEvent(
+            sample_id="sample",
+            event_id="D1:2",
+            speaker="Melanie",
+            text="I helped.",
+        ),
+    )
+
+
 def test_run_questions_preserves_completed_rows_when_later_question_fails() -> None:
     result_rows: list[dict[str, Any]] = []
     metric_rows: list[dict[str, Any]] = []
@@ -429,6 +466,613 @@ def test_run_questions_preserves_completed_rows_when_later_question_fails() -> N
     assert len(metric_rows) == 1
     assert result_rows[0]["question_id"] == "q1"
     assert result_rows[0]["proxy_answer_string_hit"] is True
+
+
+def test_run_questions_can_resume_from_completed_question_rows() -> None:
+    result_rows = [{"question_id": "q1", "retrieved_text": "adoption agencies"}]
+    metric_rows = [{"question_id": "q1", "proxy_answer_string_hit": True}]
+    memory = FakeBenchmarkMemory()
+
+    run_questions(
+        memory,
+        benchmark_questions(),
+        answer=False,
+        result_rows=result_rows,
+        metric_rows=metric_rows,
+        start_index=1,
+    )
+
+    assert memory.calls == 1
+    assert [row["question_id"] for row in result_rows] == ["q1", "q2"]
+    assert [row["question_id"] for row in metric_rows] == ["q1", "q2"]
+
+
+def test_checkpoint_round_trips_runtime_state_and_completed_rows(tmp_path: Path) -> None:
+    output_dir = tmp_path / "run"
+    memory = FakeBenchmarkMemory()
+    events = benchmark_events()
+    questions = benchmark_questions()
+    step_metrics = [{"phase": "add", "event_id": "D1:1"}]
+    result_rows = [{"question_id": "q1", "retrieved_text": "adoption agencies"}]
+    metric_rows = [{"question_id": "q1", "proxy_answer_string_hit": True}]
+
+    save_checkpoint(
+        output_dir=output_dir,
+        memory=memory,
+        sample_index=0,
+        row_limit=2,
+        question_limit=2,
+        model="test-model",
+        answer=False,
+        trace_enabled=False,
+        events=events,
+        questions=questions,
+        step_metrics=step_metrics,
+        result_rows=result_rows,
+        metric_rows=metric_rows,
+    )
+    state, loaded_steps, loaded_results, loaded_metrics = load_checkpoint(
+        output_dir=output_dir,
+        sample_index=0,
+        row_limit=2,
+        question_limit=2,
+        model="test-model",
+        answer=False,
+        trace_enabled=False,
+        events=events,
+        questions=questions,
+    )
+
+    pd.testing.assert_frame_equal(state["topics"], memory._runtime._state["topics"])
+    assert loaded_steps == step_metrics
+    assert loaded_results == result_rows
+    assert loaded_metrics == metric_rows
+
+
+def test_load_checkpoint_ignores_unreferenced_partial_snapshot(tmp_path: Path) -> None:
+    output_dir = tmp_path / "run"
+    events = benchmark_events()
+    questions = benchmark_questions()
+    step_metrics = [{"phase": "add", "event_id": "D1:1"}]
+    save_checkpoint(
+        output_dir=output_dir,
+        memory=FakeBenchmarkMemory(),
+        sample_index=0,
+        row_limit=2,
+        question_limit=2,
+        model="test-model",
+        answer=False,
+        events=events,
+        questions=questions,
+        step_metrics=step_metrics,
+        result_rows=[],
+        metric_rows=[],
+    )
+    partial_snapshot = checkpoint_snapshots_dir(output_dir) / "partial-write"
+    partial_snapshot.mkdir(parents=True)
+    write_jsonl_atomic(
+        partial_snapshot / "step_metrics.jsonl",
+        [
+            {"phase": "add", "event_id": "D1:1"},
+            {"phase": "add", "event_id": "D1:2"},
+        ],
+    )
+
+    _, loaded_steps, loaded_results, loaded_metrics = load_checkpoint(
+        output_dir=output_dir,
+        sample_index=0,
+        row_limit=2,
+        question_limit=2,
+        model="test-model",
+        answer=False,
+        trace_enabled=False,
+        events=events,
+        questions=questions,
+    )
+
+    assert loaded_steps == step_metrics
+    assert loaded_results == []
+    assert loaded_metrics == []
+
+
+def test_load_checkpoint_rejects_mismatched_arguments(tmp_path: Path) -> None:
+    output_dir = tmp_path / "run"
+    events = benchmark_events()
+    questions = benchmark_questions()
+    save_checkpoint(
+        output_dir=output_dir,
+        memory=FakeBenchmarkMemory(),
+        sample_index=0,
+        row_limit=2,
+        question_limit=2,
+        model="test-model",
+        answer=False,
+        events=events,
+        questions=questions,
+        step_metrics=[],
+        result_rows=[],
+        metric_rows=[],
+    )
+
+    with pytest.raises(SystemExit, match="model"):
+        load_checkpoint(
+            output_dir=output_dir,
+            sample_index=0,
+            row_limit=2,
+            question_limit=2,
+            model="other-model",
+            answer=False,
+            trace_enabled=False,
+            events=events,
+            questions=questions,
+        )
+
+
+def test_load_checkpoint_rejects_trace_mode_mismatch(tmp_path: Path) -> None:
+    output_dir = tmp_path / "run"
+    events = benchmark_events()
+    questions = benchmark_questions()
+    save_checkpoint(
+        output_dir=output_dir,
+        memory=FakeBenchmarkMemory(),
+        sample_index=0,
+        row_limit=2,
+        question_limit=2,
+        model="test-model",
+        answer=False,
+        events=events,
+        questions=questions,
+        step_metrics=[],
+        result_rows=[],
+        metric_rows=[],
+        trace_enabled=False,
+    )
+
+    with pytest.raises(SystemExit, match="trace_enabled"):
+        load_checkpoint(
+            output_dir=output_dir,
+            sample_index=0,
+            row_limit=2,
+            question_limit=2,
+            model="test-model",
+            answer=False,
+            trace_enabled=True,
+            events=events,
+            questions=questions,
+        )
+
+
+def test_load_checkpoint_rejects_changed_input_content_with_same_ids(tmp_path: Path) -> None:
+    output_dir = tmp_path / "run"
+    events = benchmark_events()
+    questions = benchmark_questions()
+    save_checkpoint(
+        output_dir=output_dir,
+        memory=FakeBenchmarkMemory(),
+        sample_index=0,
+        row_limit=2,
+        question_limit=2,
+        model="test-model",
+        answer=False,
+        events=events,
+        questions=questions,
+        step_metrics=[],
+        result_rows=[],
+        metric_rows=[],
+    )
+    changed_events = (
+        BenchmarkEvent(
+            sample_id="sample",
+            event_id="D1:1",
+            speaker="Caroline",
+            text="I researched something else.",
+        ),
+        events[1],
+    )
+
+    with pytest.raises(SystemExit, match="input_digest"):
+        load_checkpoint(
+            output_dir=output_dir,
+            sample_index=0,
+            row_limit=2,
+            question_limit=2,
+            model="test-model",
+            answer=False,
+            trace_enabled=False,
+            events=changed_events,
+            questions=questions,
+        )
+
+
+def test_load_checkpoint_rejects_contract_mismatch(tmp_path: Path) -> None:
+    output_dir = tmp_path / "run"
+    events = benchmark_events()
+    questions = benchmark_questions()
+    save_checkpoint(
+        output_dir=output_dir,
+        memory=FakeBenchmarkMemory(),
+        sample_index=0,
+        row_limit=2,
+        question_limit=2,
+        model="test-model",
+        answer=False,
+        events=events,
+        questions=questions,
+        step_metrics=[],
+        result_rows=[],
+        metric_rows=[],
+    )
+    manifest_path = checkpoint_manifest_path(output_dir)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["benchmark_contract"] = f"old-{BENCHMARK_CONTRACT}"
+    manifest["policy_contract"] = f"old-{POLICY_CONTRACT}"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(SystemExit, match="benchmark_contract, policy_contract"):
+        load_checkpoint(
+            output_dir=output_dir,
+            sample_index=0,
+            row_limit=2,
+            question_limit=2,
+            model="test-model",
+            answer=False,
+            trace_enabled=False,
+            events=events,
+            questions=questions,
+        )
+
+
+def test_load_checkpoint_rejects_checkpoint_contract_digest_mismatch(tmp_path: Path) -> None:
+    output_dir = tmp_path / "run"
+    events = benchmark_events()
+    questions = benchmark_questions()
+    save_checkpoint(
+        output_dir=output_dir,
+        memory=FakeBenchmarkMemory(),
+        sample_index=0,
+        row_limit=2,
+        question_limit=2,
+        model="test-model",
+        answer=False,
+        events=events,
+        questions=questions,
+        step_metrics=[],
+        result_rows=[],
+        metric_rows=[],
+    )
+    manifest_path = checkpoint_manifest_path(output_dir)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["checkpoint_contract_digest"] == checkpoint_contract_digest()
+    manifest["checkpoint_contract_digest"] = "old-digest"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(SystemExit, match="checkpoint_contract_digest"):
+        load_checkpoint(
+            output_dir=output_dir,
+            sample_index=0,
+            row_limit=2,
+            question_limit=2,
+            model="test-model",
+            answer=False,
+            trace_enabled=False,
+            events=events,
+            questions=questions,
+        )
+
+
+def test_load_checkpoint_rejects_progress_rows_that_do_not_match_manifest(tmp_path: Path) -> None:
+    output_dir = tmp_path / "run"
+    events = benchmark_events()
+    questions = benchmark_questions()
+    save_checkpoint(
+        output_dir=output_dir,
+        memory=FakeBenchmarkMemory(),
+        sample_index=0,
+        row_limit=2,
+        question_limit=2,
+        model="test-model",
+        answer=False,
+        events=events,
+        questions=questions,
+        step_metrics=[{"phase": "add", "event_id": "D1:1"}],
+        result_rows=[{"question_id": "q1", "retrieved_text": "adoption agencies"}],
+        metric_rows=[{"question_id": "q1", "proxy_answer_string_hit": True}],
+    )
+    checkpoint_directory = current_checkpoint_snapshot_dir(output_dir)
+    write_jsonl_atomic(checkpoint_directory / "step_metrics.jsonl", [])
+
+    with pytest.raises(SystemExit, match="Checkpoint step metrics do not match manifest"):
+        load_checkpoint(
+            output_dir=output_dir,
+            sample_index=0,
+            row_limit=2,
+            question_limit=2,
+            model="test-model",
+            answer=False,
+            trace_enabled=False,
+            events=events,
+            questions=questions,
+        )
+
+
+def test_load_checkpoint_rejects_same_length_wrong_event_prefix(tmp_path: Path) -> None:
+    output_dir = tmp_path / "run"
+    events = benchmark_events()
+    questions = benchmark_questions()
+    save_checkpoint(
+        output_dir=output_dir,
+        memory=FakeBenchmarkMemory(),
+        sample_index=0,
+        row_limit=2,
+        question_limit=2,
+        model="test-model",
+        answer=False,
+        events=events,
+        questions=questions,
+        step_metrics=[{"phase": "add", "event_id": "D1:1"}],
+        result_rows=[],
+        metric_rows=[],
+    )
+    checkpoint_directory = current_checkpoint_snapshot_dir(output_dir)
+    write_jsonl_atomic(checkpoint_directory / "step_metrics.jsonl", [{"event_id": "D1:2"}])
+
+    with pytest.raises(SystemExit, match="event ids"):
+        load_checkpoint(
+            output_dir=output_dir,
+            sample_index=0,
+            row_limit=2,
+            question_limit=2,
+            model="test-model",
+            answer=False,
+            trace_enabled=False,
+            events=events,
+            questions=questions,
+        )
+
+
+def test_load_checkpoint_rejects_same_length_wrong_question_prefix(tmp_path: Path) -> None:
+    output_dir = tmp_path / "run"
+    events = benchmark_events()
+    questions = benchmark_questions()
+    save_checkpoint(
+        output_dir=output_dir,
+        memory=FakeBenchmarkMemory(),
+        sample_index=0,
+        row_limit=2,
+        question_limit=2,
+        model="test-model",
+        answer=False,
+        events=events,
+        questions=questions,
+        step_metrics=[],
+        result_rows=[{"question_id": "q1", "retrieved_text": "adoption agencies"}],
+        metric_rows=[{"question_id": "q1", "proxy_answer_string_hit": True}],
+    )
+    checkpoint_directory = current_checkpoint_snapshot_dir(output_dir)
+    write_jsonl_atomic(
+        checkpoint_directory / "result_rows.jsonl",
+        [{"question_id": "q2", "retrieved_text": "Melanie"}],
+    )
+
+    with pytest.raises(SystemExit, match="question ids"):
+        load_checkpoint(
+            output_dir=output_dir,
+            sample_index=0,
+            row_limit=2,
+            question_limit=2,
+            model="test-model",
+            answer=False,
+            trace_enabled=False,
+            events=events,
+            questions=questions,
+        )
+
+
+def test_load_checkpoint_rejects_result_rows_that_do_not_match_manifest(tmp_path: Path) -> None:
+    output_dir = tmp_path / "run"
+    events = benchmark_events()
+    questions = benchmark_questions()
+    save_checkpoint(
+        output_dir=output_dir,
+        memory=FakeBenchmarkMemory(),
+        sample_index=0,
+        row_limit=2,
+        question_limit=2,
+        model="test-model",
+        answer=False,
+        events=events,
+        questions=questions,
+        step_metrics=[],
+        result_rows=[{"question_id": "q1", "retrieved_text": "adoption agencies"}],
+        metric_rows=[{"question_id": "q1", "proxy_answer_string_hit": True}],
+    )
+    checkpoint_directory = current_checkpoint_snapshot_dir(output_dir)
+    write_jsonl_atomic(checkpoint_directory / "result_rows.jsonl", [])
+
+    with pytest.raises(SystemExit, match="Checkpoint result rows do not match manifest"):
+        load_checkpoint(
+            output_dir=output_dir,
+            sample_index=0,
+            row_limit=2,
+            question_limit=2,
+            model="test-model",
+            answer=False,
+            trace_enabled=False,
+            events=events,
+            questions=questions,
+        )
+
+
+def test_load_checkpoint_rejects_metric_rows_that_do_not_match_results(tmp_path: Path) -> None:
+    output_dir = tmp_path / "run"
+    events = benchmark_events()
+    questions = benchmark_questions()
+    save_checkpoint(
+        output_dir=output_dir,
+        memory=FakeBenchmarkMemory(),
+        sample_index=0,
+        row_limit=2,
+        question_limit=2,
+        model="test-model",
+        answer=False,
+        events=events,
+        questions=questions,
+        step_metrics=[],
+        result_rows=[{"question_id": "q1", "retrieved_text": "adoption agencies"}],
+        metric_rows=[{"question_id": "q1", "proxy_answer_string_hit": True}],
+    )
+    checkpoint_directory = current_checkpoint_snapshot_dir(output_dir)
+    write_jsonl_atomic(checkpoint_directory / "metric_rows.jsonl", [])
+
+    with pytest.raises(SystemExit, match="Checkpoint metric rows do not match result rows"):
+        load_checkpoint(
+            output_dir=output_dir,
+            sample_index=0,
+            row_limit=2,
+            question_limit=2,
+            model="test-model",
+            answer=False,
+            trace_enabled=False,
+            events=events,
+            questions=questions,
+        )
+
+
+def test_load_checkpoint_rejects_same_length_wrong_metric_prefix(tmp_path: Path) -> None:
+    output_dir = tmp_path / "run"
+    events = benchmark_events()
+    questions = benchmark_questions()
+    save_checkpoint(
+        output_dir=output_dir,
+        memory=FakeBenchmarkMemory(),
+        sample_index=0,
+        row_limit=2,
+        question_limit=2,
+        model="test-model",
+        answer=False,
+        events=events,
+        questions=questions,
+        step_metrics=[],
+        result_rows=[{"question_id": "q1", "retrieved_text": "adoption agencies"}],
+        metric_rows=[{"question_id": "q1", "proxy_answer_string_hit": True}],
+    )
+    checkpoint_directory = current_checkpoint_snapshot_dir(output_dir)
+    write_jsonl_atomic(
+        checkpoint_directory / "metric_rows.jsonl",
+        [{"question_id": "q2", "proxy_answer_string_hit": False}],
+    )
+
+    with pytest.raises(SystemExit, match="metric row question ids"):
+        load_checkpoint(
+            output_dir=output_dir,
+            sample_index=0,
+            row_limit=2,
+            question_limit=2,
+            model="test-model",
+            answer=False,
+            trace_enabled=False,
+            events=events,
+            questions=questions,
+        )
+
+
+def test_trace_exclusion_keeps_failed_attempt_out_of_final_anomalies(tmp_path: Path) -> None:
+    trace_dir = tmp_path / "trace"
+    trace_dir.mkdir()
+    (trace_dir / "events.jsonl").write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "trace_id": "success-before-failure",
+                        "event_type": "operator_result",
+                        "operator": "sem_map",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "trace_id": "failed-attempt",
+                        "event_type": "llm_batch_error",
+                        "operator": "sem_topk",
+                        "error_type": "InternalServerError",
+                        "error_message": "SSL EOF",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "trace_id": "success-after-resume",
+                        "event_type": "llm_call",
+                        "operator": "sem_topk",
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    anomalies = build_llm_anomaly_rows(
+        trace_dir=trace_dir,
+        excluded_event_ranges=[(1, 2)],
+    )
+
+    assert [row["trace_id"] for row in anomalies] == ["success-after-resume"]
+    assert anomalies[0]["issue"] == "missing_raw_output"
+
+
+def test_trace_exclusion_range_preserves_checkpoint_boundary(tmp_path: Path) -> None:
+    trace_dir = tmp_path / "trace"
+    trace_dir.mkdir()
+    (trace_dir / "events.jsonl").write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "trace_id": "checkpoint-boundary",
+                        "event_type": "llm_batch_error",
+                        "operator": "sem_topk",
+                        "error_type": "ShouldRemainVisible",
+                        "error_message": "event 1 is inside the checkpoint boundary",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "trace_id": "failed-after-checkpoint",
+                        "event_type": "llm_batch_error",
+                        "operator": "sem_topk",
+                        "error_type": "ShouldBeExcluded",
+                        "error_message": "event 2 happened after the checkpoint",
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    anomalies = build_llm_anomaly_rows(
+        trace_dir=trace_dir,
+        excluded_event_ranges=[(1, 2)],
+    )
+
+    assert [row["trace_id"] for row in anomalies] == ["checkpoint-boundary"]
+
+
+def test_recovery_metadata_records_excluded_trace_ranges(tmp_path: Path) -> None:
+    output_dir = tmp_path / "run"
+    path = write_recovery_metadata(
+        output_dir=output_dir,
+        excluded_trace_event_ranges=[(3, 5), (5, 7)],
+        error=RuntimeError("transport failed"),
+        trace_dir=None,
+    )
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["excluded_trace_event_ranges"] == [
+        {"start": 3, "end": 7, "count": 4}
+    ]
+    assert payload["excluded_trace_event_count"] == 4
+    assert payload["last_error_type"] == "RuntimeError"
 
 
 def test_failed_run_helpers_write_partial_artifacts(tmp_path: Path) -> None:
@@ -451,20 +1095,7 @@ def test_failed_run_helpers_write_partial_artifacts(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     questions = benchmark_questions()
-    events = (
-        BenchmarkEvent(
-            sample_id="sample",
-            event_id="D1:1",
-            speaker="Caroline",
-            text="I researched adoption agencies.",
-        ),
-        BenchmarkEvent(
-            sample_id="sample",
-            event_id="D1:2",
-            speaker="Melanie",
-            text="I helped.",
-        ),
-    )
+    events = benchmark_events()
 
     written = write_run_artifacts(
         output_dir=output_dir,

@@ -32,10 +32,11 @@ def build_cause_trace_rows(
     questions: Sequence[BenchmarkQuestion],
     ingested_event_ids: Collection[str],
     trace_dir: Path,
+    excluded_event_ranges: Sequence[tuple[int, int]] = (),
 ) -> list[dict[str, Any]]:
     """Build per-evidence dataflow diagnostics from existing trace artifacts."""
 
-    trace_events = load_trace_events(trace_dir)
+    trace_events = load_trace_events(trace_dir, excluded_event_ranges=excluded_event_ranges)
     events_by_source = _add_events_by_source_event(trace_events)
     ingested = set(ingested_event_ids)
     rows: list[dict[str, Any]] = []
@@ -56,11 +57,15 @@ def build_cause_trace_rows(
     return rows
 
 
-def build_llm_anomaly_rows(*, trace_dir: Path) -> list[dict[str, Any]]:
+def build_llm_anomaly_rows(
+    *,
+    trace_dir: Path,
+    excluded_event_ranges: Sequence[tuple[int, int]] = (),
+) -> list[dict[str, Any]]:
     """Build LLM boundary anomaly diagnostics from existing trace artifacts."""
 
     rows: list[dict[str, Any]] = []
-    for event in load_trace_events(trace_dir):
+    for event in load_trace_events(trace_dir, excluded_event_ranges=excluded_event_ranges):
         event_type = event.get("event_type")
         if event_type == "llm_batch_error":
             rows.append(_llm_anomaly_row(event, issue="llm_batch_error", raw_output=event))
@@ -85,16 +90,22 @@ def build_llm_anomaly_rows(*, trace_dir: Path) -> list[dict[str, Any]]:
     return rows
 
 
-def load_trace_events(trace_dir: Path) -> list[dict[str, Any]]:
+def load_trace_events(
+    trace_dir: Path,
+    excluded_event_ranges: Sequence[tuple[int, int]] = (),
+) -> list[dict[str, Any]]:
     """Load JSONL semantic trace events from ``trace_dir``."""
 
     events_path = trace_dir / "events.jsonl"
     if not events_path.exists():
         return []
+    excluded_ranges = tuple(excluded_event_ranges)
     events: list[dict[str, Any]] = []
     with events_path.open(encoding="utf-8") as handle:
-        for line in handle:
+        for event_number, line in enumerate(handle, start=1):
             if not line.strip():
+                continue
+            if _is_excluded_event_number(event_number, excluded_ranges):
                 continue
             try:
                 event = json.loads(line)
@@ -103,6 +114,20 @@ def load_trace_events(trace_dir: Path) -> list[dict[str, Any]]:
             if isinstance(event, dict):
                 events.append(event)
     return events
+
+
+def _is_excluded_event_number(
+    event_number: int,
+    excluded_event_ranges: Sequence[tuple[int, int]],
+) -> bool:
+    """Return whether one 1-based event number falls inside an excluded trace range.
+
+    Ranges use checkpoint-boundary semantics: ``(start, end]``. For example,
+    ``(32, 33)`` excludes only event 33, preserving the successful checkpoint
+    boundary at event 32.
+    """
+
+    return any(start < event_number <= end for start, end in excluded_event_ranges)
 
 
 def _llm_output_issue(raw_output: Any) -> str:
