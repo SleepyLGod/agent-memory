@@ -131,11 +131,11 @@ def native_memory_text(native_run: Path, native_maint_run: Path) -> str:
     summary_path = native_run / "metrics" / "summary.csv"
     memory_path = ""
     if summary_path.exists():
-        memory_path = read_summary(summary_path).get("final_memory_path", "")
+        memory_path = read_summary(summary_path).get("final_memory_path") or ""
     if not memory_path:
         maint_summary = native_maint_run / "native" / "component_eval" / "metrics" / "summary.csv"
         if maint_summary.exists():
-            memory_path = read_summary(maint_summary).get("finalMemoryPath", "")
+            memory_path = read_summary(maint_summary).get("finalMemoryPath") or ""
     root = Path(memory_path) if memory_path else native_maint_run / "native" / "final_memory" / "memory"
     chunks = []
     if root.exists():
