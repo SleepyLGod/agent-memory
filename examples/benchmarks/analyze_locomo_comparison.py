@@ -37,7 +37,7 @@ def read_csv(path: Path) -> list[dict[str, str]]:
 
     if not path.exists():
         raise FileNotFoundError(f"Missing required CSV: {path}")
-    with path.open(newline="") as handle:
+    with path.open(newline="", encoding="utf-8") as handle:
         return list(csv.DictReader(handle))
 
 
