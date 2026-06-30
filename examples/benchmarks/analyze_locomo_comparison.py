@@ -121,7 +121,7 @@ def agent_memory_text(agent_run: Path) -> str:
         if not path.exists():
             continue
         for row in read_csv(path):
-            chunks.extend(str(row.get(field, "")) for field in ("name", "description", "type", "body", "hook"))
+            chunks.extend(str(row.get(field) or "") for field in ("name", "description", "type", "body", "hook"))
     return "\n".join(chunks)
 
 
