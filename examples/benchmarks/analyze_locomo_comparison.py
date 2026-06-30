@@ -66,7 +66,7 @@ def read_text(path: Path) -> str:
 
     if not path.exists():
         return ""
-    return path.read_text(errors="ignore")
+    return path.read_text(encoding="utf-8", errors="ignore")
 
 
 def int_value(value: Any) -> int:
