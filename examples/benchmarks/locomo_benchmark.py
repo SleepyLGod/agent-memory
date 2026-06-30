@@ -26,8 +26,12 @@ from agent_memory.adapters.lotus import DEFAULT_LOTUS_MODEL, LotusAdapter  # noq
 from agent_memory.adapters.lotus.context import LotusExecutionConfig  # noqa: E402
 from agent_memory.benchmarks.diagnostics import (  # noqa: E402
     LLM_ANOMALY_COLUMNS,
+    PROVIDER_USAGE_COLUMNS,
+    PROVIDER_USAGE_SUMMARY_COLUMNS,
     build_cause_trace_rows,
     build_llm_anomaly_rows,
+    build_provider_usage_rows,
+    build_provider_usage_summary_rows,
 )
 from agent_memory.benchmarks.locomo import (  # noqa: E402
     eligible_questions,
@@ -100,6 +104,23 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=DEFAULT_OUTPUT_DIR,
         help="Directory for benchmark artifacts.",
+    )
+    parser.add_argument(
+        "--existing-output-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Restore memory runtime state from an existing benchmark checkpoint "
+            "and run questions only."
+        ),
+    )
+    parser.add_argument(
+        "--trust-existing-output-dir",
+        action="store_true",
+        help=(
+            "Allow query-only mode to unpickle runtime state from "
+            "--existing-output-dir. Use only for trusted local benchmark outputs."
+        ),
     )
     parser.add_argument(
         "--trace",
@@ -425,6 +446,8 @@ def checkpoint_manifest(
     question_limit: int,
     model: str,
     answer: bool,
+    maintenance_mode: str = "ingest",
+    source_run_dir: str = "",
     events: Sequence[BenchmarkEvent],
     questions: Sequence[BenchmarkQuestion],
     step_metrics: Sequence[Mapping[str, Any]],
@@ -449,6 +472,8 @@ def checkpoint_manifest(
         "question_limit": question_limit,
         "model": model,
         "answer": answer,
+        "maintenance_mode": maintenance_mode,
+        "source_run_dir": source_run_dir,
         "event_ids": [event.event_id for event in events],
         "question_ids": [question.question_id for question in questions],
         "completed_events": completed_events,
@@ -470,6 +495,8 @@ def save_checkpoint(
     question_limit: int,
     model: str,
     answer: bool,
+    maintenance_mode: str = "ingest",
+    source_run_dir: str = "",
     events: Sequence[BenchmarkEvent],
     questions: Sequence[BenchmarkQuestion],
     step_metrics: Sequence[Mapping[str, Any]],
@@ -491,6 +518,8 @@ def save_checkpoint(
         question_limit=question_limit,
         model=model,
         answer=answer,
+        maintenance_mode=maintenance_mode,
+        source_run_dir=source_run_dir,
         events=events,
         questions=questions,
         step_metrics=step_metrics,
@@ -524,6 +553,8 @@ def load_checkpoint(
     question_limit: int,
     model: str,
     answer: bool,
+    maintenance_mode: str = "ingest",
+    source_run_dir: str = "",
     trace_enabled: bool,
     events: Sequence[BenchmarkEvent],
     questions: Sequence[BenchmarkQuestion],
@@ -548,6 +579,8 @@ def load_checkpoint(
         "question_limit": question_limit,
         "model": model,
         "answer": answer,
+        "maintenance_mode": maintenance_mode,
+        "source_run_dir": source_run_dir,
         "event_ids": [event.event_id for event in events],
         "question_ids": [question.question_id for question in questions],
     }
@@ -574,6 +607,75 @@ def load_checkpoint(
         metric_rows=metric_rows,
     )
     return state, step_metrics, result_rows, metric_rows
+
+
+def load_external_runtime_state(
+    source_run_dir: Path,
+    *,
+    events: Sequence[BenchmarkEvent],
+    trusted_checkpoint: bool = False,
+) -> dict[str, Any]:
+    """Load runtime state from another benchmark run checkpoint."""
+
+    pointer_path = checkpoint_current_path(source_run_dir)
+    if not pointer_path.exists():
+        raise SystemExit(
+            "--existing-output-dir requires a source checkpoint: "
+            f"{pointer_path}"
+        )
+    try:
+        pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise SystemExit(f"Invalid source checkpoint pointer: {pointer_path}") from error
+    checkpoint_id = pointer.get("checkpoint_id")
+    if not isinstance(checkpoint_id, str) or not checkpoint_id:
+        raise SystemExit("Source checkpoint current pointer is missing checkpoint_id")
+    snapshot_dir = checkpoint_snapshots_dir(source_run_dir) / checkpoint_id
+    manifest_path = snapshot_dir / "manifest.json"
+    if not manifest_path.exists():
+        raise SystemExit(f"Source checkpoint is missing manifest: {manifest_path}")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise SystemExit(f"Invalid source checkpoint manifest: {manifest_path}") from error
+    expected = {
+        "schema_version": CHECKPOINT_SCHEMA_VERSION,
+        "benchmark_contract": BENCHMARK_CONTRACT,
+        "policy_contract": POLICY_CONTRACT,
+        "scorer_contract": SCORER_CONTRACT,
+        "checkpoint_contract_digest": checkpoint_contract_digest(),
+    }
+    mismatches = [key for key, value in expected.items() if manifest.get(key) != value]
+    if mismatches:
+        joined = ", ".join(mismatches)
+        raise SystemExit(f"Source checkpoint does not match benchmark contracts: {joined}")
+    source_event_ids = manifest.get("event_ids")
+    if not isinstance(source_event_ids, list):
+        raise SystemExit("Source checkpoint manifest is missing event_ids")
+    selected_event_ids = [event.event_id for event in events]
+    if source_event_ids[: len(selected_event_ids)] != selected_event_ids:
+        raise SystemExit("Source checkpoint event ids do not cover selected events")
+    try:
+        completed_events = int(manifest.get("completed_events", -1))
+    except (TypeError, ValueError) as error:
+        raise SystemExit("Source checkpoint completed_events is invalid") from error
+    if completed_events != len(selected_event_ids):
+        raise SystemExit(
+            "Source checkpoint completed event boundary must match selected events"
+        )
+    state_path = snapshot_dir / "state.pkl"
+    if not state_path.exists():
+        raise SystemExit(f"Source checkpoint is missing runtime state: {state_path}")
+    if not trusted_checkpoint:
+        raise SystemExit(
+            "Loading --existing-output-dir requires --trust-existing-output-dir "
+            "because checkpoint state.pkl uses Python pickle. Only use trusted "
+            "local benchmark outputs."
+        )
+    state = pickle.loads(state_path.read_bytes())
+    if not isinstance(state, dict):
+        raise SystemExit("Source checkpoint runtime state must be a dict")
+    return state
 
 
 def validate_checkpoint_progress(
@@ -852,6 +954,8 @@ def summary_frame(
     run_mode: str,
     model: str,
     sample_index: int,
+    maintenance_mode: str,
+    source_run_dir: str,
     events: Sequence[BenchmarkEvent],
     questions: Sequence[BenchmarkQuestion],
     memory: am.ClaudeMemory,
@@ -885,6 +989,8 @@ def summary_frame(
         "qa_accuracy_available": run_mode == "answer",
         "official_score_available": False,
         "strict_evidence_recall_available": False,
+        "maintenance_mode": maintenance_mode,
+        "source_run_dir": source_run_dir,
         "model": model,
         "sample_index": sample_index,
         "events_ingested": len(events),
@@ -948,6 +1054,8 @@ def write_run_artifacts(
     run_mode: str,
     model: str,
     sample_index: int,
+    maintenance_mode: str,
+    source_run_dir: str,
     events: Sequence[BenchmarkEvent],
     questions: Sequence[BenchmarkQuestion],
     memory: am.ClaudeMemory | None,
@@ -984,6 +1092,8 @@ def write_run_artifacts(
                 run_mode=run_mode,
                 model=model,
                 sample_index=sample_index,
+                maintenance_mode=maintenance_mode,
+                source_run_dir=source_run_dir,
                 events=events,
                 questions=questions,
                 memory=memory,
@@ -1020,6 +1130,10 @@ def write_trace_diagnostics(
 ) -> dict[str, Path]:
     """Write trace-derived diagnostic CSV artifacts."""
 
+    provider_usage_rows = build_provider_usage_rows(
+        trace_dir=trace_dir,
+        excluded_event_ranges=excluded_trace_event_ranges,
+    )
     return {
         "diagnostics/cause_trace": write_csv(
             "cause_trace",
@@ -1038,6 +1152,19 @@ def write_trace_diagnostics(
             pd.DataFrame(llm_anomaly_rows, columns=LLM_ANOMALY_COLUMNS),
             output_dir / "diagnostics",
         ),
+        "diagnostics/provider_usage": write_csv(
+            "provider_usage",
+            pd.DataFrame(provider_usage_rows, columns=PROVIDER_USAGE_COLUMNS),
+            output_dir / "diagnostics",
+        ),
+        "metrics/provider_usage_summary": write_csv(
+            "provider_usage_summary",
+            pd.DataFrame(
+                build_provider_usage_summary_rows(provider_usage_rows),
+                columns=PROVIDER_USAGE_SUMMARY_COLUMNS,
+            ),
+            output_dir / "metrics",
+        ),
     }
 
 
@@ -1050,10 +1177,13 @@ def write_failure_metadata(
     step_metrics: Sequence[Mapping[str, Any]],
     result_rows: Sequence[Mapping[str, Any]],
     trace_dir: Path | None,
+    completed_event_count: int | None = None,
 ) -> Path:
     """Write one JSON failure summary without swallowing the original error."""
 
-    completed_events = len(step_metrics)
+    completed_events = (
+        len(step_metrics) if completed_event_count is None else completed_event_count
+    )
     completed_questions = len(result_rows)
     failed_event_id = ""
     failed_question_id = ""
@@ -1136,6 +1266,19 @@ def main() -> None:
     args = parse_args()
     require_environment()
     output_dir = args.output_dir.resolve()
+    source_run_dir = (
+        args.existing_output_dir.resolve()
+        if args.existing_output_dir is not None
+        else None
+    )
+    if source_run_dir is not None and source_run_dir == output_dir:
+        raise SystemExit("--existing-output-dir must not be the same as --output-dir")
+    if source_run_dir is not None and not args.trust_existing_output_dir:
+        raise SystemExit(
+            "--existing-output-dir requires --trust-existing-output-dir because "
+            "checkpoint state.pkl uses Python pickle. Only use trusted local "
+            "benchmark outputs."
+        )
     if args.resume:
         output_dir.mkdir(parents=True, exist_ok=True)
     else:
@@ -1148,6 +1291,8 @@ def main() -> None:
     )
     trace_dir = output_dir / "trace" if args.trace else None
     run_mode = "answer" if args.answer else "retrieval_only_diagnostic"
+    maintenance_mode = "external-state" if source_run_dir is not None else "ingest"
+    source_run_dir_str = "" if source_run_dir is None else str(source_run_dir)
 
     print("LOCOMO benchmark")
     print(f"dataset: {dataset_path}")
@@ -1155,6 +1300,9 @@ def main() -> None:
     print(f"events: {len(events)}")
     print(f"eligible_questions: {len(questions)}")
     print(f"run_mode: {run_mode}")
+    print(f"maintenance_mode: {maintenance_mode}")
+    if source_run_dir is not None:
+        print(f"source_run_dir: {source_run_dir}")
     print(f"model: {args.model}")
     print(f"output_dir: {output_dir}")
 
@@ -1181,6 +1329,8 @@ def main() -> None:
                 question_limit=args.question_limit,
                 model=args.model,
                 answer=args.answer,
+                maintenance_mode=maintenance_mode,
+                source_run_dir=source_run_dir_str,
                 trace_enabled=args.trace,
                 events=events,
                 questions=questions,
@@ -1203,6 +1353,18 @@ def main() -> None:
                 f"completed_events={len(step_metrics)}, "
                 f"completed_questions={len(result_rows)}"
             )
+        elif source_run_dir is not None:
+            memory._runtime._state = load_external_runtime_state(
+                source_run_dir,
+                events=events,
+                trusted_checkpoint=True,
+            )
+            counts = memory_row_counts(memory)
+            print(
+                "restored external memory state: "
+                f"topics_rows={counts['topics_rows']}, "
+                f"catalog_rows={counts['catalog_rows']}"
+            )
 
         def checkpoint() -> None:
             save_checkpoint(
@@ -1213,6 +1375,8 @@ def main() -> None:
                 question_limit=args.question_limit,
                 model=args.model,
                 answer=args.answer,
+                maintenance_mode=maintenance_mode,
+                source_run_dir=source_run_dir_str,
                 events=events,
                 questions=questions,
                 step_metrics=step_metrics,
@@ -1222,13 +1386,16 @@ def main() -> None:
                 trace_enabled=args.trace,
             )
 
-        run_memory_ingest(
-            memory,
-            events,
-            step_metrics=step_metrics,
-            start_index=len(step_metrics),
-            checkpoint_callback=checkpoint,
-        )
+        if source_run_dir is None:
+            run_memory_ingest(
+                memory,
+                events,
+                step_metrics=step_metrics,
+                start_index=len(step_metrics),
+                checkpoint_callback=checkpoint,
+            )
+        else:
+            print("query-only mode: skipping memory ingest")
         result_rows, metric_rows = run_questions(
             memory,
             questions,
@@ -1254,6 +1421,8 @@ def main() -> None:
                     run_mode=run_mode,
                     model=args.model,
                     sample_index=args.sample_index,
+                    maintenance_mode=maintenance_mode,
+                    source_run_dir=source_run_dir_str,
                     events=events,
                     questions=questions,
                     memory=memory,
@@ -1262,7 +1431,11 @@ def main() -> None:
                     step_metrics=step_metrics,
                     trace_dir=trace_dir,
                     llm_anomaly_rows=llm_anomaly_rows,
-                    ingested_event_ids=completed_event_ids(step_metrics),
+                    ingested_event_ids=(
+                        tuple(event.event_id for event in events)
+                        if source_run_dir is not None
+                        else completed_event_ids(step_metrics)
+                    ),
                     include_summary=False,
                     excluded_trace_event_ranges=excluded_trace_event_ranges,
                 )
@@ -1275,6 +1448,9 @@ def main() -> None:
                 step_metrics=step_metrics,
                 result_rows=result_rows,
                 trace_dir=trace_dir,
+                completed_event_count=(
+                    len(events) if source_run_dir is not None else len(step_metrics)
+                ),
             )
             if trace_dir is not None:
                 failure_trace_ranges = trace_exclusion_ranges(
@@ -1309,6 +1485,8 @@ def main() -> None:
             run_mode=run_mode,
             model=args.model,
             sample_index=args.sample_index,
+            maintenance_mode=maintenance_mode,
+            source_run_dir=source_run_dir_str,
             events=events,
             questions=questions,
             memory=memory,
@@ -1317,7 +1495,11 @@ def main() -> None:
             step_metrics=step_metrics,
             trace_dir=trace_dir,
             llm_anomaly_rows=llm_anomaly_rows,
-            ingested_event_ids=completed_event_ids(step_metrics),
+            ingested_event_ids=(
+                tuple(event.event_id for event in events)
+                if source_run_dir is not None
+                else completed_event_ids(step_metrics)
+            ),
             include_summary=True,
             excluded_trace_event_ranges=excluded_trace_event_ranges,
         )

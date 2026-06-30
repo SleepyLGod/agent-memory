@@ -25,6 +25,38 @@ LLM_ANOMALY_COLUMNS = (
     "error_message",
     "model",
 )
+PROVIDER_USAGE_COLUMNS = (
+    "phase",
+    "operator",
+    "trace_id",
+    "question_id",
+    "event_id",
+    "model",
+    "provider_usage_available",
+    "provider_prompt_tokens",
+    "provider_completion_tokens",
+    "provider_total_tokens",
+    "provider_prompt_cache_hit_tokens",
+    "provider_prompt_cache_miss_tokens",
+    "provider_cache_read_input_tokens",
+    "provider_cache_creation_input_tokens",
+    "provider_raw_usage_path",
+)
+PROVIDER_USAGE_NUMERIC_COLUMNS = (
+    "provider_prompt_tokens",
+    "provider_completion_tokens",
+    "provider_total_tokens",
+    "provider_prompt_cache_hit_tokens",
+    "provider_prompt_cache_miss_tokens",
+    "provider_cache_read_input_tokens",
+    "provider_cache_creation_input_tokens",
+)
+PROVIDER_USAGE_SUMMARY_COLUMNS = (
+    "phase",
+    "provider_usage_event_count",
+    "provider_usage_available_count",
+    *PROVIDER_USAGE_NUMERIC_COLUMNS,
+)
 
 
 def build_cause_trace_rows(
@@ -87,6 +119,67 @@ def build_llm_anomaly_rows(
                     raw_output=raw_output,
                 )
             )
+    return rows
+
+
+def build_provider_usage_rows(
+    *,
+    trace_dir: Path,
+    excluded_event_ranges: Sequence[tuple[int, int]] = (),
+) -> list[dict[str, Any]]:
+    """Build provider usage rows from provider_usage trace events."""
+
+    rows: list[dict[str, Any]] = []
+    for event in load_trace_events(trace_dir, excluded_event_ranges=excluded_event_ranges):
+        if event.get("event_type") != "provider_usage":
+            continue
+        rows.append(
+            {
+                "phase": event.get("phase", ""),
+                "operator": event.get("operator", ""),
+                "trace_id": event.get("trace_id", ""),
+                "question_id": event.get("question_id", ""),
+                "event_id": event.get("event_id", ""),
+                "model": event.get("model", ""),
+                "provider_usage_available": bool(event.get("provider_usage_available")),
+                "provider_prompt_tokens": _int_or_zero(event.get("provider_prompt_tokens")),
+                "provider_completion_tokens": _int_or_zero(
+                    event.get("provider_completion_tokens")
+                ),
+                "provider_total_tokens": _int_or_zero(event.get("provider_total_tokens")),
+                "provider_prompt_cache_hit_tokens": _int_or_zero(
+                    event.get("provider_prompt_cache_hit_tokens")
+                ),
+                "provider_prompt_cache_miss_tokens": _int_or_zero(
+                    event.get("provider_prompt_cache_miss_tokens")
+                ),
+                "provider_cache_read_input_tokens": _int_or_zero(
+                    event.get("provider_cache_read_input_tokens")
+                ),
+                "provider_cache_creation_input_tokens": _int_or_zero(
+                    event.get("provider_cache_creation_input_tokens")
+                ),
+                "provider_raw_usage_path": event.get("provider_raw_usage_path", ""),
+            }
+        )
+    return rows
+
+
+def build_provider_usage_summary_rows(
+    provider_usage_rows: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Summarize provider usage rows by phase and overall total."""
+
+    grouped: dict[str, list[Mapping[str, Any]]] = {}
+    for row in provider_usage_rows:
+        phase = str(row.get("phase", "")) or "unknown"
+        grouped.setdefault(phase, []).append(row)
+
+    rows = [
+        _provider_usage_summary_row(phase, grouped[phase])
+        for phase in sorted(grouped)
+    ]
+    rows.append(_provider_usage_summary_row("_total", provider_usage_rows))
     return rows
 
 
@@ -409,6 +502,32 @@ def _int_or_none(value: Any) -> int | None:
     if isinstance(value, str) and value.strip().isdigit():
         return int(value.strip())
     return None
+
+
+def _int_or_zero(value: Any) -> int:
+    """Convert an arbitrary value to int, using zero for absent values."""
+
+    converted = _int_or_none(value)
+    return 0 if converted is None else converted
+
+
+def _provider_usage_summary_row(
+    phase: str,
+    rows: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Return one provider usage summary row."""
+
+    return {
+        "phase": phase,
+        "provider_usage_event_count": len(rows),
+        "provider_usage_available_count": sum(
+            1 for row in rows if bool(row.get("provider_usage_available"))
+        ),
+        **{
+            column: sum(_int_or_zero(row.get(column)) for row in rows)
+            for column in PROVIDER_USAGE_NUMERIC_COLUMNS
+        },
+    }
 
 
 def _preview(value: Any, *, limit: int = 240) -> str:

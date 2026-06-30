@@ -196,6 +196,58 @@ def write_llm_call_trace(
     return rows
 
 
+def write_provider_usage_trace(
+    trace_dir: Path | str | None,
+    *,
+    model: str,
+    responses: Sequence[Any],
+    request_metadata: Mapping[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Write raw provider usage payloads observed at the ModelResponse boundary."""
+
+    if trace_dir is None:
+        return []
+
+    root = _event_root(trace_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    scope = active_trace_scope()
+    operator = str(scope.get("operator", scope.get("semantic_operator", "llm")))
+    trace_operator = "provider-usage" if operator == "llm" else f"{operator}-provider-usage"
+    batch_id = _trace_id(trace_operator)
+    rows: list[dict[str, Any]] = []
+    for index, response in enumerate(responses):
+        trace_id = f"{batch_id}-{index:04d}"
+        usage = getattr(response, "usage", None)
+        raw_usage = _usage_payload(usage)
+        event: dict[str, Any] = {
+            "trace_id": trace_id,
+            "timestamp": _timestamp(),
+            "operator": operator,
+            "event_type": "provider_usage",
+            "provider_batch_id": batch_id,
+            "provider_item_index": index,
+            "provider_batch_size": len(responses),
+            "model": model,
+            "provider_usage_available": raw_usage is not None,
+        }
+        event.update(scope)
+        if request_metadata:
+            event["provider_request"] = _compact_payload(
+                {str(key): _json_safe(value) for key, value in request_metadata.items()}
+            )
+        event.update(_normalized_provider_usage(usage, raw_usage))
+        if raw_usage is not None:
+            event["provider_raw_usage_path"] = _write_json_artifact(
+                root / TRACE_OUTPUTS_DIR,
+                trace_id,
+                "provider-usage.json",
+                raw_usage,
+            )
+        _append_event(root, event)
+        rows.append(event)
+    return rows
+
+
 def write_pair_trace(
     trace_dir: Path | str | None,
     *,
@@ -383,6 +435,92 @@ def _json_safe(value: Any) -> Any:
         if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
             return [_json_safe(item) for item in value]
         return str(value)
+
+
+def _usage_payload(usage: Any) -> Any:
+    """Return a JSON-safe representation of one provider usage object."""
+
+    if usage is None:
+        return None
+    for method_name in ("model_dump", "dict"):
+        method = getattr(usage, method_name, None)
+        if callable(method):
+            try:
+                return _json_safe(method())
+            except TypeError:
+                continue
+    if isinstance(usage, Mapping):
+        return _json_safe(dict(usage))
+    attributes = getattr(usage, "__dict__", None)
+    if isinstance(attributes, Mapping):
+        return _json_safe(
+            {
+                key: value
+                for key, value in attributes.items()
+                if not str(key).startswith("_")
+            }
+        )
+    return _json_safe(usage)
+
+
+def _normalized_provider_usage(usage: Any, raw_usage: Any) -> dict[str, Any]:
+    """Return best-effort provider usage fields without inferring missing values."""
+
+    return {
+        "provider_prompt_tokens": _usage_value(usage, raw_usage, "prompt_tokens"),
+        "provider_completion_tokens": _usage_value(usage, raw_usage, "completion_tokens"),
+        "provider_total_tokens": _usage_value(usage, raw_usage, "total_tokens"),
+        "provider_prompt_cache_hit_tokens": _usage_value(
+            usage,
+            raw_usage,
+            "prompt_cache_hit_tokens",
+            ("prompt_tokens_details", "cached_tokens"),
+        ),
+        "provider_prompt_cache_miss_tokens": _usage_value(
+            usage,
+            raw_usage,
+            "prompt_cache_miss_tokens",
+        ),
+        "provider_cache_read_input_tokens": _usage_value(
+            usage,
+            raw_usage,
+            "cache_read_input_tokens",
+        ),
+        "provider_cache_creation_input_tokens": _usage_value(
+            usage,
+            raw_usage,
+            "cache_creation_input_tokens",
+        ),
+    }
+
+
+def _usage_value(usage: Any, raw_usage: Any, *paths: str | tuple[str, ...]) -> Any:
+    """Return the first present usage value for direct or nested paths."""
+
+    for path in paths:
+        parts = (path,) if isinstance(path, str) else path
+        raw_value = _nested_mapping_value(raw_usage, parts)
+        if raw_value != "":
+            return raw_value
+        value = usage
+        for part in parts:
+            value = getattr(value, part, None)
+            if value is None:
+                break
+        if value is not None:
+            return value
+    return ""
+
+
+def _nested_mapping_value(value: Any, path: Sequence[str]) -> Any:
+    """Return a nested mapping value, or empty string when absent."""
+
+    current = value
+    for part in path:
+        if not isinstance(current, Mapping) or part not in current:
+            return ""
+        current = current[part]
+    return current
 
 
 def _preview(value: Any) -> str:

@@ -6,8 +6,15 @@ import json
 from pathlib import Path
 from typing import Any
 
-from agent_memory.benchmarks.diagnostics import build_cause_trace_rows, build_llm_anomaly_rows
+from agent_memory.benchmarks.diagnostics import (
+    build_cause_trace_rows,
+    build_llm_anomaly_rows,
+    build_provider_usage_rows,
+    build_provider_usage_summary_rows,
+)
 from agent_memory.benchmarks.types import BenchmarkQuestion
+from agent_memory.adapters.lotus import provider_usage_lm
+from agent_memory.tracing.semantic import write_provider_usage_trace
 
 
 def question(evidence_event_ids: tuple[str, ...]) -> BenchmarkQuestion:
@@ -366,3 +373,196 @@ def test_llm_anomaly_marks_batch_error(tmp_path: Path) -> None:
     assert rows[0]["prompt_path"] == "trace/prompts/topk-prompt.json"
     assert rows[0]["error_type"] == "InternalServerError"
     assert rows[0]["error_message"] == "SSL EOF"
+
+
+def test_provider_usage_rows_ignore_other_events(tmp_path: Path) -> None:
+    trace_dir = tmp_path / "trace"
+    write_events(
+        trace_dir,
+        [
+            {
+                "trace_id": "llm-1",
+                "phase": "retrieval",
+                "operator": "sem_topk",
+                "event_type": "llm_call",
+            },
+            {
+                "trace_id": "usage-1",
+                "phase": "retrieval",
+                "operator": "sem_topk",
+                "question_id": "q1",
+                "event_type": "provider_usage",
+                "provider_usage_available": True,
+                "provider_prompt_tokens": 11,
+                "provider_completion_tokens": 3,
+                "provider_total_tokens": 14,
+                "provider_prompt_cache_hit_tokens": 5,
+                "provider_prompt_cache_miss_tokens": 6,
+                "provider_raw_usage_path": "trace/outputs/usage.json",
+            },
+        ],
+    )
+
+    rows = build_provider_usage_rows(trace_dir=trace_dir)
+
+    assert len(rows) == 1
+    assert rows[0]["trace_id"] == "usage-1"
+    assert rows[0]["phase"] == "retrieval"
+    assert rows[0]["operator"] == "sem_topk"
+    assert rows[0]["question_id"] == "q1"
+    assert rows[0]["provider_usage_available"] is True
+    assert rows[0]["provider_prompt_tokens"] == 11
+    assert rows[0]["provider_completion_tokens"] == 3
+    assert rows[0]["provider_total_tokens"] == 14
+    assert rows[0]["provider_prompt_cache_hit_tokens"] == 5
+    assert rows[0]["provider_prompt_cache_miss_tokens"] == 6
+    assert rows[0]["provider_raw_usage_path"] == "trace/outputs/usage.json"
+
+
+def test_provider_usage_rows_preserve_unavailable_usage(tmp_path: Path) -> None:
+    trace_dir = tmp_path / "trace"
+    write_events(
+        trace_dir,
+        [
+            {
+                "trace_id": "usage-1",
+                "phase": "answer",
+                "operator": "answer",
+                "event_type": "provider_usage",
+                "provider_usage_available": False,
+            },
+        ],
+    )
+
+    rows = build_provider_usage_rows(trace_dir=trace_dir)
+
+    assert len(rows) == 1
+    assert rows[0]["provider_usage_available"] is False
+    assert rows[0]["provider_total_tokens"] == 0
+
+
+def test_provider_usage_rows_respect_excluded_trace_ranges(tmp_path: Path) -> None:
+    trace_dir = tmp_path / "trace"
+    write_events(
+        trace_dir,
+        [
+            {
+                "trace_id": "usage-1",
+                "phase": "retrieval",
+                "event_type": "provider_usage",
+                "provider_total_tokens": 10,
+            },
+            {
+                "trace_id": "usage-2",
+                "phase": "retrieval",
+                "event_type": "provider_usage",
+                "provider_total_tokens": 20,
+            },
+        ],
+    )
+
+    rows = build_provider_usage_rows(
+        trace_dir=trace_dir,
+        excluded_event_ranges=((1, 2),),
+    )
+
+    assert [row["trace_id"] for row in rows] == ["usage-1"]
+
+
+def test_provider_usage_trace_compacts_request_metadata(tmp_path: Path) -> None:
+    trace_dir = tmp_path / "trace"
+
+    class FakeUsage:
+        def dict(self) -> dict[str, int]:
+            return {"total_tokens": 3}
+
+    class FakeResponse:
+        usage = FakeUsage()
+
+    write_provider_usage_trace(
+        trace_dir,
+        model="test-model",
+        responses=[FakeResponse()],
+        request_metadata={
+            "instruction": "x" * 500,
+            "provider_batch_size": 2,
+        },
+    )
+
+    events = (trace_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    event = json.loads(events[0])
+    assert "instruction" not in event["provider_request"]
+    assert event["provider_request"]["instruction_preview"].endswith("...")
+    assert event["provider_request"]["provider_batch_size"] == 2
+
+
+def test_provider_usage_tracing_mixin_is_best_effort(monkeypatch: Any) -> None:
+    class BaseLM:
+        model = "test-model"
+
+        def _process_uncached_messages(self, *_args: Any, **_kwargs: Any) -> list[str]:
+            return ["ok"]
+
+    class TracedLM(provider_usage_lm.ProviderUsageTracingMixin, BaseLM):
+        pass
+
+    captured: dict[str, Any] = {}
+
+    def fail_trace(*_args: Any, **kwargs: Any) -> None:
+        captured.update(kwargs)
+        raise OSError("disk full")
+
+    monkeypatch.setattr(provider_usage_lm, "write_provider_usage_trace", fail_trace)
+    lm = TracedLM(trace_dir="/tmp/trace")
+
+    responses = lm._process_uncached_messages(
+        [([{"role": "user", "content": "hi"}], "cache-key")],
+        {"max_tokens": 5, "api_key": "secret"},
+        False,
+        "",
+    )
+
+    assert responses == ["ok"]
+    assert captured["request_metadata"]["provider_kwargs"] == {"max_tokens": 5}
+
+
+def test_provider_usage_summary_groups_by_phase_and_total() -> None:
+    rows = [
+        {
+            "phase": "retrieval",
+            "provider_usage_available": True,
+            "provider_prompt_tokens": 10,
+            "provider_completion_tokens": 2,
+            "provider_total_tokens": 12,
+            "provider_prompt_cache_hit_tokens": 4,
+        },
+        {
+            "phase": "retrieval",
+            "provider_usage_available": False,
+            "provider_prompt_tokens": 0,
+            "provider_total_tokens": 0,
+        },
+        {
+            "phase": "answer",
+            "provider_usage_available": True,
+            "provider_prompt_tokens": 7,
+            "provider_completion_tokens": 1,
+            "provider_total_tokens": 8,
+            "provider_prompt_cache_miss_tokens": 7,
+        },
+    ]
+
+    summary = build_provider_usage_summary_rows(rows)
+
+    by_phase = {row["phase"]: row for row in summary}
+    assert by_phase["answer"]["provider_usage_event_count"] == 1
+    assert by_phase["answer"]["provider_usage_available_count"] == 1
+    assert by_phase["answer"]["provider_total_tokens"] == 8
+    assert by_phase["retrieval"]["provider_usage_event_count"] == 2
+    assert by_phase["retrieval"]["provider_usage_available_count"] == 1
+    assert by_phase["retrieval"]["provider_total_tokens"] == 12
+    assert by_phase["_total"]["provider_usage_event_count"] == 3
+    assert by_phase["_total"]["provider_usage_available_count"] == 2
+    assert by_phase["_total"]["provider_total_tokens"] == 20
+    assert by_phase["_total"]["provider_prompt_cache_hit_tokens"] == 4
+    assert by_phase["_total"]["provider_prompt_cache_miss_tokens"] == 7
