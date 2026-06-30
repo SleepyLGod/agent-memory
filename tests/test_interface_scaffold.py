@@ -1085,13 +1085,13 @@ def test_differentiated_policy_compiles_views_and_retrieval_templates() -> None:
     assert retrieval_query.op == "select"
     assert retrieval_query.params["columns"] == (
         "name",
-        "description:right",
-        "type:right",
+        "description",
+        "type",
         "body",
     )
     join_query = retrieval_query.inputs[0]
     assert join_query.op == "join"
-    assert join_query.params == {"on": ("name",), "how": "inner"}
+    assert join_query.params == {"on": ("name", "description", "type"), "how": "inner"}
     topk_query, topics_query = join_query.inputs
     _assert_materialized_view(topics_query, name="topics")
     assert topk_query.op == "sem_topk"

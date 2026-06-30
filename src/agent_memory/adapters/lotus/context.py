@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from agent_memory.adapters.lotus.provider_usage_lm import provider_usage_tracing_lm_class
 from agent_memory.adapters.lotus.traced_lm import TracedLM
 
 DEFAULT_STRUCTURED_MAX_TOKENS = 8192
@@ -95,8 +96,12 @@ class LotusExecutionContext:
         if self.config.lm_rate_limit is not None:
             lm_kwargs["rate_limit"] = self.config.lm_rate_limit
 
-        base_lm = LM(**lm_kwargs)
         trace_dir = self.config.trace_dir()
+        base_lm = (
+            provider_usage_tracing_lm_class(LM)(**lm_kwargs, trace_dir=trace_dir)
+            if trace_dir is not None
+            else LM(**lm_kwargs)
+        )
         lm = TracedLM(base_lm, trace_dir) if trace_dir is not None else base_lm
         lotus.settings.configure(lm=lm)
         self._configured = True

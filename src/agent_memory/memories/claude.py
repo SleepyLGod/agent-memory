@@ -217,6 +217,6 @@ class ClaudeMemory(Memory):
     retrieval_query = (
         topics.select(["name", "description", "type"])
         .sem_topk(UserQuery(), 5)
-        .join(topics, on="name")
-        .select(["name", "description:right", "type:right", "body"])
+        .join(topics, on=["name", "description", "type"])
+        .select(["name", "description", "type", "body"])
     )

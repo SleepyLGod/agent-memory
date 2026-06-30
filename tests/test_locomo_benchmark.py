@@ -40,6 +40,7 @@ from examples.benchmarks.locomo_benchmark import (
     checkpoint_snapshots_dir,
     current_checkpoint_snapshot_dir,
     load_checkpoint,
+    load_external_runtime_state,
     run_questions,
     save_checkpoint,
     summary_frame,
@@ -362,6 +363,8 @@ def test_summary_frame_records_input_rendering_contract() -> None:
         run_mode="answer",
         model="test-model",
         sample_index=0,
+        maintenance_mode="ingest",
+        source_run_dir="",
         events=(),
         questions=(),
         memory=FakeBenchmarkMemory(),
@@ -606,6 +609,154 @@ def test_load_checkpoint_rejects_mismatched_arguments(tmp_path: Path) -> None:
             events=events,
             questions=questions,
         )
+
+
+def test_load_checkpoint_rejects_maintenance_mode_mismatch(tmp_path: Path) -> None:
+    output_dir = tmp_path / "run"
+    events = benchmark_events()
+    questions = benchmark_questions()
+    save_checkpoint(
+        output_dir=output_dir,
+        memory=FakeBenchmarkMemory(),
+        sample_index=0,
+        row_limit=2,
+        question_limit=2,
+        model="test-model",
+        answer=False,
+        maintenance_mode="external-state",
+        source_run_dir="/tmp/source-run",
+        events=events,
+        questions=questions,
+        step_metrics=[],
+        result_rows=[],
+        metric_rows=[],
+    )
+
+    with pytest.raises(SystemExit, match="maintenance_mode, source_run_dir"):
+        load_checkpoint(
+            output_dir=output_dir,
+            sample_index=0,
+            row_limit=2,
+            question_limit=2,
+            model="test-model",
+            answer=False,
+            maintenance_mode="ingest",
+            source_run_dir="",
+            trace_enabled=False,
+            events=events,
+            questions=questions,
+        )
+
+
+def test_load_external_runtime_state_requires_source_event_coverage(tmp_path: Path) -> None:
+    source_run = tmp_path / "source"
+    events = benchmark_events()
+    questions = benchmark_questions()
+    save_checkpoint(
+        output_dir=source_run,
+        memory=FakeBenchmarkMemory(),
+        sample_index=0,
+        row_limit=1,
+        question_limit=2,
+        model="test-model",
+        answer=False,
+        events=events[:1],
+        questions=questions,
+        step_metrics=[{"phase": "add", "event_id": "D1:1"}],
+        result_rows=[],
+        metric_rows=[],
+    )
+
+    with pytest.raises(SystemExit, match="event ids do not cover selected events"):
+        load_external_runtime_state(source_run, events=events)
+
+
+def test_load_external_runtime_state_loads_valid_prefix_source(tmp_path: Path) -> None:
+    source_run = tmp_path / "source"
+    events = benchmark_events()
+    questions = benchmark_questions()
+    memory = FakeBenchmarkMemory()
+    save_checkpoint(
+        output_dir=source_run,
+        memory=memory,
+        sample_index=0,
+        row_limit=2,
+        question_limit=2,
+        model="test-model",
+        answer=False,
+        events=events,
+        questions=questions,
+        step_metrics=[
+            {"phase": "add", "event_id": "D1:1"},
+            {"phase": "add", "event_id": "D1:2"},
+        ],
+        result_rows=[],
+        metric_rows=[],
+    )
+
+    state = load_external_runtime_state(
+        source_run,
+        events=events,
+        trusted_checkpoint=True,
+    )
+
+    pd.testing.assert_frame_equal(state["topics"], memory._runtime._state["topics"])
+
+
+def test_load_external_runtime_state_rejects_extra_completed_events(tmp_path: Path) -> None:
+    source_run = tmp_path / "source"
+    events = benchmark_events()
+    questions = benchmark_questions()
+    save_checkpoint(
+        output_dir=source_run,
+        memory=FakeBenchmarkMemory(),
+        sample_index=0,
+        row_limit=2,
+        question_limit=2,
+        model="test-model",
+        answer=False,
+        events=events,
+        questions=questions,
+        step_metrics=[
+            {"phase": "add", "event_id": "D1:1"},
+            {"phase": "add", "event_id": "D1:2"},
+        ],
+        result_rows=[],
+        metric_rows=[],
+    )
+
+    with pytest.raises(SystemExit, match="completed event boundary"):
+        load_external_runtime_state(
+            source_run,
+            events=events[:1],
+            trusted_checkpoint=True,
+        )
+
+
+def test_load_external_runtime_state_requires_trusted_checkpoint_gate(tmp_path: Path) -> None:
+    source_run = tmp_path / "source"
+    events = benchmark_events()
+    questions = benchmark_questions()
+    save_checkpoint(
+        output_dir=source_run,
+        memory=FakeBenchmarkMemory(),
+        sample_index=0,
+        row_limit=2,
+        question_limit=2,
+        model="test-model",
+        answer=False,
+        events=events,
+        questions=questions,
+        step_metrics=[
+            {"phase": "add", "event_id": "D1:1"},
+            {"phase": "add", "event_id": "D1:2"},
+        ],
+        result_rows=[],
+        metric_rows=[],
+    )
+
+    with pytest.raises(SystemExit, match="trust-existing-output-dir"):
+        load_external_runtime_state(source_run, events=events)
 
 
 def test_load_checkpoint_rejects_trace_mode_mismatch(tmp_path: Path) -> None:
@@ -1102,6 +1253,8 @@ def test_failed_run_helpers_write_partial_artifacts(tmp_path: Path) -> None:
         run_mode="answer",
         model="test-model",
         sample_index=0,
+        maintenance_mode="ingest",
+        source_run_dir="",
         events=events,
         questions=questions,
         memory=FakeBenchmarkMemory(),
