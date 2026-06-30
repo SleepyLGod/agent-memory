@@ -519,7 +519,7 @@ def write_report(
             "- `retrieval/native_selector_outcomes.csv`",
         ]
     )
-    (output_dir / "report.md").write_text("\n".join(lines) + "\n")
+    (output_dir / "report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def main() -> None:
