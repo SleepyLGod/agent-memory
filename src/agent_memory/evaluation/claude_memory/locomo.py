@@ -1,30 +1,25 @@
-"""Run LOCOMO v1 benchmark slices against the built-in ClaudeMemory policy."""
+"""Importable ClaudeMemory LOCOMO evaluation runner."""
 
 from __future__ import annotations
 
-import argparse
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
 import hashlib
 import json
-import os
 from pathlib import Path
 import pickle
 import shutil
-from sys import path
 import time
 from typing import Any
-import warnings
 
-from dotenv import load_dotenv
 import pandas as pd
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-path.insert(0, str(PROJECT_ROOT / "src"))
-
-import agent_memory as am  # noqa: E402
-from agent_memory.adapters.lotus import DEFAULT_LOTUS_MODEL, LotusAdapter  # noqa: E402
-from agent_memory.adapters.lotus.context import LotusExecutionConfig  # noqa: E402
-from agent_memory.benchmarks.diagnostics import (  # noqa: E402
+import agent_memory as am
+from agent_memory.adapters.lotus import LotusAdapter
+from agent_memory.adapters.lotus.context import LotusExecutionConfig
+from agent_memory.datasets.locomo import DEFAULT_LOCOMO_URL, ensure_locomo_dataset
+from agent_memory.evaluation.claude_memory.bindings import event_to_claude_log_row
+from agent_memory.evaluation.diagnostics import (
     LLM_ANOMALY_COLUMNS,
     PROVIDER_USAGE_COLUMNS,
     PROVIDER_USAGE_SUMMARY_COLUMNS,
@@ -33,31 +28,29 @@ from agent_memory.benchmarks.diagnostics import (  # noqa: E402
     build_provider_usage_rows,
     build_provider_usage_summary_rows,
 )
-from agent_memory.benchmarks.locomo import (  # noqa: E402
+from agent_memory.evaluation.locomo import (
     eligible_questions,
-    event_to_claude_log_row,
     load_locomo_sample,
     select_events,
 )
-from agent_memory.benchmarks.metrics import (  # noqa: E402
+from agent_memory.evaluation.metrics import (
     duplicate_name_count,
     duplicate_name_extra_rows,
     frame_text,
     question_metric_row,
     summarize_question_metrics,
 )
-from agent_memory.benchmarks.types import BenchmarkEvent, BenchmarkQuestion  # noqa: E402
-from agent_memory.datasets.locomo import DEFAULT_LOCOMO_URL, ensure_locomo_dataset  # noqa: E402
-from agent_memory.tracing.semantic import semantic_trace_scope  # noqa: E402
+from agent_memory.evaluation.types import BenchmarkEvent, BenchmarkQuestion
+from agent_memory.tracing.semantic import semantic_trace_scope
 
-DEFAULT_OUTPUT_DIR = PROJECT_ROOT / ".memory-test" / "locomo-benchmark" / "latest"
-LOCOMO_CACHE_PATH = PROJECT_ROOT / ".cache" / "agent-memory" / "locomo10.json"
 ANSWER_MAX_TOKENS = 256
 ANSWER_SYSTEM_PROMPT = (
     "Answer the benchmark question using only the retrieved memory context. "
     "If the context is insufficient, answer 'No information available.'."
 )
 CHECKPOINT_SCHEMA_VERSION = 1
+RUN_MARKER_SCHEMA_VERSION = 1
+RUN_MARKER_FILENAME = ".agent-memory-locomo-run.json"
 BENCHMARK_CONTRACT = "message_with_event_context:v1"
 POLICY_CONTRACT = "claude_memory_policy:v1"
 SCORER_CONTRACT = "locomo_official_compatible_category_logic:v1"
@@ -70,98 +63,98 @@ USAGE_FIELDS = (
     "virtual_total_tokens",
     "cache_hits",
 )
+CSV_FORMULA_PREFIXES = ("=", "+", "-", "@")
+CSV_FORMULA_LEADING_CHARS = " \t\r\n"
 
 
-def parse_args() -> argparse.Namespace:
-    """Parse LOCOMO benchmark CLI arguments."""
+@dataclass(frozen=True)
+class ClaudeMemoryLocomoRunConfig:
+    """Configuration for one ClaudeMemory LOCOMO evaluation run."""
 
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--sample-index",
-        type=int,
-        default=0,
-        help="0-based LOCOMO sample index.",
-    )
-    parser.add_argument(
-        "--row-limit",
-        type=int,
-        default=12,
-        help="Number of normalized LOCOMO events to ingest.",
-    )
-    parser.add_argument(
-        "--question-limit",
-        type=int,
-        default=5,
-        help="Maximum eligible questions to evaluate.",
-    )
-    parser.add_argument(
-        "--model",
-        default=DEFAULT_LOTUS_MODEL,
-        help=f"LiteLLM model passed to LotusAdapter. Defaults to {DEFAULT_LOTUS_MODEL}.",
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=Path,
-        default=DEFAULT_OUTPUT_DIR,
-        help="Directory for benchmark artifacts.",
-    )
-    parser.add_argument(
-        "--existing-output-dir",
-        type=Path,
-        default=None,
-        help=(
-            "Restore memory runtime state from an existing benchmark checkpoint "
-            "and run questions only."
-        ),
-    )
-    parser.add_argument(
-        "--trust-existing-output-dir",
-        action="store_true",
-        help=(
-            "Allow query-only mode to unpickle runtime state from "
-            "--existing-output-dir. Use only for trusted local benchmark outputs."
-        ),
-    )
-    parser.add_argument(
-        "--trace",
-        action="store_true",
-        help="Write semantic trace artifacts under output_dir/trace.",
-    )
-    parser.add_argument(
-        "--answer",
-        action="store_true",
-        help="Generate answers from retrieved memories and compute answer metrics.",
-    )
-    parser.add_argument(
-        "--resume",
-        action="store_true",
-        help="Resume from output_dir/checkpoint instead of starting from scratch.",
-    )
-    return parser.parse_args()
+    sample_index: int
+    row_limit: int
+    question_limit: int
+    model: str
+    output_dir: Path
+    locomo_cache_path: Path
+    existing_output_dir: Path | None = None
+    trust_existing_output_dir: bool = False
+    trace: bool = False
+    answer: bool = False
+    resume: bool = False
+    restore_csv_state: bool = False
+    restore_artifact_csv_state: bool = False
 
 
-def require_environment() -> None:
-    """Load local env and fail early when LOTUS cannot call DeepSeek."""
-
-    load_dotenv(PROJECT_ROOT / ".env")
-    warnings.filterwarnings(
-        "ignore",
-        message="Error calculating completion cost - cost metrics will be inaccurate.*",
-        category=UserWarning,
-    )
-    if not os.getenv("DEEPSEEK_API_KEY"):
-        raise SystemExit(
-            "DEEPSEEK_API_KEY is required for LOCOMO benchmark runs. "
-            "Set it in .env or export it in the shell."
-        )
-
-
-def reset_output_dir(output_dir: Path) -> None:
+def reset_output_dir(output_dir: Path, *, safe: bool = False) -> None:
     """Create a clean benchmark output directory."""
 
+    if not safe:
+        raise ValueError("reset_output_dir requires prior output path safety validation")
     if output_dir.exists():
+        if not output_dir.is_dir():
+            raise SystemExit(f"Unsafe --output-dir is not a directory: {output_dir}")
+        if any(output_dir.iterdir()) and not is_run_owned_output_dir(output_dir):
+            raise SystemExit(
+                "Refusing to delete non-empty --output-dir without "
+                f"{RUN_MARKER_FILENAME}: {output_dir}"
+            )
         shutil.rmtree(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    write_run_marker(output_dir)
+
+
+def run_marker_path(output_dir: Path) -> Path:
+    """Return the marker path proving a directory is owned by this runner."""
+
+    return output_dir / RUN_MARKER_FILENAME
+
+
+def write_run_marker(output_dir: Path) -> None:
+    """Write a marker that permits later safe cleanup of this run directory."""
+
+    payload = {
+        "schema_version": RUN_MARKER_SCHEMA_VERSION,
+        "tool": "agent-memory.claude-memory-locomo",
+    }
+    write_text_atomic(run_marker_path(output_dir), json.dumps(payload, indent=2))
+
+
+def is_run_owned_output_dir(output_dir: Path) -> bool:
+    """Return whether output_dir has a valid runner ownership marker."""
+
+    marker_path = run_marker_path(output_dir)
+    if not marker_path.exists():
+        return False
+    try:
+        payload = json.loads(marker_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return False
+    return (
+        payload.get("schema_version") == RUN_MARKER_SCHEMA_VERSION
+        and payload.get("tool") == "agent-memory.claude-memory-locomo"
+    )
+
+
+def csv_safe_value(value: Any) -> Any:
+    """Return a spreadsheet-safe value for CSV artifact cells."""
+
+    if isinstance(value, str) and value.lstrip(CSV_FORMULA_LEADING_CHARS).startswith(
+        CSV_FORMULA_PREFIXES
+    ):
+        return f"'{value}"
+    return value
+
+
+def csv_safe_frame(frame: Any) -> Any:
+    """Return a copy with formula-like strings escaped for CSV artifacts."""
+
+    if not isinstance(frame, pd.DataFrame):
+        return frame
+    safe = frame.copy()
+    for column in safe.select_dtypes(include=("object", "string")).columns:
+        safe[column] = safe[column].map(csv_safe_value)
+    return safe
 
 
 def write_csv(name: str, frame: Any, output_dir: Path) -> Path:
@@ -169,8 +162,20 @@ def write_csv(name: str, frame: Any, output_dir: Path) -> Path:
 
     output_dir.mkdir(parents=True, exist_ok=True)
     csv_path = output_dir / f"{name}.csv"
-    frame.to_csv(csv_path, index=False)
+    csv_safe_frame(frame).to_csv(csv_path, index=False)
     return csv_path
+
+
+def write_state_jsonl(name: str, frame: Any, output_dir: Path) -> Path:
+    """Write raw machine-readable state rows to JSONL and return its path."""
+
+    if not isinstance(frame, pd.DataFrame):
+        raise TypeError("write_state_jsonl requires a pandas DataFrame")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    jsonl_path = output_dir / f"{name}.jsonl"
+    records = frame.where(pd.notna(frame), None).to_dict(orient="records")
+    write_jsonl_atomic(jsonl_path, records)
+    return jsonl_path
 
 
 def checkpoint_dir(output_dir: Path) -> Path:
@@ -247,6 +252,34 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def path_contains(parent: Path, child: Path) -> bool:
+    """Return whether parent is child or one of child's ancestors."""
+
+    try:
+        child.relative_to(parent)
+    except ValueError:
+        return False
+    return True
+
+
+def validate_output_paths(*, output_dir: Path, source_run_dir: Path | None) -> None:
+    """Reject destructive output paths and source/output overlaps."""
+
+    cwd = Path.cwd().resolve()
+    home = Path.home().resolve()
+    root = Path(output_dir.anchor).resolve()
+    unsafe_paths = {cwd, home, root}
+    if output_dir in unsafe_paths:
+        raise SystemExit(f"Unsafe --output-dir would delete a broad path: {output_dir}")
+    if source_run_dir is None:
+        return
+    if path_contains(output_dir, source_run_dir) or path_contains(source_run_dir, output_dir):
+        raise SystemExit(
+            "--output-dir and --existing-output-dir must not be the same path "
+            "or nested inside each other"
+        )
+
+
 def stable_digest(payload: Mapping[str, Any]) -> str:
     """Return a stable SHA-256 digest for JSON-compatible benchmark metadata."""
 
@@ -293,11 +326,30 @@ def benchmark_input_digest(
     )
 
 
+def benchmark_event_fingerprints(
+    events: Sequence[BenchmarkEvent],
+) -> tuple[dict[str, Any], ...]:
+    """Return event content fingerprints for checkpoint prefix validation."""
+
+    return tuple(
+        {
+            "sample_id": event.sample_id,
+            "event_id": event.event_id,
+            "speaker": event.speaker,
+            "text": event.text,
+            "session_id": event.session_id,
+            "timestamp": event.timestamp,
+        }
+        for event in events
+    )
+
+
 def checkpoint_contract_digest() -> str:
     """Return the current benchmark/checkpoint contract digest."""
 
     return stable_digest(
         {
+            "answer_max_tokens": ANSWER_MAX_TOKENS,
             "answer_system_prompt": ANSWER_SYSTEM_PROMPT,
             "benchmark_contract": BENCHMARK_CONTRACT,
             "policy_contract": POLICY_CONTRACT,
@@ -420,6 +472,7 @@ def selected_benchmark_data(
     sample_index: int,
     row_limit: int,
     question_limit: int,
+    locomo_cache_path: Path,
 ) -> tuple[Path, tuple[BenchmarkEvent, ...], tuple[BenchmarkQuestion, ...]]:
     """Load and select one LOCOMO benchmark slice."""
 
@@ -428,7 +481,7 @@ def selected_benchmark_data(
     if question_limit < 0:
         raise SystemExit("--question-limit must be non-negative")
 
-    dataset_path = ensure_locomo_dataset(LOCOMO_CACHE_PATH, url=DEFAULT_LOCOMO_URL)
+    dataset_path = ensure_locomo_dataset(locomo_cache_path, url=DEFAULT_LOCOMO_URL)
     sample = load_locomo_sample(dataset_path, sample_index=sample_index)
     events = select_events(sample.events, row_limit=row_limit)
     questions = eligible_questions(
@@ -475,6 +528,7 @@ def checkpoint_manifest(
         "maintenance_mode": maintenance_mode,
         "source_run_dir": source_run_dir,
         "event_ids": [event.event_id for event in events],
+        "event_fingerprints": list(benchmark_event_fingerprints(events)),
         "question_ids": [question.question_id for question in questions],
         "completed_events": completed_events,
         "completed_questions": completed_questions,
@@ -558,6 +612,7 @@ def load_checkpoint(
     trace_enabled: bool,
     events: Sequence[BenchmarkEvent],
     questions: Sequence[BenchmarkQuestion],
+    trusted_checkpoint: bool = False,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     """Load and validate one benchmark checkpoint."""
 
@@ -582,6 +637,7 @@ def load_checkpoint(
         "maintenance_mode": maintenance_mode,
         "source_run_dir": source_run_dir,
         "event_ids": [event.event_id for event in events],
+        "event_fingerprints": list(benchmark_event_fingerprints(events)),
         "question_ids": [question.question_id for question in questions],
     }
     mismatches = [key for key, value in expected.items() if manifest.get(key) != value]
@@ -592,6 +648,12 @@ def load_checkpoint(
     state_path = directory / "state.pkl"
     if not state_path.exists():
         raise SystemExit(f"Checkpoint is missing runtime state: {state_path}")
+    if not trusted_checkpoint:
+        raise SystemExit(
+            "Loading --resume requires --trust-existing-output-dir because "
+            "checkpoint state.pkl uses Python pickle. Only use trusted local "
+            "benchmark outputs."
+        )
     state = pickle.loads(state_path.read_bytes())
     if not isinstance(state, dict):
         raise SystemExit("Checkpoint runtime state must be a dict")
@@ -655,6 +717,12 @@ def load_external_runtime_state(
     selected_event_ids = [event.event_id for event in events]
     if source_event_ids[: len(selected_event_ids)] != selected_event_ids:
         raise SystemExit("Source checkpoint event ids do not cover selected events")
+    source_event_fingerprints = manifest.get("event_fingerprints")
+    if not isinstance(source_event_fingerprints, list):
+        raise SystemExit("Source checkpoint manifest is missing event_fingerprints")
+    selected_event_fingerprints = list(benchmark_event_fingerprints(events))
+    if source_event_fingerprints[: len(selected_event_fingerprints)] != selected_event_fingerprints:
+        raise SystemExit("Source checkpoint event content does not cover selected events")
     try:
         completed_events = int(manifest.get("completed_events", -1))
     except (TypeError, ValueError) as error:
@@ -676,6 +744,113 @@ def load_external_runtime_state(
     if not isinstance(state, dict):
         raise SystemExit("Source checkpoint runtime state must be a dict")
     return state
+
+
+def load_artifact_runtime_state(
+    source_run_dir: Path,
+    *,
+    events: Sequence[BenchmarkEvent],
+    trusted_checkpoint: bool = False,
+) -> dict[str, Any]:
+    """Restore public ClaudeMemory state from raw machine-readable artifacts."""
+
+    if not trusted_checkpoint:
+        raise SystemExit(
+            "Loading --restore-artifact-csv-state requires --trust-existing-output-dir. "
+            "Only use trusted local benchmark outputs."
+        )
+    source_events_path = source_run_dir / "state" / "input" / "events.jsonl"
+    if not source_events_path.exists():
+        raise SystemExit(
+            "--restore-artifact-csv-state requires source events state: "
+            f"{source_events_path}"
+        )
+    event_columns = ("sample_id", "event_id", "speaker", "session_id", "timestamp", "text")
+    source_events = read_state_jsonl(
+        source_events_path,
+        required=True,
+        empty_columns=event_columns,
+    )
+    validate_artifact_event_prefix(source_events, events)
+
+    memory_dir = source_run_dir / "state" / "memory"
+    log_columns = ("message", "role", "timestamp", "session_id")
+    log = read_state_jsonl(
+        memory_dir / "log.jsonl",
+        required=False,
+        empty_columns=log_columns,
+    )
+    topic_columns = ("name", "description", "type", "body")
+    topics = read_state_jsonl(
+        memory_dir / "topics.jsonl",
+        required=True,
+        empty_columns=topic_columns,
+    )
+    require_columns(
+        topics,
+        set(topic_columns),
+        path=memory_dir / "topics.jsonl",
+    )
+    catalog_columns = ("catalog_title", "name", "hook")
+    catalog = read_state_jsonl(
+        memory_dir / "catalog.jsonl",
+        required=True,
+        empty_columns=catalog_columns,
+    )
+    require_columns(
+        catalog,
+        set(catalog_columns),
+        path=memory_dir / "catalog.jsonl",
+    )
+    return {
+        "log": log,
+        "topics": topics,
+        "catalog": catalog,
+    }
+
+
+def read_state_jsonl(
+    path: Path,
+    *,
+    required: bool,
+    empty_columns: Sequence[str] = (),
+) -> pd.DataFrame:
+    """Read one raw JSONL state artifact, returning an empty DataFrame when optional."""
+
+    if not path.exists():
+        if required:
+            raise SystemExit(f"--restore-artifact-csv-state requires state JSONL: {path}")
+        return pd.DataFrame()
+    rows = read_jsonl(path)
+    if not rows and empty_columns:
+        return pd.DataFrame(columns=list(empty_columns))
+    return pd.DataFrame(rows)
+
+
+def require_columns(frame: pd.DataFrame, columns: set[str], *, path: Path) -> None:
+    """Require restored artifact state columns."""
+
+    missing = sorted(columns.difference(frame.columns))
+    if missing:
+        raise SystemExit(f"Restored artifact state {path} is missing required columns: {missing}")
+
+
+def validate_artifact_event_prefix(
+    source_events: pd.DataFrame,
+    events: Sequence[BenchmarkEvent],
+) -> None:
+    """Validate restored source events match the selected input prefix."""
+
+    required = ("sample_id", "event_id", "speaker", "session_id", "timestamp", "text")
+    require_columns(source_events, set(required), path=Path("input/events.csv"))
+    if len(source_events) < len(events):
+        raise SystemExit("Restored CSV events do not cover selected events")
+    if not events:
+        return
+    expected = pd.DataFrame(list(benchmark_event_fingerprints(events))).loc[:, list(required)]
+    actual = source_events.loc[: len(events) - 1, list(required)].reset_index(drop=True)
+    if actual.to_dict(orient="records") != expected.to_dict(orient="records"):
+        raise SystemExit("Restored CSV event content does not cover selected events")
 
 
 def validate_checkpoint_progress(
@@ -1030,20 +1205,26 @@ def summary_frame(
 
 
 def write_memory_tables(memory: am.ClaudeMemory, output_dir: Path) -> dict[str, Path]:
-    """Write runtime memory state CSVs."""
+    """Write runtime memory state display CSVs and raw restore JSONL."""
 
     state = memory._runtime._state
+    log = state.get("log", pd.DataFrame())
+    topics = state.get("topics", pd.DataFrame())
+    catalog = state.get("catalog", pd.DataFrame())
     return {
-        "memory/log": write_csv("log", state.get("log", pd.DataFrame()), output_dir / "memory"),
-        "memory/topics": write_csv(
+        "memory/log": write_csv("log", log, output_dir / "memory"),
+        "memory/topics": write_csv("topics", topics, output_dir / "memory"),
+        "memory/catalog": write_csv("catalog", catalog, output_dir / "memory"),
+        "state/memory/log": write_state_jsonl("log", log, output_dir / "state" / "memory"),
+        "state/memory/topics": write_state_jsonl(
             "topics",
-            state.get("topics", pd.DataFrame()),
-            output_dir / "memory",
+            topics,
+            output_dir / "state" / "memory",
         ),
-        "memory/catalog": write_csv(
+        "state/memory/catalog": write_state_jsonl(
             "catalog",
-            state.get("catalog", pd.DataFrame()),
-            output_dir / "memory",
+            catalog,
+            output_dir / "state" / "memory",
         ),
     }
 
@@ -1260,50 +1441,61 @@ def completed_event_ids(step_metrics: Sequence[Mapping[str, Any]]) -> tuple[str,
     )
 
 
-def main() -> None:
-    """Run one LOCOMO benchmark slice and write CSV artifacts."""
+def run_claude_memory_locomo(config: ClaudeMemoryLocomoRunConfig) -> dict[str, Path]:
+    """Run one ClaudeMemory LOCOMO evaluation slice and write CSV artifacts."""
 
-    args = parse_args()
-    require_environment()
-    output_dir = args.output_dir.resolve()
+    output_dir = config.output_dir.resolve()
     source_run_dir = (
-        args.existing_output_dir.resolve()
-        if args.existing_output_dir is not None
+        config.existing_output_dir.resolve()
+        if config.existing_output_dir is not None
         else None
     )
-    if source_run_dir is not None and source_run_dir == output_dir:
-        raise SystemExit("--existing-output-dir must not be the same as --output-dir")
-    if source_run_dir is not None and not args.trust_existing_output_dir:
+    validate_output_paths(output_dir=output_dir, source_run_dir=source_run_dir)
+    if config.restore_csv_state:
+        raise SystemExit(
+            "--restore-csv-state is no longer supported because display CSVs "
+            "are spreadsheet-escaped. Use --restore-artifact-csv-state."
+        )
+    if config.restore_artifact_csv_state and source_run_dir is None:
+        raise SystemExit("--restore-artifact-csv-state requires --existing-output-dir")
+    if config.restore_artifact_csv_state and config.resume:
+        raise SystemExit("--restore-artifact-csv-state cannot be used with --resume")
+    if source_run_dir is not None and not config.trust_existing_output_dir:
         raise SystemExit(
             "--existing-output-dir requires --trust-existing-output-dir because "
-            "checkpoint state.pkl uses Python pickle. Only use trusted local "
-            "benchmark outputs."
+            "local benchmark outputs may contain checkpoint pickle or artifact state."
         )
-    if args.resume:
+    if config.resume and not config.trust_existing_output_dir:
+        raise SystemExit(
+            "--resume requires --trust-existing-output-dir because checkpoint "
+            "state.pkl uses Python pickle. Only use trusted local benchmark outputs."
+        )
+    if config.resume:
         output_dir.mkdir(parents=True, exist_ok=True)
     else:
-        reset_output_dir(output_dir)
+        reset_output_dir(output_dir, safe=True)
 
     dataset_path, events, questions = selected_benchmark_data(
-        sample_index=args.sample_index,
-        row_limit=args.row_limit,
-        question_limit=args.question_limit,
+        sample_index=config.sample_index,
+        row_limit=config.row_limit,
+        question_limit=config.question_limit,
+        locomo_cache_path=config.locomo_cache_path,
     )
-    trace_dir = output_dir / "trace" if args.trace else None
-    run_mode = "answer" if args.answer else "retrieval_only_diagnostic"
+    trace_dir = output_dir / "trace" if config.trace else None
+    run_mode = "answer" if config.answer else "retrieval_only_diagnostic"
     maintenance_mode = "external-state" if source_run_dir is not None else "ingest"
     source_run_dir_str = "" if source_run_dir is None else str(source_run_dir)
 
     print("LOCOMO benchmark")
     print(f"dataset: {dataset_path}")
-    print(f"sample_index: {args.sample_index}")
+    print(f"sample_index: {config.sample_index}")
     print(f"events: {len(events)}")
     print(f"eligible_questions: {len(questions)}")
     print(f"run_mode: {run_mode}")
     print(f"maintenance_mode: {maintenance_mode}")
     if source_run_dir is not None:
         print(f"source_run_dir: {source_run_dir}")
-    print(f"model: {args.model}")
+    print(f"model: {config.model}")
     print(f"output_dir: {output_dir}")
 
     written: dict[str, Path] = {
@@ -1313,6 +1505,11 @@ def main() -> None:
             questions_frame(questions),
             output_dir / "input",
         ),
+        "state/input/events": write_state_jsonl(
+            "events",
+            pd.DataFrame(list(benchmark_event_fingerprints(events))),
+            output_dir / "state" / "input",
+        ),
     }
     memory: am.ClaudeMemory | None = None
     step_metrics: list[dict[str, Any]] = []
@@ -1320,20 +1517,21 @@ def main() -> None:
     metric_rows: list[dict[str, Any]] = []
     excluded_trace_event_ranges: list[tuple[int, int]] = []
     try:
-        memory = create_memory(model=args.model, trace_dir=trace_dir)
-        if args.resume:
+        memory = create_memory(model=config.model, trace_dir=trace_dir)
+        if config.resume:
             state, step_metrics, result_rows, metric_rows = load_checkpoint(
                 output_dir=output_dir,
-                sample_index=args.sample_index,
-                row_limit=args.row_limit,
-                question_limit=args.question_limit,
-                model=args.model,
-                answer=args.answer,
+                sample_index=config.sample_index,
+                row_limit=config.row_limit,
+                question_limit=config.question_limit,
+                model=config.model,
+                answer=config.answer,
                 maintenance_mode=maintenance_mode,
                 source_run_dir=source_run_dir_str,
-                trace_enabled=args.trace,
+                trace_enabled=config.trace,
                 events=events,
                 questions=questions,
+                trusted_checkpoint=config.trust_existing_output_dir,
             )
             memory._runtime._state = state
             checkpoint_trace_count = checkpoint_trace_event_count(output_dir)
@@ -1353,11 +1551,23 @@ def main() -> None:
                 f"completed_events={len(step_metrics)}, "
                 f"completed_questions={len(result_rows)}"
             )
+        elif source_run_dir is not None and config.restore_artifact_csv_state:
+            memory._runtime._state = load_artifact_runtime_state(
+                source_run_dir,
+                events=events,
+                trusted_checkpoint=config.trust_existing_output_dir,
+            )
+            counts = memory_row_counts(memory)
+            print(
+                "restored artifact memory state: "
+                f"topics_rows={counts['topics_rows']}, "
+                f"catalog_rows={counts['catalog_rows']}"
+            )
         elif source_run_dir is not None:
             memory._runtime._state = load_external_runtime_state(
                 source_run_dir,
                 events=events,
-                trusted_checkpoint=True,
+                trusted_checkpoint=config.trust_existing_output_dir,
             )
             counts = memory_row_counts(memory)
             print(
@@ -1370,11 +1580,11 @@ def main() -> None:
             save_checkpoint(
                 output_dir=output_dir,
                 memory=memory,
-                sample_index=args.sample_index,
-                row_limit=args.row_limit,
-                question_limit=args.question_limit,
-                model=args.model,
-                answer=args.answer,
+                sample_index=config.sample_index,
+                row_limit=config.row_limit,
+                question_limit=config.question_limit,
+                model=config.model,
+                answer=config.answer,
                 maintenance_mode=maintenance_mode,
                 source_run_dir=source_run_dir_str,
                 events=events,
@@ -1383,7 +1593,7 @@ def main() -> None:
                 result_rows=result_rows,
                 metric_rows=metric_rows,
                 trace_dir=trace_dir,
-                trace_enabled=args.trace,
+                trace_enabled=config.trace,
             )
 
         if source_run_dir is None:
@@ -1399,7 +1609,7 @@ def main() -> None:
         result_rows, metric_rows = run_questions(
             memory,
             questions,
-            answer=args.answer,
+            answer=config.answer,
             result_rows=result_rows,
             metric_rows=metric_rows,
             start_index=len(result_rows),
@@ -1419,8 +1629,8 @@ def main() -> None:
                 write_run_artifacts(
                     output_dir=output_dir,
                     run_mode=run_mode,
-                    model=args.model,
-                    sample_index=args.sample_index,
+                    model=config.model,
+                    sample_index=config.sample_index,
                     maintenance_mode=maintenance_mode,
                     source_run_dir=source_run_dir_str,
                     events=events,
@@ -1483,8 +1693,8 @@ def main() -> None:
         write_run_artifacts(
             output_dir=output_dir,
             run_mode=run_mode,
-            model=args.model,
-            sample_index=args.sample_index,
+            model=config.model,
+            sample_index=config.sample_index,
             maintenance_mode=maintenance_mode,
             source_run_dir=source_run_dir_str,
             events=events,
@@ -1508,7 +1718,4 @@ def main() -> None:
     print("\nwrote benchmark artifacts:")
     for name, path_value in written.items():
         print(f"- {name}: {path_value}")
-
-
-if __name__ == "__main__":
-    main()
+    return written

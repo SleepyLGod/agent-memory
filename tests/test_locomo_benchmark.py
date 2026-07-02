@@ -9,16 +9,17 @@ from typing import Any
 import pandas as pd
 import pytest
 
-from agent_memory.benchmarks.diagnostics import build_llm_anomaly_rows
-from agent_memory.benchmarks.types import BenchmarkEvent, BenchmarkQuestion
-from agent_memory.benchmarks.locomo import (
+import agent_memory.evaluation.claude_memory.locomo as claude_memory_locomo_module
+from agent_memory.evaluation.claude_memory.bindings import event_to_claude_log_row
+from agent_memory.evaluation.diagnostics import build_llm_anomaly_rows
+from agent_memory.evaluation.types import BenchmarkEvent, BenchmarkQuestion
+from agent_memory.evaluation.locomo import (
     eligible_questions,
-    event_to_claude_log_row,
     load_locomo_sample,
     normalize_locomo_sample,
     select_events,
 )
-from agent_memory.benchmarks.metrics import (
+from agent_memory.evaluation.metrics import (
     contains_answer,
     duplicate_name_count,
     duplicate_name_extra_rows,
@@ -31,24 +32,42 @@ from agent_memory.benchmarks.metrics import (
     summarize_question_metrics,
     token_f1,
 )
-from examples.benchmarks.locomo_benchmark import (
+from agent_memory.evaluation.claude_memory.locomo import (
+    ANSWER_MAX_TOKENS,
     ANSWER_SYSTEM_PROMPT,
     BENCHMARK_CONTRACT,
+    ClaudeMemoryLocomoRunConfig,
     POLICY_CONTRACT,
     checkpoint_contract_digest,
     checkpoint_manifest_path,
     checkpoint_snapshots_dir,
+    csv_safe_frame,
     current_checkpoint_snapshot_dir,
-    load_checkpoint,
+    events_frame,
+    load_checkpoint as _load_checkpoint,
+    load_artifact_runtime_state,
     load_external_runtime_state,
+    reset_output_dir,
+    run_claude_memory_locomo,
     run_questions,
     save_checkpoint,
     summary_frame,
+    validate_output_paths,
+    write_csv,
     write_failure_metadata,
     write_recovery_metadata,
     write_run_artifacts,
     write_jsonl_atomic,
+    write_state_jsonl,
 )
+
+
+def load_checkpoint(
+    **kwargs: Any,
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Load a trusted local checkpoint in tests."""
+
+    return _load_checkpoint(**kwargs, trusted_checkpoint=True)
 
 
 def locomo_fixture() -> dict[str, Any]:
@@ -176,6 +195,29 @@ def test_eligible_questions_respects_question_limit() -> None:
     assert selected[0].question_id == "conv-test:q1"
 
 
+def test_eligible_questions_zero_limit_selects_no_questions() -> None:
+    sample = normalize_locomo_sample(locomo_fixture())
+
+    selected = eligible_questions(
+        sample.questions,
+        ingested_event_ids=["D1:1", "D1:2"],
+        question_limit=0,
+    )
+
+    assert selected == ()
+
+
+def test_eligible_questions_rejects_negative_question_limit() -> None:
+    sample = normalize_locomo_sample(locomo_fixture())
+
+    with pytest.raises(ValueError, match="question_limit must be non-negative"):
+        eligible_questions(
+            sample.questions,
+            ingested_event_ids=["D1:1", "D1:2"],
+            question_limit=-1,
+        )
+
+
 def test_select_events_applies_row_limit() -> None:
     sample = normalize_locomo_sample(locomo_fixture())
 
@@ -199,6 +241,7 @@ def test_event_to_claude_log_row_matches_current_schema() -> None:
 
 def test_text_metrics_handle_exact_contains_and_f1() -> None:
     assert exact_match("The adoption agencies", "adoption agencies")
+    assert exact_match("agencies adoption", "adoption agencies")
     assert contains_answer("Caroline researched adoption agencies yesterday.", "adoption agencies")
     assert retrieval_hit("body: adoption agencies", "adoption agencies")
     assert token_f1("adoption agencies", "adoption agencies") == 1.0
@@ -318,6 +361,32 @@ def test_proxy_answer_string_hit_does_not_imply_answer_score() -> None:
 
     assert row["proxy_answer_string_hit"] is True
     assert row["locomo_answer_score"] == 0.0
+
+
+def test_question_metric_row_skips_locomo_score_for_invalid_category() -> None:
+    row = question_metric_row(
+        question_id="q1",
+        question="When did Caroline go?",
+        gold_answer="7 May 2023",
+        retrieved_frame=pd.DataFrame(),
+        generated_answer="8 May 2023.",
+        category="",
+    )
+
+    assert row["category"] == ""
+    assert row["answer_f1"] == round(2 / 3, 6)
+    assert "locomo_answer_score" not in row
+
+    dirty = question_metric_row(
+        question_id="q2",
+        question="When did Caroline go?",
+        gold_answer="7 May 2023",
+        retrieved_frame=pd.DataFrame(),
+        generated_answer="8 May 2023.",
+        category="not-a-category",
+    )
+    assert dirty["category"] == "not-a-category"
+    assert "locomo_answer_score" not in dirty
 
 
 def test_summarize_question_metrics_handles_no_eligible_questions() -> None:
@@ -452,6 +521,21 @@ def benchmark_events() -> tuple[BenchmarkEvent, BenchmarkEvent]:
     )
 
 
+def run_config(tmp_path: Path, **overrides: Any) -> ClaudeMemoryLocomoRunConfig:
+    """Return a minimal runner config for argument-validation tests."""
+
+    values: dict[str, Any] = {
+        "sample_index": 0,
+        "row_limit": 0,
+        "question_limit": 0,
+        "model": "test-model",
+        "output_dir": tmp_path / "output",
+        "locomo_cache_path": tmp_path / "locomo.json",
+    }
+    values.update(overrides)
+    return ClaudeMemoryLocomoRunConfig(**values)
+
+
 def test_run_questions_preserves_completed_rows_when_later_question_fails() -> None:
     result_rows: list[dict[str, Any]] = []
     metric_rows: list[dict[str, Any]] = []
@@ -530,6 +614,175 @@ def test_checkpoint_round_trips_runtime_state_and_completed_rows(tmp_path: Path)
     assert loaded_steps == step_metrics
     assert loaded_results == result_rows
     assert loaded_metrics == metric_rows
+
+
+def test_load_checkpoint_requires_trusted_checkpoint_gate(tmp_path: Path) -> None:
+    output_dir = tmp_path / "run"
+    events = benchmark_events()
+    questions = benchmark_questions()
+    save_checkpoint(
+        output_dir=output_dir,
+        memory=FakeBenchmarkMemory(),
+        sample_index=0,
+        row_limit=2,
+        question_limit=2,
+        model="test-model",
+        answer=False,
+        trace_enabled=False,
+        events=events,
+        questions=questions,
+        step_metrics=[],
+        result_rows=[],
+        metric_rows=[],
+    )
+
+    with pytest.raises(SystemExit, match="trust-existing-output-dir"):
+        _load_checkpoint(
+            output_dir=output_dir,
+            sample_index=0,
+            row_limit=2,
+            question_limit=2,
+            model="test-model",
+            answer=False,
+            trace_enabled=False,
+            events=events,
+            questions=questions,
+        )
+
+
+def test_checkpoint_contract_digest_includes_answer_max_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
+    original = checkpoint_contract_digest()
+
+    monkeypatch.setattr(
+        claude_memory_locomo_module,
+        "ANSWER_MAX_TOKENS",
+        ANSWER_MAX_TOKENS + 1,
+    )
+
+    assert checkpoint_contract_digest() != original
+
+
+def test_validate_output_paths_rejects_unsafe_destructive_targets(tmp_path: Path) -> None:
+    source_run = tmp_path / "source"
+    output_run = tmp_path / "output"
+
+    validate_output_paths(output_dir=output_run.resolve(), source_run_dir=source_run.resolve())
+
+    with pytest.raises(SystemExit, match="broad path"):
+        validate_output_paths(output_dir=Path.cwd().resolve(), source_run_dir=None)
+    with pytest.raises(SystemExit, match="nested"):
+        validate_output_paths(
+            output_dir=tmp_path.resolve(),
+            source_run_dir=(tmp_path / "source").resolve(),
+        )
+    with pytest.raises(SystemExit, match="nested"):
+        validate_output_paths(
+            output_dir=(tmp_path / "child").resolve(),
+            source_run_dir=tmp_path.resolve(),
+        )
+
+
+def test_reset_output_dir_requires_run_owned_marker_for_non_empty_dirs(tmp_path: Path) -> None:
+    output_dir = tmp_path / "run"
+    output_dir.mkdir()
+    (output_dir / "unrelated.txt").write_text("do not delete", encoding="utf-8")
+
+    with pytest.raises(SystemExit, match="without .agent-memory-locomo-run.json"):
+        reset_output_dir(output_dir, safe=True)
+
+    empty_dir = tmp_path / "empty"
+    empty_dir.mkdir()
+    reset_output_dir(empty_dir, safe=True)
+    assert (empty_dir / ".agent-memory-locomo-run.json").exists()
+
+    (empty_dir / "artifact.txt").write_text("owned", encoding="utf-8")
+    reset_output_dir(empty_dir, safe=True)
+    assert (empty_dir / ".agent-memory-locomo-run.json").exists()
+    assert not (empty_dir / "artifact.txt").exists()
+
+
+def test_runner_rejects_restore_artifact_state_invalid_flag_combinations(tmp_path: Path) -> None:
+    with pytest.raises(SystemExit, match="requires --existing-output-dir"):
+        run_claude_memory_locomo(run_config(tmp_path, restore_artifact_csv_state=True))
+
+    with pytest.raises(SystemExit, match="restore-csv-state is no longer supported"):
+        run_claude_memory_locomo(
+            run_config(
+                tmp_path,
+                existing_output_dir=tmp_path / "source",
+                trust_existing_output_dir=True,
+                restore_csv_state=True,
+            )
+        )
+
+    with pytest.raises(SystemExit, match="trust-existing-output-dir"):
+        run_claude_memory_locomo(
+            run_config(
+                tmp_path,
+                existing_output_dir=tmp_path / "source",
+                restore_artifact_csv_state=True,
+            )
+        )
+
+    with pytest.raises(SystemExit, match="cannot be used with --resume"):
+        run_claude_memory_locomo(
+            run_config(
+                tmp_path,
+                existing_output_dir=tmp_path / "source",
+                trust_existing_output_dir=True,
+                restore_artifact_csv_state=True,
+                resume=True,
+            )
+        )
+
+
+def test_write_csv_escapes_spreadsheet_formula_prefixes(tmp_path: Path) -> None:
+    frame = pd.DataFrame(
+        [
+            {
+                "formula": "=SUM(1,2)",
+                "plus": "+x",
+                "minus": "-x",
+                "at": "@x",
+                "leading_space_formula": " =SUM(1,2)",
+                "leading_newline_formula": "\n=SUM(1,2)",
+                "leading_tab_formula": "\t@cmd",
+                "leading_mixed_formula": " \r\n+cmd",
+                "leading_space_text": " plain",
+                "normal": "plain",
+                "number": 3,
+                "boolean": True,
+            }
+        ]
+    )
+
+    path = write_csv("safe", frame, tmp_path)
+    restored = pd.read_csv(path, keep_default_na=False)
+
+    assert restored.loc[0, "formula"] == "'=SUM(1,2)"
+    assert restored.loc[0, "plus"] == "'+x"
+    assert restored.loc[0, "minus"] == "'-x"
+    assert restored.loc[0, "at"] == "'@x"
+    assert restored.loc[0, "leading_space_formula"] == "' =SUM(1,2)"
+    assert restored.loc[0, "leading_newline_formula"] == "'\n=SUM(1,2)"
+    assert restored.loc[0, "leading_tab_formula"] == "'\t@cmd"
+    assert restored.loc[0, "leading_mixed_formula"] == "' \r\n+cmd"
+    assert restored.loc[0, "leading_space_text"] == " plain"
+    assert restored.loc[0, "normal"] == "plain"
+    assert restored.loc[0, "number"] == 3
+    assert bool(restored.loc[0, "boolean"]) is True
+
+    safe = csv_safe_frame(frame)
+    assert frame.loc[0, "formula"] == "=SUM(1,2)"
+    assert safe.loc[0, "formula"] == "'=SUM(1,2)"
+
+    state_path = write_state_jsonl("raw", frame, tmp_path / "state")
+    raw_rows = [
+        json.loads(line)
+        for line in state_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert raw_rows[0]["formula"] == "=SUM(1,2)"
 
 
 def test_load_checkpoint_ignores_unreferenced_partial_snapshot(tmp_path: Path) -> None:
@@ -669,6 +922,297 @@ def test_load_external_runtime_state_requires_source_event_coverage(tmp_path: Pa
 
     with pytest.raises(SystemExit, match="event ids do not cover selected events"):
         load_external_runtime_state(source_run, events=events)
+
+
+def write_artifact_state_source(
+    source_run: Path,
+    *,
+    events: tuple[BenchmarkEvent, ...],
+    log: pd.DataFrame | None = None,
+    topics: pd.DataFrame | None = None,
+    catalog: pd.DataFrame | None = None,
+) -> None:
+    """Write a minimal raw artifact-state source run for restore tests."""
+
+    write_csv("events", events_frame(events), source_run / "input")
+    write_state_jsonl(
+        "events",
+        pd.DataFrame(
+            [
+                {
+                    "sample_id": event.sample_id,
+                    "event_id": event.event_id,
+                    "speaker": event.speaker,
+                    "text": event.text,
+                    "session_id": event.session_id,
+                    "timestamp": event.timestamp,
+                }
+                for event in events
+            ]
+        ),
+        source_run / "state" / "input",
+    )
+    memory_dir = source_run / "memory"
+    state_memory_dir = source_run / "state" / "memory"
+    log_frame = (
+        log
+        if log is not None
+        else pd.DataFrame([{"message": "I researched adoption agencies."}])
+    )
+    write_csv("log", log_frame, memory_dir)
+    write_state_jsonl("log", log_frame, state_memory_dir)
+    topics_frame = (
+        topics
+        if topics is not None
+        else pd.DataFrame(
+            [
+                {
+                    "name": "adoption",
+                    "description": "Adoption research.",
+                    "type": "user",
+                    "body": "Caroline researched adoption agencies.",
+                }
+            ]
+        )
+    )
+    write_csv(
+        "topics",
+        topics_frame,
+        memory_dir,
+    )
+    write_state_jsonl("topics", topics_frame, state_memory_dir)
+    catalog_frame = (
+        catalog
+        if catalog is not None
+        else pd.DataFrame(
+            [
+                {
+                    "catalog_title": "Adoption",
+                    "name": "adoption",
+                    "hook": "Caroline researched adoption agencies.",
+                }
+            ]
+        )
+    )
+    write_csv(
+        "catalog",
+        catalog_frame,
+        memory_dir,
+    )
+    write_state_jsonl("catalog", catalog_frame, state_memory_dir)
+
+
+def test_load_artifact_runtime_state_restores_public_memory_tables(tmp_path: Path) -> None:
+    source_run = tmp_path / "source"
+    events = benchmark_events()
+    write_artifact_state_source(source_run, events=events)
+
+    state = load_artifact_runtime_state(
+        source_run,
+        events=events,
+        trusted_checkpoint=True,
+    )
+
+    assert set(state) == {"log", "topics", "catalog"}
+    assert list(state["catalog"].columns) == ["catalog_title", "name", "hook"]
+    assert state["catalog"].loc[0, "name"] == "adoption"
+
+
+def test_load_artifact_runtime_state_restores_empty_public_memory_tables(tmp_path: Path) -> None:
+    source_run = tmp_path / "source"
+    events = benchmark_events()
+    write_artifact_state_source(
+        source_run,
+        events=events,
+        topics=pd.DataFrame(columns=["name", "description", "type", "body"]),
+        catalog=pd.DataFrame(columns=["catalog_title", "name", "hook"]),
+    )
+
+    state = load_artifact_runtime_state(
+        source_run,
+        events=events,
+        trusted_checkpoint=True,
+    )
+
+    assert state["topics"].empty
+    assert list(state["topics"].columns) == ["name", "description", "type", "body"]
+    assert state["catalog"].empty
+    assert list(state["catalog"].columns) == ["catalog_title", "name", "hook"]
+
+
+def test_load_artifact_runtime_state_restores_empty_event_and_log_schemas(
+    tmp_path: Path,
+) -> None:
+    source_run = tmp_path / "source"
+    write_artifact_state_source(
+        source_run,
+        events=(),
+        log=pd.DataFrame(columns=["message", "role", "timestamp", "session_id"]),
+        topics=pd.DataFrame(columns=["name", "description", "type", "body"]),
+        catalog=pd.DataFrame(columns=["catalog_title", "name", "hook"]),
+    )
+
+    state = load_artifact_runtime_state(
+        source_run,
+        events=(),
+        trusted_checkpoint=True,
+    )
+
+    assert state["log"].empty
+    assert list(state["log"].columns) == ["message", "role", "timestamp", "session_id"]
+    assert state["topics"].empty
+    assert list(state["topics"].columns) == ["name", "description", "type", "body"]
+    assert state["catalog"].empty
+    assert list(state["catalog"].columns) == ["catalog_title", "name", "hook"]
+
+
+def test_load_artifact_runtime_state_rejects_empty_source_events_for_nonempty_selection(
+    tmp_path: Path,
+) -> None:
+    source_run = tmp_path / "source"
+    write_artifact_state_source(
+        source_run,
+        events=(),
+        topics=pd.DataFrame(columns=["name", "description", "type", "body"]),
+        catalog=pd.DataFrame(columns=["catalog_title", "name", "hook"]),
+    )
+
+    with pytest.raises(SystemExit, match="do not cover selected events"):
+        load_artifact_runtime_state(
+            source_run,
+            events=benchmark_events(),
+            trusted_checkpoint=True,
+        )
+
+
+def test_load_artifact_runtime_state_requires_trusted_checkpoint_gate(tmp_path: Path) -> None:
+    source_run = tmp_path / "source"
+    events = benchmark_events()
+    write_artifact_state_source(source_run, events=events)
+
+    with pytest.raises(SystemExit, match="trust-existing-output-dir"):
+        load_artifact_runtime_state(source_run, events=events)
+
+
+def test_load_artifact_runtime_state_rejects_changed_event_content(tmp_path: Path) -> None:
+    source_run = tmp_path / "source"
+    events = benchmark_events()
+    write_artifact_state_source(source_run, events=events)
+    changed_events = (
+        BenchmarkEvent(
+            sample_id=events[0].sample_id,
+            event_id=events[0].event_id,
+            speaker=events[0].speaker,
+            text="Same id, different content.",
+            session_id=events[0].session_id,
+            timestamp=events[0].timestamp,
+        ),
+        events[1],
+    )
+
+    with pytest.raises(SystemExit, match="event content"):
+        load_artifact_runtime_state(
+            source_run,
+            events=changed_events,
+            trusted_checkpoint=True,
+        )
+
+
+def test_load_artifact_runtime_state_requires_catalog_and_retrieval_columns(tmp_path: Path) -> None:
+    source_run = tmp_path / "missing-catalog"
+    events = benchmark_events()
+    write_state_jsonl(
+        "events",
+        pd.DataFrame(
+            [
+                {
+                    "sample_id": event.sample_id,
+                    "event_id": event.event_id,
+                    "speaker": event.speaker,
+                    "text": event.text,
+                    "session_id": event.session_id,
+                    "timestamp": event.timestamp,
+                }
+                for event in events
+            ]
+        ),
+        source_run / "state" / "input",
+    )
+    write_state_jsonl(
+        "topics",
+        pd.DataFrame(
+            [
+                {
+                    "name": "adoption",
+                    "description": "Adoption research.",
+                    "type": "user",
+                    "body": "Caroline researched adoption agencies.",
+                }
+            ]
+        ),
+        source_run / "state" / "memory",
+    )
+
+    with pytest.raises(SystemExit, match="catalog.jsonl"):
+        load_artifact_runtime_state(
+            source_run,
+            events=events,
+            trusted_checkpoint=True,
+        )
+
+    bad_catalog_run = tmp_path / "bad-catalog"
+    write_artifact_state_source(
+        bad_catalog_run,
+        events=events,
+        catalog=pd.DataFrame([{"name": "adoption", "hook": "missing title"}]),
+    )
+    with pytest.raises(SystemExit, match="missing required columns"):
+        load_artifact_runtime_state(
+            bad_catalog_run,
+            events=events,
+            trusted_checkpoint=True,
+        )
+
+
+def test_load_external_runtime_state_rejects_same_id_changed_event_content(tmp_path: Path) -> None:
+    source_run = tmp_path / "source"
+    events = benchmark_events()
+    questions = benchmark_questions()
+    save_checkpoint(
+        output_dir=source_run,
+        memory=FakeBenchmarkMemory(),
+        sample_index=0,
+        row_limit=2,
+        question_limit=2,
+        model="test-model",
+        answer=False,
+        events=events,
+        questions=questions,
+        step_metrics=[
+            {"phase": "add", "event_id": "D1:1"},
+            {"phase": "add", "event_id": "D1:2"},
+        ],
+        result_rows=[],
+        metric_rows=[],
+    )
+    changed_events = (
+        BenchmarkEvent(
+            sample_id=events[0].sample_id,
+            event_id=events[0].event_id,
+            speaker=events[0].speaker,
+            text="Same id, different content.",
+            session_id=events[0].session_id,
+            timestamp=events[0].timestamp,
+        ),
+        events[1],
+    )
+
+    with pytest.raises(SystemExit, match="event content"):
+        load_external_runtime_state(
+            source_run,
+            events=changed_events,
+            trusted_checkpoint=True,
+        )
 
 
 def test_load_external_runtime_state_loads_valid_prefix_source(tmp_path: Path) -> None:

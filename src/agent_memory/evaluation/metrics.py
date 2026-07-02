@@ -35,7 +35,11 @@ def answer_texts(value: Any) -> tuple[str, ...]:
 
 
 def exact_match(prediction: str, gold_answer: Any) -> bool:
-    """Return whether prediction exactly matches any normalized gold answer."""
+    """Return LOCOMO-style unordered token-set exact match.
+
+    This intentionally mirrors LOCOMO's helper behavior instead of conventional
+    normalized string equality. The primary QA score remains locomo_answer_score.
+    """
 
     prediction_tokens = set(normalize_text(prediction).split())
     return any(
@@ -187,9 +191,10 @@ def question_metric_row(
                 "answer_f1": round(token_f1(generated_answer, gold_answer), 6),
             }
         )
-        if category is not None:
+        category_id = _locomo_category_id(category)
+        if category_id is not None:
             row["locomo_answer_score"] = round(
-                locomo_answer_score(generated_answer, gold_answer, category),
+                locomo_answer_score(generated_answer, gold_answer, category_id),
                 6,
             )
     return row
@@ -252,6 +257,18 @@ def _stemmed_tokens(value: Any) -> list[str]:
     """Return official-style normalized and Porter-stemmed tokens."""
 
     return [_PORTER_STEMMER.stem(token) for token in normalize_text(value).split()]
+
+
+def _locomo_category_id(category: str | int | None) -> int | None:
+    """Return a valid LOCOMO category id, or None for absent/dirty values."""
+
+    try:
+        category_id = int(category)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    if category_id not in {1, 2, 3, 4, 5}:
+        return None
+    return category_id
 
 
 def _mean_available(rows: Sequence[Mapping[str, Any]], key: str) -> float | str:

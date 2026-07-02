@@ -6,13 +6,13 @@ import json
 from pathlib import Path
 from typing import Any
 
-from agent_memory.benchmarks.diagnostics import (
+from agent_memory.evaluation.diagnostics import (
     build_cause_trace_rows,
     build_llm_anomaly_rows,
     build_provider_usage_rows,
     build_provider_usage_summary_rows,
 )
-from agent_memory.benchmarks.types import BenchmarkQuestion
+from agent_memory.evaluation.types import BenchmarkQuestion
 from agent_memory.adapters.lotus import provider_usage_lm
 from agent_memory.tracing.semantic import write_provider_usage_trace
 

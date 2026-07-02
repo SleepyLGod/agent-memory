@@ -1,4 +1,4 @@
-"""LOCOMO benchmark normalization helpers."""
+"""LOCOMO evaluation dataset normalization helpers."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from agent_memory.benchmarks.types import BenchmarkEvent, BenchmarkQuestion
+from agent_memory.evaluation.types import BenchmarkEvent, BenchmarkQuestion
 
 
 @dataclass(frozen=True)
@@ -69,6 +69,12 @@ def eligible_questions(
 ) -> tuple[BenchmarkQuestion, ...]:
     """Return questions whose evidence is already present in ingested events."""
 
+    if question_limit is not None:
+        if question_limit < 0:
+            raise ValueError("question_limit must be non-negative")
+        if question_limit == 0:
+            return ()
+
     ingested = set(ingested_event_ids)
     selected: list[BenchmarkQuestion] = []
     for question in questions:
@@ -77,17 +83,6 @@ def eligible_questions(
             if question_limit is not None and len(selected) >= question_limit:
                 break
     return tuple(selected)
-
-
-def event_to_claude_log_row(event: BenchmarkEvent) -> dict[str, Any]:
-    """Render one LOCOMO event into the current ClaudeMemory log schema."""
-
-    return {
-        "message": event.text,
-        "role": event.speaker,
-        "timestamp": event.timestamp,
-        "session_id": event.session_id,
-    }
 
 
 def _load_dataset(dataset_path: Path) -> list[Any]:

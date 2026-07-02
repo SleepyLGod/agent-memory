@@ -34,26 +34,55 @@ class DifferentialQueryPlanner:
     ) -> QueryExpr:
         """Generate differentiated query Q' for one memory view."""
 
-        source_input = QueryExpr(op="log")
+        return self.differentiate_query(
+            view_name=view.name,
+            query=view.query,
+            views=views,
+        )
+
+    def differentiate_query(
+        self,
+        *,
+        view_name: str,
+        query: QueryExpr,
+        views: Mapping[str, MemoryView] | None = None,
+        source_query: QueryExpr | None = None,
+        source_input: QueryExpr | None = None,
+    ) -> QueryExpr:
+        """Generate Q' for one query with an optional explicit source."""
+
+        source_input = source_input or QueryExpr(op="log")
         current_view = QueryExpr(
             op="materialized_view",
             params={
-                "name": view.name,
-                "columns": self._output_columns(view.query),
+                "name": view_name,
+                "columns": self._output_columns(query),
             },
         )
         query = self._bind_materialized_dependencies(
-            view.query,
-            current_view_name=view.name,
+            query,
+            current_view_name=view_name,
             views=views or {},
         )
-        if query != view.query and not self._contains_op(query, "log"):
+        if source_query is not None:
+            source_query = self._bind_materialized_dependencies(
+                source_query,
+                current_view_name=view_name,
+                views=views or {},
+            )
+        contains_source = (
+            self._contains_query(query, source_query)
+            if source_query is not None
+            else self._contains_op(query, "log")
+        )
+        if not contains_source:
             return query
 
         return self._rules.differentiate(
             query,
             source_input=source_input,
             current_view=current_view,
+            source_query=source_query,
             is_view_boundary=True,
             instruction_rewriter=self._instruction_rewriter,
         )
@@ -69,7 +98,13 @@ class DifferentialQueryPlanner:
 
         for name, view in views.items():
             if name != current_view_name and query == view.query:
-                return QueryExpr(op="materialized_view", params={"name": name})
+                return QueryExpr(
+                    op="materialized_view",
+                    params={
+                        "name": name,
+                        "columns": self._output_columns(view.query),
+                    },
+                )
 
         if not query.inputs:
             return query
@@ -101,6 +136,14 @@ class DifferentialQueryPlanner:
             return tuple(str(column) for column in query.params["columns"])
         if query.op == "log":
             return tuple(column.name for column in query.params.get("columns", ()))
+        if query.op == "window_source":
+            return tuple(str(column) for column in query.params.get("columns", ()))
+        if query.op == "materialized_view":
+            return tuple(str(column) for column in query.params.get("columns", ()))
+        if query.op == "array_agg":
+            return (str(query.params["output_col"]),)
+        if query.op == "array_cat":
+            return (str(query.params["column"]),)
         if query.op == "sem_agg":
             output_cols = query.params.get("output_cols")
             if output_cols is not None:
@@ -114,8 +157,19 @@ class DifferentialQueryPlanner:
                 if column.name not in columns:
                     columns.append(column.name)
             return tuple(columns)
-        if query.op in {"sem_filter", "sem_groupby", "sem_topk", "drop_duplicates"}:
+        if query.op in {
+            "sem_filter",
+            "sem_groupby",
+            "sem_topk",
+            "drop_duplicates",
+            "filter",
+            "assign",
+        }:
             return self._output_columns(query.inputs[0])
+        if query.op == "count_window":
+            return self._output_columns(query.inputs[0])
+        if query.op == "process_window":
+            return self._output_columns(query.inputs[1])
         if query.op == "join":
             return self._join_output_columns(query)
         if query.op in {"union", "concat", "subtract", "sem_join"}:
@@ -153,3 +207,12 @@ class DifferentialQueryPlanner:
             else:
                 columns.append(column)
         return tuple(columns)
+
+    def _contains_query(self, query: QueryExpr, target: QueryExpr | None) -> bool:
+        """Return whether a query tree contains one exact subtree."""
+
+        if target is None:
+            return False
+        return query == target or any(
+            self._contains_query(input_query, target) for input_query in query.inputs
+        )
