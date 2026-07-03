@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import json
 import os
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import numpy as np
 import pandas as pd
 import pytest
 from dotenv import load_dotenv
@@ -21,6 +23,7 @@ from agent_memory.adapters.lotus.context import (
     LotusExecutionContext,
 )
 from agent_memory.adapters.lotus.relational import (
+    execute_array_cat,
     execute_concat,
     execute_drop_duplicates,
     execute_join,
@@ -87,11 +90,13 @@ from agent_memory.adapters.lotus.structured import (
 )
 from agent_memory.adapters.lotus.traced_lm import TracedLM
 from agent_memory.datasets.locomo import flatten_locomo_rows
-from agent_memory.logical import ColumnSpec, MemorySpec, QueryExpr, UserQuery
+from agent_memory.logical import ColumnSpec, MemorySpec, MemoryView, QueryExpr, UserQuery
 from agent_memory.planner import DifferentialInstructionRewriter, DifferentialQueryPlanner
 from agent_memory.planner.rules import DifferentialRules
 from agent_memory.relation import GroupedRelation, Relation
+from agent_memory.runtime.runtime import MemoryRuntime
 from agent_memory.tracing.semantic import semantic_trace_scope, write_compact_operator_trace
+from agent_memory.window import WINDOW_SOURCE_INPUT, completed_count_windows, over_frames
 
 
 def trace_events(trace_dir: Path) -> list[dict[str, Any]]:
@@ -457,6 +462,224 @@ def test_join_query_expr_keeps_only_logical_params() -> None:
         log.join(log, on=[])
     with pytest.raises(TypeError):
         log.join("not a relation", on="name")
+
+
+def test_count_window_process_window_and_array_agg_query_expr_shape() -> None:
+    log = am.Log(
+        {
+            "timestamp": "Message timestamp.",
+            "speaker": "Message speaker.",
+            "message": "Message body.",
+        }
+    )
+
+    blocks = log.count_window(size=2, slide=1).process_window(
+        lambda window: window.array_agg(
+            columns=("timestamp", "speaker", "message"),
+            output_col="conversation_records",
+        )
+    )
+
+    assert blocks.expr.op == "process_window"
+    window_query, process_query = blocks.expr.inputs
+    assert window_query.op == "count_window"
+    assert window_query.params == {"size": 2, "slide": 1, "trigger": None}
+    assert window_query.inputs == (log.expr,)
+    assert process_query.op == "array_agg"
+    assert process_query.params == {
+        "columns": ("timestamp", "speaker", "message"),
+        "output_col": "conversation_records",
+    }
+    window_source = process_query.inputs[0]
+    assert window_source.op == "window_source"
+    assert window_source.params["columns"] == ("timestamp", "speaker", "message")
+
+
+def test_process_window_builder_infers_filter_passthrough_columns() -> None:
+    log = am.Log({"message": "Message body.", "speaker": "Message speaker."})
+
+    blocks = log.filter(predicate=("speaker", "==", "A")).count_window(
+        size=2,
+        slide=1,
+    ).process_window(
+        lambda window: window.array_agg(
+            columns=("speaker", "message"),
+            output_col="conversation_records",
+        )
+    )
+
+    process_query = blocks.expr.inputs[1]
+    window_source = process_query.inputs[0]
+    assert window_source.op == "window_source"
+    assert window_source.params["columns"] == ("message", "speaker")
+
+
+def test_process_window_builder_infers_join_suffix_columns() -> None:
+    log = am.Log(
+        {
+            "id": "Message id.",
+            "name": "Name.",
+            "body": "Body.",
+        }
+    )
+
+    joined = log.join(log, on="id")
+    blocks = joined.count_window(size=2, slide=1).process_window(
+        lambda window: window.array_agg(
+            columns=("id", "name:left", "body:left", "name:right", "body:right"),
+            output_col="joined_records",
+        )
+    )
+
+    process_query = blocks.expr.inputs[1]
+    window_source = process_query.inputs[0]
+    assert window_source.op == "window_source"
+    assert window_source.params["columns"] == (
+        "id",
+        "name:left",
+        "body:left",
+        "name:right",
+        "body:right",
+    )
+
+
+def test_process_window_builder_infers_sem_join_suffix_columns() -> None:
+    log = am.Log(
+        {
+            "name": "Name.",
+            "body": "Body.",
+        }
+    )
+
+    joined = log.sem_join(log, instruction="Rows describe the same memory.")
+    blocks = joined.count_window(size=2, slide=1).process_window(
+        lambda window: window.array_agg(
+            columns=("name:left", "body:left", "name:right", "body:right"),
+            output_col="joined_records",
+        )
+    )
+
+    process_query = blocks.expr.inputs[1]
+    window_source = process_query.inputs[0]
+    assert window_source.op == "window_source"
+    assert window_source.params["columns"] == (
+        "name:left",
+        "body:left",
+        "name:right",
+        "body:right",
+    )
+
+
+def test_count_window_and_array_agg_reject_invalid_arguments() -> None:
+    log = am.Log({"message": "Message body."})
+
+    with pytest.raises(ValueError, match="size must be positive"):
+        log.count_window(size=0)
+    with pytest.raises(ValueError, match="slide must be positive"):
+        log.count_window(size=2, slide=0)
+    with pytest.raises(TypeError, match="size must be an integer"):
+        log.count_window(size=2.5)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="slide must be an integer"):
+        log.count_window(size=2, slide="1")  # type: ignore[arg-type]
+    with pytest.raises(NotImplementedError, match="trigger=None"):
+        log.count_window(size=2, trigger="early")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="columns cannot be empty"):
+        log.array_agg(columns=(), output_col="records")
+    with pytest.raises(ValueError, match="output_col cannot be empty"):
+        log.array_agg(columns=("message",), output_col="")
+
+
+def test_over_relation_array_agg_query_expr_shape() -> None:
+    log = am.Log({"message": "Message body."})
+
+    contextual = log.over(rows=(-2, -1)).array_agg(
+        columns=("message",),
+        output_col="previous_messages",
+    )
+
+    assert contextual.expr.op == "array_agg"
+    over_query = contextual.expr.inputs[0]
+    assert over_query.op == "over"
+    assert over_query.params == {"rows": (-2, -1)}
+    assert contextual.expr.params == {
+        "columns": ("message",),
+        "output_col": "previous_messages",
+    }
+
+
+def test_over_relation_rejects_invalid_rows() -> None:
+    log = am.Log({"message": "Message body."})
+
+    with pytest.raises(TypeError, match="tuple of two integers"):
+        log.over(rows=[-2, -1])  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="start must be <= end"):
+        log.over(rows=(-1, -2))
+    with pytest.raises(NotImplementedError, match="N <= 0"):
+        log.over(rows=(-1, 1))
+
+
+def test_array_cat_query_expr_keeps_only_logical_params() -> None:
+    log = am.Log({"conversation_records": "JSON array aggregate state."})
+
+    combined = log.array_cat(log, column="conversation_records")
+
+    assert combined.expr.op == "array_cat"
+    assert combined.expr.inputs == (log.expr, log.expr)
+    assert combined.expr.params == {"column": "conversation_records"}
+
+    with pytest.raises(ValueError, match="column cannot be empty"):
+        log.array_cat(log, column="")
+    with pytest.raises(TypeError):
+        log.array_cat("not a relation", column="conversation_records")  # type: ignore[arg-type]
+
+
+def test_count_window_params_reject_non_integral_values() -> None:
+    source = pd.DataFrame({"message": ["one", "two"]})
+
+    with pytest.raises(TypeError, match="size must be an integer"):
+        completed_count_windows(source, {"size": 2.5, "slide": 1})
+    with pytest.raises(TypeError, match="slide must be an integer"):
+        completed_count_windows(source, {"size": 2, "slide": "1"})
+    with pytest.raises(TypeError, match="size must be an integer"):
+        completed_count_windows(source, {"size": True, "slide": 1})
+
+
+def test_over_frames_accept_dtype_different_append_suffix() -> None:
+    source = pd.DataFrame({"message": pd.Series(["one", "two"], dtype="string")})
+    emit = pd.DataFrame({"message": pd.Series(["two"], dtype="object")})
+
+    frames = over_frames(emit, source, {"rows": (-1, -1)})
+
+    assert [frame.emit_position for frame in frames] == [1]
+    assert frames[0].frame.to_dict("records") == [{"message": "one"}]
+
+
+def test_over_frames_reject_non_suffix_emit_rows() -> None:
+    source = pd.DataFrame({"message": ["one", "two", "three"]})
+    emit = pd.DataFrame({"message": ["one"]})
+
+    with pytest.raises(NotImplementedError, match="append suffix"):
+        over_frames(emit, source, {"rows": (-1, -1)})
+
+
+def test_memory_spec_rejects_unclosed_windowed_relation() -> None:
+    with pytest.raises(TypeError, match="process_window"):
+
+        class UnclosedWindowMemory(am.Memory):
+            log = am.Log({"message": "Message body."})
+            blocks = log.count_window(size=2)
+
+        UnclosedWindowMemory.spec()
+
+
+def test_memory_spec_rejects_unclosed_over_relation() -> None:
+    with pytest.raises(TypeError, match="OverRelation"):
+
+        class UnclosedOverMemory(am.Memory):
+            log = am.Log({"message": "Message body."})
+            context = log.over(rows=(-2, -1))
+
+        UnclosedOverMemory.spec()
 
 
 def test_sem_join_query_expr_keeps_only_logical_params() -> None:
@@ -866,6 +1089,44 @@ def test_differential_rules_reject_standalone_sem_agg_outside_view_boundary() ->
         _differentiate_with_defaults(query)
 
 
+def test_differential_query_planner_rewrites_array_agg_view_to_array_cat() -> None:
+    class BlocksMemory(am.Memory):
+        log = am.Log({"message": "Message body."})
+        blocks = log.array_agg(
+            columns=("message",),
+            output_col="conversation_records",
+        )
+
+    view = BlocksMemory.spec().views["blocks"]
+
+    differentiated = DifferentialQueryPlanner().differentiate(view)
+
+    assert differentiated.op == "array_cat"
+    _assert_materialized_view(
+        differentiated.inputs[0],
+        name="blocks",
+        columns=("conversation_records",),
+    )
+    changed_aggregate = differentiated.inputs[1]
+    assert changed_aggregate.op == "array_agg"
+    assert changed_aggregate.inputs[0].op == "log"
+    assert changed_aggregate.params == {
+        "columns": ("message",),
+        "output_col": "conversation_records",
+    }
+    assert differentiated.params == {"column": "conversation_records"}
+
+
+def test_differential_rules_reject_array_agg_outside_view_boundary() -> None:
+    query = am.Log({"message": "Message body."}).array_agg(
+        columns=("message",),
+        output_col="conversation_records",
+    ).select(["conversation_records"]).expr
+
+    with pytest.raises(NotImplementedError, match="array_agg changed-row differential"):
+        _differentiate_with_defaults(query)
+
+
 def test_differential_rules_support_sem_flat_map_fragments() -> None:
     query = am.Log({"message": "Raw input message."}).sem_flat_map(
         output_cols={"fact": "Extracted fact."},
@@ -975,7 +1236,48 @@ def test_differential_query_planner_recomputes_views_from_materialized_dependenc
     _assert_materialized_view(
         sem_map_expr.inputs[0],
         name="topics",
+        columns=("name", "description", "type", "body"),
     )
+
+
+def test_differential_query_planner_binds_source_query_dependencies() -> None:
+    log = am.Log({"message": "Raw message."})
+    source_relation = log.select(["message"])
+    query = source_relation.sem_map(
+        input_cols=["message"],
+        output_cols={"summary": "Summary."},
+        instruction="Summarize {message}.",
+    ).expr
+    source_input = QueryExpr(
+        op="materialized_view",
+        params={
+            "name": "_changed_source",
+            "columns": ("message",),
+        },
+    )
+
+    differentiated = DifferentialQueryPlanner().differentiate_query(
+        view_name="summaries",
+        query=query,
+        views={
+            "source_view": MemoryView(
+                name="source_view",
+                query=source_relation.expr,
+            )
+        },
+        source_query=source_relation.expr,
+        source_input=source_input,
+    )
+
+    assert differentiated.op == "union"
+    _assert_materialized_view(
+        differentiated.inputs[0],
+        name="summaries",
+        columns=("message", "summary"),
+    )
+    changed = differentiated.inputs[1]
+    assert changed.op == "sem_map"
+    assert changed.inputs[0] == source_input
 
 
 def test_differential_rules_reject_mixed_log_and_materialized_view_fragments() -> None:
@@ -1103,6 +1405,102 @@ def test_differentiated_policy_compiles_views_and_retrieval_templates() -> None:
     _assert_materialized_view(manifest_query.inputs[0], name="topics")
 
 
+def test_differentiated_policy_extracts_window_process_plan() -> None:
+    class WindowBlockMemory(am.Memory):
+        log = am.Log(
+            {
+                "timestamp": "Message timestamp.",
+                "speaker": "Message speaker.",
+                "message": "Message body.",
+            }
+        )
+        blocks = log.count_window(size=2, slide=1).process_window(
+            lambda window: window.array_agg(
+                columns=("timestamp", "speaker", "message"),
+                output_col="conversation_records",
+            )
+        )
+
+    policy = WindowBlockMemory.differentiate_policy()
+    plan = policy.window_process_plans["blocks"]
+
+    assert plan.view_name == "blocks"
+    assert plan.private_name == "_blocks_process_window"
+    assert plan.changed_name == "_blocks_process_window__changed"
+    assert plan.window_query.op == "count_window"
+    assert plan.process_query.op == "array_agg"
+    _assert_materialized_view(
+        plan.private_source,
+        name="_blocks_process_window",
+        columns=("conversation_records",),
+    )
+    _assert_materialized_view(
+        plan.changed_source,
+        name="_blocks_process_window__changed",
+        columns=("conversation_records",),
+    )
+    query = policy.view_queries["blocks"]
+    assert query.op == "union"
+    _assert_materialized_view(query.inputs[0], name="blocks", columns=("conversation_records",))
+    assert query.inputs[1] == plan.changed_source
+
+
+def test_differentiated_policy_uses_changed_process_rows_for_downstream_query() -> None:
+    class WindowCandidateMemory(am.Memory):
+        log = am.Log(
+            {
+                "timestamp": "Message timestamp.",
+                "speaker": "Message speaker.",
+                "message": "Message body.",
+            }
+        )
+        candidates = (
+            log
+            .count_window(size=2, slide=1)
+            .process_window(
+                lambda window: window.array_agg(
+                    columns=("timestamp", "speaker", "message"),
+                    output_col="conversation_records",
+                )
+            )
+            .sem_flat_map(
+                input_cols=["conversation_records"],
+                output_cols={"memory_summary": "Window-local memory summary."},
+                instruction="Extract memory summaries from {conversation_records}.",
+            )
+            .select(["memory_summary"])
+        )
+
+    policy = WindowCandidateMemory.differentiate_policy()
+    plan = policy.window_process_plans["candidates"]
+    query = policy.view_queries["candidates"]
+
+    assert query.op == "union"
+    fragment = query.inputs[1]
+    assert fragment.op == "select"
+    sem_flat_map = fragment.inputs[0]
+    assert sem_flat_map.op == "sem_flat_map"
+    assert sem_flat_map.inputs[0] == plan.changed_source
+    assert sem_flat_map.params["input_cols"] == ("conversation_records",)
+
+
+def test_differentiated_policy_rejects_unsupported_count_window_upstream() -> None:
+    class UnsupportedWindowMemory(am.Memory):
+        log = am.Log({"message": "Message body."})
+        records = log.array_agg(columns=("message",), output_col="records").count_window(
+            size=2,
+            slide=1,
+        ).process_window(
+            lambda window: window.array_agg(
+                columns=("records",),
+                output_col="window_records",
+            )
+        )
+
+    with pytest.raises(NotImplementedError, match="array_agg changed-row differential"):
+        UnsupportedWindowMemory.differentiate_policy()
+
+
 @pytest.mark.parametrize(
     "message",
     [
@@ -1150,9 +1548,10 @@ def test_claude_add_executes_differentiated_queries(message: object) -> None:
     assert topics_inputs["topics"].empty
 
     assert catalog_query.params["columns"] == ("catalog_title", "name", "hook")
-    assert catalog_query.inputs[0].inputs[0] == QueryExpr(
-        op="materialized_view",
-        params={"name": "topics"},
+    _assert_materialized_view(
+        catalog_query.inputs[0].inputs[0],
+        name="topics",
+        columns=("name", "description", "type", "body"),
     )
     assert catalog_inputs["topics"].equals(memory._runtime._state["topics"])
 
@@ -2397,6 +2796,284 @@ def test_relational_execution_ops_follow_dataframe_semantics() -> None:
     assert list(unioned["message"]) == ["hello", "world"]
     assert subtracted.empty
     assert list(deduped["message"]) == ["hello"]
+
+
+def test_array_agg_executes_to_stable_json_record_array() -> None:
+    source = QueryExpr(op="materialized_view", params={"name": "source"})
+    query = QueryExpr(
+        op="array_agg",
+        inputs=(source,),
+        params={
+            "columns": ("timestamp", "speaker", "message"),
+            "output_col": "conversation_records",
+        },
+    )
+    inputs = {
+        "source": pd.DataFrame(
+            {
+                "timestamp": ["2026-01-01T00:00:00Z", "2026-01-01T00:01:00Z"],
+                "speaker": ["Caroline", "Melanie"],
+                "message": ["Hi.", "Hello."],
+                "ignored": ["x", "y"],
+            }
+        )
+    }
+
+    result = LotusAdapter().execute(query, inputs)
+
+    assert list(result.columns) == ["conversation_records"]
+    expected_json = (
+        '[{"timestamp": "2026-01-01T00:00:00Z", "speaker": "Caroline", '
+        '"message": "Hi."}, {"timestamp": "2026-01-01T00:01:00Z", '
+        '"speaker": "Melanie", "message": "Hello."}]'
+    )
+    assert result.loc[0, "conversation_records"] == expected_json
+    assert json.loads(result.loc[0, "conversation_records"]) == [
+        {
+            "timestamp": "2026-01-01T00:00:00Z",
+            "speaker": "Caroline",
+            "message": "Hi.",
+        },
+        {
+            "timestamp": "2026-01-01T00:01:00Z",
+            "speaker": "Melanie",
+            "message": "Hello.",
+        },
+    ]
+
+
+def test_array_agg_preserves_json_numeric_and_boolean_types() -> None:
+    source = QueryExpr(op="materialized_view", params={"name": "source"})
+    query = QueryExpr(
+        op="array_agg",
+        inputs=(source,),
+        params={
+            "columns": ("count", "flag"),
+            "output_col": "records",
+        },
+    )
+    inputs = {
+        "source": pd.DataFrame(
+            {
+                "count": [np.int64(3)],
+                "flag": [np.bool_(True)],
+            }
+        )
+    }
+
+    result = LotusAdapter().execute(query, inputs)
+    records = json.loads(result.loc[0, "records"])
+
+    assert records == [{"count": 3, "flag": True}]
+    assert isinstance(records[0]["count"], int)
+    assert isinstance(records[0]["flag"], bool)
+
+
+def test_over_array_agg_executes_row_preserving_previous_frame() -> None:
+    source = QueryExpr(op="materialized_view", params={"name": "source"})
+    query = QueryExpr(
+        op="array_agg",
+        inputs=(
+            QueryExpr(
+                op="over",
+                inputs=(source,),
+                params={"rows": (-2, -1)},
+            ),
+        ),
+        params={
+            "columns": ("message",),
+            "output_col": "previous_messages",
+        },
+    )
+    inputs = {"source": pd.DataFrame({"message": ["one", "two", "three"]})}
+
+    result = LotusAdapter().execute(query, inputs)
+
+    assert list(result.columns) == ["message", "previous_messages"]
+    assert json.loads(result.loc[0, "previous_messages"]) == []
+    assert json.loads(result.loc[1, "previous_messages"]) == [{"message": "one"}]
+    assert json.loads(result.loc[2, "previous_messages"]) == [
+        {"message": "one"},
+        {"message": "two"},
+    ]
+
+
+def test_over_sem_agg_empty_frame_outputs_null_without_model_call() -> None:
+    source = QueryExpr(op="materialized_view", params={"name": "source"})
+    query = QueryExpr(
+        op="sem_agg",
+        inputs=(
+            QueryExpr(
+                op="over",
+                inputs=(source,),
+                params={"rows": (-2, -1)},
+            ),
+        ),
+        params={
+            "input_cols": ("message",),
+            "output_cols": (ColumnSpec("previous_summary"),),
+            "instruction": "Summarize previous messages.",
+        },
+    )
+    inputs = {"source": pd.DataFrame({"message": ["one"]})}
+
+    result = LotusAdapter().execute(query, inputs)
+
+    assert list(result.columns) == ["message", "previous_summary"]
+    assert pd.isna(result.loc[0, "previous_summary"])
+
+
+def test_array_cat_executes_json_array_concat() -> None:
+    left = QueryExpr(op="materialized_view", params={"name": "left"})
+    right = QueryExpr(op="materialized_view", params={"name": "right"})
+    query = QueryExpr(
+        op="array_cat",
+        inputs=(left, right),
+        params={"column": "conversation_records"},
+    )
+    inputs = {
+        "left": pd.DataFrame(
+            {
+                "conversation_records": [
+                    '[{"message": "one"}, {"message": "two"}]',
+                ]
+            }
+        ),
+        "right": pd.DataFrame(
+            {
+                "conversation_records": [
+                    '[{"message": "three"}]',
+                ]
+            }
+        ),
+    }
+
+    result = execute_array_cat(query, inputs, LotusAdapter().execute)
+
+    assert list(result.columns) == ["conversation_records"]
+    expected_json = (
+        '[{"message": "one"}, {"message": "two"}, {"message": "three"}]'
+    )
+    assert result.loc[0, "conversation_records"] == expected_json
+
+
+def test_array_cat_empty_state_returns_other_side() -> None:
+    left = QueryExpr(op="materialized_view", params={"name": "left"})
+    right = QueryExpr(op="materialized_view", params={"name": "right"})
+    query = QueryExpr(
+        op="array_cat",
+        inputs=(left, right),
+        params={"column": "conversation_records"},
+    )
+    execute = LotusAdapter().execute
+
+    left_empty = {
+        "left": pd.DataFrame(columns=["conversation_records"]),
+        "right": pd.DataFrame({"conversation_records": ['[{"message": "new"}]']}),
+    }
+    result = execute_array_cat(query, left_empty, execute)
+    assert result.loc[0, "conversation_records"] == '[{"message": "new"}]'
+
+    right_empty = {
+        "left": pd.DataFrame({"conversation_records": ['[{"message": "old"}]']}),
+        "right": pd.DataFrame(columns=["conversation_records"]),
+    }
+    result = execute_array_cat(query, right_empty, execute)
+    assert result.loc[0, "conversation_records"] == '[{"message": "old"}]'
+
+    both_empty = {
+        "left": pd.DataFrame(columns=["conversation_records"]),
+        "right": pd.DataFrame(columns=["conversation_records"]),
+    }
+    result = execute_array_cat(query, both_empty, execute)
+    assert list(result.columns) == ["conversation_records"]
+    assert result.empty
+
+
+def test_array_cat_rejects_invalid_aggregate_state() -> None:
+    left = QueryExpr(op="materialized_view", params={"name": "left"})
+    right = QueryExpr(op="materialized_view", params={"name": "right"})
+    query = QueryExpr(
+        op="array_cat",
+        inputs=(left, right),
+        params={"column": "conversation_records"},
+    )
+    execute = LotusAdapter().execute
+
+    with pytest.raises(ValueError, match="missing column"):
+        execute_array_cat(
+            query,
+            {
+                "left": pd.DataFrame({"wrong": ['[]']}),
+                "right": pd.DataFrame({"conversation_records": ['[]']}),
+            },
+            execute,
+        )
+    with pytest.raises(ValueError, match="at most one row"):
+        execute_array_cat(
+            query,
+            {
+                "left": pd.DataFrame({"conversation_records": ["[]", "[]"]}),
+                "right": pd.DataFrame({"conversation_records": ["[]"]}),
+            },
+            execute,
+        )
+    with pytest.raises(ValueError, match="JSON array"):
+        execute_array_cat(
+            query,
+            {
+                "left": pd.DataFrame({"conversation_records": ["not json"]}),
+                "right": pd.DataFrame({"conversation_records": ["[]"]}),
+            },
+            execute,
+        )
+    with pytest.raises(ValueError, match="JSON array"):
+        execute_array_cat(
+            query,
+            {
+                "left": pd.DataFrame({"conversation_records": ['{"message": "one"}']}),
+                "right": pd.DataFrame({"conversation_records": ["[]"]}),
+            },
+            execute,
+        )
+
+
+def test_process_window_full_execution_emits_completed_count_windows() -> None:
+    log = am.Log(
+        {
+            "timestamp": "Message timestamp.",
+            "speaker": "Message speaker.",
+            "message": "Message body.",
+        }
+    )
+    query = log.count_window(size=2, slide=1).process_window(
+        lambda window: window.array_agg(
+            columns=("timestamp", "speaker", "message"),
+            output_col="conversation_records",
+        )
+    ).expr
+    inputs = {
+        "log": pd.DataFrame(
+            {
+                "timestamp": ["t1", "t2", "t3"],
+                "speaker": ["A", "B", "A"],
+                "message": ["one", "two", "three"],
+            }
+        )
+    }
+
+    result = LotusAdapter().execute(query, inputs)
+
+    assert list(result.columns) == ["conversation_records"]
+    assert len(result) == 2
+    assert json.loads(result.loc[0, "conversation_records"]) == [
+        {"timestamp": "t1", "speaker": "A", "message": "one"},
+        {"timestamp": "t2", "speaker": "B", "message": "two"},
+    ]
+    assert json.loads(result.loc[1, "conversation_records"]) == [
+        {"timestamp": "t2", "speaker": "B", "message": "two"},
+        {"timestamp": "t3", "speaker": "A", "message": "three"},
+    ]
 
 
 def test_relational_join_executes_exact_key_merge_semantics() -> None:
@@ -3767,6 +4444,440 @@ def test_runtime_executes_standalone_sem_agg_q_prime_and_stores_result() -> None
     assert list(inputs["summary"].columns) == ["summary"]
     assert memory._runtime._state["summary"].to_dict("records") == [
         {"summary": "next aggregate"}
+    ]
+
+
+def test_runtime_maintains_array_agg_view_with_array_cat() -> None:
+    class RecordsMemory(am.Memory):
+        log = am.Log({"message": "Message body."})
+        records = log.array_agg(
+            columns=("message",),
+            output_col="conversation_records",
+        )
+
+    memory = RecordsMemory(adapter=LotusAdapter())
+
+    memory.add({"message": "one"})
+    memory.add({"message": "two"})
+
+    records = memory._runtime._state["records"]
+    assert list(records.columns) == ["conversation_records"]
+    assert len(records) == 1
+    assert json.loads(records.loc[0, "conversation_records"]) == [
+        {"message": "one"},
+        {"message": "two"},
+    ]
+
+
+def test_runtime_maintains_count_window_process_state_incrementally() -> None:
+    class WindowBlockMemory(am.Memory):
+        log = am.Log(
+            {
+                "timestamp": "Message timestamp.",
+                "speaker": "Message speaker.",
+                "message": "Message body.",
+            }
+        )
+        blocks = log.count_window(size=2, slide=1).process_window(
+            lambda window: window.array_agg(
+                columns=("timestamp", "speaker", "message"),
+                output_col="conversation_records",
+            )
+        )
+
+    memory = WindowBlockMemory(adapter=LotusAdapter())
+
+    memory.add({"timestamp": "t1", "speaker": "A", "message": "one"})
+    assert memory._runtime._state["blocks"].empty
+    assert "_blocks_process_window" not in memory._runtime._state
+
+    memory.add({"timestamp": "t2", "speaker": "B", "message": "two"})
+    blocks = memory._runtime._state["blocks"]
+    private_blocks = memory._runtime._state["_blocks_process_window"]
+    assert len(blocks) == 1
+    assert len(private_blocks) == 1
+    assert json.loads(blocks.loc[0, "conversation_records"]) == [
+        {"timestamp": "t1", "speaker": "A", "message": "one"},
+        {"timestamp": "t2", "speaker": "B", "message": "two"},
+    ]
+
+    memory.add({"timestamp": "t3", "speaker": "A", "message": "three"})
+    blocks = memory._runtime._state["blocks"]
+    private_blocks = memory._runtime._state["_blocks_process_window"]
+    assert len(blocks) == 2
+    assert len(private_blocks) == 2
+    assert memory._runtime._window_next_start["_blocks_process_window"] == 2
+    assert json.loads(blocks.loc[1, "conversation_records"]) == [
+        {"timestamp": "t2", "speaker": "B", "message": "two"},
+        {"timestamp": "t3", "speaker": "A", "message": "three"},
+    ]
+
+
+def test_runtime_snapshot_restores_count_window_bookkeeping() -> None:
+    class WindowBlockMemory(am.Memory):
+        log = am.Log({"message": "Message body."})
+        blocks = log.count_window(size=2, slide=1).process_window(
+            lambda window: window.array_agg(
+                columns=("message",),
+                output_col="conversation_records",
+            )
+        )
+
+    original = WindowBlockMemory(adapter=LotusAdapter())
+    original.add({"message": "one"})
+    original.add({"message": "two"})
+    snapshot = original._runtime.snapshot_state()
+
+    restored = WindowBlockMemory(adapter=LotusAdapter())
+    restored._runtime.restore_state(snapshot)
+    restored.add({"message": "three"})
+
+    blocks = restored._runtime._state["blocks"]
+    assert len(blocks) == 2
+    assert json.loads(blocks.loc[0, "conversation_records"]) == [
+        {"message": "one"},
+        {"message": "two"},
+    ]
+    assert json.loads(blocks.loc[1, "conversation_records"]) == [
+        {"message": "two"},
+        {"message": "three"},
+    ]
+
+
+def test_runtime_snapshot_copies_top_level_state_mapping() -> None:
+    class WindowBlockMemory(am.Memory):
+        log = am.Log({"message": "Message body."})
+        blocks = log.count_window(size=2, slide=1).process_window(
+            lambda window: window.array_agg(
+                columns=("message",),
+                output_col="conversation_records",
+            )
+        )
+
+    memory = WindowBlockMemory(adapter=LotusAdapter())
+    memory.add({"message": "one"})
+    snapshot = memory._runtime.snapshot_state()
+
+    memory._runtime._state["extra"] = pd.DataFrame([{"message": "later"}])
+
+    assert "extra" not in snapshot["state"]
+
+
+def test_changed_suffix_checks_schema_for_empty_current_state() -> None:
+    class WindowBlockMemory(am.Memory):
+        log = am.Log({"message": "Message body."})
+        blocks = log.count_window(size=2, slide=1).process_window(
+            lambda window: window.array_agg(
+                columns=("message",),
+                output_col="conversation_records",
+            )
+        )
+
+    runtime = WindowBlockMemory(adapter=LotusAdapter())._runtime
+    current = pd.DataFrame(columns=["message"])
+    next_frame = pd.DataFrame({"body": ["hi"]})
+
+    with pytest.raises(
+        NotImplementedError,
+        match="upstream recompute changed output columns",
+    ):
+        runtime._changed_suffix(current, next_frame)
+
+
+def test_changed_suffix_accepts_empty_current_state_with_same_schema() -> None:
+    class WindowBlockMemory(am.Memory):
+        log = am.Log({"message": "Message body."})
+        blocks = log.count_window(size=2, slide=1).process_window(
+            lambda window: window.array_agg(
+                columns=("message",),
+                output_col="conversation_records",
+            )
+        )
+
+    runtime = WindowBlockMemory(adapter=LotusAdapter())._runtime
+    current = pd.DataFrame(columns=["message"])
+    next_frame = pd.DataFrame({"message": ["hi"]})
+
+    changed = runtime._changed_suffix(current, next_frame)
+
+    assert changed.to_dict("records") == [{"message": "hi"}]
+
+
+def test_changed_suffix_projects_extra_columns_for_empty_current_state() -> None:
+    class WindowBlockMemory(am.Memory):
+        log = am.Log({"message": "Message body."})
+        blocks = log.count_window(size=2, slide=1).process_window(
+            lambda window: window.array_agg(
+                columns=("message",),
+                output_col="conversation_records",
+            )
+        )
+
+    runtime = WindowBlockMemory(adapter=LotusAdapter())._runtime
+    current = pd.DataFrame(columns=["message"])
+    next_frame = pd.DataFrame({"message": ["hi"], "speaker": ["A"]})
+
+    changed = runtime._changed_suffix(current, next_frame)
+
+    assert list(changed.columns) == ["message"]
+    assert changed.to_dict("records") == [{"message": "hi"}]
+
+
+def test_runtime_maintains_count_window_over_selected_upstream_relation() -> None:
+    class WindowBlockMemory(am.Memory):
+        log = am.Log(
+            {
+                "timestamp": "Message timestamp.",
+                "speaker": "Message speaker.",
+                "message": "Message body.",
+            }
+        )
+        blocks = log.select(["message"]).count_window(size=2, slide=1).process_window(
+            lambda window: window.array_agg(
+                columns=("message",),
+                output_col="conversation_records",
+            )
+        )
+
+    memory = WindowBlockMemory(adapter=LotusAdapter())
+
+    memory.add({"timestamp": "t1", "speaker": "A", "message": "one"})
+    memory.add({"timestamp": "t2", "speaker": "B", "message": "two"})
+    memory.add({"timestamp": "t3", "speaker": "A", "message": "three"})
+
+    blocks = memory._runtime._state["blocks"]
+    assert len(blocks) == 2
+    assert json.loads(blocks.loc[0, "conversation_records"]) == [
+        {"message": "one"},
+        {"message": "two"},
+    ]
+    assert json.loads(blocks.loc[1, "conversation_records"]) == [
+        {"message": "two"},
+        {"message": "three"},
+    ]
+
+
+def test_runtime_maintains_over_array_agg_incrementally() -> None:
+    class ContextMemory(am.Memory):
+        log = am.Log({"message": "Message body."})
+        contextual = log.over(rows=(-2, -1)).array_agg(
+            columns=("message",),
+            output_col="previous_messages",
+        )
+
+    memory = ContextMemory(adapter=LotusAdapter())
+
+    memory.add({"message": "one", "turn_id": "ignored-1"})
+    memory.add({"message": "two", "turn_id": "ignored-2"})
+    memory.add({"message": "three", "turn_id": "ignored-3"})
+
+    contextual = memory._runtime._state["contextual"]
+    assert list(contextual.columns) == ["message", "previous_messages"]
+    assert list(contextual["message"]) == ["one", "two", "three"]
+    assert json.loads(contextual.loc[0, "previous_messages"]) == []
+    assert json.loads(contextual.loc[1, "previous_messages"]) == [{"message": "one"}]
+    assert json.loads(contextual.loc[2, "previous_messages"]) == [
+        {"message": "one"},
+        {"message": "two"},
+    ]
+
+
+def test_runtime_window_update_commits_only_after_public_view_success() -> None:
+    class WindowBlockMemory(am.Memory):
+        log = am.Log({"message": "Message body."})
+        blocks = log.count_window(size=2, slide=1).process_window(
+            lambda window: window.array_agg(
+                columns=("message",),
+                output_col="conversation_records",
+            )
+        )
+
+    class FailingAfterProcessAdapter:
+        def __init__(self) -> None:
+            self.fail_downstream = True
+            self.process_calls = 0
+            self._delegate = LotusAdapter()
+
+        def execute(
+            self,
+            query: QueryExpr,
+            inputs: dict[str, pd.DataFrame],
+        ) -> pd.DataFrame:
+            if query.op == "array_agg":
+                self.process_calls += 1
+                return self._delegate.execute(query, inputs)
+            if query.op == "union" and self.fail_downstream:
+                raise RuntimeError("downstream maintenance failed")
+            return self._delegate.execute(query, inputs)
+
+    adapter = FailingAfterProcessAdapter()
+    memory = WindowBlockMemory(adapter=adapter)
+
+    memory.add({"message": "one"})
+    with pytest.raises(RuntimeError, match="downstream maintenance failed"):
+        memory.add({"message": "two"})
+
+    assert adapter.process_calls == 1
+    assert "_blocks_process_window" not in memory._runtime._state
+    assert memory._runtime._window_next_start.get("_blocks_process_window", 0) == 0
+    assert memory._runtime._state["blocks"].empty
+
+    adapter.fail_downstream = False
+    memory.add({"message": "three"})
+
+    assert adapter.process_calls == 3
+    assert memory._runtime._window_next_start["_blocks_process_window"] == 2
+    private_blocks = memory._runtime._state["_blocks_process_window"]
+    public_blocks = memory._runtime._state["blocks"]
+    assert len(private_blocks) == 2
+    assert len(public_blocks) == 2
+    assert json.loads(public_blocks.loc[0, "conversation_records"]) == [
+        {"message": "one"},
+        {"message": "two"},
+    ]
+
+
+def test_empty_private_frame_normalizes_column_specs_to_string_labels() -> None:
+    class WindowBlockMemory(am.Memory):
+        log = am.Log({"message": "Message body."})
+        blocks = log.count_window(size=2, slide=1).process_window(
+            lambda window: window.array_agg(
+                columns=("message",),
+                output_col="conversation_records",
+            )
+        )
+
+    policy = WindowBlockMemory.differentiate_policy()
+    plan = policy.window_process_plans["blocks"]
+    plan = replace(
+        plan,
+        private_source=QueryExpr(
+            op="materialized_view",
+            params={
+                "name": plan.private_name,
+                "columns": (ColumnSpec("conversation_records"),),
+            },
+        ),
+    )
+    runtime = MemoryRuntime(policy, adapter=LotusAdapter())
+
+    frame = runtime._empty_private_frame(plan)
+
+    assert list(frame.columns) == ["conversation_records"]
+
+
+def test_runtime_commits_window_cursor_when_process_output_is_empty() -> None:
+    class WindowBlockMemory(am.Memory):
+        log = am.Log({"message": "Message body."})
+        blocks = log.count_window(size=2, slide=1).process_window(
+            lambda window: window.array_agg(
+                columns=("message",),
+                output_col="conversation_records",
+            )
+        )
+
+    class EmptyProcessAdapter:
+        def __init__(self) -> None:
+            self.process_calls = 0
+            self.window_sizes: list[int] = []
+            self._delegate = LotusAdapter()
+
+        def execute(
+            self,
+            query: QueryExpr,
+            inputs: dict[str, pd.DataFrame],
+        ) -> pd.DataFrame:
+            if query.op == "array_agg":
+                self.process_calls += 1
+                self.window_sizes.append(len(inputs[WINDOW_SOURCE_INPUT]))
+                return pd.DataFrame(columns=["conversation_records"])
+            return self._delegate.execute(query, inputs)
+
+    adapter = EmptyProcessAdapter()
+    memory = WindowBlockMemory(adapter=adapter)
+
+    memory.add({"message": "one"})
+    memory.add({"message": "two"})
+
+    assert adapter.process_calls == 1
+    assert adapter.window_sizes == [2]
+    assert memory._runtime._state["blocks"].empty
+    assert memory._runtime._state["_blocks_process_window"].empty
+    assert memory._runtime._window_next_start["_blocks_process_window"] == 1
+
+    memory.add({"message": "three"})
+
+    assert adapter.process_calls == 2
+    assert adapter.window_sizes == [2, 2]
+    assert memory._runtime._state["blocks"].empty
+    assert memory._runtime._state["_blocks_process_window"].empty
+    assert memory._runtime._window_next_start["_blocks_process_window"] == 2
+
+
+def test_runtime_count_window_uses_append_sequence_with_timestamp() -> None:
+    class WindowBlockMemory(am.Memory):
+        log = am.Log(
+            {
+                "timestamp": "Message timestamp.",
+                "speaker": "Message speaker.",
+                "message": "Message body.",
+            }
+        )
+        blocks = log.count_window(size=2, slide=1).process_window(
+            lambda window: window.array_agg(
+                columns=("timestamp", "speaker", "message"),
+                output_col="conversation_records",
+            )
+        )
+
+    memory = WindowBlockMemory(adapter=LotusAdapter())
+
+    memory.add({"timestamp": "t1", "speaker": "A", "message": "one"})
+    memory.add({"timestamp": "t3", "speaker": "B", "message": "three"})
+    memory.add({"timestamp": "t2", "speaker": "A", "message": "two"})
+
+    blocks = memory._runtime._state["blocks"]
+    assert len(blocks) == 2
+    assert json.loads(blocks.loc[0, "conversation_records"]) == [
+        {"timestamp": "t1", "speaker": "A", "message": "one"},
+        {"timestamp": "t3", "speaker": "B", "message": "three"},
+    ]
+    assert json.loads(blocks.loc[1, "conversation_records"]) == [
+        {"timestamp": "t3", "speaker": "B", "message": "three"},
+        {"timestamp": "t2", "speaker": "A", "message": "two"},
+    ]
+
+
+def test_runtime_count_window_uses_append_sequence_without_timestamp() -> None:
+    class WindowBlockMemory(am.Memory):
+        log = am.Log(
+            {
+                "speaker": "Message speaker.",
+                "message": "Message body.",
+            }
+        )
+        blocks = log.count_window(size=2, slide=1).process_window(
+            lambda window: window.array_agg(
+                columns=("speaker", "message"),
+                output_col="conversation_records",
+            )
+        )
+
+    memory = WindowBlockMemory(adapter=LotusAdapter())
+
+    memory.add({"speaker": "A", "message": "one"})
+    memory.add({"speaker": "B", "message": "two"})
+    memory.add({"speaker": "A", "message": "three"})
+
+    blocks = memory._runtime._state["blocks"]
+    assert len(blocks) == 2
+    assert json.loads(blocks.loc[0, "conversation_records"]) == [
+        {"speaker": "A", "message": "one"},
+        {"speaker": "B", "message": "two"},
+    ]
+    assert json.loads(blocks.loc[1, "conversation_records"]) == [
+        {"speaker": "B", "message": "two"},
+        {"speaker": "A", "message": "three"},
     ]
 
 

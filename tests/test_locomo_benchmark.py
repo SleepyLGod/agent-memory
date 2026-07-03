@@ -451,21 +451,7 @@ class FakeBenchmarkMemory:
     """Minimal memory object for runner helper tests."""
 
     def __init__(self) -> None:
-        self._runtime = type(
-            "Runtime",
-            (),
-            {
-                "_state": {
-                    "log": pd.DataFrame([{"message": "I researched adoption agencies."}]),
-                    "topics": pd.DataFrame(
-                        [{"name": "adoption", "body": "Caroline researched adoption agencies."}]
-                    ),
-                    "catalog": pd.DataFrame(
-                        [{"catalog_title": "Adoption", "name": "adoption", "hook": "adoption"}]
-                    ),
-                }
-            },
-        )()
+        self._runtime = FakeBenchmarkRuntime()
         self.calls = 0
 
     def query(self, question: str) -> pd.DataFrame:
@@ -477,6 +463,33 @@ class FakeBenchmarkMemory:
         return pd.DataFrame(
             [{"name": "adoption", "body": "Caroline researched adoption agencies."}]
         )
+
+
+class FakeBenchmarkRuntime:
+    """Minimal runtime snapshot surface for checkpoint helper tests."""
+
+    def __init__(self) -> None:
+        self._state = {
+            "log": pd.DataFrame([{"message": "I researched adoption agencies."}]),
+            "topics": pd.DataFrame(
+                [{"name": "adoption", "body": "Caroline researched adoption agencies."}]
+            ),
+            "catalog": pd.DataFrame(
+                [{"catalog_title": "Adoption", "name": "adoption", "hook": "adoption"}]
+            ),
+        }
+        self._window_next_start = {"_blocks_process_window": 2}
+        self._upstream_log_count = {"_blocks_upstream": 3}
+
+    def snapshot_state(self) -> dict[str, Any]:
+        """Return the same shape as MemoryRuntime.snapshot_state()."""
+
+        return {
+            "schema_version": 1,
+            "state": dict(self._state),
+            "window_next_start": dict(self._window_next_start),
+            "upstream_log_count": dict(self._upstream_log_count),
+        }
 
 
 def benchmark_questions() -> tuple[BenchmarkQuestion, BenchmarkQuestion]:
@@ -598,7 +611,7 @@ def test_checkpoint_round_trips_runtime_state_and_completed_rows(tmp_path: Path)
         result_rows=result_rows,
         metric_rows=metric_rows,
     )
-    state, loaded_steps, loaded_results, loaded_metrics = load_checkpoint(
+    snapshot, loaded_steps, loaded_results, loaded_metrics = load_checkpoint(
         output_dir=output_dir,
         sample_index=0,
         row_limit=2,
@@ -610,7 +623,12 @@ def test_checkpoint_round_trips_runtime_state_and_completed_rows(tmp_path: Path)
         questions=questions,
     )
 
-    pd.testing.assert_frame_equal(state["topics"], memory._runtime._state["topics"])
+    pd.testing.assert_frame_equal(
+        snapshot["state"]["topics"],
+        memory._runtime._state["topics"],
+    )
+    assert snapshot["window_next_start"] == memory._runtime._window_next_start
+    assert snapshot["upstream_log_count"] == memory._runtime._upstream_log_count
     assert loaded_steps == step_metrics
     assert loaded_results == result_rows
     assert loaded_metrics == metric_rows
@@ -1238,13 +1256,18 @@ def test_load_external_runtime_state_loads_valid_prefix_source(tmp_path: Path) -
         metric_rows=[],
     )
 
-    state = load_external_runtime_state(
+    snapshot = load_external_runtime_state(
         source_run,
         events=events,
         trusted_checkpoint=True,
     )
 
-    pd.testing.assert_frame_equal(state["topics"], memory._runtime._state["topics"])
+    pd.testing.assert_frame_equal(
+        snapshot["state"]["topics"],
+        memory._runtime._state["topics"],
+    )
+    assert snapshot["window_next_start"] == memory._runtime._window_next_start
+    assert snapshot["upstream_log_count"] == memory._runtime._upstream_log_count
 
 
 def test_load_external_runtime_state_rejects_extra_completed_events(tmp_path: Path) -> None:

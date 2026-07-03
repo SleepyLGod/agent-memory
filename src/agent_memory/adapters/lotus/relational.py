@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+import json
 from typing import Any
 
 import pandas as pd
 
 from agent_memory.logical import QueryExpr
+from agent_memory.query_schema import output_columns
+from agent_memory.window import over_frames
 
 
 def execute_select(
@@ -98,6 +101,105 @@ def execute_drop_duplicates(
     return source.drop_duplicates(ignore_index=True)
 
 
+def execute_array_agg(
+    query: QueryExpr,
+    inputs: Mapping[str, Any],
+    execute: Callable[[QueryExpr, Mapping[str, Any]], Any],
+) -> Any:
+    """Execute deterministic array-of-records aggregation."""
+
+    if query.inputs[0].op == "over":
+        return execute_over_array_agg(query, inputs, execute)
+
+    source = execute(query.inputs[0], inputs)
+    columns = tuple(str(column) for column in query.params["columns"])
+    output_col = str(query.params["output_col"])
+    missing = [column for column in columns if column not in source.columns]
+    if missing:
+        raise ValueError(f"array_agg input columns not found in DataFrame: {missing}")
+
+    projected = source.loc[:, list(columns)]
+    clean = projected.where(pd.notna(projected), None)
+    records = clean.to_dict(orient="records")
+    value = json.dumps(records, ensure_ascii=False, default=_json_default, allow_nan=False)
+    return pd.DataFrame([{output_col: value}], columns=[output_col])
+
+
+def execute_over_array_agg(
+    query: QueryExpr,
+    inputs: Mapping[str, Any],
+    execute: Callable[[QueryExpr, Mapping[str, Any]], Any],
+) -> Any:
+    """Execute row-preserving over-window array aggregation."""
+
+    over_query = query.inputs[0]
+    emit_source = execute(over_query.inputs[0], inputs)
+    frame_source_query = over_query.params.get("frame_source")
+    frame_source = (
+        execute(frame_source_query, inputs)
+        if isinstance(frame_source_query, QueryExpr)
+        else emit_source
+    )
+    columns = tuple(str(column) for column in query.params["columns"])
+    output_col = str(query.params["output_col"])
+    emit_columns = tuple(output_columns(over_query.inputs[0])) or tuple(emit_source.columns)
+    missing = [column for column in columns if column not in frame_source.columns]
+    if missing:
+        raise ValueError(f"over array_agg input columns not found in DataFrame: {missing}")
+    missing_emit = [column for column in emit_columns if column not in emit_source.columns]
+    if missing_emit:
+        raise ValueError(f"over array_agg emit columns not found in DataFrame: {missing_emit}")
+
+    rows: list[dict[str, Any]] = []
+    for frame in over_frames(emit_source, frame_source, over_query.params):
+        projected = frame.frame.loc[:, list(columns)]
+        clean = projected.where(pd.notna(projected), None)
+        value = json.dumps(
+            clean.to_dict(orient="records"),
+            ensure_ascii=False,
+            default=_json_default,
+            allow_nan=False,
+        )
+        row = frame.emit_row.loc[list(emit_columns)].to_dict()
+        row[output_col] = value
+        rows.append(row)
+    return pd.DataFrame(rows, columns=[*emit_columns, output_col])
+
+
+def execute_array_cat(
+    query: QueryExpr,
+    inputs: Mapping[str, Any],
+    execute: Callable[[QueryExpr, Mapping[str, Any]], Any],
+) -> Any:
+    """Execute deterministic JSON array-state concatenation."""
+
+    left, right = _execute_binary_inputs(query, inputs, execute)
+    column = str(query.params["column"])
+    _require_array_column(left, column, side="left")
+    _require_array_column(right, column, side="right")
+    _require_at_most_one_row(left, op="array_cat", side="left")
+    _require_at_most_one_row(right, op="array_cat", side="right")
+
+    if left.empty and right.empty:
+        return pd.DataFrame(columns=[column])
+    if left.empty:
+        _load_array_json(right.iloc[0][column], column=column, side="right")
+        return right.loc[:, [column]].copy().reset_index(drop=True)
+    if right.empty:
+        _load_array_json(left.iloc[0][column], column=column, side="left")
+        return left.loc[:, [column]].copy().reset_index(drop=True)
+
+    left_items = _load_array_json(left.iloc[0][column], column=column, side="left")
+    right_items = _load_array_json(right.iloc[0][column], column=column, side="right")
+    value = json.dumps(
+        [*left_items, *right_items],
+        ensure_ascii=False,
+        default=_json_default,
+        allow_nan=False,
+    )
+    return pd.DataFrame([{column: value}], columns=[column])
+
+
 def _execute_binary_inputs(
     query: QueryExpr,
     inputs: Mapping[str, Any],
@@ -143,3 +245,46 @@ def _require_non_null_join_keys(frame: Any, keys: tuple[str, ...], *, side: str)
 
     if frame.loc[:, list(keys)].isna().any().any():
         raise ValueError(f"join key columns cannot contain null values on {side} side")
+
+
+def _require_array_column(frame: Any, column: str, *, side: str) -> None:
+    """Require one JSON array column for aggregate-state concatenation."""
+
+    if column not in frame.columns:
+        raise ValueError(f"array_cat {side} input is missing column {column!r}")
+
+
+def _require_at_most_one_row(frame: Any, *, op: str, side: str) -> None:
+    """Require a one-row aggregate-state relation, allowing empty state."""
+
+    if len(frame) > 1:
+        raise ValueError(f"{op} expects {side} input to contain at most one row")
+
+
+def _load_array_json(value: Any, *, column: str, side: str) -> list[Any]:
+    """Parse one JSON array aggregate-state value."""
+
+    try:
+        parsed = json.loads(value)
+    except (TypeError, json.JSONDecodeError) as error:
+        raise ValueError(
+            f"array_cat {side} value in column {column!r} must be a JSON array"
+        ) from error
+    if not isinstance(parsed, list):
+        raise ValueError(
+            f"array_cat {side} value in column {column!r} must be a JSON array"
+        )
+    return parsed
+
+
+def _json_default(value: Any) -> Any:
+    """Convert pandas/numpy scalar values before string fallback."""
+
+    if isinstance(value, pd.Timestamp):
+        return value.isoformat()
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except (TypeError, ValueError):
+            pass
+    return str(value)

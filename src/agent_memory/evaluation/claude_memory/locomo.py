@@ -48,7 +48,7 @@ ANSWER_SYSTEM_PROMPT = (
     "Answer the benchmark question using only the retrieved memory context. "
     "If the context is insufficient, answer 'No information available.'."
 )
-CHECKPOINT_SCHEMA_VERSION = 1
+CHECKPOINT_SCHEMA_VERSION = 2
 RUN_MARKER_SCHEMA_VERSION = 1
 RUN_MARKER_FILENAME = ".agent-memory-locomo-run.json"
 BENCHMARK_CONTRACT = "message_with_event_context:v1"
@@ -581,7 +581,7 @@ def save_checkpoint(
         trace_dir=trace_dir,
         trace_enabled=trace_enabled,
     )
-    write_bytes_atomic(directory / "state.pkl", pickle.dumps(memory._runtime._state))
+    write_bytes_atomic(directory / "state.pkl", pickle.dumps(memory._runtime.snapshot_state()))
     write_jsonl_atomic(directory / "step_metrics.jsonl", step_metrics)
     write_jsonl_atomic(directory / "result_rows.jsonl", result_rows)
     write_jsonl_atomic(directory / "metric_rows.jsonl", metric_rows)
@@ -654,9 +654,9 @@ def load_checkpoint(
             "checkpoint state.pkl uses Python pickle. Only use trusted local "
             "benchmark outputs."
         )
-    state = pickle.loads(state_path.read_bytes())
-    if not isinstance(state, dict):
-        raise SystemExit("Checkpoint runtime state must be a dict")
+    runtime_snapshot = pickle.loads(state_path.read_bytes())
+    if not isinstance(runtime_snapshot, dict):
+        raise SystemExit("Checkpoint runtime snapshot must be a dict")
     step_metrics = read_jsonl(directory / "step_metrics.jsonl")
     result_rows = read_jsonl(directory / "result_rows.jsonl")
     metric_rows = read_jsonl(directory / "metric_rows.jsonl")
@@ -668,7 +668,7 @@ def load_checkpoint(
         result_rows=result_rows,
         metric_rows=metric_rows,
     )
-    return state, step_metrics, result_rows, metric_rows
+    return runtime_snapshot, step_metrics, result_rows, metric_rows
 
 
 def load_external_runtime_state(
@@ -740,10 +740,10 @@ def load_external_runtime_state(
             "because checkpoint state.pkl uses Python pickle. Only use trusted "
             "local benchmark outputs."
         )
-    state = pickle.loads(state_path.read_bytes())
-    if not isinstance(state, dict):
-        raise SystemExit("Source checkpoint runtime state must be a dict")
-    return state
+    runtime_snapshot = pickle.loads(state_path.read_bytes())
+    if not isinstance(runtime_snapshot, dict):
+        raise SystemExit("Source checkpoint runtime snapshot must be a dict")
+    return runtime_snapshot
 
 
 def load_artifact_runtime_state(
@@ -1519,7 +1519,7 @@ def run_claude_memory_locomo(config: ClaudeMemoryLocomoRunConfig) -> dict[str, P
     try:
         memory = create_memory(model=config.model, trace_dir=trace_dir)
         if config.resume:
-            state, step_metrics, result_rows, metric_rows = load_checkpoint(
+            runtime_snapshot, step_metrics, result_rows, metric_rows = load_checkpoint(
                 output_dir=output_dir,
                 sample_index=config.sample_index,
                 row_limit=config.row_limit,
@@ -1533,7 +1533,7 @@ def run_claude_memory_locomo(config: ClaudeMemoryLocomoRunConfig) -> dict[str, P
                 questions=questions,
                 trusted_checkpoint=config.trust_existing_output_dir,
             )
-            memory._runtime._state = state
+            memory._runtime.restore_state(runtime_snapshot)
             checkpoint_trace_count = checkpoint_trace_event_count(output_dir)
             excluded_trace_event_ranges = trace_exclusion_ranges(
                 output_dir=output_dir,
@@ -1564,11 +1564,12 @@ def run_claude_memory_locomo(config: ClaudeMemoryLocomoRunConfig) -> dict[str, P
                 f"catalog_rows={counts['catalog_rows']}"
             )
         elif source_run_dir is not None:
-            memory._runtime._state = load_external_runtime_state(
+            runtime_snapshot = load_external_runtime_state(
                 source_run_dir,
                 events=events,
                 trusted_checkpoint=config.trust_existing_output_dir,
             )
+            memory._runtime.restore_state(runtime_snapshot)
             counts = memory_row_counts(memory)
             print(
                 "restored external memory state: "

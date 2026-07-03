@@ -9,6 +9,7 @@ from agent_memory.planner.rules import (
     DifferentialInstructionRewriter,
     DifferentialRules,
 )
+from agent_memory.query_schema import output_columns
 
 
 class DifferentialQueryPlanner:
@@ -87,6 +88,44 @@ class DifferentialQueryPlanner:
             instruction_rewriter=self._instruction_rewriter,
         )
 
+    def differentiate_rows(
+        self,
+        *,
+        query: QueryExpr,
+        views: Mapping[str, MemoryView] | None = None,
+        source_query: QueryExpr | None = None,
+        source_input: QueryExpr | None = None,
+    ) -> QueryExpr:
+        """Generate changed-output rows for one query."""
+
+        source_input = source_input or QueryExpr(op="log")
+        current_view = QueryExpr(
+            op="materialized_view",
+            params={
+                "name": "__unused_current_view",
+                "columns": self._output_columns(query),
+            },
+        )
+        query = self._bind_materialized_dependencies(
+            query,
+            current_view_name="__unused_current_view",
+            views=views or {},
+        )
+        if source_query is not None:
+            source_query = self._bind_materialized_dependencies(
+                source_query,
+                current_view_name="__unused_current_view",
+                views=views or {},
+            )
+        return self._rules.differentiate(
+            query,
+            source_input=source_input,
+            current_view=current_view,
+            source_query=source_query,
+            is_view_boundary=False,
+            instruction_rewriter=self._instruction_rewriter,
+        )
+
     def _bind_materialized_dependencies(
         self,
         query: QueryExpr,
@@ -132,81 +171,7 @@ class DifferentialQueryPlanner:
     def _output_columns(self, query: QueryExpr) -> tuple[str, ...]:
         """Infer output columns for materialized-view placeholders."""
 
-        if query.op == "select":
-            return tuple(str(column) for column in query.params["columns"])
-        if query.op == "log":
-            return tuple(column.name for column in query.params.get("columns", ()))
-        if query.op == "window_source":
-            return tuple(str(column) for column in query.params.get("columns", ()))
-        if query.op == "materialized_view":
-            return tuple(str(column) for column in query.params.get("columns", ()))
-        if query.op == "array_agg":
-            return (str(query.params["output_col"]),)
-        if query.op == "array_cat":
-            return (str(query.params["column"]),)
-        if query.op == "sem_agg":
-            output_cols = query.params.get("output_cols")
-            if output_cols is not None:
-                return tuple(column.name for column in output_cols)
-            input_cols = query.params.get("input_cols")
-            if input_cols is not None:
-                return tuple(str(column) for column in input_cols)
-        if query.op in {"sem_map", "sem_flat_map"}:
-            columns = list(self._output_columns(query.inputs[0]))
-            for column in query.params.get("output_cols") or ():
-                if column.name not in columns:
-                    columns.append(column.name)
-            return tuple(columns)
-        if query.op in {
-            "sem_filter",
-            "sem_groupby",
-            "sem_topk",
-            "drop_duplicates",
-            "filter",
-            "assign",
-        }:
-            return self._output_columns(query.inputs[0])
-        if query.op == "count_window":
-            return self._output_columns(query.inputs[0])
-        if query.op == "process_window":
-            return self._output_columns(query.inputs[1])
-        if query.op == "join":
-            return self._join_output_columns(query)
-        if query.op in {"union", "concat", "subtract", "sem_join"}:
-            columns: list[str] = []
-            for input_query in query.inputs:
-                for column in self._output_columns(input_query):
-                    if column not in columns:
-                        columns.append(column)
-            return tuple(columns)
-        raise NotImplementedError(
-            f"Cannot infer output columns for QueryExpr op {query.op!r}."
-        )
-
-    def _join_output_columns(self, query: QueryExpr) -> tuple[str, ...]:
-        """Infer pandas merge output columns for same-key relational joins."""
-
-        left_columns = self._output_columns(query.inputs[0])
-        right_columns = self._output_columns(query.inputs[1])
-        keys = tuple(str(column) for column in query.params["on"])
-        overlapping = (
-            set(left_columns).intersection(right_columns).difference(keys)
-        )
-
-        columns: list[str] = []
-        for column in left_columns:
-            if column in overlapping:
-                columns.append(f"{column}:left")
-            else:
-                columns.append(column)
-        for column in right_columns:
-            if column in keys:
-                continue
-            if column in overlapping:
-                columns.append(f"{column}:right")
-            else:
-                columns.append(column)
-        return tuple(columns)
+        return output_columns(query)
 
     def _contains_query(self, query: QueryExpr, target: QueryExpr | None) -> bool:
         """Return whether a query tree contains one exact subtree."""

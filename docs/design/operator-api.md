@@ -170,7 +170,148 @@ operator is not interchangeable with `sem_join(...)`: `sem_join` asks an LLM
 whether two rows semantically match, while `join(on=...)` requires exact key
 identity.
 
-## 3. Instruction And Column Conventions
+## 3. Aggregate And Window Operators
+
+These operators are part of the public authoring surface, but they use different
+receiver types. A `WindowedRelation` or `OverRelation` is not an ordinary
+`Relation`; it must be closed by one of its allowed window functions before the
+query can continue.
+
+For window semantics and differential rules, see `docs/design/window.md`.
+
+### `array_agg`
+
+Deterministic aggregate that turns relation rows into one JSON array-of-records
+column.
+
+```python
+records = log.array_agg(
+    columns=("timestamp", "speaker", "message"),
+    output_col="conversation_records",
+)
+```
+
+Contract:
+
+- input receiver: `Relation`
+- cardinality: many input rows to one output row
+- output receiver: ordinary `Relation`
+- output columns: one JSON text array-of-records column named by `output_col`
+- value format: stable JSON text array of records
+
+`array_agg(columns=...)` preserves row alignment inside each record. It does not
+create one independent array per column.
+
+### `array_cat`
+
+Deterministic combine operator for one JSON array aggregate-state column.
+
+```python
+next_records = current_records.array_cat(delta_records, column="records")
+```
+
+Contract:
+
+- input receivers: two ordinary `Relation` values
+- supported state shape: the named column contains JSON arrays
+- output receiver: ordinary `Relation`
+- output columns: the same array column
+- primary use: `array_agg` differential maintenance
+
+`array_cat` is not a semantic merge. It concatenates JSON arrays. It currently
+has no generic differential rule beyond the `array_agg` view-boundary rule.
+
+### `count_window`
+
+Count-window assigner. It returns `WindowedRelation`, not ordinary `Relation`.
+
+```python
+blocks = (
+    log
+    .count_window(size=10, slide=1, trigger=None)
+    .process_window(
+        lambda w: w.array_agg(
+            columns=("timestamp", "speaker", "message"),
+            output_col="conversation_records",
+        )
+    )
+)
+```
+
+Contract:
+
+- input receiver: `Relation`
+- intermediate receiver: `WindowedRelation`
+- `size`: positive integer window length
+- `slide`: positive integer window start step; default `1`, not the only
+  supported value
+- closing method: `process_window(lambda w: ...)`
+- output receiver after closing: ordinary `Relation`
+- ordering: runtime append sequence
+- supported trigger: `trigger=None`
+
+`slide < size` creates overlapping windows, `slide == size` creates
+non-overlapping windows, and `slide > size` creates gapped windows.
+
+Inside `process_window(...)`, `w` is a window-local ordinary `Relation`.
+After `process_window(...)`, downstream operators are global over the process
+output relation.
+
+Invalid shape:
+
+```python
+log.count_window(size=10).sem_map(...)
+```
+
+The window must first be closed:
+
+```python
+log.count_window(size=10).process_window(lambda w: w.array_agg(...)).sem_map(...)
+```
+
+### `over`
+
+Row-preserving over-window handle. It returns `OverRelation`, not ordinary
+`Relation`.
+
+```python
+contextual_log = (
+    log
+    .over(rows=(-10, -1))
+    .array_agg(
+        columns=("timestamp", "speaker", "message"),
+        output_col="previous_messages",
+    )
+)
+```
+
+```python
+contextual_log = (
+    log
+    .over(rows=(-10, -1))
+    .sem_agg(
+        input_cols=["message"],
+        output_cols={"previous_summary": "Summary of previous messages."},
+        instruction="Summarize the previous messages in this frame.",
+    )
+)
+```
+
+Contract:
+
+- input receiver: `Relation`
+- intermediate receiver: `OverRelation`
+- closing methods: `array_agg(...)` or `sem_agg(...)`
+- cardinality: row-preserving
+- output receiver after closing: ordinary `Relation`
+- output columns: original row columns plus frame aggregate columns
+- supported frames: append-sequence `rows=(M, N)` with `N <= 0`
+
+`OverRelation.array_agg(...)` differs from `Relation.array_agg(...)`.
+The ordinary relation version collapses many rows into one row. The over-window
+version keeps each emit row and adds one frame aggregate column.
+
+## 4. Instruction And Column Conventions
 
 Semantic operators use an `instruction` string. The string may refer to columns
 with placeholders.
@@ -224,7 +365,7 @@ content follows the operator semantics:
 - `sem_agg`: aggregation / merge instruction, such as `"Merge topic content into one durable memory."`
 - `sem_topk`: ranking query or relevance criterion; adapters may lower plain user query text into backend-specific column-aware expressions.
 
-## 4. Semantic Operators
+## 5. Semantic Operators
 
 ### `sem_filter`
 
@@ -585,7 +726,7 @@ optimizer concerns. When used as a memory retrieval template, the `instruction`
 argument is typically `am.UserQuery()`, which runtime binds to the end-user
 query text. `k` is the policy author's initial retrieval width.
 
-## 5. Differential Maintenance Notes
+## 6. Differential Maintenance Notes
 
 The API is designed so full view definitions and differential maintenance can be
 discussed in the same dataframe language.
@@ -680,7 +821,7 @@ V_prime = V.subtract(delta_minus).concat(delta_plus)
 `sem_union` may be useful as backend theory terminology for semantic upsert or
 semantic union-distinct, but it is not a public v0 operator in this API.
 
-## 6. LOTUS Alignment
+## 7. LOTUS Alignment
 
 This API follows the LOTUS direction closely:
 
