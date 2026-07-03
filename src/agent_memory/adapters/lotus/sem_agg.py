@@ -20,6 +20,8 @@ from agent_memory.adapters.lotus.structured import (
     write_structured_failure_artifacts,
 )
 from agent_memory.logical import ColumnSpec, QueryExpr
+from agent_memory.query_schema import output_columns
+from agent_memory.window import over_frames
 
 JSON_OBJECT_RESPONSE_FORMAT = {"type": "json_object"}
 
@@ -33,6 +35,9 @@ def execute_sem_agg(
     """Execute whole-relation or grouped semantic aggregation."""
 
     context.configure()
+    if query.inputs[0].op == "over":
+        return execute_over_sem_agg(query, inputs, execute, context)
+
     source = execute(query.inputs[0], inputs)
     input_cols = aggregate_input_columns(source, query.params.get("input_cols"))
     output_cols = aggregate_output_columns(query, input_cols)
@@ -50,6 +55,66 @@ def execute_sem_agg(
         input_cols,
         output_cols,
         context.config,
+    )
+
+
+def execute_over_sem_agg(
+    query: QueryExpr,
+    inputs: Mapping[str, Any],
+    execute: Callable[[QueryExpr, Mapping[str, Any]], Any],
+    context: LotusExecutionContext,
+) -> pd.DataFrame:
+    """Execute row-preserving over-window semantic aggregation."""
+
+    over_query = query.inputs[0]
+    declared_output_cols = query.params.get("output_cols")
+    if declared_output_cols is None:
+        raise ValueError("over sem_agg requires explicit output_cols")
+    output_cols = tuple(declared_output_cols)
+    emit_source = execute(over_query.inputs[0], inputs)
+    emit_columns = tuple(output_columns(over_query.inputs[0])) or tuple(emit_source.columns)
+    missing_emit = [column for column in emit_columns if column not in emit_source.columns]
+    if missing_emit:
+        raise ValueError(f"over sem_agg emit columns not found in DataFrame: {missing_emit}")
+    frame_source_query = over_query.params.get("frame_source")
+    frame_source = (
+        execute(frame_source_query, inputs)
+        if isinstance(frame_source_query, QueryExpr)
+        else emit_source
+    )
+    rows: list[dict[str, Any]] = []
+    for frame in over_frames(emit_source, frame_source, over_query.params):
+        row = frame.emit_row.loc[list(emit_columns)].to_dict()
+        if frame.frame.empty:
+            for column in output_cols:
+                row[column.name] = None
+            rows.append(row)
+            continue
+
+        input_cols = aggregate_input_columns(frame.frame, query.params.get("input_cols"))
+        if len(output_cols) == 1:
+            result = execute_native_sem_agg(
+                query,
+                frame.frame,
+                input_cols,
+                output_cols[0],
+                context.config,
+            )
+        else:
+            result = execute_structured_sem_agg(
+                query,
+                frame.frame,
+                input_cols,
+                output_cols,
+                context.config,
+            )
+        values = result.iloc[0].to_dict() if not result.empty else {}
+        for column in output_cols:
+            row[column.name] = values.get(column.name)
+        rows.append(row)
+    return pd.DataFrame(
+        rows,
+        columns=[*emit_columns, *(column.name for column in output_cols)],
     )
 
 

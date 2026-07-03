@@ -6,6 +6,7 @@ from collections.abc import Sequence
 import re
 
 from agent_memory.logical import ColumnSpec, QueryExpr
+from agent_memory.query_schema import output_columns
 
 ROW_LOCAL_UNARY_OPS = {
     "select",
@@ -92,6 +93,7 @@ class DifferentialRules:
         *,
         source_input: QueryExpr,
         current_view: QueryExpr,
+        source_query: QueryExpr | None = None,
         is_view_boundary: bool = False,
         instruction_rewriter: DifferentialInstructionRewriter | None = None,
     ) -> QueryExpr:
@@ -103,6 +105,7 @@ class DifferentialRules:
                 query,
                 source_input=source_input,
                 current_view=current_view,
+                source_query=source_query,
                 instruction_rewriter=rewriter,
             )
 
@@ -110,6 +113,7 @@ class DifferentialRules:
             query,
             source_input=source_input,
             current_view=current_view,
+            source_query=source_query,
             instruction_rewriter=rewriter,
         )
 
@@ -119,18 +123,21 @@ class DifferentialRules:
         *,
         source_input: QueryExpr,
         current_view: QueryExpr,
+        source_query: QueryExpr | None,
         instruction_rewriter: DifferentialInstructionRewriter,
     ) -> QueryExpr:
         """Differentiate a view definition query into a full next-view query."""
 
         for rule in (
             self._differentiate_sem_groupby_agg_view,
+            self._differentiate_array_agg_view,
             self._differentiate_sem_agg_view,
         ):
             differentiated = rule(
                 query,
                 source_input=source_input,
                 current_view=current_view,
+                source_query=source_query,
                 instruction_rewriter=instruction_rewriter,
             )
             if differentiated is not None:
@@ -140,6 +147,7 @@ class DifferentialRules:
             query,
             source_input=source_input,
             current_view=current_view,
+            source_query=source_query,
             instruction_rewriter=instruction_rewriter,
         )
         return QueryExpr(op="union", inputs=(current_view, changed_rows))
@@ -150,13 +158,22 @@ class DifferentialRules:
         *,
         source_input: QueryExpr,
         current_view: QueryExpr,
+        source_query: QueryExpr | None,
         instruction_rewriter: DifferentialInstructionRewriter,
     ) -> QueryExpr:
         """Differentiate one query subtree into changed output rows."""
 
+        changed_rows = self._differentiate_source_input(
+            query,
+            source_input=source_input,
+            current_view=current_view,
+            source_query=source_query,
+            instruction_rewriter=instruction_rewriter,
+        )
+        if changed_rows is not None:
+            return changed_rows
         self._raise_if_rows_unsupported(query)
         for rule in (
-            self._differentiate_source_input,
             self._differentiate_row_local_operator,
             self._differentiate_append_binary_operator,
             self._differentiate_sem_join,
@@ -165,6 +182,7 @@ class DifferentialRules:
                 query,
                 source_input=source_input,
                 current_view=current_view,
+                source_query=source_query,
                 instruction_rewriter=instruction_rewriter,
             )
             if changed_rows is not None:
@@ -190,6 +208,10 @@ class DifferentialRules:
             raise NotImplementedError(
                 "standalone sem_agg differential is only supported at a view boundary."
             )
+        if query.op == "array_agg":
+            raise NotImplementedError(
+                "array_agg changed-row differential is not implemented; array_agg is only supported at a view boundary or inside process_window."
+            )
 
     def _differentiate_source_input(
         self,
@@ -197,10 +219,13 @@ class DifferentialRules:
         *,
         source_input: QueryExpr,
         current_view: QueryExpr,
+        source_query: QueryExpr | None,
         instruction_rewriter: DifferentialInstructionRewriter,
     ) -> QueryExpr | None:
         """Rewrite the source log leaf to the runtime-bound changed rows input."""
 
+        if source_query is not None:
+            return source_input if query == source_query else None
         if query.op != "log":
             return None
         return source_input
@@ -211,6 +236,7 @@ class DifferentialRules:
         *,
         source_input: QueryExpr,
         current_view: QueryExpr,
+        source_query: QueryExpr | None,
         instruction_rewriter: DifferentialInstructionRewriter,
     ) -> QueryExpr | None:
         """Differentiate row-local unary operator patterns."""
@@ -230,6 +256,7 @@ class DifferentialRules:
                     query.inputs[0],
                     source_input=source_input,
                     current_view=current_view,
+                    source_query=source_query,
                     instruction_rewriter=instruction_rewriter,
                 ),
             ),
@@ -242,6 +269,7 @@ class DifferentialRules:
         *,
         source_input: QueryExpr,
         current_view: QueryExpr,
+        source_query: QueryExpr | None,
         instruction_rewriter: DifferentialInstructionRewriter,
     ) -> QueryExpr | None:
         """Differentiate append-preserving binary operator patterns."""
@@ -261,6 +289,7 @@ class DifferentialRules:
                     input_query,
                     source_input=source_input,
                     current_view=current_view,
+                    source_query=source_query,
                     instruction_rewriter=instruction_rewriter,
                 )
                 for input_query in query.inputs
@@ -274,6 +303,7 @@ class DifferentialRules:
         *,
         source_input: QueryExpr,
         current_view: QueryExpr,
+        source_query: QueryExpr | None,
         instruction_rewriter: DifferentialInstructionRewriter,
     ) -> QueryExpr | None:
         """Differentiate generic sem_join changed rows when state is available."""
@@ -289,12 +319,47 @@ class DifferentialRules:
             "Generic sem_join differential requires materialized old L/R state and is not implemented yet."
         )
 
+    def _differentiate_array_agg_view(
+        self,
+        query: QueryExpr,
+        *,
+        source_input: QueryExpr,
+        current_view: QueryExpr,
+        source_query: QueryExpr | None,
+        instruction_rewriter: DifferentialInstructionRewriter,
+    ) -> QueryExpr | None:
+        """Differentiate view-boundary array_agg via array aggregate-state concat."""
+
+        if query.op != "array_agg":
+            return None
+        if len(query.inputs) != 1:
+            raise ValueError("array_agg expects exactly one input")
+
+        changed_input = self._differentiate_to_rows(
+            query.inputs[0],
+            source_input=source_input,
+            current_view=current_view,
+            source_query=source_query,
+            instruction_rewriter=instruction_rewriter,
+        )
+        changed_aggregate = QueryExpr(
+            op="array_agg",
+            inputs=(changed_input,),
+            params=query.params,
+        )
+        return QueryExpr(
+            op="array_cat",
+            inputs=(current_view, changed_aggregate),
+            params={"column": str(query.params["output_col"])},
+        )
+
     def _differentiate_sem_groupby_agg_view(
         self,
         query: QueryExpr,
         *,
         source_input: QueryExpr,
         current_view: QueryExpr,
+        source_query: QueryExpr | None,
         instruction_rewriter: DifferentialInstructionRewriter,
     ) -> QueryExpr | None:
         """Differentiate sem_groupby(...).sem_agg(...) into a full V' query."""
@@ -308,6 +373,7 @@ class DifferentialRules:
             groupby.inputs[0],
             source_input=source_input,
             current_view=current_view,
+            source_query=source_query,
             instruction_rewriter=instruction_rewriter,
         )
         changed_groupby = QueryExpr(
@@ -363,6 +429,7 @@ class DifferentialRules:
         *,
         source_input: QueryExpr,
         current_view: QueryExpr,
+        source_query: QueryExpr | None,
         instruction_rewriter: DifferentialInstructionRewriter,
     ) -> QueryExpr | None:
         """Differentiate standalone sem_agg using compressed aggregate state."""
@@ -388,6 +455,7 @@ class DifferentialRules:
             aggregate.inputs[0],
             source_input=source_input,
             current_view=current_view,
+            source_query=source_query,
             instruction_rewriter=instruction_rewriter,
         )
         self._require_columns(
@@ -497,41 +565,7 @@ class DifferentialRules:
     def _output_column_names_for_query(self, query: QueryExpr) -> tuple[str, ...]:
         """Infer output column names for schema-only differential checks."""
 
-        if query.op == "select":
-            return tuple(str(column) for column in query.params["columns"])
-        if query.op == "log":
-            columns = query.params.get("columns", ())
-            return tuple(column.name for column in columns if isinstance(column, ColumnSpec))
-        if query.op == "materialized_view":
-            return self._output_column_names(query.params.get("columns"))
-        if query.op == "sem_agg":
-            output_cols = query.params.get("output_cols")
-            if output_cols is not None:
-                return self._output_column_names(output_cols)
-            input_cols = query.params.get("input_cols")
-            if input_cols is not None:
-                return tuple(str(column) for column in input_cols)
-            raise NotImplementedError(
-                "Cannot infer sem_agg output columns without input_cols or output_cols."
-            )
-        if query.op in {"sem_map", "sem_flat_map"}:
-            columns = list(self._output_column_names_for_query(query.inputs[0]))
-            for column in query.params.get("output_cols") or ():
-                if isinstance(column, ColumnSpec) and column.name not in columns:
-                    columns.append(column.name)
-            return tuple(columns)
-        if query.op in {"sem_filter", "sem_groupby", "sem_topk", "drop_duplicates"}:
-            return self._output_column_names_for_query(query.inputs[0])
-        if query.op in {"union", "concat", "subtract", "sem_join"}:
-            columns: list[str] = []
-            for input_query in query.inputs:
-                for column in self._output_column_names_for_query(input_query):
-                    if column not in columns:
-                        columns.append(column)
-            return tuple(columns)
-        raise NotImplementedError(
-            f"Cannot infer output columns for QueryExpr op {query.op!r}."
-        )
+        return output_columns(query)
 
     def _require_columns(
         self,

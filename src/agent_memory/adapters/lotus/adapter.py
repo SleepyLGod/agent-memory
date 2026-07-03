@@ -9,6 +9,8 @@ from uuid import uuid4
 
 from agent_memory.adapters.lotus.context import LotusExecutionConfig, LotusExecutionContext
 from agent_memory.adapters.lotus.relational import (
+    execute_array_agg,
+    execute_array_cat,
     execute_concat,
     execute_drop_duplicates,
     execute_select,
@@ -28,6 +30,11 @@ from agent_memory.tracing.semantic import (
     write_compact_operator_trace,
 )
 from agent_memory.adapters.lotus.sources import execute_log, execute_materialized_view
+from agent_memory.adapters.lotus.window import (
+    execute_count_window,
+    execute_process_window,
+    execute_window_source,
+)
 from agent_memory.logical import QueryExpr
 
 DEFAULT_LOTUS_MODEL = "deepseek/deepseek-v4-pro"
@@ -54,8 +61,14 @@ class LotusAdapter:
                 return execute_log(inputs)
             case "materialized_view":
                 return execute_materialized_view(query, inputs)
+            case "window_source":
+                return execute_window_source(inputs)
             case "select":
                 return self._execute_traced_relational(query, inputs, execute_select)
+            case "array_agg":
+                return self._execute_traced_relational(query, inputs, execute_array_agg)
+            case "array_cat":
+                return self._execute_traced_relational(query, inputs, execute_array_cat)
             case "concat":
                 return self._execute_traced_relational(query, inputs, execute_concat)
             case "union":
@@ -64,6 +77,10 @@ class LotusAdapter:
                 return self._execute_traced_relational(query, inputs, execute_subtract)
             case "drop_duplicates":
                 return self._execute_traced_relational(query, inputs, execute_drop_duplicates)
+            case "count_window":
+                return self._execute_traced_relational(query, inputs, execute_count_window)
+            case "process_window":
+                return self._execute_traced_relational(query, inputs, execute_process_window)
             case "sem_filter":
                 return self._execute_traced_semantic(query, inputs, execute_sem_filter)
             case "sem_flat_map":

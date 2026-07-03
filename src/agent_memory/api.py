@@ -8,7 +8,7 @@ from typing import Any
 from .logical import ColumnSpec, MemorySpec, MemoryView, QueryExpr
 from .message import MessageInput
 from .policy import DifferentiatedPolicy, DifferentialPolicyCompiler
-from .relation import Relation
+from .relation import OverRelation, Relation, WindowedRelation
 from .runtime import MemoryRuntime
 
 
@@ -121,6 +121,16 @@ class Memory:
                 continue
 
             if not isinstance(value, Relation):
+                if isinstance(value, WindowedRelation):
+                    raise TypeError(
+                        f"{name} is a WindowedRelation; call process_window(...) "
+                        "before declaring it as a memory relation"
+                    )
+                if isinstance(value, OverRelation):
+                    raise TypeError(
+                        f"{name} is an OverRelation; call array_agg(...) or sem_agg(...) "
+                        "before declaring it as a memory relation"
+                    )
                 continue
 
             if name.startswith("_"):
