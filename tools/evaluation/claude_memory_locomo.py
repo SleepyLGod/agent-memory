@@ -16,6 +16,8 @@ path.insert(0, str(PROJECT_ROOT / "src"))
 from agent_memory.adapters.lotus import DEFAULT_LOTUS_MODEL  # noqa: E402
 from agent_memory.evaluation.claude_memory.locomo import (  # noqa: E402
     ClaudeMemoryLocomoRunConfig,
+    GROUPED_AGG_RULES,
+    SEM_TOPK_METHODS,
     run_claude_memory_locomo,
 )
 
@@ -51,6 +53,18 @@ def parse_args() -> argparse.Namespace:
         help=f"LiteLLM model passed to LotusAdapter. Defaults to {DEFAULT_LOTUS_MODEL}.",
     )
     parser.add_argument(
+        "--grouped-agg-rule",
+        choices=GROUPED_AGG_RULES,
+        default="compressed",
+        help="Grouped aggregate differential rule strategy for this evaluation run.",
+    )
+    parser.add_argument(
+        "--sem-topk-method",
+        choices=SEM_TOPK_METHODS,
+        default="pairwise-naive",
+        help="Physical sem_topk execution method for retrieval queries.",
+    )
+    parser.add_argument(
         "--output-dir",
         type=Path,
         default=DEFAULT_OUTPUT_DIR,
@@ -64,6 +78,20 @@ def parse_args() -> argparse.Namespace:
             "Restore memory runtime state from an existing benchmark output "
             "and run questions only."
         ),
+    )
+    parser.add_argument(
+        "--continue-from-output-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Read one historical ingestion checkpoint from this run and continue "
+            "ingestion into a new --output-dir."
+        ),
+    )
+    parser.add_argument(
+        "--source-checkpoint-id",
+        default=None,
+        help="Snapshot directory name selected from --continue-from-output-dir.",
     )
     parser.add_argument(
         "--restore-csv-state",
@@ -103,7 +131,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--resume",
         action="store_true",
-        help="Resume from output_dir/checkpoint instead of starting from scratch.",
+        help=(
+            "Resume from --output-dir/checkpoint. The target checkpoint restores "
+            "its own maintenance origin; do not repeat external source arguments."
+        ),
     )
     return parser.parse_args()
 
@@ -135,9 +166,13 @@ def main() -> None:
             row_limit=args.row_limit,
             question_limit=args.question_limit,
             model=args.model,
+            grouped_agg_rule=args.grouped_agg_rule,
+            sem_topk_method=args.sem_topk_method,
             output_dir=args.output_dir,
             locomo_cache_path=LOCOMO_CACHE_PATH,
             existing_output_dir=args.existing_output_dir,
+            continue_from_output_dir=args.continue_from_output_dir,
+            source_checkpoint_id=args.source_checkpoint_id,
             trust_existing_output_dir=args.trust_existing_output_dir,
             trace=args.trace,
             answer=args.answer,

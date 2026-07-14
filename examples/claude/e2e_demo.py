@@ -8,10 +8,11 @@ shell before running this script. The script writes local CSV artifacts under
 from __future__ import annotations
 
 import argparse
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+import json
 import os
 from pathlib import Path
-import shutil
+import pickle
 from sys import path
 import time
 from typing import Any
@@ -40,7 +41,7 @@ from agent_memory.tracing.semantic import (  # noqa: E402
     append_trace_metrics,
     semantic_trace_scope,
 )
-from agent_memory.logical import MemorySpec, QueryExpr  # noqa: E402
+from agent_memory.policy.logical import MemorySpec, QueryExpr, UserQuery  # noqa: E402
 
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / ".memory-test" / "claude-e2e" / "latest"
 LOCOMO_CACHE_PATH = PROJECT_ROOT / ".cache" / "agent-memory" / "locomo10.json"
@@ -119,10 +120,10 @@ def parse_args() -> argparse.Namespace:
 
 
 def reset_output_dir(output_dir: Path) -> None:
-    """Create the output directory and remove stale artifacts from prior runs."""
+    """Create a fresh output directory without deleting prior artifacts."""
 
-    if output_dir.exists():
-        shutil.rmtree(output_dir)
+    if output_dir.exists() and any(output_dir.iterdir()):
+        raise SystemExit(f"--output-dir must be empty or absent: {output_dir}")
     output_dir.mkdir(parents=True, exist_ok=True)
 
 
@@ -274,17 +275,16 @@ def run_differential(
     model: str,
     print_steps: bool,
     semantic_trace_dir: Path | None,
-) -> tuple[am.ClaudeMemory, list[dict[str, Any]]]:
+) -> tuple[am.ClaudeMemory, LotusAdapter, list[dict[str, Any]]]:
     """Maintain ClaudeMemory by appending rows through runtime Q' execution."""
 
-    memory = am.ClaudeMemory(
-        adapter=LotusAdapter(
-            model=model,
-            config=LotusExecutionConfig(
-                semantic_trace_dir=semantic_trace_dir,
-            )
-        )
+    adapter = LotusAdapter(
+        model=model,
+        config=LotusExecutionConfig(
+            semantic_trace_dir=semantic_trace_dir,
+        ),
     )
+    memory = am.ClaudeMemory(adapter=adapter)
     step_metrics: list[dict[str, Any]] = []
     for index, row in enumerate(rows, start=1):
         print(f"add[{index}]: {row['role']}: {row['message'][:100]}")
@@ -301,7 +301,7 @@ def run_differential(
         step_metrics.append(metric)
         if print_steps:
             print_step_counts(memory)
-    return memory, step_metrics
+    return memory, adapter, step_metrics
 
 
 def turn_id(row: dict[str, Any]) -> str:
@@ -338,18 +338,18 @@ def print_step_counts(memory: am.ClaudeMemory) -> None:
 
 def run_full_recompute(
     memory: am.ClaudeMemory,
+    adapter: LotusAdapter,
     query_text: str,
 ) -> tuple[dict[str, Any], Any, list[dict[str, Any]]]:
     """Execute full view queries over the final source log state."""
 
     policy = am.ClaudeMemory.differentiate_policy()
     spec = am.ClaudeMemory.spec()
-    adapter = memory._runtime.adapter
     log_state = memory._runtime._state["log"]
     full_state: dict[str, Any] = {}
     phase_metrics: list[dict[str, Any]] = []
 
-    for view_name in policy.view_execution_order:
+    for view_name in policy.view_outputs:
         query = bind_materialized_dependencies(
             spec.views[view_name].query,
             spec=spec,
@@ -372,7 +372,7 @@ def run_full_recompute(
         phase_metrics.append(metric)
 
     retrieval_template = policy.retrieval_queries["default"]
-    retrieval_query = memory._runtime._bind_user_query(retrieval_template, query_text)
+    retrieval_query = bind_user_query(retrieval_template, query_text)
     query_result, metric = run_measured(
         run_kind="view",
         phase="view_query",
@@ -383,15 +383,36 @@ def run_full_recompute(
     return full_state, query_result, phase_metrics
 
 
-def run_full_candidates(memory: am.ClaudeMemory) -> Any:
+def run_full_candidates(memory: am.ClaudeMemory, adapter: LotusAdapter) -> Any:
     """Execute the topic-candidate extraction subtree over the final log state."""
 
     spec = am.ClaudeMemory.spec()
-    adapter = memory._runtime.adapter
     candidate_query = find_first_op(spec.views["topics"].query, "sem_flat_map")
     if candidate_query is None:
         raise RuntimeError("ClaudeMemory topics view does not contain sem_flat_map")
     return adapter.execute(candidate_query, {"log": memory._runtime._state["log"]})
+
+
+def bind_user_query(query: QueryExpr, text: str) -> QueryExpr:
+    """Bind UserQuery placeholders for full-reference execution."""
+
+    return QueryExpr(
+        op=query.op,
+        inputs=tuple(bind_user_query(item, text) for item in query.inputs),
+        params={key: bind_user_query_value(value, text) for key, value in query.params.items()},
+    )
+
+
+def bind_user_query_value(value: Any, text: str) -> Any:
+    """Recursively bind one query parameter value."""
+
+    if isinstance(value, UserQuery):
+        return text
+    if isinstance(value, Mapping):
+        return {key: bind_user_query_value(item, text) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return tuple(bind_user_query_value(item, text) for item in value)
+    return value
 
 
 def find_first_op(query: QueryExpr, op: str) -> QueryExpr | None:
@@ -446,6 +467,7 @@ def metrics_summary(
     step_metrics: list[dict[str, Any]],
     phase_metrics: list[dict[str, Any]],
     memory: am.ClaudeMemory,
+    adapter: LotusAdapter,
     compare_full: bool,
     model: str,
 ) -> pd.DataFrame:
@@ -480,10 +502,10 @@ def metrics_summary(
                     selected["structured_failure_artifacts"].sum()
                 ),
                 "cache_enabled": lotus_cache_enabled(),
-                "lm_backend_retry_configured": memory._runtime.adapter.config.lm_num_retries,
-                "lm_max_batch_size": memory._runtime.adapter.config.lm_max_batch_size,
-                "lm_rate_limit": memory._runtime.adapter.config.lm_rate_limit,
-                "structured_parse_retries": memory._runtime.adapter.config.structured_parse_retries,
+                "lm_backend_retry_configured": adapter.config.lm_num_retries,
+                "lm_max_batch_size": adapter.config.lm_max_batch_size,
+                "lm_rate_limit": adapter.config.lm_rate_limit,
+                "structured_parse_retries": adapter.config.structured_parse_retries,
             }
         )
     return pd.DataFrame(summary_rows)
@@ -525,7 +547,7 @@ def main() -> None:
     print(f"output_dir: {output_dir}")
     write_csv("locomo_rows", pd.DataFrame(rows), input_dir)
 
-    memory, step_metrics = run_differential(
+    memory, adapter, step_metrics = run_differential(
         rows,
         model=args.model,
         print_steps=args.print_steps,
@@ -566,11 +588,15 @@ def main() -> None:
         full_candidates, candidate_metric = run_measured(
             run_kind="view",
             phase="view_candidates",
-            action=lambda: run_full_candidates(memory),
+            action=lambda: run_full_candidates(memory, adapter),
         )
         candidate_metric["candidate_rows"] = len(full_candidates)
         phase_metrics.append(candidate_metric)
-        full_state, full_result, full_metrics = run_full_recompute(memory, args.query)
+        full_state, full_result, full_metrics = run_full_recompute(
+            memory,
+            adapter,
+            args.query,
+        )
         phase_metrics.extend(full_metrics)
         print_frame("view candidates", full_candidates)
         print_frame("differential topics", topics)
@@ -611,12 +637,29 @@ def main() -> None:
         step_metrics=step_metrics,
         phase_metrics=phase_metrics,
         memory=memory,
+        adapter=adapter,
         compare_full=args.compare_full,
         model=args.model,
     )
     written["metrics/steps"] = write_csv("steps", steps_frame, metrics_dir)
     written["metrics/phases"] = write_csv("phases", phases_frame, metrics_dir)
     written["metrics/summary"] = write_csv("summary", summary_frame, metrics_dir)
+    checkpoint_dir = output_dir / "checkpoint"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    snapshot = memory._runtime.snapshot_state()
+    (checkpoint_dir / "state.pkl").write_bytes(pickle.dumps(snapshot))
+    (checkpoint_dir / "metadata.json").write_text(
+        json.dumps(
+            {
+                "schema_version": snapshot["schema_version"],
+                "policy_fingerprint": memory._runtime.policy.fingerprint,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    written["checkpoint/state"] = checkpoint_dir / "state.pkl"
+    written["checkpoint/metadata"] = checkpoint_dir / "metadata.json"
     if trace_dir is not None:
         append_trace_metrics(trace_dir, [*step_metrics, *phase_metrics])
         written["trace/differential/metrics"] = trace_dir / "differential" / "metrics.csv"
