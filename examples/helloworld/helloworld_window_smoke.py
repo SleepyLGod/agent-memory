@@ -208,8 +208,13 @@ def _run_deterministic(output_dir: Path, rows: list[dict[str, str]]) -> None:
     print(f"\nwrote deterministic CSVs: {output_dir}")
 
 
-def _run_semantic(rows: list[dict[str, str]], *, model: str) -> None:
-    """Run optional real LOTUS semantic window policies."""
+def _run_semantic(
+    rows: list[dict[str, str]],
+    *,
+    model: str,
+    output_dir: Path,
+) -> None:
+    """Run real LOTUS semantic window policies and persist their views."""
 
     if not os.getenv("DEEPSEEK_API_KEY"):
         print("\nsemantic window smoke skipped: DEEPSEEK_API_KEY is not set")
@@ -219,24 +224,33 @@ def _run_semantic(rows: list[dict[str, str]], *, model: str) -> None:
 
     semantic_in_window = WindowSemanticInWindowMemory(adapter=adapter)
     _add_rows(semantic_in_window, rows)
+    window_memories = semantic_in_window._runtime._state["window_memories"]
     _print_frame(
         "semantic-in-window memories",
-        semantic_in_window._runtime._state["window_memories"],
+        window_memories,
     )
 
     global_after_window = WindowGlobalAfterMemory(adapter=adapter)
     _add_rows(global_after_window, rows)
+    topics = global_after_window._runtime._state["topics"]
     _print_frame(
         "global-after-window topics",
-        global_after_window._runtime._state["topics"],
+        topics,
     )
 
     over_semantic = OverSemanticMemory(adapter=adapter)
     _add_rows(over_semantic, rows)
+    contextual_summaries = over_semantic._runtime._state["contextual_summaries"]
     _print_frame(
         "over semantic summaries",
-        over_semantic._runtime._state["contextual_summaries"],
+        contextual_summaries,
     )
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    window_memories.to_csv(output_dir / "semantic_in_window.csv", index=False)
+    topics.to_csv(output_dir / "global_after_window.csv", index=False)
+    contextual_summaries.to_csv(output_dir / "over_semantic.csv", index=False)
+    print(f"\nwrote semantic CSVs: {output_dir}")
 
 
 def main() -> None:
@@ -270,7 +284,7 @@ def main() -> None:
     rows = _load_rows(args.row_limit)
     _run_deterministic(args.output_dir, rows)
     if args.run_semantic:
-        _run_semantic(rows, model=args.model)
+        _run_semantic(rows, model=args.model, output_dir=args.output_dir)
 
 
 if __name__ == "__main__":
