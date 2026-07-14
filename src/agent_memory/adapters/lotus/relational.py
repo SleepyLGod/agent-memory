@@ -908,10 +908,10 @@ def _evaluate_array_cat(expr: ArrayCatExpr, frame: Any) -> pd.Series:
     left = _expr_as_series(evaluate_expr(expr.left, frame), frame)
     right = _expr_as_series(evaluate_expr(expr.right, frame), frame)
     values: list[str] = []
-    for index in frame.index:
+    for left_value, right_value in zip(left.array, right.array, strict=True):
         items = [
-            *_load_optional_array_json(left.loc[index], column="array_cat", side="left"),
-            *_load_optional_array_json(right.loc[index], column="array_cat", side="right"),
+            *_load_optional_array_json(left_value, column="array_cat", side="left"),
+            *_load_optional_array_json(right_value, column="array_cat", side="right"),
         ]
         values.append(
             json.dumps(
