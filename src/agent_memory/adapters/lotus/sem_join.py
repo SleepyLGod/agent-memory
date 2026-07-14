@@ -14,7 +14,7 @@ from agent_memory.tracing.semantic import (
     write_trace_event,
 )
 from agent_memory.adapters.lotus.structured import examples_dataframe, normalize_strategy
-from agent_memory.logical import QueryExpr
+from agent_memory.policy.logical import QueryExpr
 
 
 def execute_sem_join(

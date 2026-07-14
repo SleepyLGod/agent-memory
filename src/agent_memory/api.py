@@ -3,35 +3,73 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any
 
-from .logical import ColumnSpec, MemorySpec, MemoryView, QueryExpr
-from .message import MessageInput
-from .policy import DifferentiatedPolicy, DifferentialPolicyCompiler
-from .relation import OverRelation, Relation, WindowedRelation
-from .runtime import MemoryRuntime
+from .planner.differential_policy import DifferentiatedPolicy, PolicyDifferentiator
+from .policy.logical import MemorySpec, MemoryView, QueryExpr
+from .policy.relation import Log, OverRelation, Relation, WindowedRelation
 
 
-class Log(Relation):
-    """Base source relation for memory policies.
+def _freeze_metadata(value: Any) -> Any:
+    """Recursively freeze message metadata into immutable containers."""
 
-    A Log is the input table for a memory class. It is collected as the source
-    relation, not as a derived MemoryView.
-    """
-
-    def __init__(self, columns: Mapping[str, str] | None = None) -> None:
-        column_defs = tuple(
-            ColumnSpec(name=name, description=description)
-            for name, description in (
-                columns or {"message": "Raw memory log message."}
-            ).items()
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {key: _freeze_metadata(item) for key, item in value.items()}
         )
-        super().__init__(
-            QueryExpr(
-                op="log",
-                params={"columns": column_defs},
+    if isinstance(value, (set, frozenset)):
+        return tuple(sorted((_freeze_metadata(item) for item in value), key=repr))
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_metadata(item) for item in value)
+    return value
+
+
+def _hashable_metadata(value: Any) -> Any:
+    """Convert frozen metadata into a canonical hashable shape."""
+
+    if isinstance(value, Mapping):
+        return tuple(
+            sorted(
+                ((key, _hashable_metadata(item)) for key, item in value.items()),
+                key=lambda item: item[0],
             )
         )
+    if isinstance(value, (list, tuple)):
+        return tuple(_hashable_metadata(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return tuple(sorted((_hashable_metadata(item) for item in value), key=repr))
+    return value
+
+
+@dataclass(frozen=True)
+class Message:
+    """Minimal message or event accepted by ``Memory.add``."""
+
+    content: str
+    role: str | None = None
+    timestamp: str | None = None
+    session_id: str | None = None
+    metadata: Mapping[str, Any] | None = None
+
+    def __post_init__(self) -> None:
+        if self.metadata is not None:
+            object.__setattr__(self, "metadata", _freeze_metadata(self.metadata))
+
+    def __hash__(self) -> int:
+        return hash(
+            (
+                self.content,
+                self.role,
+                self.timestamp,
+                self.session_id,
+                _hashable_metadata(self.metadata),
+            )
+        )
+
+
+MessageInput = str | Message | Mapping[str, Any]
 
 
 class Memory:
@@ -51,6 +89,8 @@ class Memory:
             raise TypeError("retrieval_query must be a Relation")
 
     def __init__(self, *, adapter: Any | None = None) -> None:
+        from .runtime import MemoryRuntime
+
         self._runtime = MemoryRuntime(
             self.__class__.differentiate_policy(),
             adapter=adapter,
@@ -96,7 +136,7 @@ class Memory:
         if isinstance(cached, DifferentiatedPolicy):
             return cached
 
-        policy = DifferentialPolicyCompiler().differentiate(cls.spec())
+        policy = PolicyDifferentiator().differentiate(cls.spec())
         setattr(cls, "_agent_memory_differentiated_policy", policy)
         return policy
 

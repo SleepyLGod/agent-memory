@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from agent_memory.api import Log, Memory
-from agent_memory.logical import UserQuery
+from agent_memory.policy.logical import UserQuery
 
 
 _EXTRACT_INSTRUCTION = """

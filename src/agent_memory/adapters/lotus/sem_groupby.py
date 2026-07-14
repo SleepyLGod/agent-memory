@@ -11,7 +11,7 @@ from agent_memory.adapters.lotus.context import LotusExecutionContext
 from agent_memory.adapters.lotus.sem_join import row_text_series
 from agent_memory.tracing.semantic import write_compact_operator_trace, write_pair_trace
 from agent_memory.adapters.lotus.structured import StructuredLMExecutor
-from agent_memory.logical import ColumnSpec, QueryExpr
+from agent_memory.policy.logical import ColumnSpec, QueryExpr
 
 GROUP_ID_COLUMN = "_agent_memory_group_id"
 
@@ -27,7 +27,20 @@ def execute_sem_groupby(
     context.configure()
     source = execute(query.inputs[0], inputs)
     input_cols = tuple(str(column) for column in query.params["input_cols"])
+    partition_by = tuple(str(column) for column in query.params.get("partition_by", ()))
+    validate_partition_by(source, partition_by)
     labels = tuple(query.params.get("labels") or ())
+    if partition_by:
+        return execute_partitioned_sem_groupby(
+            source,
+            input_cols=input_cols,
+            partition_by=partition_by,
+            labels=labels,
+            label_col=str(query.params.get("label_col", "_label")),
+            instruction=str(query.params["instruction"]),
+            default=context.config.sem_groupby_default,
+            trace_dir=context.config.trace_dir(),
+        )
     if labels:
         return assign_declared_labels(
             source,
@@ -52,6 +65,7 @@ def execute_sem_groupby(
         row_to_unique=row_to_unique,
     )
     result.attrs["agent_memory_groupby_input_cols"] = input_cols
+    result.attrs["agent_memory_sem_groupby_partition_by"] = partition_by
     write_compact_operator_trace(
         context.config.trace_dir(),
         operator="sem_groupby",
@@ -64,6 +78,81 @@ def execute_sem_groupby(
         },
     )
     return result
+
+
+def execute_partitioned_sem_groupby(
+    source: pd.DataFrame,
+    *,
+    input_cols: Sequence[str],
+    partition_by: Sequence[str],
+    labels: Sequence[ColumnSpec],
+    label_col: str,
+    instruction: str,
+    default: bool,
+    trace_dir: Any,
+) -> pd.DataFrame:
+    """Assign semantic group ids independently within deterministic partitions."""
+
+    if source.empty:
+        result = source.copy()
+        if labels:
+            result[label_col] = []
+        result[GROUP_ID_COLUMN] = []
+        result.attrs["agent_memory_groupby_input_cols"] = tuple(input_cols)
+        result.attrs["agent_memory_sem_groupby_partition_by"] = tuple(partition_by)
+        return result
+
+    parts: list[pd.DataFrame] = []
+    next_group_id = 0
+    grouped = source.groupby(list(partition_by), sort=False, dropna=False)
+    for _partition_key, partition in grouped:
+        if labels:
+            result = assign_declared_labels(
+                partition,
+                input_cols=input_cols,
+                labels=labels,
+                label_col=label_col,
+                instruction=instruction,
+            )
+        else:
+            unique_rows, row_to_unique = exact_unique_key_rows(partition, input_cols)
+            matched_pairs = evaluate_group_matches(
+                unique_rows,
+                input_cols=input_cols,
+                instruction=instruction,
+                default=default,
+                trace_dir=trace_dir,
+            )
+            result = assign_semantic_group_ids(
+                partition,
+                input_cols=input_cols,
+                matched_unique_pairs=matched_pairs,
+                row_to_unique=row_to_unique,
+            )
+        if not result.empty:
+            result[GROUP_ID_COLUMN] = result[GROUP_ID_COLUMN].astype(int) + next_group_id
+            next_group_id = int(result[GROUP_ID_COLUMN].max()) + 1
+        parts.append(result)
+
+    combined = pd.concat(parts).sort_index().reset_index(drop=True)
+    combined.attrs["agent_memory_groupby_input_cols"] = tuple(input_cols)
+    combined.attrs["agent_memory_sem_groupby_partition_by"] = tuple(partition_by)
+    if labels:
+        combined.attrs["agent_memory_groupby_labels"] = tuple(label.name for label in labels)
+        combined.attrs["agent_memory_groupby_label_col"] = label_col
+    write_compact_operator_trace(
+        trace_dir,
+        operator="sem_groupby",
+        event_type="operator_result",
+        input_frame=source,
+        output_frame=combined,
+        payload={
+            "instruction": instruction,
+            "input_cols": list(input_cols),
+            "partition_by": list(partition_by),
+        },
+    )
+    return combined
 
 
 def assign_declared_labels(
@@ -158,6 +247,14 @@ def validate_groupby_input_cols(source: pd.DataFrame, input_cols: Sequence[str])
     missing = [column for column in input_cols if column not in source.columns]
     if missing:
         raise ValueError(f"sem_groupby input columns not found in DataFrame: {missing}")
+
+
+def validate_partition_by(source: pd.DataFrame, partition_by: Sequence[str]) -> None:
+    """Raise when deterministic partition columns are missing."""
+
+    missing = [column for column in partition_by if column not in source.columns]
+    if missing:
+        raise ValueError(f"sem_groupby partition_by columns not found in DataFrame: {missing}")
 
 
 def validate_label_col(source: pd.DataFrame, label_col: str) -> None:

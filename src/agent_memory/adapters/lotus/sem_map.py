@@ -17,7 +17,7 @@ from agent_memory.adapters.lotus.structured import (
     structured_instruction as build_structured_instruction,
     validate_model_kwargs,
 )
-from agent_memory.logical import ColumnSpec, QueryExpr
+from agent_memory.policy.logical import ColumnSpec, QueryExpr
 
 
 def execute_sem_map(
@@ -198,7 +198,7 @@ def parse_structured_map_json(
     output_cols: Sequence[ColumnSpec],
     *,
     require_explanation: bool = False,
-) -> dict[str, str]:
+) -> dict[str, Any]:
     """Parse and validate one structured sem_map JSON output."""
 
     parsed, _explanation = parse_structured_object_json(
@@ -212,7 +212,7 @@ def parse_structured_map_json(
 
 def apply_structured_map_outputs(
     source: Any,
-    parsed_outputs: Sequence[Mapping[str, str]],
+    parsed_outputs: Sequence[Mapping[str, Any]],
     output_cols: Sequence[ColumnSpec],
     *,
     raw_outputs: Sequence[str] | None = None,

@@ -8,7 +8,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, TypeAlias
 from uuid import uuid4
 
 import pandas as pd
@@ -19,7 +19,7 @@ from agent_memory.adapters.lotus.context import (
     DEFAULT_STRUCTURED_PARSE_RETRIES,
 )
 from agent_memory.tracing.semantic import write_structured_generation_trace
-from agent_memory.logical import ColumnSpec, QueryExpr
+from agent_memory.policy.logical import ColumnSpec, QueryExpr
 
 EXPLANATION_FIELD = "_explanation"
 FLAT_MAP_ROWS_FIELD = "rows"
@@ -29,6 +29,7 @@ STRUCTURED_FAILURE_DIR = Path(".memory-test") / "structured-failures" / "latest"
 PLACEHOLDER_PATTERN = re.compile(
     r"(?<!\{)\{([A-Za-z_][A-Za-z0-9_]*)(?::(left|right))?\}(?!\})"
 )
+StructuredScalar: TypeAlias = str | int | float | bool | None
 
 
 @dataclass
@@ -198,6 +199,11 @@ def structured_instruction(
         {column.name: "string" for column in output_cols},
         ensure_ascii=False,
     )
+    scalar_contract = (
+        "Each field value must be a JSON scalar (string, number, boolean, or null) "
+        "that follows the instruction and field description. Use JSON null for "
+        "missing values. Do not use nested arrays or objects as field values."
+    )
     if shape == "object":
         return (
             f"{instruction}\n\n"
@@ -206,7 +212,7 @@ def structured_instruction(
             f"The JSON object must include these fields: {field_text}.\n"
             f"Field descriptions: {schema_text}.\n"
             f"Output shape example: {object_example}.\n"
-            "Use string values for every field."
+            f"{scalar_contract}"
         )
 
     rows_example = json.dumps(
@@ -223,7 +229,7 @@ def structured_instruction(
         f"Every object in rows must include these fields: {field_text}.\n"
         f"Field descriptions: {schema_text}.\n"
         f"Output shape example: {rows_example}.\n"
-        "Use string values for every field."
+        f"{scalar_contract}"
     )
 
 
@@ -256,7 +262,7 @@ def parse_structured_object_json(
     *,
     require_explanation: bool = False,
     operator: str = "sem_map",
-) -> tuple[dict[str, str], str | None]:
+) -> tuple[dict[str, StructuredScalar], str | None]:
     """Parse one JSON object output and return columns plus optional explanation."""
 
     parsed = _load_structured_json(
@@ -275,8 +281,15 @@ def parse_structured_object_json(
     if missing:
         raise ValueError(f"{operator} JSON output is missing required keys: {missing}")
 
-    output = {column.name: str(parsed[column.name]) for column in output_cols}
-    explanation = str(parsed[EXPLANATION_FIELD]) if require_explanation else None
+    output = structured_scalar_values(parsed, output_cols, operator=operator)
+    explanation = None
+    if require_explanation:
+        explanation_value = parsed[EXPLANATION_FIELD]
+        if not _is_json_scalar(explanation_value):
+            raise ValueError(
+                f"{operator} JSON field {EXPLANATION_FIELD!r} must be a JSON scalar"
+            )
+        explanation = None if explanation_value is None else str(explanation_value)
     return output, explanation
 
 
@@ -285,7 +298,7 @@ def parse_structured_array_json(
     output_cols: Sequence[ColumnSpec],
     *,
     operator: str = "sem_flat_map",
-) -> list[dict[str, str]]:
+) -> list[dict[str, StructuredScalar]]:
     """Parse one JSON array output for flat-map style row expansion."""
 
     expected_shape = f'JSON object with "{FLAT_MAP_ROWS_FIELD}" array'
@@ -312,7 +325,7 @@ def parse_structured_array_json(
             f"expected {expected_shape}; raw_output={_preview_raw_output(raw_output)!r}"
         )
 
-    rows: list[dict[str, str]] = []
+    rows: list[dict[str, StructuredScalar]] = []
     for index, item in enumerate(emitted_rows):
         if not isinstance(item, Mapping):
             raise ValueError(f"{operator} JSON item {index} is not an object: {item!r}")
@@ -322,8 +335,43 @@ def parse_structured_array_json(
             raise ValueError(
                 f"{operator} JSON item {index} is missing required keys: {missing}"
             )
-        rows.append({column.name: str(item[column.name]) for column in output_cols})
+        rows.append(
+            structured_scalar_values(
+                item,
+                output_cols,
+                operator=operator,
+                item_index=index,
+            )
+        )
     return rows
+
+
+def structured_scalar_values(
+    values: Mapping[str, Any],
+    output_cols: Sequence[ColumnSpec],
+    *,
+    operator: str,
+    item_index: int | None = None,
+) -> dict[str, StructuredScalar]:
+    """Return declared JSON scalar fields without changing their value types."""
+
+    output: dict[str, StructuredScalar] = {}
+    location = "" if item_index is None else f" item {item_index}"
+    for column in output_cols:
+        value = values[column.name]
+        if not _is_json_scalar(value):
+            raise ValueError(
+                f"{operator} JSON{location} field {column.name!r} must be a JSON scalar; "
+                f"got {type(value).__name__}"
+            )
+        output[column.name] = value
+    return output
+
+
+def _is_json_scalar(value: Any) -> bool:
+    """Return whether a decoded JSON value is scalar rather than nested."""
+
+    return value is None or isinstance(value, (str, int, float, bool))
 
 
 def _load_structured_json(raw_output: str, *, operator: str, expected_shape: str) -> Any:

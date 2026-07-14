@@ -1,19 +1,19 @@
-"""Differential query planner."""
+"""Differentiate one logical query into its incremental form."""
 
 from __future__ import annotations
 
 from collections.abc import Mapping
 
-from agent_memory.logical import MemoryView, QueryExpr
+from agent_memory.policy.logical import MemoryView, QueryExpr
+from agent_memory.policy.schema import output_columns
 from agent_memory.planner.rules import (
     DifferentialInstructionRewriter,
     DifferentialRules,
 )
-from agent_memory.query_schema import output_columns
 
 
-class DifferentialQueryPlanner:
-    """View-level Q -> Q' planner."""
+class QueryDifferentiator:
+    """Differentiate logical queries with one reusable rule configuration."""
 
     def __init__(
         self,
@@ -27,31 +27,24 @@ class DifferentialQueryPlanner:
             else DifferentialInstructionRewriter()
         )
 
+    @property
+    def grouped_agg_rule(self) -> str:
+        """Return the canonical grouped aggregate rule used by this planner."""
+
+        return self._rules.grouped_agg_rule
+
     def differentiate(
         self,
         view: MemoryView,
         *,
         views: Mapping[str, MemoryView] | None = None,
-    ) -> QueryExpr:
-        """Generate differentiated query Q' for one memory view."""
-
-        return self.differentiate_query(
-            view_name=view.name,
-            query=view.query,
-            views=views,
-        )
-
-    def differentiate_query(
-        self,
-        *,
-        view_name: str,
-        query: QueryExpr,
-        views: Mapping[str, MemoryView] | None = None,
         source_query: QueryExpr | None = None,
         source_input: QueryExpr | None = None,
     ) -> QueryExpr:
-        """Generate Q' for one query with an optional explicit source."""
+        """Generate differentiated query Q' for one memory view."""
 
+        view_name = view.name
+        query = view.query
         source_input = source_input or QueryExpr(op="log")
         current_view = QueryExpr(
             op="materialized_view",

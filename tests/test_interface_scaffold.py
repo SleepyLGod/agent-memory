@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from uuid import UUID
 
 import numpy as np
 import pandas as pd
@@ -15,6 +16,7 @@ import pytest
 from dotenv import load_dotenv
 
 import agent_memory as am
+from agent_memory.policy.aggregates import MinAggregateSpec, normalize_aggregate_specs
 from agent_memory.adapters import LotusAdapter
 from agent_memory.adapters.lotus.context import (
     DEFAULT_STRUCTURED_MAX_TOKENS,
@@ -23,13 +25,23 @@ from agent_memory.adapters.lotus.context import (
     LotusExecutionContext,
 )
 from agent_memory.adapters.lotus.relational import (
+    execute_agg,
+    execute_array_agg,
     execute_array_cat,
+    execute_assign,
     execute_concat,
     execute_drop_duplicates,
+    execute_explode,
+    execute_filter,
+    execute_flatten,
     execute_join,
+    execute_min,
     execute_subtract,
+    execute_unnest,
     execute_union,
+    execute_union_by_name,
 )
+import agent_memory.adapters.lotus.relational as relational_module
 from agent_memory.adapters.lotus.sem_agg import (
     GROUP_ID_COLUMN,
     JSON_OBJECT_RESPONSE_FORMAT,
@@ -57,6 +69,7 @@ from agent_memory.adapters.lotus.sem_flat_map import (
     parse_structured_flat_map_json,
 )
 from agent_memory.adapters.lotus.sem_filter import (
+    bind_qualified_filter_columns,
     execute_sem_filter,
     native_sem_filter_kwargs,
 )
@@ -74,7 +87,9 @@ from agent_memory.adapters.lotus.sem_join import (
     join_series,
     renamed_columns,
 )
+import agent_memory.adapters.lotus.sem_topk as sem_topk_module
 from agent_memory.adapters.lotus.sem_topk import execute_sem_topk, topk_instruction
+from agent_memory.policy.expressions import ColumnExpr, LeastExpr, expr_from_param
 import agent_memory.adapters.lotus.structured as structured_module
 from agent_memory.adapters.lotus.structured import (
     STRUCTURED_RESERVED_MODEL_KWARGS,
@@ -90,13 +105,14 @@ from agent_memory.adapters.lotus.structured import (
 )
 from agent_memory.adapters.lotus.traced_lm import TracedLM
 from agent_memory.datasets.locomo import flatten_locomo_rows
-from agent_memory.logical import ColumnSpec, MemorySpec, MemoryView, QueryExpr, UserQuery
-from agent_memory.planner import DifferentialInstructionRewriter, DifferentialQueryPlanner
+from agent_memory.planner import DifferentialInstructionRewriter, QueryDifferentiator
 from agent_memory.planner.rules import DifferentialRules
-from agent_memory.relation import GroupedRelation, Relation
-from agent_memory.runtime.runtime import MemoryRuntime
+from agent_memory.policy.logical import ColumnSpec, MemorySpec, MemoryView, QueryExpr, UserQuery
+from agent_memory.policy.relation import GroupedRelation, Relation
+from agent_memory.policy.schema import output_columns
+from agent_memory.runtime import MemoryRuntime
+from agent_memory.runtime.window import WINDOW_SOURCE_INPUT, completed_count_windows, over_frames
 from agent_memory.tracing.semantic import semantic_trace_scope, write_compact_operator_trace
-from agent_memory.window import WINDOW_SOURCE_INPUT, completed_count_windows, over_frames
 
 
 def trace_events(trace_dir: Path) -> list[dict[str, Any]]:
@@ -234,6 +250,149 @@ def test_claude_memory_log_schema_is_explicit() -> None:
         "session_id",
         "metadata",
     )
+
+
+def test_log_system_columns_are_opt_in_and_reserved() -> None:
+    plain = am.Log({"message": "Message."})
+    metadata = am.Log({"message": "Message."}, system_columns=True)
+
+    assert output_columns(plain.expr) == ("message",)
+    assert output_columns(metadata.expr) == (
+        "message",
+        "_row_id",
+        "_added_at",
+        "_add_seq",
+    )
+    assert metadata.expr.params["system_columns"] is True
+
+    with pytest.raises(ValueError, match="reserved system column"):
+        am.Log({"_row_id": "Caller-owned id."})
+
+
+def test_runtime_generates_log_system_columns_and_restores_sequence() -> None:
+    class MetadataMemory(am.Memory):
+        log = am.Log({"message": "Message."}, system_columns=True)
+        rows = log.select(["message", "_row_id", "_added_at", "_add_seq"])
+
+    original = MetadataMemory(adapter=LotusAdapter())
+    original.add({"message": "one"})
+    original.add({"message": "two"})
+
+    log = original._runtime._state["log"]
+    assert list(log["_add_seq"]) == [0, 1]
+    assert len(set(log["_row_id"])) == 2
+    assert all(str(UUID(value)) == value for value in log["_row_id"])
+    assert all(isinstance(value, datetime) for value in log["_added_at"])
+    assert all(value.utcoffset().total_seconds() == 0 for value in log["_added_at"])
+    assert list(original._runtime._state["rows"]["_add_seq"]) == [0, 1]
+
+    restored = MetadataMemory(adapter=LotusAdapter())
+    restored._runtime.restore_state(original._runtime.snapshot_state())
+    restored.add({"message": "three"})
+
+    assert list(restored._runtime._state["log"]["_add_seq"]) == [0, 1, 2]
+
+
+def test_runtime_rejects_caller_owned_log_system_columns() -> None:
+    class MetadataMemory(am.Memory):
+        log = am.Log({"message": "Message."}, system_columns=True)
+        rows = log.select(["message", "_row_id", "_added_at", "_add_seq"])
+
+    memory = MetadataMemory(adapter=LotusAdapter())
+
+    with pytest.raises(ValueError, match="reserved log system columns"):
+        memory.add({"message": "spoofed", "_add_seq": 99})
+
+
+def test_sem_flat_map_preserves_log_system_columns() -> None:
+    source = pd.DataFrame(
+        [
+            {
+                "content": "Caroline adopted a dog.",
+                "_row_id": "row-1",
+                "_added_at": pd.Timestamp("2026-01-01T00:00:00Z"),
+                "_add_seq": 0,
+            }
+        ]
+    )
+
+    result = apply_flat_map_outputs(
+        source,
+        [[{"entity": "Caroline"}]],
+        (ColumnSpec("entity"),),
+    )
+
+    assert result.loc[0, "_row_id"] == "row-1"
+    assert result.loc[0, "_add_seq"] == 0
+    assert result.loc[0, "entity"] == "Caroline"
+
+
+def test_sem_flat_map_ordinal_resets_for_each_input_row() -> None:
+    source = pd.DataFrame(
+        [
+            {"message": "first", "_add_seq": 4},
+            {"message": "second", "_add_seq": 5},
+            {"message": "empty", "_add_seq": 6},
+        ]
+    )
+
+    result = apply_flat_map_outputs(
+        source,
+        [
+            [{"entity": "Alice"}, {"entity": "Bob"}],
+            [{"entity": "Carol"}],
+            [],
+        ],
+        (ColumnSpec("entity"),),
+        ordinal_col="entity_ordinal",
+    )
+
+    assert result.to_dict("records") == [
+        {
+            "message": "first",
+            "_add_seq": 4,
+            "entity": "Alice",
+            "entity_ordinal": 0,
+        },
+        {
+            "message": "first",
+            "_add_seq": 4,
+            "entity": "Bob",
+            "entity_ordinal": 1,
+        },
+        {
+            "message": "second",
+            "_add_seq": 5,
+            "entity": "Carol",
+            "entity_ordinal": 0,
+        },
+    ]
+
+
+def test_sem_flat_map_ordinal_is_declared_in_query_schema() -> None:
+    log = am.Log({"message": "Message."}, system_columns=True)
+    query = log.sem_flat_map(
+        output_cols={"entity": "Extracted entity."},
+        instruction="Extract entities from {message}.",
+        ordinal_col="entity_ordinal",
+    )
+
+    assert query.expr.params["ordinal_col"] == "entity_ordinal"
+    assert output_columns(query.expr) == (
+        "message",
+        "_row_id",
+        "_added_at",
+        "_add_seq",
+        "entity",
+        "entity_ordinal",
+    )
+
+    with pytest.raises(ValueError, match="ordinal_col.*conflicts"):
+        log.sem_flat_map(
+            output_cols={"entity_ordinal": "Extracted position."},
+            instruction="Extract positions from {message}.",
+            ordinal_col="entity_ordinal",
+        )
 
 
 def test_memory_spec_requires_a_log_relation() -> None:
@@ -383,6 +542,192 @@ def test_grouped_relation_sem_agg_returns_normal_relation() -> None:
     assert aggregated.expr.inputs[0].op == "sem_groupby"
 
 
+def test_grouped_relation_agg_accepts_public_aggregate_specs() -> None:
+    log = am.Log(
+        {
+            "episode_id": "Episode id.",
+            "name": "Entity name.",
+            "summary": "Entity summary.",
+        }
+    )
+    aggregated = log.group_by("episode_id").agg(
+        am.array_agg(columns=["name"], output_col="mentions"),
+        am.collect_list(column="summary", output_col="raw_summaries"),
+        am.sem_agg(
+            input_cols=["summary"],
+            output_cols={"episode_summary": "Episode-level entity summary."},
+            instruction="Summarize entity mentions.",
+        ),
+    )
+
+    assert aggregated.expr.op == "agg"
+    assert aggregated.expr.inputs[0].op == "group_by"
+    assert output_columns(aggregated.expr) == (
+        "episode_id",
+        "mentions",
+        "raw_summaries",
+        "episode_summary",
+    )
+
+
+def test_min_public_api_supports_global_grouped_and_mixed_aggregation() -> None:
+    log = am.Log({"group": "Group.", "value": "Value."})
+
+    global_min = log.min(column="value", output_col="minimum")
+    grouped_min = log.group_by("group").min(column="value", output_col="minimum")
+    mixed = log.group_by("group").agg(
+        am.min(column="value", output_col="minimum"),
+        am.collect_list(column="value", output_col="values"),
+    )
+
+    assert global_min.expr.op == "min"
+    assert output_columns(global_min.expr) == ("minimum",)
+    assert grouped_min.expr.op == "min"
+    assert output_columns(grouped_min.expr) == ("group", "minimum")
+    assert output_columns(mixed.expr) == ("group", "minimum", "values")
+
+    semantic_grouped = log.sem_groupby(
+        input_cols=["group"],
+        instruction="Rows have the same {group}.",
+    )
+    with pytest.raises(NotImplementedError, match="sem_groupby.*min"):
+        semantic_grouped.min(column="value", output_col="minimum")
+
+    with pytest.raises(ValueError, match="conflicts with group key"):
+        log.group_by("group").min(column="value", output_col="group")
+
+
+def test_min_public_api_supports_composite_columns() -> None:
+    log = am.Log(
+        {
+            "group": "Group.",
+            "add_seq": "Append sequence.",
+            "ordinal": "Occurrence ordinal.",
+        }
+    )
+
+    global_min = log.min(
+        columns=["add_seq", "ordinal"],
+        output_col="occurrence_id",
+    )
+    grouped_min = log.group_by("group").min(
+        columns=["add_seq", "ordinal"],
+        output_col="occurrence_id",
+    )
+    mixed = log.group_by("group").agg(
+        am.min(
+            columns=["add_seq", "ordinal"],
+            output_col="occurrence_id",
+        ),
+        am.collect_list(column="ordinal", output_col="ordinals"),
+    )
+
+    assert global_min.expr.params["columns"] == ("add_seq", "ordinal")
+    assert grouped_min.expr.params["columns"] == ("add_seq", "ordinal")
+    composite_spec = mixed.expr.params["aggregates"][0]
+    assert isinstance(composite_spec, MinAggregateSpec)
+    assert composite_spec.columns == ("add_seq", "ordinal")
+
+    with pytest.raises(ValueError, match="exactly one of column or columns"):
+        am.min(
+            column="add_seq",
+            columns=["add_seq", "ordinal"],
+            output_col="occurrence_id",
+        )
+    with pytest.raises(ValueError, match="exactly one of column or columns"):
+        am.min(output_col="occurrence_id")
+    with pytest.raises(TypeError, match="sequence of column names"):
+        am.min(columns="add_seq", output_col="occurrence_id")
+
+
+def test_least_is_serializable_and_requires_two_operands() -> None:
+    log = am.Log({"left": "Left value.", "right": "Right value."})
+    expr = am.least(log.col("left"), log.col("right"), 10)
+
+    assert isinstance(expr, LeastExpr)
+    assert expr_from_param(expr.to_param()).to_param() == expr.to_param()
+    assert expr.to_param()["kind"] == "least"
+
+    with pytest.raises(ValueError, match="at least two operands"):
+        am.least(log.col("left"))
+    with pytest.raises(TypeError, match="relational expression or scalar literal"):
+        am.least(log.col("left"), [1, 2])
+
+
+def test_sem_groupby_agg_preserves_optional_partition_by_schema() -> None:
+    log = am.Log(
+        {
+            "group_id": "Graph partition.",
+            "name": "Entity name.",
+            "body": "Evidence body.",
+        }
+    )
+    aggregated = log.sem_groupby(
+        input_cols=["name"],
+        partition_by="group_id",
+        instruction="Rows refer to the same entity.",
+    ).agg(
+        am.sem_agg(
+            input_cols=["name", "body"],
+            output_cols={"name": "Canonical entity name."},
+            instruction="Choose canonical name.",
+        ),
+        am.array_agg(columns=["body"], output_col="evidence"),
+    )
+
+    sem_groupby_expr = aggregated.expr.inputs[0]
+    assert sem_groupby_expr.params["partition_by"] == ("group_id",)
+    assert output_columns(aggregated.expr) == ("group_id", "name", "evidence")
+
+
+def test_sem_groupby_array_agg_public_api_is_not_supported() -> None:
+    grouped = am.Log({"name": "Entity name."}).sem_groupby(
+        input_cols=["name"],
+        instruction="Rows refer to the same entity.",
+    )
+
+    with pytest.raises(NotImplementedError, match="sem_groupby.*array_agg"):
+        grouped.array_agg(columns=["name"], output_col="names")
+
+
+def test_sem_groupby_agg_rejects_array_only_specs() -> None:
+    grouped = am.Log({"name": "Entity name."}).sem_groupby(
+        input_cols=["name"],
+        instruction="Rows refer to the same entity.",
+    )
+
+    with pytest.raises(NotImplementedError, match="requires at least one sem_agg"):
+        grouped.agg(am.collect_list(column="name", output_col="names"))
+
+
+def test_grouped_agg_rejects_duplicate_aggregate_outputs() -> None:
+    grouped = am.Log({"name": "Entity name."}).group_by("name")
+
+    with pytest.raises(ValueError, match="aggregate output columns"):
+        grouped.agg(
+            am.array_agg(columns=["name"], output_col="summary"),
+            am.sem_agg(
+                input_cols=["name"],
+                output_cols={"summary": "Semantic summary."},
+                instruction="Summarize.",
+            ),
+        )
+
+
+def test_aggregate_spec_normalization_rejects_duplicate_outputs() -> None:
+    with pytest.raises(ValueError, match="aggregate output columns must be unique"):
+        normalize_aggregate_specs(
+            (
+                am.array_agg(columns=["name"], output_col="summary"),
+                am.sem_agg(
+                    input_cols=["name"],
+                    output_cols={"summary": "Semantic summary."},
+                    instruction="Summarize.",
+                ),
+            )
+        )
+
+
 def test_sem_groupby_accepts_declared_labels() -> None:
     grouped = am.Log().sem_groupby(
         input_cols=["title", "abstract"],
@@ -464,6 +809,24 @@ def test_join_query_expr_keeps_only_logical_params() -> None:
         log.join("not a relation", on="name")
 
 
+def test_union_by_name_query_expr_keeps_only_logical_params() -> None:
+    log = am.Log({"name": "Topic identity.", "body": "Topic body."})
+
+    unioned = log.union_by_name(log)
+
+    assert unioned.expr.op == "union_by_name"
+    assert unioned.expr.params == {"allow_missing_columns": True}
+    assert unioned.expr.inputs == (log.expr, log.expr)
+
+    strict = log.union_by_name(log, allow_missing_columns=False)
+    assert strict.expr.params == {"allow_missing_columns": False}
+
+    with pytest.raises(TypeError, match="allow_missing_columns"):
+        log.union_by_name(log, allow_missing_columns="yes")  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        log.union_by_name("not a relation")  # type: ignore[arg-type]
+
+
 def test_count_window_process_window_and_array_agg_query_expr_shape() -> None:
     log = am.Log(
         {
@@ -498,7 +861,7 @@ def test_count_window_process_window_and_array_agg_query_expr_shape() -> None:
 def test_process_window_builder_infers_filter_passthrough_columns() -> None:
     log = am.Log({"message": "Message body.", "speaker": "Message speaker."})
 
-    blocks = log.filter(predicate=("speaker", "==", "A")).count_window(
+    blocks = log.filter(predicate=log.col("speaker") == "A").count_window(
         size=2,
         slide=1,
     ).process_window(
@@ -633,6 +996,75 @@ def test_array_cat_query_expr_keeps_only_logical_params() -> None:
         log.array_cat("not a relation", column="conversation_records")  # type: ignore[arg-type]
 
 
+def test_flatten_query_expr_keeps_only_logical_params() -> None:
+    log = am.Log({"nested_records": "JSON array of JSON array states."})
+
+    flattened = log.flatten(column="nested_records", output_col="records")
+
+    assert flattened.expr.op == "flatten"
+    assert flattened.expr.inputs == (log.expr,)
+    assert flattened.expr.params == {"column": "nested_records", "output_col": "records"}
+    assert output_columns(flattened.expr) == ("nested_records", "records")
+
+    same_column = log.flatten(column="nested_records")
+    assert same_column.expr.params == {"column": "nested_records", "output_col": None}
+
+    with pytest.raises(ValueError, match="column cannot be empty"):
+        log.flatten(column="")
+    with pytest.raises(ValueError, match="output_col cannot be empty"):
+        log.flatten(column="nested_records", output_col="")
+
+
+def test_explode_query_expr_keeps_only_logical_params() -> None:
+    log = am.Log({"entity_id": "Entity id.", "mentions": "JSON array of mention records."})
+
+    exploded = log.explode(column="mentions", output_col="_mention")
+
+    assert exploded.expr.op == "explode"
+    assert exploded.expr.inputs == (log.expr,)
+    assert exploded.expr.params == {"column": "mentions", "output_col": "_mention"}
+    assert output_columns(exploded.expr) == ("entity_id", "mentions", "_mention")
+
+    same_column = log.explode(column="mentions")
+    assert same_column.expr.params == {"column": "mentions", "output_col": None}
+    assert output_columns(same_column.expr) == ("entity_id", "mentions")
+
+    with pytest.raises(ValueError, match="column cannot be empty"):
+        log.explode(column="")
+    with pytest.raises(ValueError, match="output_col cannot be empty"):
+        log.explode(column="mentions", output_col="")
+    with pytest.raises(ValueError, match="already exists"):
+        output_columns(log.explode(column="mentions", output_col="entity_id").expr)
+
+
+def test_unnest_query_expr_keeps_only_logical_params() -> None:
+    log = am.Log({"entity_id": "Entity id.", "_mention": "Mention record."})
+
+    unnested = log.unnest(
+        column="_mention",
+        fields={"episode_id": "episode_id", "name": "mention_name"},
+    )
+
+    assert unnested.expr.op == "unnest"
+    assert unnested.expr.inputs == (log.expr,)
+    assert unnested.expr.params == {
+        "column": "_mention",
+        "fields": (("episode_id", "episode_id"), ("name", "mention_name")),
+    }
+    assert output_columns(unnested.expr) == ("entity_id", "episode_id", "mention_name")
+
+    with pytest.raises(ValueError, match="column cannot be empty"):
+        log.unnest(column="", fields={"episode_id": "episode_id"})
+    with pytest.raises(ValueError, match="fields cannot be empty"):
+        log.unnest(column="_mention", fields={})
+    with pytest.raises(ValueError, match="output columns must be unique"):
+        log.unnest(column="_mention", fields={"episode_id": "x", "name": "x"})
+    with pytest.raises(ValueError, match="conflict"):
+        output_columns(
+            log.unnest(column="_mention", fields={"episode_id": "entity_id"}).expr
+        )
+
+
 def test_count_window_params_reject_non_integral_values() -> None:
     source = pd.DataFrame({"message": ["one", "two"]})
 
@@ -736,6 +1168,18 @@ def _differentiate_with_defaults(
     )
 
 
+def _query_ops(query: QueryExpr) -> tuple[str, ...]:
+    return (query.op,) + tuple(
+        op for input_query in query.inputs for op in _query_ops(input_query)
+    )
+
+
+def _query_nodes(query: QueryExpr) -> tuple[QueryExpr, ...]:
+    return (query,) + tuple(
+        node for input_query in query.inputs for node in _query_nodes(input_query)
+    )
+
+
 def _assert_materialized_view(
     query: QueryExpr,
     *,
@@ -818,6 +1262,37 @@ def test_differential_instruction_rewriter_rejects_unknown_placeholders() -> Non
         )
 
 
+def test_differential_instruction_rewriter_rewrites_state_reaggregation_placeholders() -> None:
+    rewritten = DifferentialInstructionRewriter().state_reaggregation(
+        "Merge raw {body} into canonical {summary}.",
+        state_cols=("topic", "summary"),
+        raw_input_cols=("body", "summary"),
+    )
+
+    assert rewritten == "Merge raw body into canonical {summary}."
+
+    side_aware = DifferentialInstructionRewriter().state_reaggregation(
+        "Keep {summary:right}.",
+        state_cols=("summary:right",),
+        raw_input_cols=(),
+    )
+    assert side_aware == "Keep {summary:right}."
+
+    with pytest.raises(ValueError, match="not present in aggregate state"):
+        DifferentialInstructionRewriter().state_reaggregation(
+            "Use {body:left}.",
+            state_cols=("summary",),
+            raw_input_cols=("body",),
+        )
+
+    with pytest.raises(ValueError, match="not present in aggregate state"):
+        DifferentialInstructionRewriter().state_reaggregation(
+            "Use {unknown}.",
+            state_cols=("summary",),
+            raw_input_cols=("body",),
+        )
+
+
 def test_differential_instruction_rewriter_ignores_non_column_braces() -> None:
     instruction = "Keep {{name}} and {not a column} untouched, rewrite {name}."
 
@@ -889,7 +1364,7 @@ def test_differential_query_planner_supports_sem_filter_views() -> None:
         )
 
     view = FilterMemory.spec().views["helloworld_tests"]
-    differentiated = DifferentialQueryPlanner().differentiate(view)
+    differentiated = QueryDifferentiator().differentiate(view)
 
     assert differentiated.op == "union"
     _assert_materialized_view(
@@ -915,7 +1390,7 @@ def test_differential_query_planner_supports_sem_map_select_views() -> None:
         ).select(["message", "label", "summary"])
 
     view = MapMemory.spec().views["labels"]
-    differentiated = DifferentialQueryPlanner().differentiate(view)
+    differentiated = QueryDifferentiator().differentiate(view)
 
     assert differentiated.op == "union"
     _assert_materialized_view(
@@ -942,7 +1417,7 @@ def test_differential_query_planner_supports_standalone_sem_agg_views() -> None:
         )
 
     view = SummaryMemory.spec().views["summary"]
-    differentiated = DifferentialQueryPlanner().differentiate(view)
+    differentiated = QueryDifferentiator().differentiate(view)
 
     assert differentiated.op == "sem_agg"
     assert differentiated.params == view.query.params
@@ -971,7 +1446,7 @@ def test_differential_query_planner_supports_select_over_standalone_sem_agg_view
         ).select(["summary"])
 
     view = SummaryMemory.spec().views["summary"]
-    differentiated = DifferentialQueryPlanner().differentiate(view)
+    differentiated = QueryDifferentiator().differentiate(view)
 
     assert differentiated.op == "select"
     assert differentiated.params["columns"] == ("summary",)
@@ -1007,7 +1482,7 @@ def test_differential_query_planner_supports_sem_agg_after_row_local_fragment() 
         )
 
     view = FilteredSummaryMemory.spec().views["summary"]
-    differentiated = DifferentialQueryPlanner().differentiate(view)
+    differentiated = QueryDifferentiator().differentiate(view)
 
     changed_state = differentiated.inputs[0].inputs[1]
     changed_fragment = changed_state.inputs[0]
@@ -1027,7 +1502,7 @@ def test_differential_query_planner_rejects_sem_agg_without_input_cols() -> None
     view = SummaryMemory.spec().views["summary"]
 
     with pytest.raises(NotImplementedError, match="requires explicit input_cols"):
-        DifferentialQueryPlanner().differentiate(view)
+        QueryDifferentiator().differentiate(view)
 
 
 def test_differential_query_planner_rejects_sem_agg_missing_current_view_columns() -> None:
@@ -1099,7 +1574,7 @@ def test_differential_query_planner_rewrites_array_agg_view_to_array_cat() -> No
 
     view = BlocksMemory.spec().views["blocks"]
 
-    differentiated = DifferentialQueryPlanner().differentiate(view)
+    differentiated = QueryDifferentiator().differentiate(view)
 
     assert differentiated.op == "array_cat"
     _assert_materialized_view(
@@ -1115,6 +1590,295 @@ def test_differential_query_planner_rewrites_array_agg_view_to_array_cat() -> No
         "output_col": "conversation_records",
     }
     assert differentiated.params == {"column": "conversation_records"}
+
+
+def test_differential_query_planner_rewrites_group_by_array_agg_view_to_collect_list_flatten() -> None:
+    class EpisodeEntitiesMemory(am.Memory):
+        log = am.Log({"episode_id": "Episode id.", "entity": "Entity name."})
+        entities = log.group_by("episode_id").array_agg(
+            columns=("entity",),
+            output_col="entities",
+        )
+
+    view = EpisodeEntitiesMemory.spec().views["entities"]
+
+    differentiated = QueryDifferentiator().differentiate(view)
+
+    assert differentiated.op == "flatten"
+    assert differentiated.params == {"column": "entities", "output_col": None}
+    aggregate = differentiated.inputs[0]
+    assert aggregate.op == "agg"
+    collect_spec = aggregate.params["aggregates"][0]
+    assert collect_spec.column == "entities"
+    assert collect_spec.output_col == "entities"
+    assert aggregate.inputs[0].op == "group_by"
+    combined = aggregate.inputs[0].inputs[0]
+    assert combined.op == "concat"
+    _assert_materialized_view(
+        combined.inputs[0],
+        name="entities",
+        columns=("episode_id", "entities"),
+    )
+    changed_aggregate = combined.inputs[1]
+    assert changed_aggregate.op == "array_agg"
+    assert changed_aggregate.inputs[0].op == "group_by"
+
+
+def test_differential_query_planner_rewrites_global_min_view() -> None:
+    class EarliestMemory(am.Memory):
+        log = am.Log({"valid_at": "Fact validity time."})
+        earliest = log.min(column="valid_at", output_col="valid_at")
+
+    differentiated = QueryDifferentiator().differentiate(
+        EarliestMemory.spec().views["earliest"]
+    )
+
+    assert differentiated.op == "min"
+    assert differentiated.params == {
+        "columns": ("valid_at",),
+        "output_col": "valid_at",
+    }
+    combined = differentiated.inputs[0]
+    assert combined.op == "concat"
+    assert combined.inputs[0].op == "min"
+    _assert_materialized_view(
+        combined.inputs[1],
+        name="earliest",
+        columns=("valid_at",),
+    )
+
+
+def test_differential_query_planner_supports_group_by_min_rule_families() -> None:
+    class EarliestByTopicMemory(am.Memory):
+        log = am.Log({"topic": "Topic.", "valid_at": "Fact validity time."})
+        earliest = log.group_by("topic").min(
+            column="valid_at",
+            output_col="valid_at",
+        )
+
+    view = EarliestByTopicMemory.spec().views["earliest"]
+    regrouped = QueryDifferentiator(
+        rules=DifferentialRules(grouped_agg_rule="rule-re-group"),
+    ).differentiate(view)
+    assert regrouped.op == "min"
+    assert regrouped.params == {
+        "columns": ("valid_at",),
+        "output_col": "valid_at",
+    }
+    assert regrouped.inputs[0].op == "group_by"
+    combined = regrouped.inputs[0].inputs[0]
+    assert combined.op == "concat"
+    assert combined.inputs[0].op == "min"
+    _assert_materialized_view(
+        combined.inputs[1],
+        name="earliest",
+        columns=("topic", "valid_at"),
+    )
+
+    joined = QueryDifferentiator(
+        rules=DifferentialRules(grouped_agg_rule="rule-join-map"),
+    ).differentiate(view)
+    assert joined.op == "select"
+    assert joined.params["columns"] == ("topic", "valid_at")
+    assigned = joined.inputs[0]
+    assert assigned.op == "assign"
+    assert assigned.params["assignments"]["valid_at"]["kind"] == "least"
+    assert assigned.inputs[0].op == "join"
+    assert assigned.inputs[0].params == {"on": ("topic",), "how": "outer"}
+
+
+def test_differential_query_planner_supports_composite_min_state() -> None:
+    class EarliestOccurrenceMemory(am.Memory):
+        log = am.Log(
+            {
+                "topic": "Topic.",
+                "add_seq": "Append sequence.",
+                "ordinal": "Occurrence ordinal.",
+            }
+        )
+        earliest = log.group_by("topic").min(
+            columns=["add_seq", "ordinal"],
+            output_col="occurrence_id",
+        )
+
+    view = EarliestOccurrenceMemory.spec().views["earliest"]
+    regrouped = QueryDifferentiator(
+        rules=DifferentialRules(grouped_agg_rule="rule-re-group"),
+    ).differentiate(view)
+    assert regrouped.params == {
+        "columns": ("occurrence_id",),
+        "output_col": "occurrence_id",
+    }
+    changed_min = regrouped.inputs[0].inputs[0].inputs[0]
+    assert changed_min.params == {
+        "columns": ("add_seq", "ordinal"),
+        "output_col": "occurrence_id",
+    }
+
+    joined = QueryDifferentiator(
+        rules=DifferentialRules(grouped_agg_rule="rule-join-map"),
+    ).differentiate(view)
+    assignment = joined.inputs[0].params["assignments"]["occurrence_id"]
+    assert assignment["kind"] == "least"
+
+
+def test_differential_query_planner_supports_group_by_sem_agg_re_group_rule() -> None:
+    class TopicSummaryMemory(am.Memory):
+        log = am.Log({"topic": "Topic.", "body": "Evidence body."})
+        summaries = log.group_by("topic").sem_agg(
+            input_cols=["body"],
+            output_cols={"summary": "Topic summary."},
+            instruction="Summarize {body}.",
+        )
+
+    view = TopicSummaryMemory.spec().views["summaries"]
+    differentiated = QueryDifferentiator(
+        rules=DifferentialRules(grouped_agg_rule="rule-re-group"),
+    ).differentiate(view)
+
+    assert differentiated.op == "select"
+    assert differentiated.params["columns"] == ("topic", "summary")
+    final_aggregate = differentiated.inputs[0]
+    assert final_aggregate.op == "sem_agg"
+    assert final_aggregate.params["input_cols"] is None
+    assert final_aggregate.inputs[0].op == "group_by"
+    combined = final_aggregate.inputs[0].inputs[0]
+    assert combined.op == "union_by_name"
+    assert combined.inputs[0].op == "sem_agg"
+    _assert_materialized_view(
+        combined.inputs[1],
+        name="summaries",
+        columns=("topic", "summary"),
+    )
+
+
+def test_differential_query_planner_supports_group_by_mixed_agg_re_group_rule() -> None:
+    class TopicEvidenceMemory(am.Memory):
+        log = am.Log(
+            {"topic": "Topic.", "body": "Evidence body.", "valid_at": "Valid time."}
+        )
+        summaries = log.group_by("topic").agg(
+            am.sem_agg(
+                input_cols=["body"],
+                output_cols={"summary": "Topic summary."},
+                instruction="Summarize {body}.",
+            ),
+            am.array_agg(columns=["body"], output_col="evidence"),
+            am.min(column="valid_at", output_col="earliest"),
+        )
+
+    view = TopicEvidenceMemory.spec().views["summaries"]
+    differentiated = QueryDifferentiator(
+        rules=DifferentialRules(grouped_agg_rule="rule-re-group"),
+    ).differentiate(view)
+
+    assert differentiated.op == "select"
+    assert differentiated.params["columns"] == (
+        "topic",
+        "summary",
+        "evidence",
+        "earliest",
+    )
+    flattened = differentiated.inputs[0]
+    assert flattened.op == "flatten"
+    assert flattened.params == {"column": "evidence", "output_col": None}
+    final_aggregate = flattened.inputs[0]
+    assert final_aggregate.op == "agg"
+    semantic_spec, collect_spec, min_spec = final_aggregate.params["aggregates"]
+    assert semantic_spec.input_cols is None
+    assert semantic_spec.instruction == "Summarize body."
+    assert collect_spec.column == "evidence"
+    assert collect_spec.output_col == "evidence"
+    assert isinstance(min_spec, MinAggregateSpec)
+    assert min_spec.columns == ("earliest",)
+    assert min_spec.output_col == "earliest"
+    assert final_aggregate.inputs[0].op == "group_by"
+    combined = final_aggregate.inputs[0].inputs[0]
+    assert combined.op == "concat"
+    assert combined.inputs[1].op == "agg"
+
+
+def test_differential_query_planner_supports_group_by_mixed_agg_join_map_rule() -> None:
+    class TopicEvidenceMemory(am.Memory):
+        log = am.Log(
+            {"topic": "Topic.", "body": "Evidence body.", "valid_at": "Valid time."}
+        )
+        summaries = log.group_by("topic").agg(
+            am.sem_agg(
+                input_cols=["body"],
+                output_cols={"summary": "Topic summary."},
+                instruction="Summarize {body}.",
+            ),
+            am.array_agg(columns=["body"], output_col="evidence"),
+            am.min(column="valid_at", output_col="earliest"),
+        )
+
+    view = TopicEvidenceMemory.spec().views["summaries"]
+    differentiated = QueryDifferentiator(
+        rules=DifferentialRules(grouped_agg_rule="rule-join-map"),
+    ).differentiate(view)
+    ops = _query_ops(differentiated)
+
+    assert differentiated.op == "select"
+    assert differentiated.params["columns"] == (
+        "topic",
+        "summary",
+        "evidence",
+        "earliest",
+    )
+    assert "join" in ops
+    assert "sem_map" in ops
+    assert "assign" in ops
+    assert "array_merge_columns" not in ops
+    assignments = next(
+        node.params["assignments"]
+        for node in _query_nodes(differentiated)
+        if node.op == "assign"
+    )
+    assert assignments["evidence"]["kind"] == "array_cat"
+    assert assignments["earliest"]["kind"] == "least"
+
+
+def test_join_map_rejects_partitioned_semantic_grouping() -> None:
+    log = am.Log(
+        {"group_id": "Partition.", "name": "Name.", "body": "Evidence."}
+    )
+    direct = log.sem_groupby(
+        input_cols=["name"],
+        partition_by="group_id",
+        instruction="Rows with {name} refer to the same entity.",
+    ).sem_agg(
+        input_cols=["name", "body"],
+        output_cols={"name": "Canonical name.", "summary": "Summary."},
+        instruction="Return {name} and summarize {body} as {summary}.",
+    ).expr
+    mixed = log.sem_groupby(
+        input_cols=["name"],
+        partition_by="group_id",
+        instruction="Rows with {name} refer to the same entity.",
+    ).agg(
+        am.sem_agg(
+            input_cols=["name", "body"],
+            output_cols={"name": "Canonical name.", "summary": "Summary."},
+            instruction="Return {name} and summarize {body} as {summary}.",
+        ),
+        am.min(column="body", output_col="first_body"),
+    ).expr
+
+    for query in (direct, mixed):
+        with pytest.raises(
+            NotImplementedError,
+            match="partition_by.*rule-join-map",
+        ):
+            DifferentialRules(grouped_agg_rule="rule-join-map").differentiate(
+                query,
+                source_input=QueryExpr(op="log"),
+                current_view=QueryExpr(
+                    op="materialized_view",
+                    params={"name": "view", "columns": output_columns(query)},
+                ),
+                is_view_boundary=True,
+            )
 
 
 def test_differential_rules_reject_array_agg_outside_view_boundary() -> None:
@@ -1141,91 +1905,258 @@ def test_differential_rules_support_sem_flat_map_fragments() -> None:
     assert tuple(col.name for col in differentiated.params["output_cols"]) == ("fact",)
 
 
+def test_differential_rules_preserve_sem_flat_map_ordinal_col() -> None:
+    query = am.Log({"message": "Raw input message."}).sem_flat_map(
+        output_cols={"fact": "Extracted fact."},
+        instruction="Extract facts from {message}.",
+        ordinal_col="fact_ordinal",
+    ).expr
+
+    differentiated = _differentiate_with_defaults(query)
+
+    assert differentiated.op == "sem_flat_map"
+    assert differentiated.params["ordinal_col"] == "fact_ordinal"
+    assert output_columns(differentiated) == ("fact", "fact_ordinal")
+
+
+def test_differential_rules_support_explode_and_unnest_fragments() -> None:
+    query = (
+        am.Log({"entity_id": "Entity id.", "mentions": "Mention records."})
+        .explode(column="mentions", output_col="_mention")
+        .unnest(
+            column="_mention",
+            fields={"episode_id": "episode_id", "name": "mention_name"},
+        )
+        .expr
+    )
+
+    differentiated = _differentiate_with_defaults(query)
+
+    assert differentiated.op == "unnest"
+    assert differentiated.params == {
+        "column": "_mention",
+        "fields": (("episode_id", "episode_id"), ("name", "mention_name")),
+    }
+    assert differentiated.inputs[0].op == "explode"
+    assert differentiated.inputs[0].params == {"column": "mentions", "output_col": "_mention"}
+    assert differentiated.inputs[0].inputs[0].op == "log"
+
+
 def test_differential_query_planner_builds_claude_topics_full_next_view() -> None:
     view = am.ClaudeMemory.spec().views["topics"]
 
-    differentiated = DifferentialQueryPlanner().differentiate(view)
+    differentiated = QueryDifferentiator().differentiate(view)
+
+    assert differentiated.op == "select"
+    assert differentiated.params["columns"] == ("name", "description", "type", "body")
+    sem_agg_expr = differentiated.inputs[0]
+    assert sem_agg_expr.op == "sem_agg"
+    assert tuple(col.name for col in sem_agg_expr.params["output_cols"]) == (
+        "name",
+        "description",
+        "type",
+        "body",
+    )
+    sem_groupby_expr = sem_agg_expr.inputs[0]
+    assert sem_groupby_expr.op == "sem_groupby"
+    assert sem_groupby_expr.params["input_cols"] == (
+        "name",
+        "description",
+        "type",
+    )
+    union_expr = sem_groupby_expr.inputs[0]
+    assert union_expr.op == "union_by_name"
+    assert union_expr.params == {"allow_missing_columns": True}
+    assert union_expr.inputs[0].op == "select"
+    _assert_materialized_view(
+        union_expr.inputs[1],
+        name="topics",
+        columns=("name", "description", "type", "body"),
+    )
+
+
+def test_claude_topics_differentiated_query_no_longer_uses_join_map_merge() -> None:
+    view = am.ClaudeMemory.spec().views["topics"]
+
+    differentiated = QueryDifferentiator().differentiate(view)
+    ops = _query_ops(differentiated)
+
+    assert "union_by_name" in ops
+    assert "sem_join" not in ops
+    assert "sem_map" not in ops
+
+
+def test_default_grouped_agg_rule_stays_compressed() -> None:
+    view = am.ClaudeMemory.spec().views["topics"]
+
+    differentiated = QueryDifferentiator(
+        rules=DifferentialRules(grouped_agg_rule="compressed"),
+    ).differentiate(view)
+    ops = _query_ops(differentiated)
+
+    assert "union_by_name" in ops
+    assert "assign" not in ops
+    assert "filter" not in ops
+    assert "join" not in ops
+
+
+def test_changed_aware_grouped_agg_rule_emits_touched_group_shape() -> None:
+    view = am.ClaudeMemory.spec().views["topics"]
+    differentiated = QueryDifferentiator(
+        rules=DifferentialRules(grouped_agg_rule="changed-aware"),
+    ).differentiate(view)
+    ops = _query_ops(differentiated)
+
+    assert differentiated.op == "union"
+    assert len(differentiated.inputs) == 2
+    kept, updates = differentiated.inputs
+    assert kept.op == "select"
+    assert kept.params["columns"] == ("name", "description", "type", "body")
+    assert kept.inputs[0].op == "join"
+    assert kept.inputs[0].params["how"] == "left_anti"
+    assert updates.op == "select"
+    assert updates.params["columns"] == ("name", "description", "type", "body")
+    assert updates.inputs[0].op == "sem_agg"
+    assert "assign" in ops
+    assert "filter" in ops
+    assert "join" in ops
+    assert "left_anti" in [
+        query.params.get("how")
+        for query in _query_nodes(differentiated)
+        if query.op == "join"
+    ]
+    assert "sem_join" not in ops
+    assert "sem_map" not in ops
+
+
+def test_changed_aware_partitioned_grouping_uses_partition_and_group_id() -> None:
+    query = (
+        am.Log({"group_id": "Partition.", "name": "Name.", "body": "Body."})
+        .sem_groupby(
+            input_cols=["name"],
+            partition_by="group_id",
+            instruction="Rows with {name} refer to the same entity.",
+        )
+        .sem_agg(
+            input_cols=["name", "body"],
+            output_cols={"name": "Canonical name.", "body": "Merged body."},
+            instruction="Return {name} and merge {body}.",
+        )
+        .expr
+    )
+
+    differentiated = DifferentialRules(
+        grouped_agg_rule="rule-all-group-optimized"
+    ).differentiate(
+        query,
+        source_input=QueryExpr(op="log"),
+        current_view=QueryExpr(
+            op="materialized_view",
+            params={"name": "entities", "columns": output_columns(query)},
+        ),
+        is_view_boundary=True,
+    )
+
+    touched_joins = [
+        node
+        for node in _query_nodes(differentiated)
+        if node.op == "join" and node.params.get("how") in {"inner", "left_anti"}
+    ]
+    assert touched_joins
+    assert all(
+        node.params["on"] == ("group_id", GROUP_ID_COLUMN)
+        for node in touched_joins
+    )
+
+
+def test_join_map_grouped_agg_rule_emits_join_map_shape() -> None:
+    view = am.ClaudeMemory.spec().views["topics"]
+    differentiated = QueryDifferentiator(
+        rules=DifferentialRules(grouped_agg_rule="join-map"),
+    ).differentiate(view)
+    ops = _query_ops(differentiated)
 
     assert differentiated.op == "select"
     assert differentiated.params["columns"] == ("name", "description", "type", "body")
     sem_map_expr = differentiated.inputs[0]
     assert sem_map_expr.op == "sem_map"
+    sem_join_expr = sem_map_expr.inputs[0]
+    assert sem_join_expr.op == "sem_join"
+    assert sem_join_expr.params["how"] == "outer"
+    assert "sem_join" in ops
+    assert "sem_map" in ops
+    assert "{name:left} and {name:right}" in sem_join_expr.params["instruction"]
+    assert "{body:left} and {body:right}" in sem_map_expr.params["instruction"]
+
+
+def test_changed_aware_grouped_agg_execution_keeps_old_only_groups() -> None:
+    view = am.ClaudeMemory.spec().views["topics"]
+    query = QueryDifferentiator(
+        rules=DifferentialRules(grouped_agg_rule="changed-aware"),
+    ).differentiate(view)
+    current = pd.DataFrame(
+        [
+            {
+                "name": "caroline_adoption_goal",
+                "description": "Caroline's adoption plan.",
+                "type": "profile",
+                "body": "Caroline is researching adoption agencies.",
+            }
+        ]
+    )
+    changed_log = pd.DataFrame(columns=["role", "message", "timestamp", "session_id"])
+
+    result = LotusAdapter().execute(query, {"log": changed_log, "topics": current})
+
+    assert result.to_dict(orient="records") == current.to_dict(orient="records")
+    assert "_changed" not in result.columns
+    assert GROUP_ID_COLUMN not in result.columns
+
+
+def test_differential_rules_reject_unknown_grouped_agg_strategy() -> None:
+    with pytest.raises(ValueError, match="grouped_agg_rule"):
+        DifferentialRules(grouped_agg_rule="unknown")
+
+
+def test_claude_topics_join_map_candidate_builder_rewrites_placeholders() -> None:
+    view = am.ClaudeMemory.spec().views["topics"]
+    current_view = QueryExpr(
+        op="materialized_view",
+        params={"name": "topics", "columns": ("name", "description", "type", "body")},
+    )
+
+    candidate = DifferentialRules()._build_sem_groupby_agg_join_map_candidate(
+        view.query,
+        changed_group_input=QueryExpr(op="log"),
+        current_view=current_view,
+        instruction_rewriter=DifferentialInstructionRewriter(),
+    )
+
+    assert candidate is not None
+    assert candidate.op == "select"
+    assert candidate.params["columns"] == ("name", "description", "type", "body")
+    sem_map_expr = candidate.inputs[0]
+    assert sem_map_expr.op == "sem_map"
+    sem_join_expr = sem_map_expr.inputs[0]
+    assert sem_join_expr.op == "sem_join"
+    assert sem_join_expr.params["how"] == "outer"
+    assert "{name:left} and {name:right}" in sem_join_expr.params["instruction"]
+    assert "{description:left} and {description:right}" in sem_join_expr.params["instruction"]
+    assert "{type:left} and {type:right}" in sem_join_expr.params["instruction"]
+    assert "{body:left} and {body:right}" in sem_map_expr.params["instruction"]
     assert tuple(col.name for col in sem_map_expr.params["output_cols"]) == (
         "name",
         "description",
         "type",
         "body",
     )
-    sem_join_expr = sem_map_expr.inputs[0]
-    assert sem_join_expr.op == "sem_join"
-    assert sem_join_expr.params["how"] == "outer"
-    join_instruction = sem_join_expr.params["instruction"]
-    assert "{name:left} and {name:right}" in join_instruction
-    assert "{description:left} and {description:right}" in join_instruction
-    assert "{type:left} and {type:right}" in join_instruction
-    assert "{name}," not in join_instruction
-    _assert_materialized_view(
-        sem_join_expr.inputs[1],
-        name="topics",
-        columns=("name", "description", "type", "body"),
-    )
-    map_instruction = sem_map_expr.params["instruction"]
-    assert "{name:left} and {name:right}" in map_instruction
-    assert "{description:left} and {description:right}" in map_instruction
-    assert "{type:left} and {type:right}" in map_instruction
-    assert "{body:left} and {body:right}" in map_instruction
-    changed_aggregate = sem_join_expr.inputs[0]
-    assert changed_aggregate.op == "sem_agg"
-    assert changed_aggregate.inputs[0].op == "sem_groupby"
-
-
-def test_claude_topics_join_instruction_lowers_to_composite_records() -> None:
-    view = am.ClaudeMemory.spec().views["topics"]
-    differentiated = DifferentialQueryPlanner().differentiate(view)
-    sem_map_expr = differentiated.inputs[0]
-    sem_join_expr = sem_map_expr.inputs[0]
-
-    left = pd.DataFrame(
-        {
-            "name": ["adoption_goal"],
-            "description": ["Caroline wants to adopt children."],
-            "type": ["user"],
-            "body": ["Caroline is researching adoption agencies."],
-        }
-    )
-    right = pd.DataFrame(
-        {
-            "name": ["caroline_adoption_journey"],
-            "description": ["Caroline is pursuing single-parent adoption."],
-            "type": ["user"],
-            "body": ["Caroline values LGBTQ+ inclusive adoption agencies."],
-        }
-    )
-
-    left_series, right_series, left_label, right_label, instruction = join_series(
-        left,
-        right,
-        str(sem_join_expr.params["instruction"]),
-    )
-
-    assert left_label == "left"
-    assert right_label == "right"
-    assert "satisfy this semantic join condition" in instruction
-    assert "name: adoption_goal" in left_series.iloc[0]
-    assert "description: Caroline wants to adopt children." in left_series.iloc[0]
-    assert "type: user" in left_series.iloc[0]
-    assert "body:" not in left_series.iloc[0]
-    assert "name: caroline_adoption_journey" in right_series.iloc[0]
-    assert "description: Caroline is pursuing single-parent adoption." in right_series.iloc[0]
-    assert "type: user" in right_series.iloc[0]
-    assert "body:" not in right_series.iloc[0]
 
 
 def test_differential_query_planner_recomputes_views_from_materialized_dependencies() -> None:
     spec = am.ClaudeMemory.spec()
     catalog = spec.views["catalog"]
 
-    differentiated = DifferentialQueryPlanner().differentiate(
+    differentiated = QueryDifferentiator().differentiate(
         catalog,
         views=spec.views,
     )
@@ -1256,9 +2187,8 @@ def test_differential_query_planner_binds_source_query_dependencies() -> None:
         },
     )
 
-    differentiated = DifferentialQueryPlanner().differentiate_query(
-        view_name="summaries",
-        query=query,
+    differentiated = QueryDifferentiator().differentiate(
+        MemoryView(name="summaries", query=query),
         views={
             "source_view": MemoryView(
                 name="source_view",
@@ -1376,12 +2306,8 @@ def test_differentiated_policy_compiles_views_and_retrieval_templates() -> None:
     policy = am.ClaudeMemory.differentiate_policy()
 
     assert policy.spec is am.ClaudeMemory.spec()
-    assert policy.view_execution_order == ("topics", "catalog")
-    assert policy.view_dependencies == {
-        "topics": (),
-        "catalog": ("topics",),
-    }
-    assert sorted(policy.view_queries) == ["catalog", "topics"]
+    assert set(policy.view_outputs) == {"topics", "catalog"}
+    assert policy.execution_order[-1] == policy.view_outputs["catalog"]
 
     retrieval_query = policy.retrieval_queries["default"]
     assert retrieval_query.op == "select"
@@ -1405,7 +2331,7 @@ def test_differentiated_policy_compiles_views_and_retrieval_templates() -> None:
     _assert_materialized_view(manifest_query.inputs[0], name="topics")
 
 
-def test_differentiated_policy_extracts_window_process_plan() -> None:
+def test_differentiated_policy_compiles_window_process_node() -> None:
     class WindowBlockMemory(am.Memory):
         log = am.Log(
             {
@@ -1422,30 +2348,17 @@ def test_differentiated_policy_extracts_window_process_plan() -> None:
         )
 
     policy = WindowBlockMemory.differentiate_policy()
-    plan = policy.window_process_plans["blocks"]
+    node_id = policy.view_outputs["blocks"]
+    node = policy.nodes[node_id]
 
-    assert plan.view_name == "blocks"
-    assert plan.private_name == "_blocks_process_window"
-    assert plan.changed_name == "_blocks_process_window__changed"
-    assert plan.window_query.op == "count_window"
-    assert plan.process_query.op == "array_agg"
-    _assert_materialized_view(
-        plan.private_source,
-        name="_blocks_process_window",
-        columns=("conversation_records",),
-    )
-    _assert_materialized_view(
-        plan.changed_source,
-        name="_blocks_process_window__changed",
-        columns=("conversation_records",),
-    )
-    query = policy.view_queries["blocks"]
-    assert query.op == "union"
-    _assert_materialized_view(query.inputs[0], name="blocks", columns=("conversation_records",))
-    assert query.inputs[1] == plan.changed_source
+    assert node.execution_kind == "process_window"
+    assert node.query.op == "process_window"
+    assert node.query.inputs[0].op == "count_window"
+    assert node.query.inputs[1].op == "array_agg"
+    assert node.output_columns == ("conversation_records",)
 
 
-def test_differentiated_policy_uses_changed_process_rows_for_downstream_query() -> None:
+def test_differentiated_policy_routes_window_changes_to_downstream_node() -> None:
     class WindowCandidateMemory(am.Memory):
         log = am.Log(
             {
@@ -1472,20 +2385,18 @@ def test_differentiated_policy_uses_changed_process_rows_for_downstream_query() 
         )
 
     policy = WindowCandidateMemory.differentiate_policy()
-    plan = policy.window_process_plans["candidates"]
-    query = policy.view_queries["candidates"]
+    sink = policy.nodes[policy.view_outputs["candidates"]]
+    sem_flat_map_node = policy.nodes[sink.input_node_ids[0]]
+    process_node = policy.nodes[sem_flat_map_node.input_node_ids[0]]
 
-    assert query.op == "union"
-    fragment = query.inputs[1]
-    assert fragment.op == "select"
-    sem_flat_map = fragment.inputs[0]
-    assert sem_flat_map.op == "sem_flat_map"
-    assert sem_flat_map.inputs[0] == plan.changed_source
-    assert sem_flat_map.params["input_cols"] == ("conversation_records",)
+    assert sink.query.op == "select"
+    assert sem_flat_map_node.execution_kind == "semantic_row"
+    assert sem_flat_map_node.query.params["input_cols"] == ("conversation_records",)
+    assert process_node.execution_kind == "process_window"
 
 
-def test_differentiated_policy_rejects_unsupported_count_window_upstream() -> None:
-    class UnsupportedWindowMemory(am.Memory):
+def test_differentiated_policy_supports_deterministic_count_window_upstream() -> None:
+    class AggregateWindowMemory(am.Memory):
         log = am.Log({"message": "Message body."})
         records = log.array_agg(columns=("message",), output_col="records").count_window(
             size=2,
@@ -1497,8 +2408,13 @@ def test_differentiated_policy_rejects_unsupported_count_window_upstream() -> No
             )
         )
 
-    with pytest.raises(NotImplementedError, match="array_agg changed-row differential"):
-        UnsupportedWindowMemory.differentiate_policy()
+    policy = AggregateWindowMemory.differentiate_policy()
+    sink = policy.nodes[policy.view_outputs["records"]]
+
+    assert sink.execution_kind == "process_window"
+    upstream = policy.nodes[sink.input_node_ids[0]]
+    assert upstream.query.op == "array_agg"
+    assert upstream.execution_kind == "deterministic"
 
 
 @pytest.mark.parametrize(
@@ -1509,62 +2425,17 @@ def test_differentiated_policy_rejects_unsupported_count_window_upstream() -> No
         {"message": "Please remember that I prefer concise docs."},
     ],
 )
-def test_claude_add_executes_differentiated_queries(message: object) -> None:
-    class RecordingAdapter:
-        def __init__(self) -> None:
-            self.calls: list[tuple[QueryExpr, dict[str, pd.DataFrame]]] = []
+def test_memory_add_normalizes_supported_input_forms(message: object) -> None:
+    class InputMemory(am.Memory):
+        log = am.Log({"message": "Message body."})
+        rows = log.select(["message"])
 
-        def execute(
-            self,
-            query: QueryExpr,
-            inputs: dict[str, pd.DataFrame],
-        ) -> pd.DataFrame:
-            self.calls.append((query, inputs))
-            if query.op == "select":
-                columns = [str(column) for column in query.params["columns"]]
-            else:
-                columns = ["value"]
-            return pd.DataFrame(
-                [{column: f"{column}-{len(self.calls)}" for column in columns}]
-            )
-
-    adapter = RecordingAdapter()
-    memory = am.ClaudeMemory(adapter=adapter)
+    memory = InputMemory(adapter=LotusAdapter())
 
     memory.add(message)
 
-    assert [query.op for query, _ in adapter.calls] == ["select", "select"]
-    topics_query, topics_inputs = adapter.calls[0]
-    catalog_query, catalog_inputs = adapter.calls[1]
-
-    assert topics_query.params["columns"] == ("name", "description", "type", "body")
-    assert "log" in topics_inputs
-    assert list(topics_inputs["topics"].columns) == [
-        "name",
-        "description",
-        "type",
-        "body",
-    ]
-    assert topics_inputs["topics"].empty
-
-    assert catalog_query.params["columns"] == ("catalog_title", "name", "hook")
-    _assert_materialized_view(
-        catalog_query.inputs[0].inputs[0],
-        name="topics",
-        columns=("name", "description", "type", "body"),
-    )
-    assert catalog_inputs["topics"].equals(memory._runtime._state["topics"])
-
-    assert list(memory._runtime._state["topics"].columns) == [
-        "name",
-        "description",
-        "type",
-        "body",
-    ]
-    assert list(memory._runtime._state["catalog"].columns) == [
-        "catalog_title",
-        "name",
-        "hook",
+    assert memory._runtime._state["rows"].to_dict("records") == [
+        {"message": "Please remember that I prefer concise docs."}
     ]
 
 
@@ -1832,6 +2703,7 @@ def test_lotus_execution_config_keeps_retry_defaults_disabled() -> None:
     assert config.lm_rate_limit is None
     assert config.semantic_trace_dir is None
     assert config.structured_parse_retries == DEFAULT_STRUCTURED_PARSE_RETRIES
+    assert config.sem_topk_method == "pairwise-naive"
 
 
 def test_lotus_adapter_forwards_topk_lotus_options() -> None:
@@ -1840,6 +2712,9 @@ def test_lotus_adapter_forwards_topk_lotus_options() -> None:
 
         def __init__(self) -> None:
             self.kwargs: dict[str, Any] | None = None
+
+        def __len__(self) -> int:
+            return 1
 
         def sem_topk(self, instruction: str, **kwargs: Any) -> str:
             self.instruction = instruction
@@ -1855,7 +2730,7 @@ def test_lotus_adapter_forwards_topk_lotus_options() -> None:
 
     source = Source()
     config = LotusExecutionConfig(
-        sem_topk_method="naive",
+        sem_topk_method="pairwise-naive",
         sem_topk_strategy="ZS_COT",
         sem_topk_cascade_threshold=0.7,
         sem_topk_return_stats=True,
@@ -1889,6 +2764,349 @@ def test_lotus_adapter_forwards_topk_lotus_options() -> None:
     assert source.kwargs["safe_mode"] is True
     assert source.kwargs["return_explanations"] is True
     assert source.kwargs["strategy"].name == "ZS_COT"
+
+
+@pytest.mark.parametrize(
+    ("configured_method", "lotus_method"),
+    [
+        ("pairwise-naive", "naive"),
+        ("pairwise-quick", "quick"),
+        ("pairwise-heap", "heap"),
+    ],
+)
+def test_lotus_adapter_maps_canonical_pairwise_topk_methods(
+    configured_method: str,
+    lotus_method: str,
+) -> None:
+    class Source:
+        columns = ["message"]
+
+        def __len__(self) -> int:
+            return 2
+
+        def sem_topk(self, _instruction: str, **kwargs: Any) -> str:
+            self.kwargs = kwargs
+            return "ranked"
+
+    class Context:
+        config = LotusExecutionConfig(sem_topk_method=configured_method)
+
+        def configure(self) -> None:
+            pass
+
+    source = Source()
+    query = QueryExpr(
+        op="sem_topk",
+        inputs=(QueryExpr(op="materialized_view", params={"name": "source"}),),
+        params={"instruction": "plans", "k": 1},
+    )
+
+    assert execute_sem_topk(
+        query,
+        {},
+        lambda _query, _inputs: source,
+        Context(),
+    ) == "ranked"
+    assert source.kwargs["method"] == lotus_method
+
+
+def test_lotus_adapter_dispatches_listwise_topk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Context:
+        config = LotusExecutionConfig(sem_topk_method="listwise")
+
+        def configure(self) -> None:
+            pass
+
+    source = pd.DataFrame(
+        {
+            "name": ["docs", "travel"],
+            "description": ["Architecture notes", "Trip plans"],
+        }
+    )
+    ranked = source.iloc[[1]].reset_index(drop=True)
+    captured: dict[str, Any] = {}
+
+    def execute_listwise_topk(
+        frame: pd.DataFrame,
+        *,
+        instruction: str,
+        k: int,
+        context: Any,
+    ) -> Any:
+        captured.update(
+            frame=frame,
+            instruction=instruction,
+            k=k,
+            context=context,
+        )
+        return SimpleNamespace(
+            frame=ranked,
+            selected_ids=("row_1",),
+            retry_count=0,
+        )
+
+    monkeypatch.setattr(
+        sem_topk_module,
+        "execute_listwise_topk",
+        execute_listwise_topk,
+        raising=False,
+    )
+    query = QueryExpr(
+        op="sem_topk",
+        inputs=(QueryExpr(op="materialized_view", params={"name": "source"}),),
+        params={"instruction": "architecture", "k": 1},
+    )
+
+    result = execute_sem_topk(
+        query,
+        {},
+        lambda _query, _inputs: source,
+        Context(),
+    )
+
+    pd.testing.assert_frame_equal(result, ranked)
+    assert captured["frame"] is source
+    assert captured["instruction"] == (
+        "{name}, {description} is relevant to: architecture"
+    )
+    assert captured["k"] == 1
+
+
+class FakeListwiseLM:
+    """Return configured raw outputs for listwise top-k tests."""
+
+    max_tokens = 512
+
+    def __init__(self, raw_outputs: list[str]) -> None:
+        self._raw_outputs = iter(raw_outputs)
+        self.calls: list[tuple[Any, dict[str, Any]]] = []
+
+    def __call__(self, messages: Any, **kwargs: Any) -> Any:
+        self.calls.append((messages, kwargs))
+        return SimpleNamespace(outputs=[next(self._raw_outputs)])
+
+
+class StaticTopKContext:
+    """Expose a preconfigured semantic top-k execution config."""
+
+    def __init__(self, config: LotusExecutionConfig) -> None:
+        self.config = config
+
+    def configure(self) -> None:
+        pass
+
+
+def execute_listwise_test_query(
+    source: pd.DataFrame,
+    *,
+    k: int,
+    config: LotusExecutionConfig,
+) -> pd.DataFrame:
+    """Execute one listwise top-k query against an in-memory frame."""
+
+    query = QueryExpr(
+        op="sem_topk",
+        inputs=(QueryExpr(op="materialized_view", params={"name": "source"}),),
+        params={
+            "instruction": "{name} and {description} are relevant to architecture",
+            "k": k,
+        },
+    )
+    return execute_sem_topk(
+        query,
+        {},
+        lambda _query, _inputs: source,
+        StaticTopKContext(config),
+    )
+
+
+def test_listwise_topk_uses_stable_ids_and_preserves_output_schema(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import lotus
+
+    source = pd.DataFrame(
+        {
+            "name": ["melanie", "travel", "melanie"],
+            "description": ["Architecture docs", "Summer trip", "API design"],
+            "body": ["first", "second", "third"],
+        }
+    )
+    fake_lm = FakeListwiseLM(
+        ['{"selected_ids": ["row_2", "row_0"]}']
+    )
+    monkeypatch.setattr(lotus.settings, "lm", fake_lm)
+
+    result = execute_listwise_test_query(
+        source,
+        k=2,
+        config=LotusExecutionConfig(sem_topk_method="listwise"),
+    )
+
+    pd.testing.assert_frame_equal(result, source.iloc[[2, 0]].reset_index(drop=True))
+    assert list(result.columns) == ["name", "description", "body"]
+    assert len(fake_lm.calls) == 1
+    messages, kwargs = fake_lm.calls[0]
+    prompt_text = json.dumps(messages, ensure_ascii=False)
+    assert all(candidate_id in prompt_text for candidate_id in ("row_0", "row_1", "row_2"))
+    assert '"body"' not in prompt_text
+    assert kwargs["response_format"] == {"type": "json_object"}
+    assert kwargs["max_tokens"] == 1024
+
+
+def test_listwise_topk_deduplicates_repeated_instruction_columns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import lotus
+
+    source = pd.DataFrame(
+        {
+            "name": ["docs", "travel"],
+            "description": ["Architecture notes", "Trip plans"],
+        }
+    )
+    fake_lm = FakeListwiseLM(['{"selected_ids": ["row_0"]}'])
+    monkeypatch.setattr(lotus.settings, "lm", fake_lm)
+    query = QueryExpr(
+        op="sem_topk",
+        inputs=(QueryExpr(op="materialized_view", params={"name": "source"}),),
+        params={
+            "instruction": "Compare {name} to {name}; use {description}.",
+            "k": 1,
+        },
+    )
+
+    result = execute_sem_topk(
+        query,
+        {},
+        lambda _query, _inputs: source,
+        StaticTopKContext(LotusExecutionConfig(sem_topk_method="listwise")),
+    )
+
+    pd.testing.assert_frame_equal(result, source.iloc[[0]].reset_index(drop=True))
+    messages, _kwargs = fake_lm.calls[0]
+    user_payload = json.loads(messages[0][1]["content"])
+    assert list(user_payload["candidates"][0]["row"]) == ["name", "description"]
+
+
+def test_listwise_topk_retries_invalid_output_and_traces_retry_count(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import lotus
+
+    source = pd.DataFrame(
+        {
+            "name": ["docs", "travel"],
+            "description": ["Architecture notes", "Trip plans"],
+        }
+    )
+    fake_lm = FakeListwiseLM(
+        ["", '{"selected_ids": ["row_9"]}', '{"selected_ids": ["row_1"]}']
+    )
+    monkeypatch.setattr(lotus.settings, "lm", fake_lm)
+    trace_dir = tmp_path / "trace"
+
+    result = execute_listwise_test_query(
+        source,
+        k=1,
+        config=LotusExecutionConfig(
+            sem_topk_method="listwise",
+            structured_parse_retries=2,
+            semantic_trace_dir=trace_dir,
+        ),
+    )
+
+    pd.testing.assert_frame_equal(result, source.iloc[[1]].reset_index(drop=True))
+    assert len(fake_lm.calls) == 3
+    [event] = trace_events(trace_dir)
+    assert event["operator"] == "sem_topk"
+    assert event["sem_topk_method"] == "listwise"
+    assert event["candidate_count"] == 2
+    assert event["selected_ids"] == ["row_1"]
+    assert event["retry_count"] == 2
+
+
+@pytest.mark.parametrize(
+    ("raw_output", "message"),
+    [
+        ('{"selected_ids": ["row_0", "row_0"]}', "unique"),
+        ('{"selected_ids": ["row_9", "row_0"]}', "unknown"),
+        ('{"selected_ids": ["row_0"]}', "exactly 2"),
+        ('{"selected_ids": "row_0"}', "list"),
+    ],
+)
+def test_listwise_topk_rejects_invalid_selection_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    raw_output: str,
+    message: str,
+) -> None:
+    import lotus
+
+    source = pd.DataFrame(
+        {
+            "name": ["docs", "travel"],
+            "description": ["Architecture notes", "Trip plans"],
+        }
+    )
+    monkeypatch.setattr(lotus.settings, "lm", FakeListwiseLM([raw_output]))
+
+    with pytest.raises(ValueError, match=message):
+        execute_listwise_test_query(
+            source,
+            k=2,
+            config=LotusExecutionConfig(
+                sem_topk_method="listwise",
+                structured_parse_retries=0,
+            ),
+        )
+
+
+def test_listwise_topk_returns_all_rows_when_k_exceeds_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import lotus
+
+    source = pd.DataFrame(
+        {
+            "name": ["docs", "travel"],
+            "description": ["Architecture notes", "Trip plans"],
+        }
+    )
+    monkeypatch.setattr(
+        lotus.settings,
+        "lm",
+        FakeListwiseLM(['{"selected_ids": ["row_1", "row_0"]}']),
+    )
+
+    result = execute_listwise_test_query(
+        source,
+        k=5,
+        config=LotusExecutionConfig(sem_topk_method="listwise"),
+    )
+
+    pd.testing.assert_frame_equal(result, source.iloc[[1, 0]].reset_index(drop=True))
+
+
+def test_listwise_topk_empty_input_skips_lm_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import lotus
+
+    source = pd.DataFrame(columns=["name", "description"])
+    fake_lm = FakeListwiseLM([])
+    monkeypatch.setattr(lotus.settings, "lm", fake_lm)
+
+    result = execute_listwise_test_query(
+        source,
+        k=5,
+        config=LotusExecutionConfig(sem_topk_method="listwise"),
+    )
+
+    pd.testing.assert_frame_equal(result, source)
+    assert fake_lm.calls == []
 
 
 def test_lotus_adapter_forwards_sem_filter_config_options() -> None:
@@ -1959,6 +3177,37 @@ def test_native_sem_filter_kwargs_keeps_debug_output_off_by_default() -> None:
     assert kwargs["return_raw_outputs"] is False
     assert kwargs["return_explanations"] is False
     assert kwargs["return_stats"] is False
+
+
+def test_sem_filter_binds_alias_qualified_columns_for_lotus_formatting() -> None:
+    source = pd.DataFrame(
+        {
+            "fact:earlier_added": ["Alice lives in Paris."],
+            "fact:later_added": ["Alice lives in London."],
+            "fact_id:earlier_added": [(1, 0)],
+        }
+    )
+
+    bound, instruction, restore_columns = bind_qualified_filter_columns(
+        source,
+        (
+            "Does {fact:later_added} contradict "
+            "{fact:earlier_added}?"
+        ),
+    )
+
+    assert instruction == (
+        "Does {fact_later_added} contradict {fact_earlier_added}?"
+    )
+    assert list(bound.columns) == [
+        "fact_earlier_added",
+        "fact_later_added",
+        "fact_id:earlier_added",
+    ]
+    assert restore_columns == {
+        "fact_earlier_added": "fact:earlier_added",
+        "fact_later_added": "fact:later_added",
+    }
 
 
 def test_lotus_adapter_default_model_is_deepseek_v4_pro() -> None:
@@ -2250,6 +3499,54 @@ def test_structured_sem_map_parses_required_explanation() -> None:
 
     assert output == {"label": "greeting"}
     assert explanation == "The message greets someone."
+
+
+def test_structured_output_preserves_json_scalar_types() -> None:
+    output, explanation = parse_structured_object_json(
+        '{"name": "Alice", "ordinal": 2, "active": true, "invalid_at": null}',
+        (
+            ColumnSpec("name"),
+            ColumnSpec("ordinal"),
+            ColumnSpec("active"),
+            ColumnSpec("invalid_at"),
+        ),
+        require_explanation=False,
+        operator="sem_map",
+    )
+
+    assert output == {
+        "name": "Alice",
+        "ordinal": 2,
+        "active": True,
+        "invalid_at": None,
+    }
+    assert explanation is None
+
+
+@pytest.mark.parametrize("nested", ['["Alice"]', '{"name": "Alice"}'])
+def test_structured_output_rejects_nested_field_values(nested: str) -> None:
+    with pytest.raises(ValueError, match="JSON scalar"):
+        parse_structured_object_json(
+            f'{{"value": {nested}}}',
+            (ColumnSpec("value"),),
+            require_explanation=False,
+            operator="sem_map",
+        )
+
+
+def test_structured_instruction_requests_json_scalars_not_only_strings() -> None:
+    instruction = build_structured_instruction(
+        "Return an ordinal and optional invalidation time.",
+        (
+            ColumnSpec("ordinal", "Integer position."),
+            ColumnSpec("invalid_at", "Timestamp or null."),
+        ),
+        shape="object",
+    )
+
+    assert "JSON scalar" in instruction
+    assert "JSON null" in instruction
+    assert "string values for every field" not in instruction
 
 
 def test_structured_sem_map_rejects_invalid_json() -> None:
@@ -2638,6 +3935,37 @@ def test_structured_lm_retries_only_invalid_json_rows() -> None:
     assert stats.failure_artifacts == 0
 
 
+def test_structured_lm_retries_nested_field_values() -> None:
+    class Output:
+        def __init__(self, outputs: list[str]) -> None:
+            self.outputs = outputs
+
+    class FakeLM:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def __call__(self, _prompts: object, **_kwargs: Any) -> Output:
+            self.calls += 1
+            if self.calls == 1:
+                return Output(['{"ordinal": [0]}'])
+            return Output(['{"ordinal": 0}'])
+
+    fake_lm = FakeLM()
+    outputs = execute_structured_lm_with_retries(
+        fake_lm,
+        ["prompt"],
+        lm_kwargs={"progress_bar_desc": "Mapping"},
+        output_cols=(ColumnSpec("ordinal"),),
+        shape="object",
+        require_explanation=False,
+        operator="sem_map",
+        max_retries=1,
+    )
+
+    assert outputs == ['{"ordinal": 0}']
+    assert fake_lm.calls == 2
+
+
 def test_structured_lm_retry_failure_writes_artifact(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2705,6 +4033,20 @@ def test_sem_flat_map_parses_and_explodes_json_rows_wrapper_outputs() -> None:
         "I prefer concise docs and plan a meeting.",
     ]
     assert list(result["topic"]) == ["docs", "meetings"]
+
+
+def test_sem_flat_map_preserves_json_scalar_field_types() -> None:
+    output_cols = (
+        ColumnSpec("entity_ordinal"),
+        ColumnSpec("invalid_at"),
+    )
+
+    parsed = parse_structured_flat_map_json(
+        '{"rows": [{"entity_ordinal": 1, "invalid_at": null}]}',
+        output_cols,
+    )
+
+    assert parsed == [{"entity_ordinal": 1, "invalid_at": None}]
 
 
 def test_sem_flat_map_empty_array_emits_zero_rows_with_columns() -> None:
@@ -2798,6 +4140,358 @@ def test_relational_execution_ops_follow_dataframe_semantics() -> None:
     assert list(deduped["message"]) == ["hello"]
 
 
+def test_union_by_name_aligns_missing_columns_and_deduplicates() -> None:
+    left = QueryExpr(op="materialized_view", params={"name": "left"})
+    right = QueryExpr(op="materialized_view", params={"name": "right"})
+    inputs = {
+        "left": pd.DataFrame(
+            {
+                "name": ["caroline", "caroline"],
+                "body": ["Adoption goal.", "Adoption goal."],
+            }
+        ),
+        "right": pd.DataFrame(
+            {
+                "body": ["Adoption goal.", "Values LGBTQ+ inclusion."],
+                "type": [pd.NA, "user"],
+                "name": ["caroline", "caroline_values"],
+            }
+        ),
+    }
+
+    result = execute_union_by_name(
+        QueryExpr(
+            op="union_by_name",
+            inputs=(left, right),
+            params={"allow_missing_columns": True},
+        ),
+        inputs,
+        LotusAdapter().execute,
+    )
+
+    records = result.astype(object).where(pd.notna(result), None).to_dict(
+        orient="records"
+    )
+    assert list(result.columns) == ["name", "body", "type"]
+    assert records == [
+        {"name": "caroline", "body": "Adoption goal.", "type": None},
+        {"name": "caroline_values", "body": "Values LGBTQ+ inclusion.", "type": "user"},
+    ]
+
+
+def test_union_by_name_rejects_missing_columns_when_strict() -> None:
+    left = QueryExpr(op="materialized_view", params={"name": "left"})
+    right = QueryExpr(op="materialized_view", params={"name": "right"})
+    inputs = {
+        "left": pd.DataFrame({"name": ["caroline"], "body": ["Adoption goal."]}),
+        "right": pd.DataFrame({"name": ["caroline"], "type": ["user"]}),
+    }
+
+    with pytest.raises(ValueError, match="same column names"):
+        execute_union_by_name(
+            QueryExpr(
+                op="union_by_name",
+                inputs=(left, right),
+                params={"allow_missing_columns": False},
+            ),
+            inputs,
+            LotusAdapter().execute,
+        )
+
+
+def test_union_by_name_rejects_non_bool_allow_missing_columns() -> None:
+    left = QueryExpr(op="materialized_view", params={"name": "left"})
+    right = QueryExpr(op="materialized_view", params={"name": "right"})
+    inputs = {
+        "left": pd.DataFrame({"name": ["caroline"]}),
+        "right": pd.DataFrame({"name": ["caroline"]}),
+    }
+
+    with pytest.raises(TypeError, match="allow_missing_columns"):
+        execute_union_by_name(
+            QueryExpr(
+                op="union_by_name",
+                inputs=(left, right),
+                params={"allow_missing_columns": "yes"},
+            ),
+            inputs,
+            LotusAdapter().execute,
+        )
+
+
+def test_assign_executes_literal_scalar_columns() -> None:
+    source = QueryExpr(op="materialized_view", params={"name": "source"})
+    inputs = {"source": pd.DataFrame({"name": ["caroline", "melanie"]})}
+
+    result = execute_assign(
+        QueryExpr(
+            op="assign",
+            inputs=(source,),
+            params={"assignments": {"_changed": True, "rank": 1}},
+        ),
+        inputs,
+        LotusAdapter().execute,
+    )
+
+    assert result.to_dict(orient="records") == [
+        {"name": "caroline", "_changed": True, "rank": 1},
+        {"name": "melanie", "_changed": True, "rank": 1},
+    ]
+    assert output_columns(
+        QueryExpr(
+            op="assign",
+            inputs=(source,),
+            params={"assignments": {"_changed": True}},
+        )
+    ) == ("_changed",)
+
+
+def test_assign_executes_row_wise_array_cat_expression() -> None:
+    source = QueryExpr(
+        op="materialized_view",
+        params={"name": "source", "columns": ("records:right", "records:left")},
+    )
+    relation = Relation(source)
+    query = relation.assign(
+        records=relation.col("records:right").array_cat(relation.col("records:left"))
+    ).expr
+    inputs = {
+        "source": pd.DataFrame(
+            {
+                "records:right": ['[{"body": "old"}]', pd.NA],
+                "records:left": ['[{"body": "new"}]', '[{"body": "only-new"}]'],
+            }
+        )
+    }
+
+    result = execute_assign(query, inputs, LotusAdapter().execute)
+
+    assert [json.loads(value) for value in result["records"]] == [
+        [{"body": "old"}, {"body": "new"}],
+        [{"body": "only-new"}],
+    ]
+
+
+def test_assign_rejects_callable_or_complex_values() -> None:
+    source = QueryExpr(op="materialized_view", params={"name": "source"})
+    inputs = {"source": pd.DataFrame({"name": ["caroline"]})}
+
+    with pytest.raises((TypeError, ValueError), match="Expression param|Unsupported expression"):
+        execute_assign(
+            QueryExpr(
+                op="assign",
+                inputs=(source,),
+                params={"assignments": {"bad": lambda row: row}},
+            ),
+            inputs,
+            LotusAdapter().execute,
+        )
+    with pytest.raises((TypeError, ValueError), match="Expression param|Unsupported expression"):
+        execute_assign(
+            QueryExpr(
+                op="assign",
+                inputs=(source,),
+                params={"assignments": {"bad": {"nested": True}}},
+            ),
+            inputs,
+            LotusAdapter().execute,
+        )
+
+
+def test_filter_executes_internal_is_true_predicate() -> None:
+    source = QueryExpr(op="materialized_view", params={"name": "source"})
+    inputs = {
+        "source": pd.DataFrame(
+            {
+                "name": ["new", "old", "unknown"],
+                "_changed": [True, False, pd.NA],
+            }
+        )
+    }
+
+    result = execute_filter(
+        QueryExpr(
+            op="filter",
+            inputs=(source,),
+            params={"predicate": ColumnExpr("_changed").to_param()},
+        ),
+        inputs,
+        LotusAdapter().execute,
+    )
+
+    assert result.to_dict(orient="records") == [{"name": "new", "_changed": True}]
+    assert output_columns(
+        QueryExpr(
+            op="filter",
+            inputs=(source,),
+            params={"predicate": ColumnExpr("_changed").to_param()},
+        )
+    ) == ()
+
+
+def test_filter_rejects_unsupported_predicates() -> None:
+    source = QueryExpr(op="materialized_view", params={"name": "source"})
+    inputs = {"source": pd.DataFrame({"name": ["new"], "_changed": [True]})}
+
+    with pytest.raises(ValueError, match="Unsupported expression kind"):
+        execute_filter(
+            QueryExpr(
+                op="filter",
+                inputs=(source,),
+                params={"predicate": {"op": "equals", "column": "_changed"}},
+            ),
+            inputs,
+            LotusAdapter().execute,
+        )
+    with pytest.raises(ValueError, match="not found"):
+        execute_filter(
+            QueryExpr(
+                op="filter",
+                inputs=(source,),
+                params={"predicate": ColumnExpr("missing").to_param()},
+            ),
+            inputs,
+            LotusAdapter().execute,
+        )
+
+
+def test_relation_bound_expression_api_query_expr_shape() -> None:
+    log = am.Log(
+        {
+            "fact_id": "Fact id.",
+            "source_entity_id": "Source entity.",
+            "target_entity_id": "Target entity.",
+            "valid_at": "Valid timestamp.",
+            "action": "Resolution action.",
+        }
+    )
+    old = log.alias("old")
+    new = log.alias("new")
+
+    joined = old.join(
+        new,
+        on=[
+            old.col("fact_id") != new.col("fact_id"),
+            old.col("source_entity_id") == new.col("source_entity_id"),
+            old.col("target_entity_id") == new.col("target_entity_id"),
+            old.col("valid_at") <= new.col("valid_at"),
+        ],
+    )
+    filtered = joined.filter(joined.col("action:old").isin(["contradicts"]))
+    assigned = filtered.assign(
+        invalid_at=filtered.col("valid_at:new"),
+        status="inactive",
+    )
+
+    assert old.expr.op == "alias"
+    assert old.expr.params["name"] == "old"
+    assert joined.expr.op == "join"
+    assert len(joined.expr.params["on"]) == 4
+    assert filtered.expr.params["predicate"]["kind"] == "boolean"
+    assert assigned.expr.params["assignments"]["invalid_at"]["kind"] == "column"
+    assert assigned.expr.params["assignments"]["status"]["kind"] == "literal"
+    assert output_columns(joined.expr) == (
+        "fact_id:old",
+        "source_entity_id:old",
+        "target_entity_id:old",
+        "valid_at:old",
+        "action:old",
+        "fact_id:new",
+        "source_entity_id:new",
+        "target_entity_id:new",
+        "valid_at:new",
+        "action:new",
+    )
+
+
+def test_relation_bound_expression_truthiness_raises() -> None:
+    left = ColumnExpr("source_entity_id", qualifier="old")
+    right = ColumnExpr("source_entity_id", qualifier="new")
+    predicate = left == right
+
+    assert predicate.__class__.__name__ == "ComparisonExpr"
+    assert predicate.to_param()["kind"] == "comparison"
+    assert ColumnExpr("source_entity_id").to_param() == ColumnExpr("source_entity_id").to_param()
+
+    with pytest.raises(TypeError, match="Relational expressions cannot be used as Python booleans"):
+        bool(predicate)
+
+    with pytest.raises(TypeError, match="Relational expressions cannot be used as Python booleans"):
+        ColumnExpr("a") in [ColumnExpr("b")]
+
+    with pytest.raises(TypeError, match="Relational expressions cannot be used as Python booleans"):
+        (ColumnExpr("a"),) == (ColumnExpr("b"),)
+
+
+def test_column_expr_is_unhashable() -> None:
+    with pytest.raises(TypeError, match="unhashable type"):
+        hash(ColumnExpr("name"))
+
+
+def test_join_on_rejects_mixed_key_names_and_predicates() -> None:
+    log = am.Log({"name": "Name.", "body": "Body.", "valid_at": "Valid timestamp."})
+    old = log.alias("old")
+    new = log.alias("new")
+
+    key_join = log.join(log, on=["name", "body"])
+    predicate_join = old.join(new, on=[old.col("valid_at") <= new.col("valid_at")])
+
+    assert key_join.expr.params["on"] == ("name", "body")
+    assert predicate_join.expr.params["on"][0]["kind"] == "comparison"
+
+    with pytest.raises(
+        ValueError,
+        match="join on sequence cannot mix key column names and predicate expressions",
+    ):
+        old.join(new, on=["name", old.col("valid_at") <= new.col("valid_at")])
+
+
+def test_filter_and_assign_execute_expression_values() -> None:
+    source = QueryExpr(op="materialized_view", params={"name": "source"})
+    action = ColumnExpr("action")
+    valid_at = ColumnExpr("valid_at:new")
+    inputs = {
+        "source": pd.DataFrame(
+            {
+                "action": ["contradicts", "unrelated", "supersedes"],
+                "valid_at:new": ["t2", "t3", "t4"],
+            }
+        )
+    }
+    filtered_query = QueryExpr(
+        op="filter",
+        inputs=(source,),
+        params={"predicate": action.isin(["contradicts", "supersedes"]).to_param()},
+    )
+    assigned_query = QueryExpr(
+        op="assign",
+        inputs=(filtered_query,),
+        params={
+            "assignments": {
+                "invalid_at": valid_at.to_param(),
+                "status": {"kind": "literal", "value": "inactive"},
+            }
+        },
+    )
+
+    result = LotusAdapter().execute(assigned_query, inputs)
+
+    assert result.to_dict(orient="records") == [
+        {
+            "action": "contradicts",
+            "valid_at:new": "t2",
+            "invalid_at": "t2",
+            "status": "inactive",
+        },
+        {
+            "action": "supersedes",
+            "valid_at:new": "t4",
+            "invalid_at": "t4",
+            "status": "inactive",
+        },
+    ]
+
+
 def test_array_agg_executes_to_stable_json_record_array() -> None:
     source = QueryExpr(op="materialized_view", params={"name": "source"})
     query = QueryExpr(
@@ -2867,6 +4561,409 @@ def test_array_agg_preserves_json_numeric_and_boolean_types() -> None:
     assert records == [{"count": 3, "flag": True}]
     assert isinstance(records[0]["count"], int)
     assert isinstance(records[0]["flag"], bool)
+
+
+def test_array_agg_paths_serialize_nullable_numeric_values_as_json_null() -> None:
+    log = am.Log({"group": "Group key.", "value": "Nullable numeric value."})
+    source = pd.DataFrame(
+        {
+            "group": ["a", "a", "b"],
+            "value": [1.5, np.nan, 3.0],
+        }
+    )
+    inputs = {"log": source}
+
+    global_result = LotusAdapter().execute(
+        log.array_agg(columns=["value"], output_col="records").expr,
+        inputs,
+    )
+    assert json.loads(global_result.loc[0, "records"]) == [
+        {"value": 1.5},
+        {"value": None},
+        {"value": 3.0},
+    ]
+
+    grouped_result = LotusAdapter().execute(
+        log.group_by("group").array_agg(
+            columns=["value"],
+            output_col="records",
+        ).expr,
+        inputs,
+    )
+    assert json.loads(grouped_result.loc[0, "records"]) == [
+        {"value": 1.5},
+        {"value": None},
+    ]
+
+    mixed_result = LotusAdapter().execute(
+        log.group_by("group").agg(
+            am.array_agg(columns=["value"], output_col="records"),
+        ).expr,
+        inputs,
+    )
+    assert json.loads(mixed_result.loc[0, "records"]) == [
+        {"value": 1.5},
+        {"value": None},
+    ]
+
+    over_result = LotusAdapter().execute(
+        log.over(rows=(-2, -1)).array_agg(
+            columns=["value"],
+            output_col="previous_values",
+        ).expr,
+        inputs,
+    )
+    assert json.loads(over_result.loc[2, "previous_values"]) == [
+        {"value": 1.5},
+        {"value": None},
+    ]
+
+
+def test_group_by_array_agg_executes_per_exact_key() -> None:
+    source = QueryExpr(op="materialized_view", params={"name": "source"})
+    query = QueryExpr(
+        op="array_agg",
+        inputs=(
+            QueryExpr(
+                op="group_by",
+                inputs=(source,),
+                params={"keys": ("episode_id",)},
+            ),
+        ),
+        params={"columns": ("entity_id", "name"), "output_col": "entities"},
+    )
+    inputs = {
+        "source": pd.DataFrame(
+            {
+                "episode_id": ["e1", "e1", "e2"],
+                "entity_id": ["c", "m", "c"],
+                "name": ["Caroline", "Melanie", "Caroline"],
+            }
+        )
+    }
+
+    result = LotusAdapter().execute(query, inputs)
+
+    assert list(result.columns) == ["episode_id", "entities"]
+    assert result.loc[0, "episode_id"] == "e1"
+    assert json.loads(result.loc[0, "entities"]) == [
+        {"entity_id": "c", "name": "Caroline"},
+        {"entity_id": "m", "name": "Melanie"},
+    ]
+    assert result.loc[1, "episode_id"] == "e2"
+    assert json.loads(result.loc[1, "entities"]) == [
+        {"entity_id": "c", "name": "Caroline"}
+    ]
+    assert output_columns(query) == ("episode_id", "entities")
+
+    duplicate_output_col_query = QueryExpr(
+        op="array_agg",
+        inputs=query.inputs,
+        params={"columns": ("entity_id",), "output_col": "episode_id"},
+    )
+    with pytest.raises(ValueError, match="array_agg output column conflicts with group key"):
+        output_columns(duplicate_output_col_query)
+
+    with pytest.raises(ValueError, match="array_agg output column conflicts with group key"):
+        LotusAdapter().execute(duplicate_output_col_query, inputs)
+
+
+def test_group_by_collect_list_executes_per_exact_key() -> None:
+    source = QueryExpr(op="materialized_view", params={"name": "source"})
+    query = QueryExpr(
+        op="agg",
+        inputs=(
+            QueryExpr(
+                op="group_by",
+                inputs=(source,),
+                params={"keys": ("episode_id",)},
+            ),
+        ),
+        params={"aggregates": (am.collect_list(column="entity_id", output_col="entity_ids"),)},
+    )
+    inputs = {
+        "source": pd.DataFrame(
+            {
+                "episode_id": ["e1", "e1", "e2"],
+                "entity_id": ["c", "m", None],
+            }
+        )
+    }
+
+    result = execute_agg(query, inputs, LotusAdapter().execute, SimpleNamespace(config=LotusExecutionConfig()))
+
+    assert list(result.columns) == ["episode_id", "entity_ids"]
+    assert json.loads(result.loc[0, "entity_ids"]) == ["c", "m"]
+    assert json.loads(result.loc[1, "entity_ids"]) == [None]
+    assert output_columns(query) == ("episode_id", "entity_ids")
+
+
+def test_min_executes_global_grouped_and_mixed_null_semantics() -> None:
+    log = am.Log({"group": "Group.", "value": "Value."})
+    global_query = log.min(column="value", output_col="minimum").expr
+
+    result = execute_min(
+        global_query,
+        {"log": pd.DataFrame({"group": ["a", "a", "b"], "value": [None, 3, 1]})},
+        LotusAdapter().execute,
+    )
+    assert result.to_dict("records") == [{"minimum": 1.0}]
+
+    empty = execute_min(
+        global_query,
+        {"log": pd.DataFrame(columns=["group", "value"])},
+        LotusAdapter().execute,
+    )
+    assert empty.to_dict("records") == [{"minimum": None}]
+
+    all_null = execute_min(
+        global_query,
+        {"log": pd.DataFrame({"group": ["a"], "value": [None]})},
+        LotusAdapter().execute,
+    )
+    assert all_null.to_dict("records") == [{"minimum": None}]
+
+    grouped_query = log.group_by("group").min(
+        column="value",
+        output_col="minimum",
+    ).expr
+    grouped = execute_min(
+        grouped_query,
+        {
+            "log": pd.DataFrame(
+                {"group": ["a", "a", "b"], "value": [None, 2, None]}
+            )
+        },
+        LotusAdapter().execute,
+    )
+    assert grouped.to_dict("records") == [
+        {"group": "a", "minimum": 2.0},
+        {"group": "b", "minimum": None},
+    ]
+
+    grouped_empty = execute_min(
+        grouped_query,
+        {"log": pd.DataFrame(columns=["group", "value"])},
+        LotusAdapter().execute,
+    )
+    assert grouped_empty.empty
+    assert list(grouped_empty.columns) == ["group", "minimum"]
+
+    mixed_query = log.group_by("group").agg(
+        am.min(column="value", output_col="minimum"),
+        am.collect_list(column="value", output_col="values"),
+    ).expr
+    mixed = LotusAdapter().execute(
+        mixed_query,
+        {"log": pd.DataFrame({"group": ["a", "a"], "value": [None, 2]})},
+    )
+    assert mixed.loc[0, "minimum"] == 2
+    assert json.loads(mixed.loc[0, "values"]) == [None, 2.0]
+
+    with pytest.raises(ValueError, match="min input column not found"):
+        execute_min(
+            log.min(column="missing", output_col="minimum").expr,
+            {"log": pd.DataFrame({"group": ["a"], "value": [1]})},
+            LotusAdapter().execute,
+        )
+
+
+def test_composite_min_executes_lexicographically_and_skips_partial_nulls() -> None:
+    log = am.Log(
+        {
+            "group": "Group.",
+            "add_seq": "Append sequence.",
+            "ordinal": "Occurrence ordinal.",
+        }
+    )
+    source = pd.DataFrame(
+        {
+            "group": ["a", "a", "a", "b"],
+            "add_seq": [12, 8, 8, None],
+            "ordinal": [0, 3, 1, 0],
+        }
+    )
+
+    global_result = execute_min(
+        log.min(
+            columns=["add_seq", "ordinal"],
+            output_col="occurrence_id",
+        ).expr,
+        {"log": source},
+        LotusAdapter().execute,
+    )
+    assert global_result.to_dict("records") == [{"occurrence_id": (8, 1)}]
+
+    grouped_query = log.group_by("group").min(
+        columns=["add_seq", "ordinal"],
+        output_col="occurrence_id",
+    ).expr
+    grouped_result = execute_min(
+        grouped_query,
+        {"log": source},
+        LotusAdapter().execute,
+    )
+    assert grouped_result.to_dict("records") == [
+        {"group": "a", "occurrence_id": (8, 1)},
+        {"group": "b", "occurrence_id": None},
+    ]
+
+    mixed_query = log.group_by("group").agg(
+        am.min(
+            columns=["add_seq", "ordinal"],
+            output_col="occurrence_id",
+        )
+    ).expr
+    mixed_result = LotusAdapter().execute(mixed_query, {"log": source})
+    assert mixed_result.to_dict("records") == [
+        {"group": "a", "occurrence_id": (8, 1)},
+        {"group": "b", "occurrence_id": None},
+    ]
+
+
+def test_least_assign_executes_row_wise_and_ignores_nulls() -> None:
+    log = am.Log({"left": "Left value.", "right": "Right value."})
+    query = log.assign(
+        earliest=am.least(log.col("left"), log.col("right")),
+    ).expr
+
+    result = LotusAdapter().execute(
+        query,
+        {
+            "log": pd.DataFrame(
+                {
+                    "left": [3, None, None],
+                    "right": [2, 5, None],
+                },
+                index=[7, 7, 8],
+            )
+        },
+    )
+
+    assert result["earliest"].tolist()[:2] == [2.0, 5.0]
+    assert pd.isna(result.iloc[2]["earliest"])
+
+    incompatible = am.Log({"left": "Left.", "right": "Right."})
+    incompatible_query = incompatible.assign(
+        minimum=am.least(incompatible.col("left"), incompatible.col("right")),
+    ).expr
+    with pytest.raises(TypeError, match="least operands are not mutually comparable"):
+        LotusAdapter().execute(
+            incompatible_query,
+            {"log": pd.DataFrame({"left": [1], "right": ["x"]})},
+        )
+
+
+def test_least_assign_compares_composite_min_state() -> None:
+    rows = am.Log({"left": "Left tuple.", "right": "Right tuple."})
+    query = rows.assign(
+        occurrence_id=am.least(rows.col("left"), rows.col("right")),
+    ).expr
+
+    result = LotusAdapter().execute(
+        query,
+        {
+            "log": pd.DataFrame(
+                {
+                    "left": [(2, 0), None],
+                    "right": [(1, 3), (5, 0)],
+                }
+            )
+        },
+    )
+
+    assert result["occurrence_id"].tolist() == [(1, 3), (5, 0)]
+
+
+def test_sem_groupby_array_agg_is_rejected_without_semantic_key_aggregate() -> None:
+    source = QueryExpr(
+        op="sem_groupby",
+        inputs=(QueryExpr(op="materialized_view", params={"name": "source"}),),
+    )
+    query = QueryExpr(
+        op="array_agg",
+        inputs=(source,),
+        params={"columns": ("fact", "episode_id"), "output_col": "evidence"},
+    )
+
+    def execute(query_expr: QueryExpr, inputs: dict[str, Any]) -> pd.DataFrame:
+        assert query_expr is source
+        return pd.DataFrame(
+            {
+                GROUP_ID_COLUMN: [0, 0, 1],
+                "fact": ["A", "B", "C"],
+                "episode_id": ["e1", "e2", "e3"],
+            }
+        )
+
+    with pytest.raises(NotImplementedError, match="sem_groupby.*array_agg"):
+        execute_array_agg(query, {}, execute)
+    assert output_columns(query) == ("evidence",)
+
+
+def test_sem_groupby_agg_executes_semantic_and_array_specs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = QueryExpr(
+        op="sem_groupby",
+        inputs=(QueryExpr(op="materialized_view", params={"name": "source"}),),
+        params={"input_cols": ("name",), "instruction": "Same entity."},
+    )
+    query = QueryExpr(
+        op="agg",
+        inputs=(source,),
+        params={
+            "aggregates": (
+                am.sem_agg(
+                    input_cols=["name"],
+                    output_cols={"name": "Canonical name."},
+                    instruction="Choose canonical name.",
+                ),
+                am.array_agg(
+                    columns=["fact", "episode_id"],
+                    output_col="evidence",
+                ),
+                am.min(column="valid_at", output_col="valid_at"),
+            )
+        },
+    )
+
+    def execute(query_expr: QueryExpr, inputs: dict[str, Any]) -> pd.DataFrame:
+        assert query_expr is source
+        return pd.DataFrame(
+            {
+                GROUP_ID_COLUMN: [0, 0, 1],
+                "name": ["caroline", "Caroline", "melanie"],
+                "fact": ["A", "B", "C"],
+                "episode_id": ["e1", "e2", "e3"],
+                "valid_at": ["2026-01-02", "2026-01-01", None],
+            }
+        )
+
+    def execute_native_sem_agg_group(
+        query_expr: QueryExpr,
+        group: pd.DataFrame,
+        input_cols: tuple[str, ...],
+        config: LotusExecutionConfig,
+    ) -> str:
+        return str(group.loc[0, input_cols[0]]).title()
+
+    monkeypatch.setattr(
+        relational_module,
+        "execute_native_sem_agg_group",
+        execute_native_sem_agg_group,
+    )
+
+    result = execute_agg(query, {}, execute, SimpleNamespace(config=LotusExecutionConfig()))
+
+    assert list(result.columns) == ["name", "evidence", "valid_at"]
+    assert result["name"].tolist() == ["Caroline", "Melanie"]
+    assert [json.loads(value) for value in result["evidence"]] == [
+        [{"fact": "A", "episode_id": "e1"}, {"fact": "B", "episode_id": "e2"}],
+        [{"fact": "C", "episode_id": "e3"}],
+    ]
+    assert result["valid_at"].tolist() == ["2026-01-01", None]
+    assert output_columns(query) == ("name", "evidence", "valid_at")
 
 
 def test_over_array_agg_executes_row_preserving_previous_frame() -> None:
@@ -3038,6 +5135,280 @@ def test_array_cat_rejects_invalid_aggregate_state() -> None:
         )
 
 
+def test_flatten_executes_json_array_state_flattening() -> None:
+    source = QueryExpr(
+        op="materialized_view",
+        params={
+            "name": "source",
+            "columns": ("topic", "nested_evidence"),
+        },
+    )
+    query = QueryExpr(
+        op="flatten",
+        inputs=(source,),
+        params={"column": "nested_evidence", "output_col": "evidence"},
+    )
+    inputs = {
+        "source": pd.DataFrame(
+            {
+                "topic": ["docs", "meetings"],
+                "nested_evidence": [
+                    json.dumps(['[{"body": "old"}]', '[{"body": "new"}]']),
+                    json.dumps([None, '[{"body": "only-new"}]']),
+                ],
+            }
+        )
+    }
+
+    result = execute_flatten(query, inputs, LotusAdapter().execute)
+
+    assert output_columns(query) == (
+        "topic",
+        "nested_evidence",
+        "evidence",
+    )
+    assert [json.loads(value) for value in result["evidence"]] == [
+        [{"body": "old"}, {"body": "new"}],
+        [{"body": "only-new"}],
+    ]
+
+
+def test_flatten_rejects_overwriting_an_unrelated_existing_column() -> None:
+    source = QueryExpr(
+        op="materialized_view",
+        params={"name": "source", "columns": ("nested_evidence", "evidence")},
+    )
+    query = QueryExpr(
+        op="flatten",
+        inputs=(source,),
+        params={"column": "nested_evidence", "output_col": "evidence"},
+    )
+    inputs = {
+        "source": pd.DataFrame(
+            {
+                "nested_evidence": [json.dumps(['[{"body": "new"}]'])],
+                "evidence": ["keep-me"],
+            }
+        )
+    }
+
+    with pytest.raises(ValueError, match="flatten output column already exists"):
+        output_columns(query)
+    with pytest.raises(ValueError, match="flatten output column already exists"):
+        execute_flatten(query, inputs, LotusAdapter().execute)
+
+
+def test_flatten_allows_explicit_in_place_output_column() -> None:
+    source = QueryExpr(
+        op="materialized_view",
+        params={"name": "source", "columns": ("evidence",)},
+    )
+    query = QueryExpr(
+        op="flatten",
+        inputs=(source,),
+        params={"column": "evidence", "output_col": "evidence"},
+    )
+    inputs = {
+        "source": pd.DataFrame(
+            {"evidence": [json.dumps(['[{"body": "old"}]', '[{"body": "new"}]'])]}
+        )
+    }
+
+    assert output_columns(query) == ("evidence",)
+    result = execute_flatten(query, inputs, LotusAdapter().execute)
+    assert json.loads(result.loc[0, "evidence"]) == [
+        {"body": "old"},
+        {"body": "new"},
+    ]
+
+
+def test_explode_executes_json_array_expansion() -> None:
+    source = QueryExpr(
+        op="materialized_view",
+        params={"name": "source", "columns": ("entity_id", "mentions")},
+    )
+    query = QueryExpr(
+        op="explode",
+        inputs=(source,),
+        params={"column": "mentions", "output_col": "_mention"},
+    )
+    inputs = {
+        "source": pd.DataFrame(
+            {
+                "entity_id": ["e1", "e2", "e3"],
+                "mentions": [
+                    json.dumps(
+                        [
+                            {"episode_id": "m1", "name": "Caroline"},
+                            {"episode_id": "m2", "name": "Carol"},
+                        ]
+                    ),
+                    "[]",
+                    None,
+                ],
+            }
+        )
+    }
+
+    result = execute_explode(query, inputs, LotusAdapter().execute)
+
+    assert output_columns(query) == ("entity_id", "mentions", "_mention")
+    assert result["entity_id"].tolist() == ["e1", "e1"]
+    assert result["_mention"].tolist() == [
+        {"episode_id": "m1", "name": "Caroline"},
+        {"episode_id": "m2", "name": "Carol"},
+    ]
+
+
+def test_explode_can_replace_source_column() -> None:
+    source = QueryExpr(
+        op="materialized_view",
+        params={"name": "source", "columns": ("entity_id", "mentions")},
+    )
+    query = QueryExpr(
+        op="explode",
+        inputs=(source,),
+        params={"column": "mentions", "output_col": None},
+    )
+
+    result = execute_explode(
+        query,
+        {
+            "source": pd.DataFrame(
+                {"entity_id": ["e1"], "mentions": [json.dumps(["m1", "m2"])]}
+            )
+        },
+        LotusAdapter().execute,
+    )
+
+    assert list(result.columns) == ["entity_id", "mentions"]
+    assert result["mentions"].tolist() == ["m1", "m2"]
+
+
+def test_explode_rejects_invalid_array_input() -> None:
+    source = QueryExpr(
+        op="materialized_view",
+        params={"name": "source", "columns": ("entity_id", "mentions")},
+    )
+    query = QueryExpr(
+        op="explode",
+        inputs=(source,),
+        params={"column": "mentions", "output_col": "_mention"},
+    )
+
+    with pytest.raises(ValueError, match="input column not found"):
+        execute_explode(
+            query,
+            {"source": pd.DataFrame({"entity_id": ["e1"]})},
+            LotusAdapter().execute,
+        )
+    with pytest.raises(ValueError, match="already exists"):
+        execute_explode(
+            QueryExpr(
+                op="explode",
+                inputs=(source,),
+                params={"column": "mentions", "output_col": "entity_id"},
+            ),
+            {"source": pd.DataFrame({"entity_id": ["e1"], "mentions": ["[]"]})},
+            LotusAdapter().execute,
+        )
+    with pytest.raises(ValueError, match="JSON array"):
+        execute_explode(
+            query,
+            {"source": pd.DataFrame({"entity_id": ["e1"], "mentions": ["not json"]})},
+            LotusAdapter().execute,
+        )
+
+
+def test_unnest_executes_json_object_expansion() -> None:
+    source = QueryExpr(
+        op="materialized_view",
+        params={"name": "source", "columns": ("entity_id", "_mention")},
+    )
+    query = QueryExpr(
+        op="unnest",
+        inputs=(source,),
+        params={
+            "column": "_mention",
+            "fields": (("episode_id", "episode_id"), ("name", "mention_name")),
+        },
+    )
+    inputs = {
+        "source": pd.DataFrame(
+            {
+                "entity_id": ["e1", "e1"],
+                "_mention": [
+                    {"episode_id": "m1", "name": "Caroline"},
+                    json.dumps({"episode_id": "m2", "name": "Carol"}),
+                ],
+            }
+        )
+    }
+
+    result = execute_unnest(query, inputs, LotusAdapter().execute)
+
+    assert output_columns(query) == ("entity_id", "episode_id", "mention_name")
+    assert result.to_dict(orient="records") == [
+        {"entity_id": "e1", "episode_id": "m1", "mention_name": "Caroline"},
+        {"entity_id": "e1", "episode_id": "m2", "mention_name": "Carol"},
+    ]
+
+
+def test_unnest_rejects_invalid_object_input() -> None:
+    source = QueryExpr(
+        op="materialized_view",
+        params={"name": "source", "columns": ("entity_id", "_mention")},
+    )
+    query = QueryExpr(
+        op="unnest",
+        inputs=(source,),
+        params={"column": "_mention", "fields": (("episode_id", "episode_id"),)},
+    )
+
+    with pytest.raises(ValueError, match="input column not found"):
+        execute_unnest(
+            query,
+            {"source": pd.DataFrame({"entity_id": ["e1"]})},
+            LotusAdapter().execute,
+        )
+    with pytest.raises(ValueError, match="JSON object"):
+        execute_unnest(
+            query,
+            {"source": pd.DataFrame({"entity_id": ["e1"], "_mention": ["[]"]})},
+            LotusAdapter().execute,
+        )
+    with pytest.raises(ValueError, match="field 'episode_id' not found"):
+        execute_unnest(
+            query,
+            {"source": pd.DataFrame({"entity_id": ["e1"], "_mention": [{}]})},
+            LotusAdapter().execute,
+        )
+
+
+def test_unnest_rejects_duplicate_outputs_in_hand_written_ir() -> None:
+    source = QueryExpr(
+        op="materialized_view",
+        params={"name": "source", "columns": ("_mention",)},
+    )
+    query = QueryExpr(
+        op="unnest",
+        inputs=(source,),
+        params={
+            "column": "_mention",
+            "fields": (("episode_id", "identifier"), ("name", "identifier")),
+        },
+    )
+
+    with pytest.raises(ValueError, match="output columns must be unique"):
+        output_columns(query)
+    with pytest.raises(ValueError, match="output columns must be unique"):
+        execute_unnest(
+            query,
+            {"source": pd.DataFrame({"_mention": ["not json"]})},
+            LotusAdapter().execute,
+        )
+
+
 def test_process_window_full_execution_emits_completed_count_windows() -> None:
     log = am.Log(
         {
@@ -3133,6 +5504,15 @@ def test_relational_join_executes_exact_key_merge_semantics() -> None:
         inputs,
         execute,
     )
+    left_anti = execute_join(
+        QueryExpr(
+            op="join",
+            inputs=(left, right),
+            params={"on": ("name",), "how": "left_anti"},
+        ),
+        inputs,
+        execute,
+    )
 
     assert list(inner.columns) == [
         "name",
@@ -3147,6 +5527,186 @@ def test_relational_join_executes_exact_key_merge_semantics() -> None:
     assert list(left_join["name"]) == ["a", "b", "c"]
     assert list(right_join["name"]) == ["a", "b", "d"]
     assert list(outer["name"]) == ["a", "b", "c", "d"]
+    assert list(left_anti.columns) == ["name", "description", "rank"]
+    assert left_anti.to_dict(orient="records") == [
+        {"name": "c", "description": "left c", "rank": 3}
+    ]
+    assert output_columns(
+        QueryExpr(
+            op="join",
+            inputs=(
+                QueryExpr(
+                    op="materialized_view",
+                    params={"name": "left", "columns": ("name", "description", "rank")},
+                ),
+                QueryExpr(
+                    op="materialized_view",
+                    params={"name": "right", "columns": ("name", "body")},
+                ),
+            ),
+            params={"on": ("name",), "how": "left_anti"},
+        )
+    ) == ("name", "description", "rank")
+
+
+def test_relational_predicate_join_executes_alias_self_join() -> None:
+    left = QueryExpr(
+        op="alias",
+        inputs=(QueryExpr(op="materialized_view", params={"name": "left"}),),
+        params={"name": "old"},
+    )
+    right = QueryExpr(
+        op="alias",
+        inputs=(QueryExpr(op="materialized_view", params={"name": "right"}),),
+        params={"name": "new"},
+    )
+    predicates = (
+        (ColumnExpr("fact_id", qualifier="old") != ColumnExpr("fact_id", qualifier="new")).to_param(),
+        (
+            ColumnExpr("source_entity_id", qualifier="old")
+            == ColumnExpr("source_entity_id", qualifier="new")
+        ).to_param(),
+        (
+            ColumnExpr("target_entity_id", qualifier="old")
+            == ColumnExpr("target_entity_id", qualifier="new")
+        ).to_param(),
+        (ColumnExpr("valid_at", qualifier="old") <= ColumnExpr("valid_at", qualifier="new")).to_param(),
+    )
+    query = QueryExpr(
+        op="join",
+        inputs=(left, right),
+        params={"on": predicates, "how": "inner"},
+    )
+    inputs = {
+        "left": pd.DataFrame(
+            {
+                "fact_id": ["old-1", "old-2"],
+                "source_entity_id": ["caroline", "caroline"],
+                "target_entity_id": ["home", "home"],
+                "valid_at": [1, 5],
+            }
+        ),
+        "right": pd.DataFrame(
+            {
+                "fact_id": ["new-1", "new-2"],
+                "source_entity_id": ["caroline", "caroline"],
+                "target_entity_id": ["home", "work"],
+                "valid_at": [2, 6],
+            }
+        ),
+    }
+
+    result = execute_join(query, inputs, LotusAdapter().execute)
+
+    assert list(result.columns) == [
+        "fact_id:old",
+        "source_entity_id:old",
+        "target_entity_id:old",
+        "valid_at:old",
+        "fact_id:new",
+        "source_entity_id:new",
+        "target_entity_id:new",
+        "valid_at:new",
+    ]
+    assert result.to_dict(orient="records") == [
+        {
+            "fact_id:old": "old-1",
+            "source_entity_id:old": "caroline",
+            "target_entity_id:old": "home",
+            "valid_at:old": 1,
+            "fact_id:new": "new-1",
+            "source_entity_id:new": "caroline",
+            "target_entity_id:new": "home",
+            "valid_at:new": 2,
+        }
+    ]
+    assert output_columns(
+        QueryExpr(
+            op="join",
+            inputs=(
+                QueryExpr(
+                    op="alias",
+                    inputs=(
+                        QueryExpr(
+                            op="materialized_view",
+                            params={
+                                "name": "left",
+                                "columns": (
+                                    "fact_id",
+                                    "source_entity_id",
+                                    "target_entity_id",
+                                    "valid_at",
+                                ),
+                            },
+                        ),
+                    ),
+                    params={"name": "old"},
+                ),
+                QueryExpr(
+                    op="alias",
+                    inputs=(
+                        QueryExpr(
+                            op="materialized_view",
+                            params={
+                                "name": "right",
+                                "columns": (
+                                    "fact_id",
+                                    "source_entity_id",
+                                    "target_entity_id",
+                                    "valid_at",
+                                ),
+                            },
+                        ),
+                    ),
+                    params={"name": "new"},
+                ),
+            ),
+            params={"on": predicates, "how": "inner"},
+        )
+    ) == tuple(result.columns)
+
+
+def test_relational_predicate_join_rejects_non_inner_how() -> None:
+    left = QueryExpr(op="materialized_view", params={"name": "left"})
+    right = QueryExpr(op="materialized_view", params={"name": "right"})
+
+    with pytest.raises(NotImplementedError, match="predicate join"):
+        execute_join(
+            QueryExpr(
+                op="join",
+                inputs=(left, right),
+                params={
+                    "on": ((ColumnExpr("rank") < 3).to_param(),),
+                    "how": "left",
+                },
+            ),
+            {
+                "left": pd.DataFrame({"rank": [1]}),
+                "right": pd.DataFrame({"rank": [2]}),
+            },
+            LotusAdapter().execute,
+        )
+
+
+def test_relational_predicate_self_join_orders_composite_ids() -> None:
+    facts = am.Log({"fact_id": "Composite fact identity."})
+    earlier = facts.alias("earlier")
+    later = facts.alias("later")
+    query = earlier.join(
+        later,
+        on=[earlier.col("fact_id") < later.col("fact_id")],
+    ).expr
+
+    result = LotusAdapter().execute(
+        query,
+        {"log": pd.DataFrame({"fact_id": [(1, 2), (1, 0), (2, 0)]})},
+    )
+
+    assert result[["fact_id:earlier", "fact_id:later"]].to_dict("records") == [
+        {"fact_id:earlier": (1, 2), "fact_id:later": (2, 0)},
+        {"fact_id:earlier": (1, 0), "fact_id:later": (1, 2)},
+        {"fact_id:earlier": (1, 0), "fact_id:later": (2, 0)},
+    ]
 
 
 def test_relational_join_rejects_missing_or_null_keys() -> None:
@@ -3876,7 +6436,7 @@ def test_sem_agg_resolves_input_columns_and_builds_structured_instruction() -> N
     )
     source.attrs["agent_memory_groupby_input_cols"] = ("topic",)
 
-    assert aggregate_input_columns(source, None) == ("body",)
+    assert aggregate_input_columns(source, None) == ("topic", "body")
     query = QueryExpr(
         op="sem_agg",
         params={"instruction": "Merge {body} into durable memory."},
@@ -3894,6 +6454,29 @@ def test_sem_agg_resolves_input_columns_and_builds_structured_instruction() -> N
     assert "- topic: Short topic." in instruction
     assert "- body: Durable memory summary." in instruction
     assert 'Expected JSON shape: {"topic": "string", "body": "string"}' in instruction
+
+
+def test_sem_agg_instruction_preserves_output_only_placeholders() -> None:
+    query = QueryExpr(
+        op="sem_agg",
+        params={
+            "instruction": (
+                "Use {content} to return canonical {name} and concise {summary}."
+            ),
+            "output_cols": (
+                ColumnSpec("name", "Canonical name."),
+                ColumnSpec("summary", "Concise summary."),
+            ),
+        },
+    )
+
+    instruction = structured_aggregate_instruction(
+        query,
+        ("content",),
+        query.params["output_cols"],
+    )
+
+    assert "Use Content to return canonical {name} and concise {summary}." in instruction
 
 
 def test_lotus_style_sem_agg_passes_response_format_only_on_final_pass() -> None:
@@ -4029,6 +6612,65 @@ def test_sem_agg_grouped_single_output_returns_one_row_per_group(
 
     assert captured_groups == [["doc one", "doc two"], ["cooking"]]
     assert list(result["summary"]) == ["doc one + doc two", "cooking"]
+
+
+def test_group_by_sem_agg_preserves_deterministic_keys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import agent_memory.adapters.lotus.sem_agg as sem_agg_module
+
+    class Context:
+        config = LotusExecutionConfig()
+
+        def configure(self) -> None:
+            pass
+
+    def execute_native_sem_agg_group(
+        query: QueryExpr,
+        group: pd.DataFrame,
+        input_cols: tuple[str, ...],
+        config: LotusExecutionConfig | None = None,
+    ) -> str:
+        return " + ".join(group["body"])
+
+    monkeypatch.setattr(
+        sem_agg_module,
+        "execute_native_sem_agg_group",
+        execute_native_sem_agg_group,
+    )
+    source = QueryExpr(op="materialized_view", params={"name": "source"})
+    query = QueryExpr(
+        op="sem_agg",
+        inputs=(
+            QueryExpr(
+                op="group_by",
+                inputs=(source,),
+                params={"keys": ("topic",)},
+            ),
+        ),
+        params={
+            "input_cols": ("body",),
+            "output_cols": (ColumnSpec("summary"),),
+            "instruction": "Summarize {body}.",
+        },
+    )
+    inputs = {
+        "source": pd.DataFrame(
+            {
+                "topic": ["docs", "docs", "meetings"],
+                "body": ["a", "b", "c"],
+            }
+        )
+    }
+
+    result = execute_sem_agg(query, inputs, LotusAdapter().execute, Context())
+
+    assert list(result.columns) == ["topic", "summary"]
+    assert result.to_dict(orient="records") == [
+        {"topic": "docs", "summary": "a + b"},
+        {"topic": "meetings", "summary": "c"},
+    ]
+    assert output_columns(query) == ("topic", "summary")
 
 
 def test_sem_agg_whole_single_output_returns_one_row(
@@ -4262,6 +6904,20 @@ def test_sem_agg_rejects_missing_structured_key() -> None:
         parse_structured_sem_agg_output('{"topic": "docs"}', output_cols)
 
 
+def test_sem_agg_preserves_structured_scalar_types() -> None:
+    output_cols = (ColumnSpec("ordinal"), ColumnSpec("invalid_at"))
+
+    assert parse_structured_sem_agg_output(
+        {"ordinal": 2, "invalid_at": None},
+        output_cols,
+    ) == {"ordinal": 2, "invalid_at": None}
+    with pytest.raises(ValueError, match="JSON scalar"):
+        parse_structured_sem_agg_output(
+            {"ordinal": [2], "invalid_at": None},
+            output_cols,
+        )
+
+
 def test_sem_agg_structured_failure_writes_artifact(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -4353,18 +7009,22 @@ def test_lotus_adapter_dispatches_sem_join_groupby_and_agg(
     assert called == ["sem_join", "sem_groupby", "sem_agg"]
 
 
-def test_runtime_log_append_and_view_union_semantics() -> None:
-    memory = HelloWorldTestMemory()
-    current = pd.DataFrame({"message": ["hello"]})
-    duplicate = pd.DataFrame({"message": ["hello"]})
-    new_row = pd.DataFrame({"message": ["world"]})
+def test_runtime_preserves_log_bag_and_recomputes_distinct_view() -> None:
+    class DistinctMemory(am.Memory):
+        log = am.Log({"message": "Message body."})
+        rows = log.drop_duplicates()
 
-    log_state = memory._runtime._append_log_frame(current, duplicate)
-    view_state = memory._runtime._union_view_frame(current, duplicate)
-    view_state = memory._runtime._union_view_frame(view_state, new_row)
+    memory = DistinctMemory(adapter=LotusAdapter())
+    memory.add({"message": "hello"})
+    memory.add({"message": "hello"})
+    memory.add({"message": "world"})
 
-    assert list(log_state["message"]) == ["hello", "hello"]
-    assert list(view_state["message"]) == ["hello", "world"]
+    assert list(memory._runtime._state["log"]["message"]) == [
+        "hello",
+        "hello",
+        "world",
+    ]
+    assert list(memory._runtime._state["rows"]["message"]) == ["hello", "world"]
 
 
 def test_runtime_executes_q_prime_and_stores_adapter_result() -> None:
@@ -4374,8 +7034,9 @@ def test_runtime_executes_q_prime_and_stores_adapter_result() -> None:
             instruction="{message} is a coherent sentence."
         ).select(["message"])
 
-    class RecordingAdapter:
+    class RecordingAdapter(LotusAdapter):
         def __init__(self) -> None:
+            super().__init__()
             self.calls: list[tuple[QueryExpr, dict[str, pd.DataFrame]]] = []
 
         def execute(
@@ -4383,8 +7044,11 @@ def test_runtime_executes_q_prime_and_stores_adapter_result() -> None:
             query: QueryExpr,
             inputs: dict[str, pd.DataFrame],
         ) -> pd.DataFrame:
-            self.calls.append((query, inputs))
-            return pd.DataFrame({"message": ["next view row"]})
+            if query.op == "sem_filter":
+                self.calls.append((query, inputs))
+                source_name = str(query.inputs[0].params["name"])
+                return inputs[source_name].copy()
+            return super().execute(query, inputs)
 
     adapter = RecordingAdapter()
     memory = FilterMemory(adapter=adapter)
@@ -4393,16 +7057,10 @@ def test_runtime_executes_q_prime_and_stores_adapter_result() -> None:
 
     assert not hasattr(memory._runtime, "_planner")
     query, inputs = adapter.calls[0]
-    assert query.op == "union"
-    _assert_materialized_view(
-        query.inputs[0],
-        name="helloworld_tests",
-        columns=("message",),
-    )
-    assert list(inputs["helloworld_tests"].columns) == ["message"]
-    assert inputs["helloworld_tests"].empty
+    assert query.op == "sem_filter"
+    assert list(next(iter(inputs.values()))["message"]) == ["hello"]
     assert memory._runtime._state["helloworld_tests"].to_dict("records") == [
-        {"message": "next view row"}
+        {"message": "hello"}
     ]
 
 
@@ -4435,13 +7093,15 @@ def test_runtime_executes_standalone_sem_agg_q_prime_and_stores_result() -> None
     query, inputs = adapter.calls[0]
     assert query.op == "sem_agg"
     assert query.inputs[0].op == "union"
+    current_source = query.inputs[0].inputs[0].inputs[0]
+    current_node_id = memory._runtime.policy.view_outputs["summary"]
     _assert_materialized_view(
-        query.inputs[0].inputs[0].inputs[0],
-        name="summary",
+        current_source,
+        name=current_node_id,
         columns=("summary",),
     )
-    assert inputs["summary"].empty
-    assert list(inputs["summary"].columns) == ["summary"]
+    assert inputs[current_node_id].empty
+    assert list(inputs[current_node_id].columns) == ["summary"]
     assert memory._runtime._state["summary"].to_dict("records") == [
         {"summary": "next aggregate"}
     ]
@@ -4469,6 +7129,26 @@ def test_runtime_maintains_array_agg_view_with_array_cat() -> None:
     ]
 
 
+def test_runtime_maintains_grouped_min_view_incrementally() -> None:
+    class EarliestFactMemory(am.Memory):
+        log = am.Log({"fact_id": "Fact id.", "valid_at": "Validity time."})
+        earliest = log.group_by("fact_id").min(
+            column="valid_at",
+            output_col="valid_at",
+        )
+
+    memory = EarliestFactMemory(adapter=LotusAdapter())
+
+    memory.add({"fact_id": "f1", "valid_at": "2026-01-03"})
+    memory.add({"fact_id": "f1", "valid_at": "2026-01-01"})
+    memory.add({"fact_id": "f2", "valid_at": None})
+
+    assert memory._runtime._state["earliest"].to_dict("records") == [
+        {"fact_id": "f1", "valid_at": "2026-01-01"},
+        {"fact_id": "f2", "valid_at": None},
+    ]
+
+
 def test_runtime_maintains_count_window_process_state_incrementally() -> None:
     class WindowBlockMemory(am.Memory):
         log = am.Log(
@@ -4493,9 +7173,7 @@ def test_runtime_maintains_count_window_process_state_incrementally() -> None:
 
     memory.add({"timestamp": "t2", "speaker": "B", "message": "two"})
     blocks = memory._runtime._state["blocks"]
-    private_blocks = memory._runtime._state["_blocks_process_window"]
     assert len(blocks) == 1
-    assert len(private_blocks) == 1
     assert json.loads(blocks.loc[0, "conversation_records"]) == [
         {"timestamp": "t1", "speaker": "A", "message": "one"},
         {"timestamp": "t2", "speaker": "B", "message": "two"},
@@ -4503,10 +7181,9 @@ def test_runtime_maintains_count_window_process_state_incrementally() -> None:
 
     memory.add({"timestamp": "t3", "speaker": "A", "message": "three"})
     blocks = memory._runtime._state["blocks"]
-    private_blocks = memory._runtime._state["_blocks_process_window"]
     assert len(blocks) == 2
-    assert len(private_blocks) == 2
-    assert memory._runtime._window_next_start["_blocks_process_window"] == 2
+    process_node_id = memory._runtime.policy.view_outputs["blocks"]
+    assert memory._runtime._engine._window_next_start[process_node_id] == 2
     assert json.loads(blocks.loc[1, "conversation_records"]) == [
         {"timestamp": "t2", "speaker": "B", "message": "two"},
         {"timestamp": "t3", "speaker": "A", "message": "three"},
@@ -4561,66 +7238,6 @@ def test_runtime_snapshot_copies_top_level_state_mapping() -> None:
     memory._runtime._state["extra"] = pd.DataFrame([{"message": "later"}])
 
     assert "extra" not in snapshot["state"]
-
-
-def test_changed_suffix_checks_schema_for_empty_current_state() -> None:
-    class WindowBlockMemory(am.Memory):
-        log = am.Log({"message": "Message body."})
-        blocks = log.count_window(size=2, slide=1).process_window(
-            lambda window: window.array_agg(
-                columns=("message",),
-                output_col="conversation_records",
-            )
-        )
-
-    runtime = WindowBlockMemory(adapter=LotusAdapter())._runtime
-    current = pd.DataFrame(columns=["message"])
-    next_frame = pd.DataFrame({"body": ["hi"]})
-
-    with pytest.raises(
-        NotImplementedError,
-        match="upstream recompute changed output columns",
-    ):
-        runtime._changed_suffix(current, next_frame)
-
-
-def test_changed_suffix_accepts_empty_current_state_with_same_schema() -> None:
-    class WindowBlockMemory(am.Memory):
-        log = am.Log({"message": "Message body."})
-        blocks = log.count_window(size=2, slide=1).process_window(
-            lambda window: window.array_agg(
-                columns=("message",),
-                output_col="conversation_records",
-            )
-        )
-
-    runtime = WindowBlockMemory(adapter=LotusAdapter())._runtime
-    current = pd.DataFrame(columns=["message"])
-    next_frame = pd.DataFrame({"message": ["hi"]})
-
-    changed = runtime._changed_suffix(current, next_frame)
-
-    assert changed.to_dict("records") == [{"message": "hi"}]
-
-
-def test_changed_suffix_projects_extra_columns_for_empty_current_state() -> None:
-    class WindowBlockMemory(am.Memory):
-        log = am.Log({"message": "Message body."})
-        blocks = log.count_window(size=2, slide=1).process_window(
-            lambda window: window.array_agg(
-                columns=("message",),
-                output_col="conversation_records",
-            )
-        )
-
-    runtime = WindowBlockMemory(adapter=LotusAdapter())._runtime
-    current = pd.DataFrame(columns=["message"])
-    next_frame = pd.DataFrame({"message": ["hi"], "speaker": ["A"]})
-
-    changed = runtime._changed_suffix(current, next_frame)
-
-    assert list(changed.columns) == ["message"]
-    assert changed.to_dict("records") == [{"message": "hi"}]
 
 
 def test_runtime_maintains_count_window_over_selected_upstream_relation() -> None:
@@ -4685,11 +7302,15 @@ def test_runtime_maintains_over_array_agg_incrementally() -> None:
 def test_runtime_window_update_commits_only_after_public_view_success() -> None:
     class WindowBlockMemory(am.Memory):
         log = am.Log({"message": "Message body."})
-        blocks = log.count_window(size=2, slide=1).process_window(
-            lambda window: window.array_agg(
-                columns=("message",),
-                output_col="conversation_records",
+        blocks = (
+            log.count_window(size=2, slide=1)
+            .process_window(
+                lambda window: window.array_agg(
+                    columns=("message",),
+                    output_col="conversation_records",
+                )
             )
+            .select(["conversation_records"])
         )
 
     class FailingAfterProcessAdapter:
@@ -4706,38 +7327,41 @@ def test_runtime_window_update_commits_only_after_public_view_success() -> None:
             if query.op == "array_agg":
                 self.process_calls += 1
                 return self._delegate.execute(query, inputs)
-            if query.op == "union" and self.fail_downstream:
+            if query.op == "select" and self.fail_downstream:
                 raise RuntimeError("downstream maintenance failed")
             return self._delegate.execute(query, inputs)
 
     adapter = FailingAfterProcessAdapter()
     memory = WindowBlockMemory(adapter=adapter)
+    sink_node_id = memory._runtime.policy.view_outputs["blocks"]
+    process_node_id = memory._runtime.policy.nodes[sink_node_id].input_node_ids[0]
 
     memory.add({"message": "one"})
     with pytest.raises(RuntimeError, match="downstream maintenance failed"):
         memory.add({"message": "two"})
 
     assert adapter.process_calls == 1
-    assert "_blocks_process_window" not in memory._runtime._state
-    assert memory._runtime._window_next_start.get("_blocks_process_window", 0) == 0
+    assert memory._runtime._engine.node_state[process_node_id].empty
+    assert memory._runtime._engine._window_next_start.get(process_node_id, 0) == 0
     assert memory._runtime._state["blocks"].empty
+    assert memory._runtime._state["log"].to_dict("records") == [{"message": "one"}]
 
     adapter.fail_downstream = False
     memory.add({"message": "three"})
 
-    assert adapter.process_calls == 3
-    assert memory._runtime._window_next_start["_blocks_process_window"] == 2
-    private_blocks = memory._runtime._state["_blocks_process_window"]
+    assert adapter.process_calls == 2
+    assert memory._runtime._engine._window_next_start[process_node_id] == 1
+    private_blocks = memory._runtime._engine.node_state[process_node_id]
     public_blocks = memory._runtime._state["blocks"]
-    assert len(private_blocks) == 2
-    assert len(public_blocks) == 2
+    assert len(private_blocks) == 1
+    assert len(public_blocks) == 1
     assert json.loads(public_blocks.loc[0, "conversation_records"]) == [
         {"message": "one"},
-        {"message": "two"},
+        {"message": "three"},
     ]
 
 
-def test_empty_private_frame_normalizes_column_specs_to_string_labels() -> None:
+def test_process_window_node_has_normalized_string_output_columns() -> None:
     class WindowBlockMemory(am.Memory):
         log = am.Log({"message": "Message body."})
         blocks = log.count_window(size=2, slide=1).process_window(
@@ -4748,21 +7372,12 @@ def test_empty_private_frame_normalizes_column_specs_to_string_labels() -> None:
         )
 
     policy = WindowBlockMemory.differentiate_policy()
-    plan = policy.window_process_plans["blocks"]
-    plan = replace(
-        plan,
-        private_source=QueryExpr(
-            op="materialized_view",
-            params={
-                "name": plan.private_name,
-                "columns": (ColumnSpec("conversation_records"),),
-            },
-        ),
-    )
+    node_id = policy.view_outputs["blocks"]
+    node = policy.nodes[node_id]
     runtime = MemoryRuntime(policy, adapter=LotusAdapter())
+    frame = runtime._engine._empty_node_frame(node_id)
 
-    frame = runtime._empty_private_frame(plan)
-
+    assert node.output_columns == ("conversation_records",)
     assert list(frame.columns) == ["conversation_records"]
 
 
@@ -4795,6 +7410,7 @@ def test_runtime_commits_window_cursor_when_process_output_is_empty() -> None:
 
     adapter = EmptyProcessAdapter()
     memory = WindowBlockMemory(adapter=adapter)
+    process_node_id = memory._runtime.policy.view_outputs["blocks"]
 
     memory.add({"message": "one"})
     memory.add({"message": "two"})
@@ -4802,16 +7418,16 @@ def test_runtime_commits_window_cursor_when_process_output_is_empty() -> None:
     assert adapter.process_calls == 1
     assert adapter.window_sizes == [2]
     assert memory._runtime._state["blocks"].empty
-    assert memory._runtime._state["_blocks_process_window"].empty
-    assert memory._runtime._window_next_start["_blocks_process_window"] == 1
+    assert memory._runtime._engine.node_state[process_node_id].empty
+    assert memory._runtime._engine._window_next_start[process_node_id] == 1
 
     memory.add({"message": "three"})
 
     assert adapter.process_calls == 2
     assert adapter.window_sizes == [2, 2]
     assert memory._runtime._state["blocks"].empty
-    assert memory._runtime._state["_blocks_process_window"].empty
-    assert memory._runtime._window_next_start["_blocks_process_window"] == 2
+    assert memory._runtime._engine.node_state[process_node_id].empty
+    assert memory._runtime._engine._window_next_start[process_node_id] == 2
 
 
 def test_runtime_count_window_uses_append_sequence_with_timestamp() -> None:

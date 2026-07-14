@@ -1,4 +1,4 @@
-"""Policy-level differentiation artifacts."""
+"""Legacy per-view differentiation used for schema-v1 checkpoints."""
 
 from __future__ import annotations
 
@@ -6,9 +6,10 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 
-from agent_memory.logical import MemorySpec, QueryExpr
-from agent_memory.planner import DifferentialQueryPlanner
-from agent_memory.query_schema import output_columns
+from agent_memory.planner.differential_query import QueryDifferentiator
+from agent_memory.planner.rules import DifferentialRules
+from agent_memory.policy.logical import MemorySpec, MemoryView, QueryExpr
+from agent_memory.policy.schema import output_columns
 
 
 @dataclass(frozen=True)
@@ -51,7 +52,7 @@ class OverWindowPlan:
 
 
 @dataclass(frozen=True)
-class DifferentiatedPolicy:
+class LegacyPolicyPlan:
     """In-memory policy artifact produced by whole-policy differentiation."""
 
     spec: MemorySpec
@@ -95,15 +96,26 @@ class DifferentiatedPolicy:
         )
 
 
-class DifferentialPolicyCompiler:
-    """Compile a MemorySpec into differentiated view and retrieval queries."""
+def differentiate_legacy_policy(
+    spec: MemorySpec,
+    *,
+    grouped_agg_rule: str,
+) -> LegacyPolicyPlan:
+    """Rebuild a schema-v1 policy with its explicitly selected grouped rule."""
 
-    def __init__(self, view_planner: DifferentialQueryPlanner | None = None) -> None:
-        self._view_planner = (
-            view_planner if view_planner is not None else DifferentialQueryPlanner()
-        )
+    differentiator = QueryDifferentiator(
+        rules=DifferentialRules(grouped_agg_rule=grouped_agg_rule)
+    )
+    return _LegacyPolicyBuilder(differentiator).build(spec)
 
-    def differentiate(self, spec: MemorySpec) -> DifferentiatedPolicy:
+
+class _LegacyPolicyBuilder:
+    """Build the per-view query layout expected by schema-v1 execution."""
+
+    def __init__(self, query_differentiator: QueryDifferentiator) -> None:
+        self._query_differentiator = query_differentiator
+
+    def build(self, spec: MemorySpec) -> LegacyPolicyPlan:
         """Differentiate a full memory policy into an in-memory artifact."""
 
         view_dependencies = self._view_dependencies(spec)
@@ -122,9 +134,8 @@ class DifferentialPolicyCompiler:
             )
             if plan is not None:
                 window_process_plans[name] = plan
-                view_queries[name] = self._view_planner.differentiate_query(
-                    view_name=name,
-                    query=downstream_query,
+                view_queries[name] = self._query_differentiator.differentiate(
+                    MemoryView(name=name, query=downstream_query),
                     views=spec.views,
                     source_query=plan.private_source,
                     source_input=plan.changed_source,
@@ -138,18 +149,16 @@ class DifferentialPolicyCompiler:
             )
             if over_plan is not None:
                 over_window_plans[name] = over_plan
-                view_queries[name] = self._view_planner.differentiate_query(
-                    view_name=name,
-                    query=downstream_query,
+                view_queries[name] = self._query_differentiator.differentiate(
+                    MemoryView(name=name, query=downstream_query),
                     views=spec.views,
                     source_query=over_plan.private_source,
                     source_input=over_plan.changed_source,
                 )
                 continue
 
-            view_queries[name] = self._view_planner.differentiate_query(
-                view_name=name,
-                query=spec.views[name].query,
+            view_queries[name] = self._query_differentiator.differentiate(
+                spec.views[name],
                 views=spec.views,
             )
 
@@ -157,7 +166,7 @@ class DifferentialPolicyCompiler:
             name: self._bind_materialized_views(query, spec=spec)
             for name, query in spec.retrieval_queries.items()
         }
-        return DifferentiatedPolicy(
+        return LegacyPolicyPlan(
             spec=spec,
             view_queries=view_queries,
             retrieval_queries=retrieval_queries,
@@ -317,7 +326,7 @@ class DifferentialPolicyCompiler:
             op="materialized_view",
             params={"name": upstream_changed_name, "columns": upstream_columns},
         )
-        upstream_changed_query = self._view_planner.differentiate_rows(
+        upstream_changed_query = self._query_differentiator.differentiate_rows(
             query=upstream_query,
             views=spec.views,
             source_input=QueryExpr(op="log"),
@@ -387,7 +396,7 @@ class DifferentialPolicyCompiler:
             op="materialized_view",
             params={"name": upstream_changed_name, "columns": upstream_columns},
         )
-        upstream_changed_query = self._view_planner.differentiate_rows(
+        upstream_changed_query = self._query_differentiator.differentiate_rows(
             query=upstream_query,
             views=spec.views,
             source_input=QueryExpr(op="log"),
