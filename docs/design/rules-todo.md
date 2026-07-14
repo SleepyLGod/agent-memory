@@ -53,13 +53,12 @@ Policy Q
   -> end-user runtime load artifact 并执行
 ```
 
-`DifferentialPolicyCompiler` 负责 whole-policy differentiation。它不是 single
-view 的 `DifferentialQueryPlanner`，而是把完整 policy 转成
-`DifferentiatedPolicy`：
+`PolicyDifferentiator` 负责 whole-policy differentiation。它组合
+`QueryDifferentiator`，把完整 policy 转成 `DifferentiatedPolicy`：
 
 ```text
 MemorySpec
-  -> DifferentialPolicyCompiler
+  -> PolicyDifferentiator
   -> DifferentiatedPolicy
   -> optional offline optimizer
   -> DifferentiatedPolicy
@@ -69,19 +68,17 @@ MemorySpec
 `DifferentiatedPolicy` 的最小方向是保存：
 
 - `spec: MemorySpec`。
-- `view_queries: Mapping[str, QueryExpr]`，每个 public view 的 differentiated
-  update query `Q'`。
+- `nodes`、`execution_order` 和 `view_outputs`，包含共享 node、node-local
+  execution query、stateful maintenance query、topological order 和 public
+  sinks。
 - `retrieval_queries: Mapping[str, QueryExpr]`，parameterized retrieval query
   templates。
-- `view_dependencies: Mapping[str, tuple[str, ...]]`，public view dependency
-  graph。
-- `view_execution_order: tuple[str, ...]`，runtime 可直接执行的 topological
-  order。
+- `fingerprint` 和 canonical grouped rule，用于 checkpoint compatibility。
 
-不要在 `DifferentiatedPolicy` 里增加 `optimized_view_queries` /
-`optimized_retrieval_queries` 这类字段。Optimizer 应输入一个
-`DifferentiatedPolicy`，输出一个新的 `DifferentiatedPolicy`，直接改写
-`view_queries`、`retrieval_queries`、dependencies 或 execution order。
+不要在 `DifferentiatedPolicy` 里增加 `optimized_dataflow_plan` /
+`optimized_retrieval_queries` 这类平行字段。Optimizer 应输入一个
+`DifferentiatedPolicy`，输出一个新的 `DifferentiatedPolicy`，直接替换 nodes、
+retrieval queries 或 execution order。
 
 artifact 可以用 JSON、YAML、或其他机器可执行格式表示。Runtime load artifact 后
 只负责把真实 `changed_rows`、当前 materialized views、storage state 绑定进去并
@@ -147,7 +144,7 @@ model choice 或 index 相关优化。
 
 代码命名约定：
 
-- `DifferentialQueryPlanner.differentiate(view)`：生成 differentiated query
+- `QueryDifferentiator(...).differentiate(view)`：生成 differentiated query
   `Q'`，语义是返回下一版 view `V'`。
 - `DifferentialRules.differentiate(query, *, source_input, current_view,
   is_view_boundary, instruction_rewriter)`：执行 operator / pattern rewrite。
@@ -205,8 +202,8 @@ Delta(sem_filter(Q, instruction)) =
 Delta(sem_map(Q, input_cols, output_cols, instruction)) =
   sem_map(Delta(Q), input_cols, output_cols, instruction)
 
-Delta(sem_flat_map(Q, input_cols, output_cols, instruction)) =
-  sem_flat_map(Delta(Q), input_cols, output_cols, instruction)
+Delta(sem_flat_map(Q, input_cols, output_cols, instruction, ordinal_col)) =
+  sem_flat_map(Delta(Q), input_cols, output_cols, instruction, ordinal_col)
 ```
 
 这些 rule 只产生 changed output。它们不负责 `V.union(...)`。如果这些
@@ -320,6 +317,13 @@ DataFrame 已经没有 `name` / `body` column，LOTUS 会严格解析 placeholde
 这只是保证 differentiated query 可执行，不做 create / keep / merge / delete 的
 semantic prompt rewrite。更好的 semantic rewrite 后续再设计，例如显式说明 left
 side 是 new candidate、right side 是 existing memory、matched rows 才需要 merge。
+
+`rule-re-group` 的 final semantic aggregate 还会消费 aggregate-state rows，而不
+是原始 rows。当前 schema-aware rewrite 保留 state 中仍存在的 `{column}`；如果
+某个 placeholder 属于原始 `input_cols`、但已经不在 state schema 中，只去掉花
+括号变成普通文字。final `sem_agg(input_cols=None)` 读取除 internal semantic
+group id 外的所有可见 state columns。这同样是 deterministic schema repair，
+不是 semantic rewrite。
 
 ## 8. `sem_agg` Rules
 
@@ -500,8 +504,9 @@ compile 阶段做 topological ordering 和 cycle detection。Runtime load artifa
 
 ## 13. 暂不实现的 Rules
 
-- `filter(predicate)` / `assign(...)`：当前仍接受 arbitrary Python value，还没
-  收窄成 serializable deterministic expression。
+- generic `filter(predicate)` / `assign(...)` differential：operator execution 已
+  收窄成 minimal serializable `relation.col(...)` expression subset，但通用
+  differential rules 仍需逐类定义。
 - generic `subtract` differential：需要 negative delta / delete semantics。
 - generic arbitrary-subquery `sem_join`：需要 old intermediate materialization
   或 full recompute fallback。
@@ -539,7 +544,7 @@ compile 阶段做 topological ordering 和 cycle detection。Runtime load artifa
    `source_input`、`current_view`、`is_view_boundary`、`instruction_rewriter`。
 3. 实现 row-local changed-output fragment rules：`log`、`select`、
    `sem_filter`、`sem_map`、`sem_flat_map`。
-4. 在 `DifferentialQueryPlanner.differentiate(view)` 的 view boundary assemble
+4. 在 `QueryDifferentiator(...).differentiate(view)` 的 view boundary assemble
    `current_view.union(fragment)`，使 planner 返回完整 `Q'`。
 5. 实现 `sem_groupby(...).sem_agg(...)` 的 view-boundary stateful pattern，
    返回 full `V'` query。
@@ -558,3 +563,32 @@ compile 阶段做 topological ordering 和 cycle detection。Runtime load artifa
     recompute fallback。
 11. 已实现：把 grouped aggregate view-boundary rule 和 standalone aggregate view
     rule 拆成独立 helper，避免 generic rules 层使用 `consolidation` 作为抽象名。
+12. 已实现：`PolicyDifferentiator` 生成共享 `DifferentiatedPolicy`；runtime 按
+    node topology 传播 multiset change，保存 semantic output cache 和 window
+    state，并原子提交一次 add step。
+
+## 16. Grouped Aggregate / DAG Follow-ups
+
+当前 grouped aggregate implementation 已使用真实 operator graph 表达
+`collect_list(...).flatten(...)`、row-wise `array_cat(...)`、`min(...)` 和
+`least(...)`；没有 `agg_merge` operator 或 planner-only merge mode。
+单列和复合 `min(columns=[...])` 共享相同 rule：第一次聚合产生 scalar/tuple
+minimum state，后续只合并该 output state。
+
+Shared finite-DAG changed-state propagation 已实现。Compiler 合并结构相同的
+subtree；runtime 保存 private node state，并让 replacement change 继续传给下游。
+完整设计见 `policy-differentiation-dataflow-runtime.zh.md`。
+
+仍未完成：
+
+- **partitioned semantic join-map**：`sem_groupby(partition_by=...).agg(...)` 的
+  re-group rule 可保留 deterministic partitions；join-map 当前明确拒绝，直到
+  semantic join 能在 ON 语义中同时强制 partition equality。
+- **minimum removal**：append-only `min` merge 是 exact；delete 或 current-min
+  removal 需要 negative delta、raw-group recompute 或 ordered auxiliary state。
+- **`min_by` / `arg_min`**：只有 view contract 真正需要“最小 ordering value
+  对应 payload”时再增加 operator 和 differential rule。
+- **recursive/fixpoint dataflow**：当前 compiler 只接受有限 DAG；recursive view
+  query 在 compile time 拒绝。
+- **physical optimizer**：deterministic node 先按 next parent state 精确重算；
+  indexed join/aggregate state 和 arrangement sharing 留给 optimizer。

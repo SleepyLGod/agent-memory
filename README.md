@@ -81,18 +81,19 @@ model APIs.
 ```text
 src/agent_memory/
   __init__.py              public package exports
-  api.py                   Memory, Log, class-body spec/retrieval collection
-  message.py               normalized append input object
-  relation.py              DataFrame-style Relation and GroupedRelation operators
-  logical.py               immutable QueryExpr, UserQuery, MemoryView, MemorySpec
-  policy.py                DifferentialPolicyCompiler and DifferentiatedPolicy
+  api.py                   Memory, Message, add/query boundary
+  policy/                  logical IR, Relation API, expressions, aggregates, schema
   memories/claude.py       built-in ClaudeMemory policy
-  planner/                 Q-to-Q' differential query planner interfaces
-  runtime/                 runtime state and future execution shell
-  adapters/                execution adapter protocol and LotusAdapter shell
+  memories/zep.py          Zep-style temporal memory policy
+  planner/                 query and whole-policy differentiation
+  runtime/                 v2 executor, v1 compatibility, and window state
+  adapters/                execution adapter protocol and LOTUS-backed operator implementation
 
 examples/claude/
   interface_smoke.py       inspectable v0.0 interface demo
+
+examples/zep/
+  e2e_demo.py              real three-row LOCOMO + Zep policy demo
 
 examples/helloworld/
   helloworld_smoke.py      real LOCOMO + LOTUS sem_filter/sem_map/top-k smoke
