@@ -11,7 +11,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 path.insert(0, str(PROJECT_ROOT / "src"))
 
 import agent_memory as am  # noqa: E402
-from agent_memory.logical import QueryExpr  # noqa: E402
+from agent_memory.policy.logical import QueryExpr  # noqa: E402
 
 VISIBLE_PARAM_KEYS = {
     "columns",
@@ -66,11 +66,19 @@ def main() -> None:
         print_expr(view.query)
 
     policy = am.ClaudeMemory.differentiate_policy()
-    print(f"\nview execution order: {policy.view_execution_order}")
+    print(f"\npolicy fingerprint: {policy.fingerprint}")
 
-    for name in policy.view_execution_order:
-        print(f"\ndifferentiated view query: {name}")
-        print_expr(policy.view_queries[name])
+    print("\ndifferential policy nodes:")
+    for node_id in policy.execution_order:
+        node = policy.nodes[node_id]
+        print(
+            f"- {node_id} [{node.execution_kind}] "
+            f"inputs={list(node.input_node_ids)} op={node.query.op}"
+        )
+
+    print("\npublic sinks:")
+    for name, node_id in policy.view_outputs.items():
+        print(f"- {name}: {node_id}")
 
     for name, query in policy.retrieval_queries.items():
         print(f"\nretrieval query: {name}")
