@@ -447,6 +447,28 @@ def test_summary_frame_records_input_rendering_contract() -> None:
     assert bool(row["bookkeeping_metadata_excluded_from_semantic_input"]) is True
 
 
+def test_summary_frame_records_sem_topk_method() -> None:
+    frame = summary_frame(
+        run_mode="answer",
+        model="test-model",
+        grouped_agg_rule="join-map",
+        sem_topk_method="listwise",
+        sample_index=0,
+        maintenance_mode="external-state",
+        source_run_dir="/tmp/source",
+        events=(),
+        questions=(),
+        memory=FakeBenchmarkMemory(),
+        question_metrics=(),
+        question_results=(),
+        step_metrics=(),
+    )
+
+    row = frame.iloc[0]
+    assert row["grouped_agg_rule"] == "join-map"
+    assert row["sem_topk_method"] == "listwise"
+
+
 class FakeBenchmarkMemory:
     """Minimal memory object for runner helper tests."""
 
@@ -754,6 +776,46 @@ def test_runner_rejects_restore_artifact_state_invalid_flag_combinations(tmp_pat
         )
 
 
+def test_runner_rejects_invalid_continuation_flag_combinations(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+
+    with pytest.raises(SystemExit, match="mutually exclusive"):
+        run_claude_memory_locomo(
+            run_config(
+                tmp_path,
+                existing_output_dir=source,
+                continue_from_output_dir=source,
+                source_checkpoint_id="checkpoint-1",
+                trust_existing_output_dir=True,
+            )
+        )
+
+    with pytest.raises(SystemExit, match="requires --continue-from-output-dir"):
+        run_claude_memory_locomo(
+            run_config(tmp_path, source_checkpoint_id="checkpoint-1")
+        )
+
+    with pytest.raises(SystemExit, match="requires --source-checkpoint-id"):
+        run_claude_memory_locomo(
+            run_config(
+                tmp_path,
+                continue_from_output_dir=source,
+                trust_existing_output_dir=True,
+            )
+        )
+
+    with pytest.raises(SystemExit, match="omit external source arguments"):
+        run_claude_memory_locomo(
+            run_config(
+                tmp_path,
+                continue_from_output_dir=source,
+                source_checkpoint_id="checkpoint-1",
+                trust_existing_output_dir=True,
+                resume=True,
+            )
+        )
+
+
 def test_write_csv_escapes_spreadsheet_formula_prefixes(tmp_path: Path) -> None:
     frame = pd.DataFrame(
         [
@@ -882,6 +944,196 @@ def test_load_checkpoint_rejects_mismatched_arguments(tmp_path: Path) -> None:
         )
 
 
+def test_grouped_agg_rule_choices_include_join_map() -> None:
+    assert claude_memory_locomo_module.GROUPED_AGG_RULES == (
+        "compressed",
+        "changed-aware",
+        "join-map",
+    )
+
+
+def test_sem_topk_method_choices_use_canonical_names() -> None:
+    assert claude_memory_locomo_module.SEM_TOPK_METHODS == (
+        "pairwise-naive",
+        "pairwise-quick",
+        "pairwise-heap",
+        "listwise",
+    )
+
+
+def test_load_checkpoint_rejects_cross_sem_topk_method_resume(
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "run"
+    events = benchmark_events()
+    questions = benchmark_questions()
+    save_checkpoint(
+        output_dir=output_dir,
+        memory=FakeBenchmarkMemory(),
+        sample_index=0,
+        row_limit=2,
+        question_limit=2,
+        model="test-model",
+        answer=False,
+        sem_topk_method="pairwise-naive",
+        events=events,
+        questions=questions,
+        step_metrics=[],
+        result_rows=[],
+        metric_rows=[],
+    )
+
+    with pytest.raises(SystemExit, match="sem_topk_method"):
+        load_checkpoint(
+            output_dir=output_dir,
+            sample_index=0,
+            row_limit=2,
+            question_limit=2,
+            model="test-model",
+            answer=False,
+            sem_topk_method="listwise",
+            trace_enabled=False,
+            events=events,
+            questions=questions,
+        )
+
+
+def test_legacy_checkpoint_without_sem_topk_method_means_pairwise_naive(
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "run"
+    events = benchmark_events()
+    questions = benchmark_questions()
+    save_checkpoint(
+        output_dir=output_dir,
+        memory=FakeBenchmarkMemory(),
+        sample_index=0,
+        row_limit=2,
+        question_limit=2,
+        model="test-model",
+        answer=False,
+        sem_topk_method="pairwise-naive",
+        events=events,
+        questions=questions,
+        step_metrics=[],
+        result_rows=[],
+        metric_rows=[],
+    )
+    manifest_path = checkpoint_manifest_path(output_dir)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.pop("sem_topk_method")
+    manifest.pop("sem_topk_contract")
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    load_checkpoint(
+        output_dir=output_dir,
+        sample_index=0,
+        row_limit=2,
+        question_limit=2,
+        model="test-model",
+        answer=False,
+        sem_topk_method="pairwise-naive",
+        trace_enabled=False,
+        events=events,
+        questions=questions,
+    )
+    with pytest.raises(SystemExit, match="sem_topk_method"):
+        load_checkpoint(
+            output_dir=output_dir,
+            sample_index=0,
+            row_limit=2,
+            question_limit=2,
+            model="test-model",
+            answer=False,
+            sem_topk_method="listwise",
+            trace_enabled=False,
+            events=events,
+            questions=questions,
+        )
+
+
+@pytest.mark.parametrize("grouped_agg_rule", ["compressed", "changed-aware"])
+def test_load_checkpoint_accepts_existing_grouped_agg_rules(
+    tmp_path: Path,
+    grouped_agg_rule: str,
+) -> None:
+    output_dir = tmp_path / grouped_agg_rule
+    events = benchmark_events()
+    questions = benchmark_questions()
+    save_checkpoint(
+        output_dir=output_dir,
+        memory=FakeBenchmarkMemory(),
+        sample_index=0,
+        row_limit=2,
+        question_limit=2,
+        model="test-model",
+        answer=False,
+        grouped_agg_rule=grouped_agg_rule,
+        events=events,
+        questions=questions,
+        step_metrics=[],
+        result_rows=[],
+        metric_rows=[],
+    )
+
+    snapshot, loaded_steps, loaded_results, loaded_metrics = load_checkpoint(
+        output_dir=output_dir,
+        sample_index=0,
+        row_limit=2,
+        question_limit=2,
+        model="test-model",
+        answer=False,
+        grouped_agg_rule=grouped_agg_rule,
+        trace_enabled=False,
+        events=events,
+        questions=questions,
+    )
+
+    assert set(snapshot) >= {"state", "window_next_start", "upstream_log_count"}
+    assert loaded_steps == []
+    assert loaded_results == []
+    assert loaded_metrics == []
+
+
+@pytest.mark.parametrize("stored_rule", ["compressed", "changed-aware"])
+def test_load_checkpoint_rejects_cross_grouped_agg_rule_resume(
+    tmp_path: Path,
+    stored_rule: str,
+) -> None:
+    output_dir = tmp_path / stored_rule
+    events = benchmark_events()
+    questions = benchmark_questions()
+    save_checkpoint(
+        output_dir=output_dir,
+        memory=FakeBenchmarkMemory(),
+        sample_index=0,
+        row_limit=2,
+        question_limit=2,
+        model="test-model",
+        answer=False,
+        grouped_agg_rule=stored_rule,
+        events=events,
+        questions=questions,
+        step_metrics=[],
+        result_rows=[],
+        metric_rows=[],
+    )
+
+    with pytest.raises(SystemExit, match="grouped_agg_rule"):
+        load_checkpoint(
+            output_dir=output_dir,
+            sample_index=0,
+            row_limit=2,
+            question_limit=2,
+            model="test-model",
+            answer=False,
+            grouped_agg_rule="join-map",
+            trace_enabled=False,
+            events=events,
+            questions=questions,
+        )
+
+
 def test_load_checkpoint_rejects_maintenance_mode_mismatch(tmp_path: Path) -> None:
     output_dir = tmp_path / "run"
     events = benchmark_events()
@@ -919,6 +1171,153 @@ def test_load_checkpoint_rejects_maintenance_mode_mismatch(tmp_path: Path) -> No
         )
 
 
+@pytest.mark.parametrize("runtime_schema_version", [1, 2])
+def test_external_state_resume_uses_target_checkpoint_origin_and_skips_ingest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    runtime_schema_version: int,
+) -> None:
+    output_dir = tmp_path / f"resume-v{runtime_schema_version}"
+    missing_source_dir = (tmp_path / "source-no-longer-available").resolve()
+    events = benchmark_events()
+    questions = benchmark_questions()[:1]
+
+    class ResumeRuntime(FakeBenchmarkRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.restored_snapshot: dict[str, Any] | None = None
+
+        def snapshot_state(self) -> dict[str, Any]:
+            return {
+                "schema_version": runtime_schema_version,
+                "test_marker": f"runtime-v{runtime_schema_version}",
+            }
+
+        def restore_state(self, snapshot: dict[str, Any]) -> None:
+            self.restored_snapshot = snapshot
+
+    class ResumeMemory(FakeBenchmarkMemory):
+        def __init__(self) -> None:
+            super().__init__()
+            self._runtime = ResumeRuntime()
+
+    save_checkpoint(
+        output_dir=output_dir,
+        memory=ResumeMemory(),
+        sample_index=0,
+        row_limit=2,
+        question_limit=1,
+        model="test-model",
+        answer=False,
+        maintenance_mode="external-state",
+        source_run_dir=str(missing_source_dir),
+        events=events,
+        questions=questions,
+        step_metrics=[],
+        result_rows=[],
+        metric_rows=[],
+    )
+
+    resumed_memory = ResumeMemory()
+    monkeypatch.setattr(
+        claude_memory_locomo_module,
+        "selected_benchmark_data",
+        lambda **_kwargs: (tmp_path / "locomo.json", events, questions),
+    )
+    monkeypatch.setattr(
+        claude_memory_locomo_module,
+        "create_memory",
+        lambda **_kwargs: resumed_memory,
+    )
+
+    def reject_ingest(*_args: Any, **_kwargs: Any) -> None:
+        pytest.fail("external-state resume must not ingest source events again")
+
+    monkeypatch.setattr(
+        claude_memory_locomo_module,
+        "run_memory_ingest",
+        reject_ingest,
+    )
+
+    def finish_question(
+        _memory: Any,
+        selected_questions: Any,
+        *,
+        answer: bool,
+        result_rows: list[dict[str, Any]],
+        metric_rows: list[dict[str, Any]],
+        start_index: int,
+        checkpoint_callback: Any,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        assert answer is False
+        assert start_index == 0
+        question = selected_questions[0]
+        result_rows.append({"question_id": question.question_id})
+        metric_rows.append({"question_id": question.question_id})
+        checkpoint_callback()
+        return result_rows, metric_rows
+
+    monkeypatch.setattr(
+        claude_memory_locomo_module,
+        "run_questions",
+        finish_question,
+    )
+    monkeypatch.setattr(
+        claude_memory_locomo_module,
+        "write_run_artifacts",
+        lambda **_kwargs: {},
+    )
+
+    run_claude_memory_locomo(
+        run_config(
+            tmp_path,
+            output_dir=output_dir,
+            row_limit=2,
+            question_limit=1,
+            resume=True,
+            trust_existing_output_dir=True,
+        )
+    )
+
+    assert resumed_memory._runtime.restored_snapshot == {
+        "schema_version": runtime_schema_version,
+        "test_marker": f"runtime-v{runtime_schema_version}",
+    }
+    manifest = json.loads(checkpoint_manifest_path(output_dir).read_text(encoding="utf-8"))
+    assert manifest["maintenance_mode"] == "external-state"
+    assert manifest["source_run_dir"] == str(missing_source_dir)
+    assert manifest["completed_events"] == 0
+    assert manifest["completed_questions"] == 1
+
+
+def test_checkpoint_run_origin_defaults_old_manifest_to_ingest(tmp_path: Path) -> None:
+    output_dir = tmp_path / "run"
+    save_checkpoint(
+        output_dir=output_dir,
+        memory=FakeBenchmarkMemory(),
+        sample_index=0,
+        row_limit=0,
+        question_limit=0,
+        model="test-model",
+        answer=False,
+        events=(),
+        questions=(),
+        step_metrics=[],
+        result_rows=[],
+        metric_rows=[],
+    )
+    manifest_path = checkpoint_manifest_path(output_dir)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.pop("maintenance_mode")
+    manifest.pop("source_run_dir")
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    assert claude_memory_locomo_module.checkpoint_run_origin(output_dir) == (
+        "ingest",
+        "",
+    )
+
+
 def test_load_external_runtime_state_requires_source_event_coverage(tmp_path: Path) -> None:
     source_run = tmp_path / "source"
     events = benchmark_events()
@@ -940,6 +1339,152 @@ def test_load_external_runtime_state_requires_source_event_coverage(tmp_path: Pa
 
     with pytest.raises(SystemExit, match="event ids do not cover selected events"):
         load_external_runtime_state(source_run, events=events)
+
+
+def test_load_continuation_checkpoint_reads_a_specific_snapshot_without_mutating_source(
+    tmp_path: Path,
+) -> None:
+    source_run = tmp_path / "source"
+    events = benchmark_events()
+    memory = FakeBenchmarkMemory()
+    save_checkpoint(
+        output_dir=source_run,
+        memory=memory,
+        sample_index=0,
+        row_limit=2,
+        question_limit=0,
+        model="test-model",
+        answer=False,
+        grouped_agg_rule="join-map",
+        sem_topk_method="pairwise-naive",
+        events=events,
+        questions=(),
+        step_metrics=[{"phase": "add", "event_id": "D1:1"}],
+        result_rows=[],
+        metric_rows=[],
+    )
+    checkpoint_id = json.loads(
+        (source_run / "checkpoint" / "current.json").read_text(encoding="utf-8")
+    )["checkpoint_id"]
+    before = {
+        path.relative_to(source_run): path.read_bytes()
+        for path in source_run.rglob("*")
+        if path.is_file()
+    }
+
+    snapshot, step_metrics = claude_memory_locomo_module.load_continuation_checkpoint(
+        source_run,
+        checkpoint_id=checkpoint_id,
+        sample_index=0,
+        model="test-model",
+        answer=False,
+        grouped_agg_rule="join-map",
+        sem_topk_method="pairwise-naive",
+        events=events,
+        trusted_checkpoint=True,
+    )
+
+    assert snapshot["schema_version"] == 1
+    assert [row["event_id"] for row in step_metrics] == ["D1:1"]
+    assert before == {
+        path.relative_to(source_run): path.read_bytes()
+        for path in source_run.rglob("*")
+        if path.is_file()
+    }
+
+
+def test_load_continuation_checkpoint_accepts_legacy_manifest_without_rule(
+    tmp_path: Path,
+) -> None:
+    source_run = tmp_path / "source"
+    events = benchmark_events()
+    save_checkpoint(
+        output_dir=source_run,
+        memory=FakeBenchmarkMemory(),
+        sample_index=0,
+        row_limit=2,
+        question_limit=0,
+        model="test-model",
+        answer=False,
+        grouped_agg_rule="join-map",
+        events=events,
+        questions=(),
+        step_metrics=[{"phase": "add", "event_id": "D1:1"}],
+        result_rows=[],
+        metric_rows=[],
+    )
+    checkpoint_id = json.loads(
+        (source_run / "checkpoint" / "current.json").read_text(encoding="utf-8")
+    )["checkpoint_id"]
+    manifest_path = (
+        source_run / "checkpoint" / "snapshots" / checkpoint_id / "manifest.json"
+    )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.pop("grouped_agg_rule")
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    snapshot, _ = claude_memory_locomo_module.load_continuation_checkpoint(
+        source_run,
+        checkpoint_id=checkpoint_id,
+        sample_index=0,
+        model="test-model",
+        answer=False,
+        grouped_agg_rule="join-map",
+        sem_topk_method="pairwise-naive",
+        events=events,
+        trusted_checkpoint=True,
+    )
+
+    assert snapshot["schema_version"] == 1
+
+
+def test_load_continuation_checkpoint_rejects_changed_completed_event(
+    tmp_path: Path,
+) -> None:
+    source_run = tmp_path / "source"
+    events = benchmark_events()
+    save_checkpoint(
+        output_dir=source_run,
+        memory=FakeBenchmarkMemory(),
+        sample_index=0,
+        row_limit=2,
+        question_limit=0,
+        model="test-model",
+        answer=False,
+        grouped_agg_rule="join-map",
+        events=events,
+        questions=(),
+        step_metrics=[{"phase": "add", "event_id": "D1:1"}],
+        result_rows=[],
+        metric_rows=[],
+    )
+    checkpoint_id = json.loads(
+        (source_run / "checkpoint" / "current.json").read_text(encoding="utf-8")
+    )["checkpoint_id"]
+    changed_events = (
+        BenchmarkEvent(
+            sample_id=events[0].sample_id,
+            event_id=events[0].event_id,
+            speaker=events[0].speaker,
+            text="Changed completed event.",
+            session_id=events[0].session_id,
+            timestamp=events[0].timestamp,
+        ),
+        events[1],
+    )
+
+    with pytest.raises(SystemExit, match="completed event content"):
+        claude_memory_locomo_module.load_continuation_checkpoint(
+            source_run,
+            checkpoint_id=checkpoint_id,
+            sample_index=0,
+            model="test-model",
+            answer=False,
+            grouped_agg_rule="join-map",
+            sem_topk_method="pairwise-naive",
+            events=changed_events,
+            trusted_checkpoint=True,
+        )
 
 
 def write_artifact_state_source(
@@ -1783,6 +2328,7 @@ def test_recovery_metadata_records_excluded_trace_ranges(tmp_path: Path) -> None
         excluded_trace_event_ranges=[(3, 5), (5, 7)],
         error=RuntimeError("transport failed"),
         trace_dir=None,
+        sem_topk_method="listwise",
     )
 
     payload = json.loads(path.read_text(encoding="utf-8"))
@@ -1791,6 +2337,8 @@ def test_recovery_metadata_records_excluded_trace_ranges(tmp_path: Path) -> None
     ]
     assert payload["excluded_trace_event_count"] == 4
     assert payload["last_error_type"] == "RuntimeError"
+    assert payload["sem_topk_method"] == "listwise"
+    assert payload["sem_topk_contract"] == "listwise:v1"
 
 
 def test_failed_run_helpers_write_partial_artifacts(tmp_path: Path) -> None:
@@ -1857,6 +2405,7 @@ def test_failed_run_helpers_write_partial_artifacts(tmp_path: Path) -> None:
         step_metrics=[{"event_id": "D1:1"}, {"event_id": "D1:2"}],
         result_rows=[{"question_id": "q1"}],
         trace_dir=trace_dir,
+        sem_topk_method="listwise",
     )
 
     assert (output_dir / "memory" / "topics.csv").exists()
@@ -1873,3 +2422,5 @@ def test_failed_run_helpers_write_partial_artifacts(tmp_path: Path) -> None:
     assert failure["failed_phase"] == "question"
     assert failure["failed_question_id"] == "q2"
     assert failure["completed_questions"] == 1
+    assert failure["sem_topk_method"] == "listwise"
+    assert failure["sem_topk_contract"] == "listwise:v1"

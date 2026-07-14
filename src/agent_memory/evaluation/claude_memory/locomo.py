@@ -16,7 +16,8 @@ import pandas as pd
 
 import agent_memory as am
 from agent_memory.adapters.lotus import LotusAdapter
-from agent_memory.adapters.lotus.context import LotusExecutionConfig
+from agent_memory.adapters.lotus.context import SEM_TOPK_METHODS, LotusExecutionConfig
+from agent_memory.adapters.lotus.sem_topk_listwise import LISTWISE_TOPK_CONTRACT
 from agent_memory.datasets.locomo import DEFAULT_LOCOMO_URL, ensure_locomo_dataset
 from agent_memory.evaluation.claude_memory.bindings import event_to_claude_log_row
 from agent_memory.evaluation.diagnostics import (
@@ -41,6 +42,8 @@ from agent_memory.evaluation.metrics import (
     summarize_question_metrics,
 )
 from agent_memory.evaluation.types import BenchmarkEvent, BenchmarkQuestion
+from agent_memory.planner import DifferentialRules, PolicyDifferentiator
+from agent_memory.runtime import MemoryRuntime
 from agent_memory.tracing.semantic import semantic_trace_scope
 
 ANSWER_MAX_TOKENS = 256
@@ -53,6 +56,7 @@ RUN_MARKER_SCHEMA_VERSION = 1
 RUN_MARKER_FILENAME = ".agent-memory-locomo-run.json"
 BENCHMARK_CONTRACT = "message_with_event_context:v1"
 POLICY_CONTRACT = "claude_memory_policy:v1"
+GROUPED_AGG_RULES = ("compressed", "changed-aware", "join-map")
 SCORER_CONTRACT = "locomo_official_compatible_category_logic:v1"
 USAGE_FIELDS = (
     "physical_prompt_tokens",
@@ -78,10 +82,14 @@ class ClaudeMemoryLocomoRunConfig:
     output_dir: Path
     locomo_cache_path: Path
     existing_output_dir: Path | None = None
+    continue_from_output_dir: Path | None = None
+    source_checkpoint_id: str | None = None
     trust_existing_output_dir: bool = False
     trace: bool = False
     answer: bool = False
     resume: bool = False
+    grouped_agg_rule: str = "compressed"
+    sem_topk_method: str = "pairwise-naive"
     restore_csv_state: bool = False
     restore_artifact_csv_state: bool = False
 
@@ -213,6 +221,39 @@ def current_checkpoint_snapshot_dir(output_dir: Path) -> Path:
     if not isinstance(checkpoint_id, str) or not checkpoint_id:
         raise SystemExit("Checkpoint current pointer is missing checkpoint_id")
     return checkpoint_snapshots_dir(output_dir) / checkpoint_id
+
+
+def checkpoint_run_origin(output_dir: Path) -> tuple[str, str]:
+    """Return the maintenance origin persisted by the target checkpoint."""
+
+    manifest_path = checkpoint_manifest_path(output_dir)
+    if not manifest_path.exists():
+        raise SystemExit(f"Checkpoint snapshot is missing manifest: {manifest_path}")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise SystemExit(f"Invalid checkpoint manifest: {manifest_path}") from error
+
+    maintenance_mode = manifest.get("maintenance_mode", "ingest")
+    source_run_dir = manifest.get("source_run_dir", "")
+    if not isinstance(maintenance_mode, str) or maintenance_mode not in {
+        "ingest",
+        "external-state",
+        "continuation",
+    }:
+        raise SystemExit(
+            "Checkpoint manifest has invalid maintenance_mode: "
+            f"{maintenance_mode!r}"
+        )
+    if not isinstance(source_run_dir, str):
+        raise SystemExit("Checkpoint manifest source_run_dir must be a string")
+    if maintenance_mode == "ingest" and source_run_dir:
+        raise SystemExit("Ingest checkpoint manifest must not have source_run_dir")
+    if maintenance_mode != "ingest" and not source_run_dir:
+        raise SystemExit(
+            f"{maintenance_mode} checkpoint manifest requires source_run_dir"
+        )
+    return maintenance_mode, source_run_dir
 
 
 def write_text_atomic(path: Path, content: str) -> None:
@@ -358,6 +399,12 @@ def checkpoint_contract_digest() -> str:
     )
 
 
+def sem_topk_contract(method: str) -> str:
+    """Return the retrieval execution contract recorded in artifacts."""
+
+    return LISTWISE_TOPK_CONTRACT if method == "listwise" else "lotus-native"
+
+
 def trace_event_count(trace_dir: Path | None) -> int:
     """Return the current number of trace event rows."""
 
@@ -499,6 +546,8 @@ def checkpoint_manifest(
     question_limit: int,
     model: str,
     answer: bool,
+    grouped_agg_rule: str = "compressed",
+    sem_topk_method: str = "pairwise-naive",
     maintenance_mode: str = "ingest",
     source_run_dir: str = "",
     events: Sequence[BenchmarkEvent],
@@ -525,6 +574,9 @@ def checkpoint_manifest(
         "question_limit": question_limit,
         "model": model,
         "answer": answer,
+        "grouped_agg_rule": grouped_agg_rule,
+        "sem_topk_method": sem_topk_method,
+        "sem_topk_contract": sem_topk_contract(sem_topk_method),
         "maintenance_mode": maintenance_mode,
         "source_run_dir": source_run_dir,
         "event_ids": [event.event_id for event in events],
@@ -549,6 +601,8 @@ def save_checkpoint(
     question_limit: int,
     model: str,
     answer: bool,
+    grouped_agg_rule: str = "compressed",
+    sem_topk_method: str = "pairwise-naive",
     maintenance_mode: str = "ingest",
     source_run_dir: str = "",
     events: Sequence[BenchmarkEvent],
@@ -572,6 +626,8 @@ def save_checkpoint(
         question_limit=question_limit,
         model=model,
         answer=answer,
+        grouped_agg_rule=grouped_agg_rule,
+        sem_topk_method=sem_topk_method,
         maintenance_mode=maintenance_mode,
         source_run_dir=source_run_dir,
         events=events,
@@ -607,6 +663,8 @@ def load_checkpoint(
     question_limit: int,
     model: str,
     answer: bool,
+    grouped_agg_rule: str = "compressed",
+    sem_topk_method: str = "pairwise-naive",
     maintenance_mode: str = "ingest",
     source_run_dir: str = "",
     trace_enabled: bool,
@@ -621,6 +679,13 @@ def load_checkpoint(
     if not manifest_path.exists():
         raise SystemExit(f"Checkpoint snapshot is missing manifest: {manifest_path}")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.setdefault("sem_topk_method", "pairwise-naive")
+    manifest.setdefault(
+        "sem_topk_contract",
+        sem_topk_contract(str(manifest["sem_topk_method"])),
+    )
+    manifest.setdefault("maintenance_mode", "ingest")
+    manifest.setdefault("source_run_dir", "")
     expected = {
         "schema_version": CHECKPOINT_SCHEMA_VERSION,
         "benchmark_contract": BENCHMARK_CONTRACT,
@@ -634,6 +699,9 @@ def load_checkpoint(
         "question_limit": question_limit,
         "model": model,
         "answer": answer,
+        "grouped_agg_rule": grouped_agg_rule,
+        "sem_topk_method": sem_topk_method,
+        "sem_topk_contract": sem_topk_contract(sem_topk_method),
         "maintenance_mode": maintenance_mode,
         "source_run_dir": source_run_dir,
         "event_ids": [event.event_id for event in events],
@@ -744,6 +812,105 @@ def load_external_runtime_state(
     if not isinstance(runtime_snapshot, dict):
         raise SystemExit("Source checkpoint runtime snapshot must be a dict")
     return runtime_snapshot
+
+
+def load_continuation_checkpoint(
+    source_run_dir: Path,
+    *,
+    checkpoint_id: str,
+    sample_index: int,
+    model: str,
+    answer: bool,
+    grouped_agg_rule: str,
+    sem_topk_method: str,
+    events: Sequence[BenchmarkEvent],
+    trusted_checkpoint: bool = False,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Load one schema-v1 ingestion snapshot for continuation in a new run."""
+
+    if Path(checkpoint_id).name != checkpoint_id or checkpoint_id in {".", ".."}:
+        raise SystemExit("--source-checkpoint-id must be one checkpoint directory name")
+    snapshot_dir = checkpoint_snapshots_dir(source_run_dir) / checkpoint_id
+    manifest_path = snapshot_dir / "manifest.json"
+    if not manifest_path.exists():
+        raise SystemExit(f"Source checkpoint is missing manifest: {manifest_path}")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise SystemExit(f"Invalid source checkpoint manifest: {manifest_path}") from error
+    manifest.setdefault("grouped_agg_rule", grouped_agg_rule)
+    manifest.setdefault("sem_topk_method", "pairwise-naive")
+    manifest.setdefault(
+        "sem_topk_contract",
+        sem_topk_contract(str(manifest["sem_topk_method"])),
+    )
+    expected = {
+        "schema_version": CHECKPOINT_SCHEMA_VERSION,
+        "benchmark_contract": BENCHMARK_CONTRACT,
+        "policy_contract": POLICY_CONTRACT,
+        "scorer_contract": SCORER_CONTRACT,
+        "checkpoint_contract_digest": checkpoint_contract_digest(),
+        "sample_index": sample_index,
+        "model": model,
+        "answer": answer,
+        "grouped_agg_rule": grouped_agg_rule,
+        "sem_topk_method": sem_topk_method,
+        "sem_topk_contract": sem_topk_contract(sem_topk_method),
+    }
+    mismatches = [key for key, value in expected.items() if manifest.get(key) != value]
+    if mismatches:
+        joined = ", ".join(mismatches)
+        raise SystemExit(f"Continuation checkpoint does not match current arguments: {joined}")
+    try:
+        completed_events = int(manifest.get("completed_events", -1))
+        completed_questions = int(manifest.get("completed_questions", -1))
+    except (TypeError, ValueError) as error:
+        raise SystemExit("Continuation checkpoint progress is invalid") from error
+    if completed_events < 0 or completed_events > len(events):
+        raise SystemExit("Continuation checkpoint exceeds the selected event boundary")
+    if completed_questions != 0:
+        raise SystemExit("Continuation requires an ingestion checkpoint with no completed questions")
+
+    source_event_ids = manifest.get("event_ids")
+    source_event_fingerprints = manifest.get("event_fingerprints")
+    if not isinstance(source_event_ids, list):
+        raise SystemExit("Continuation checkpoint manifest is missing event_ids")
+    if not isinstance(source_event_fingerprints, list):
+        raise SystemExit("Continuation checkpoint manifest is missing event_fingerprints")
+    completed_ids = [event.event_id for event in events[:completed_events]]
+    if source_event_ids[:completed_events] != completed_ids:
+        raise SystemExit("Continuation checkpoint completed event ids do not match")
+    completed_fingerprints = list(
+        benchmark_event_fingerprints(events[:completed_events])
+    )
+    if source_event_fingerprints[:completed_events] != completed_fingerprints:
+        raise SystemExit("Continuation checkpoint completed event content does not match")
+
+    step_metrics = read_jsonl(snapshot_dir / "step_metrics.jsonl")
+    if len(step_metrics) != completed_events:
+        raise SystemExit("Continuation checkpoint step metrics do not match manifest")
+    if [row.get("event_id") for row in step_metrics] != completed_ids:
+        raise SystemExit("Continuation checkpoint step metric event ids do not match")
+    if read_jsonl(snapshot_dir / "result_rows.jsonl"):
+        raise SystemExit("Continuation checkpoint unexpectedly contains result rows")
+    if read_jsonl(snapshot_dir / "metric_rows.jsonl"):
+        raise SystemExit("Continuation checkpoint unexpectedly contains question metrics")
+
+    state_path = snapshot_dir / "state.pkl"
+    if not state_path.exists():
+        raise SystemExit(f"Continuation checkpoint is missing runtime state: {state_path}")
+    if not trusted_checkpoint:
+        raise SystemExit(
+            "Loading --continue-from-output-dir requires --trust-existing-output-dir "
+            "because checkpoint state.pkl uses Python pickle. Only use trusted "
+            "local benchmark outputs."
+        )
+    runtime_snapshot = pickle.loads(state_path.read_bytes())
+    if not isinstance(runtime_snapshot, dict):
+        raise SystemExit("Continuation checkpoint runtime snapshot must be a dict")
+    if runtime_snapshot.get("schema_version") != 1:
+        raise SystemExit("Continuation currently requires a schema-v1 runtime snapshot")
+    return runtime_snapshot, step_metrics
 
 
 def load_artifact_runtime_state(
@@ -985,15 +1152,39 @@ def run_memory_ingest(
     return step_metrics
 
 
-def create_memory(*, model: str, trace_dir: Path | None) -> am.ClaudeMemory:
+def create_memory(
+    *,
+    model: str,
+    trace_dir: Path | None,
+    grouped_agg_rule: str = "compressed",
+    sem_topk_method: str = "pairwise-naive",
+) -> am.ClaudeMemory:
     """Create the ClaudeMemory instance used by one benchmark run."""
 
-    return am.ClaudeMemory(
-        adapter=LotusAdapter(
-            model=model,
-            config=LotusExecutionConfig(semantic_trace_dir=trace_dir),
+    if grouped_agg_rule not in GROUPED_AGG_RULES:
+        raise ValueError(
+            "grouped_agg_rule must be one of: " + ", ".join(GROUPED_AGG_RULES)
         )
+    if sem_topk_method not in SEM_TOPK_METHODS:
+        raise ValueError(
+            "sem_topk_method must be one of: " + ", ".join(SEM_TOPK_METHODS)
+        )
+    adapter = LotusAdapter(
+        model=model,
+        config=LotusExecutionConfig(
+            semantic_trace_dir=trace_dir,
+            sem_topk_method=sem_topk_method,
+        ),
     )
+    memory = am.ClaudeMemory(adapter=adapter)
+    if grouped_agg_rule == "compressed":
+        return memory
+
+    policy = PolicyDifferentiator(
+        rules=DifferentialRules(grouped_agg_rule=grouped_agg_rule),
+    ).differentiate(am.ClaudeMemory.spec())
+    memory._runtime = MemoryRuntime(policy, adapter=adapter)
+    return memory
 
 
 def memory_row_counts(memory: am.ClaudeMemory) -> dict[str, int]:
@@ -1128,6 +1319,8 @@ def summary_frame(
     *,
     run_mode: str,
     model: str,
+    grouped_agg_rule: str = "compressed",
+    sem_topk_method: str = "pairwise-naive",
     sample_index: int,
     maintenance_mode: str,
     source_run_dir: str,
@@ -1167,6 +1360,8 @@ def summary_frame(
         "maintenance_mode": maintenance_mode,
         "source_run_dir": source_run_dir,
         "model": model,
+        "grouped_agg_rule": grouped_agg_rule,
+        "sem_topk_method": sem_topk_method,
         "sample_index": sample_index,
         "events_ingested": len(events),
         "eligible_questions": len(questions),
@@ -1234,6 +1429,8 @@ def write_run_artifacts(
     output_dir: Path,
     run_mode: str,
     model: str,
+    grouped_agg_rule: str = "compressed",
+    sem_topk_method: str = "pairwise-naive",
     sample_index: int,
     maintenance_mode: str,
     source_run_dir: str,
@@ -1272,6 +1469,8 @@ def write_run_artifacts(
             summary_frame(
                 run_mode=run_mode,
                 model=model,
+                grouped_agg_rule=grouped_agg_rule,
+                sem_topk_method=sem_topk_method,
                 sample_index=sample_index,
                 maintenance_mode=maintenance_mode,
                 source_run_dir=source_run_dir,
@@ -1358,6 +1557,7 @@ def write_failure_metadata(
     step_metrics: Sequence[Mapping[str, Any]],
     result_rows: Sequence[Mapping[str, Any]],
     trace_dir: Path | None,
+    sem_topk_method: str = "pairwise-naive",
     completed_event_count: int | None = None,
 ) -> Path:
     """Write one JSON failure summary without swallowing the original error."""
@@ -1391,6 +1591,8 @@ def write_failure_metadata(
         "total_questions": len(questions),
         "output_dir": str(output_dir),
         "trace_dir": "" if trace_dir is None else str(trace_dir),
+        "sem_topk_method": sem_topk_method,
+        "sem_topk_contract": sem_topk_contract(sem_topk_method),
     }
     failure_path.write_text(
         json.dumps(failure, ensure_ascii=False, indent=2),
@@ -1405,6 +1607,7 @@ def write_recovery_metadata(
     excluded_trace_event_ranges: Sequence[tuple[int, int]],
     error: BaseException | None = None,
     trace_dir: Path | None = None,
+    sem_topk_method: str = "pairwise-naive",
 ) -> Path:
     """Write recovery-only diagnostics that are excluded from final benchmark scoring."""
 
@@ -1419,6 +1622,8 @@ def write_recovery_metadata(
         ],
         "excluded_trace_event_count": sum(end - start for start, end in ranges),
         "trace_event_count": trace_event_count(trace_dir),
+        "sem_topk_method": sem_topk_method,
+        "sem_topk_contract": sem_topk_contract(sem_topk_method),
     }
     if error is not None:
         payload.update(
@@ -1445,11 +1650,37 @@ def run_claude_memory_locomo(config: ClaudeMemoryLocomoRunConfig) -> dict[str, P
     """Run one ClaudeMemory LOCOMO evaluation slice and write CSV artifacts."""
 
     output_dir = config.output_dir.resolve()
-    source_run_dir = (
+    if config.grouped_agg_rule not in GROUPED_AGG_RULES:
+        raise SystemExit(
+            "--grouped-agg-rule must be one of: " + ", ".join(GROUPED_AGG_RULES)
+        )
+    if config.sem_topk_method not in SEM_TOPK_METHODS:
+        raise SystemExit(
+            "--sem-topk-method must be one of: " + ", ".join(SEM_TOPK_METHODS)
+        )
+    existing_source_dir = (
         config.existing_output_dir.resolve()
         if config.existing_output_dir is not None
         else None
     )
+    continuation_source_dir = (
+        config.continue_from_output_dir.resolve()
+        if config.continue_from_output_dir is not None
+        else None
+    )
+    if existing_source_dir is not None and continuation_source_dir is not None:
+        raise SystemExit(
+            "--existing-output-dir and --continue-from-output-dir are mutually exclusive"
+        )
+    if continuation_source_dir is None and config.source_checkpoint_id is not None:
+        raise SystemExit(
+            "--source-checkpoint-id requires --continue-from-output-dir"
+        )
+    if continuation_source_dir is not None and config.source_checkpoint_id is None:
+        raise SystemExit(
+            "--continue-from-output-dir requires --source-checkpoint-id"
+        )
+    source_run_dir = continuation_source_dir or existing_source_dir
     validate_output_paths(output_dir=output_dir, source_run_dir=source_run_dir)
     if config.restore_csv_state:
         raise SystemExit(
@@ -1460,6 +1691,15 @@ def run_claude_memory_locomo(config: ClaudeMemoryLocomoRunConfig) -> dict[str, P
         raise SystemExit("--restore-artifact-csv-state requires --existing-output-dir")
     if config.restore_artifact_csv_state and config.resume:
         raise SystemExit("--restore-artifact-csv-state cannot be used with --resume")
+    if continuation_source_dir is not None and config.restore_artifact_csv_state:
+        raise SystemExit(
+            "--restore-artifact-csv-state cannot be used with --continue-from-output-dir"
+        )
+    if source_run_dir is not None and config.resume:
+        raise SystemExit(
+            "--resume reads the target --output-dir checkpoint; omit external "
+            "source arguments"
+        )
     if source_run_dir is not None and not config.trust_existing_output_dir:
         raise SystemExit(
             "--existing-output-dir requires --trust-existing-output-dir because "
@@ -1483,8 +1723,17 @@ def run_claude_memory_locomo(config: ClaudeMemoryLocomoRunConfig) -> dict[str, P
     )
     trace_dir = output_dir / "trace" if config.trace else None
     run_mode = "answer" if config.answer else "retrieval_only_diagnostic"
-    maintenance_mode = "external-state" if source_run_dir is not None else "ingest"
-    source_run_dir_str = "" if source_run_dir is None else str(source_run_dir)
+    if config.resume:
+        maintenance_mode, source_run_dir_str = checkpoint_run_origin(output_dir)
+    else:
+        maintenance_mode = (
+            "continuation"
+            if continuation_source_dir is not None
+            else "external-state"
+            if existing_source_dir is not None
+            else "ingest"
+        )
+        source_run_dir_str = "" if source_run_dir is None else str(source_run_dir)
 
     print("LOCOMO benchmark")
     print(f"dataset: {dataset_path}")
@@ -1493,9 +1742,11 @@ def run_claude_memory_locomo(config: ClaudeMemoryLocomoRunConfig) -> dict[str, P
     print(f"eligible_questions: {len(questions)}")
     print(f"run_mode: {run_mode}")
     print(f"maintenance_mode: {maintenance_mode}")
-    if source_run_dir is not None:
-        print(f"source_run_dir: {source_run_dir}")
+    if source_run_dir_str:
+        print(f"source_run_dir: {source_run_dir_str}")
     print(f"model: {config.model}")
+    print(f"grouped_agg_rule: {config.grouped_agg_rule}")
+    print(f"sem_topk_method: {config.sem_topk_method}")
     print(f"output_dir: {output_dir}")
 
     written: dict[str, Path] = {
@@ -1517,7 +1768,12 @@ def run_claude_memory_locomo(config: ClaudeMemoryLocomoRunConfig) -> dict[str, P
     metric_rows: list[dict[str, Any]] = []
     excluded_trace_event_ranges: list[tuple[int, int]] = []
     try:
-        memory = create_memory(model=config.model, trace_dir=trace_dir)
+        memory = create_memory(
+            model=config.model,
+            trace_dir=trace_dir,
+            grouped_agg_rule=config.grouped_agg_rule,
+            sem_topk_method=config.sem_topk_method,
+        )
         if config.resume:
             runtime_snapshot, step_metrics, result_rows, metric_rows = load_checkpoint(
                 output_dir=output_dir,
@@ -1526,6 +1782,8 @@ def run_claude_memory_locomo(config: ClaudeMemoryLocomoRunConfig) -> dict[str, P
                 question_limit=config.question_limit,
                 model=config.model,
                 answer=config.answer,
+                grouped_agg_rule=config.grouped_agg_rule,
+                sem_topk_method=config.sem_topk_method,
                 maintenance_mode=maintenance_mode,
                 source_run_dir=source_run_dir_str,
                 trace_enabled=config.trace,
@@ -1545,11 +1803,32 @@ def run_claude_memory_locomo(config: ClaudeMemoryLocomoRunConfig) -> dict[str, P
                     output_dir=output_dir,
                     excluded_trace_event_ranges=excluded_trace_event_ranges,
                     trace_dir=trace_dir,
+                    sem_topk_method=config.sem_topk_method,
                 )
             print(
                 "resuming checkpoint: "
                 f"completed_events={len(step_metrics)}, "
                 f"completed_questions={len(result_rows)}"
+            )
+        elif continuation_source_dir is not None:
+            runtime_snapshot, step_metrics = load_continuation_checkpoint(
+                continuation_source_dir,
+                checkpoint_id=str(config.source_checkpoint_id),
+                sample_index=config.sample_index,
+                model=config.model,
+                answer=config.answer,
+                grouped_agg_rule=config.grouped_agg_rule,
+                sem_topk_method=config.sem_topk_method,
+                events=events,
+                trusted_checkpoint=config.trust_existing_output_dir,
+            )
+            memory._runtime.restore_state(runtime_snapshot)
+            counts = memory_row_counts(memory)
+            print(
+                "continuing source checkpoint: "
+                f"completed_events={len(step_metrics)}, "
+                f"topics_rows={counts['topics_rows']}, "
+                f"catalog_rows={counts['catalog_rows']}"
             )
         elif source_run_dir is not None and config.restore_artifact_csv_state:
             memory._runtime._state = load_artifact_runtime_state(
@@ -1586,6 +1865,8 @@ def run_claude_memory_locomo(config: ClaudeMemoryLocomoRunConfig) -> dict[str, P
                 question_limit=config.question_limit,
                 model=config.model,
                 answer=config.answer,
+                grouped_agg_rule=config.grouped_agg_rule,
+                sem_topk_method=config.sem_topk_method,
                 maintenance_mode=maintenance_mode,
                 source_run_dir=source_run_dir_str,
                 events=events,
@@ -1597,7 +1878,7 @@ def run_claude_memory_locomo(config: ClaudeMemoryLocomoRunConfig) -> dict[str, P
                 trace_enabled=config.trace,
             )
 
-        if source_run_dir is None:
+        if maintenance_mode != "external-state":
             run_memory_ingest(
                 memory,
                 events,
@@ -1631,6 +1912,8 @@ def run_claude_memory_locomo(config: ClaudeMemoryLocomoRunConfig) -> dict[str, P
                     output_dir=output_dir,
                     run_mode=run_mode,
                     model=config.model,
+                    grouped_agg_rule=config.grouped_agg_rule,
+                    sem_topk_method=config.sem_topk_method,
                     sample_index=config.sample_index,
                     maintenance_mode=maintenance_mode,
                     source_run_dir=source_run_dir_str,
@@ -1644,7 +1927,7 @@ def run_claude_memory_locomo(config: ClaudeMemoryLocomoRunConfig) -> dict[str, P
                     llm_anomaly_rows=llm_anomaly_rows,
                     ingested_event_ids=(
                         tuple(event.event_id for event in events)
-                        if source_run_dir is not None
+                        if maintenance_mode == "external-state"
                         else completed_event_ids(step_metrics)
                     ),
                     include_summary=False,
@@ -1659,8 +1942,11 @@ def run_claude_memory_locomo(config: ClaudeMemoryLocomoRunConfig) -> dict[str, P
                 step_metrics=step_metrics,
                 result_rows=result_rows,
                 trace_dir=trace_dir,
+                sem_topk_method=config.sem_topk_method,
                 completed_event_count=(
-                    len(events) if source_run_dir is not None else len(step_metrics)
+                    len(events)
+                    if maintenance_mode == "external-state"
+                    else len(step_metrics)
                 ),
             )
             if trace_dir is not None:
@@ -1674,6 +1960,7 @@ def run_claude_memory_locomo(config: ClaudeMemoryLocomoRunConfig) -> dict[str, P
                     excluded_trace_event_ranges=failure_trace_ranges,
                     error=error,
                     trace_dir=trace_dir,
+                    sem_topk_method=config.sem_topk_method,
                 )
         except Exception as artifact_error:
             print(f"warning: failed to write partial artifacts: {artifact_error}")
@@ -1695,6 +1982,8 @@ def run_claude_memory_locomo(config: ClaudeMemoryLocomoRunConfig) -> dict[str, P
             output_dir=output_dir,
             run_mode=run_mode,
             model=config.model,
+            grouped_agg_rule=config.grouped_agg_rule,
+            sem_topk_method=config.sem_topk_method,
             sample_index=config.sample_index,
             maintenance_mode=maintenance_mode,
             source_run_dir=source_run_dir_str,
@@ -1708,7 +1997,7 @@ def run_claude_memory_locomo(config: ClaudeMemoryLocomoRunConfig) -> dict[str, P
             llm_anomaly_rows=llm_anomaly_rows,
             ingested_event_ids=(
                 tuple(event.event_id for event in events)
-                if source_run_dir is not None
+                if maintenance_mode == "external-state"
                 else completed_event_ids(step_metrics)
             ),
             include_summary=True,
