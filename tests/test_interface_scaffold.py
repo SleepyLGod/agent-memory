@@ -4260,7 +4260,8 @@ def test_assign_executes_row_wise_array_cat_expression() -> None:
             {
                 "records:right": ['[{"body": "old"}]', pd.NA],
                 "records:left": ['[{"body": "new"}]', '[{"body": "only-new"}]'],
-            }
+            },
+            index=[7, 7],
         )
     }
 
@@ -4270,6 +4271,7 @@ def test_assign_executes_row_wise_array_cat_expression() -> None:
         [{"body": "old"}, {"body": "new"}],
         [{"body": "only-new"}],
     ]
+    assert result.index.tolist() == [7, 7]
 
 
 def test_assign_rejects_callable_or_complex_values() -> None:
