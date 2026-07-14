@@ -32,7 +32,7 @@
 |---|---|---|---|
 | `select` | 可用 | pandas 本地实现 | 暂无 |
 | `concat` / `union` / `subtract` / `drop_duplicates` | 可用 | pandas 本地实现 | 暂无 |
-| `filter(predicate)` / `assign(...)` | 暂不执行 | 未对齐 | 先收窄成 serializable expression |
+| `filter(predicate)` / `assign(...)` / predicate `join(...)` | 可用 | pandas 本地实现 | 后续只按真实需求扩 deterministic expression subset |
 | `sem_filter` | 可用 | native LOTUS path，基础 adapter config 已接入 | 补 side-channel stats / cascade real audit |
 | `sem_map` 单输出 | 可用 | native LOTUS `sem_map` | adapter config 对齐 execution options |
 | `sem_map` 多输出 | 可用 | custom structured lowering | 对齐 LOTUS execution ergonomics，不把 debug 写入结果列 |
@@ -51,8 +51,8 @@ Multi-output `sem_map` 未来可以有两条 optimizer-selectable lowering：
 - native per-column：每个 output column 调一次 LOTUS native `df.sem_map`，可以更
   直接复用 LOTUS 原生 execution options，但成本变成 N 倍，字段之间也可能不一致。
 
-`sem_flat_map` 当前要求每个 input row 返回 top-level JSON array。未来可以改成
-`{"rows": [...]}` wrapper 来提高 JSON-mode 稳定性，例如：
+`sem_flat_map` 当前要求每个 input row 返回 `{"rows": [...]}` wrapper，以提高
+JSON-mode 稳定性，例如：
 
 ```json
 {
@@ -63,8 +63,9 @@ Multi-output `sem_map` 未来可以有两条 optimizer-selectable lowering：
 }
 ```
 
-这属于 lowering format / optimizer 设计，不改变 `sem_flat_map` 的 logical 语义：
-一行输入仍然产生 zero or more output rows。
+这属于 lowering format，不改变 `sem_flat_map` 的 logical 语义：一行输入仍然
+产生 zero or more output rows。可选 `ordinal_col` 由 executor 在解析成功后按每个
+input row 从 0 编号，不进入 prompt。
 
 ## 3. `sem_filter` TODO
 
@@ -398,3 +399,19 @@ explanation 更适合作为 adapter trace / audit log / stats object。如果 ex
 ```python
 # TODO: improve this later
 ```
+
+## 10. Deterministic Aggregate / Source Metadata TODO
+
+当前已实现单列/复合 `min` aggregate 和 row-wise `least` expression。复合
+`min(columns=[...])` 返回字典序最小 tuple；`least` 只比较同一 row 的 operands。
+二者都不会返回 ordering key 对应的另一份 payload。
+
+待办：
+
+- `min_by(value, order_by)` / `arg_min`：返回最小 ordering value 对应的整行或
+  payload。只有出现真实 policy 需求后再确定 public spelling。
+- delete / correction semantics：append-only `min` 可以只合并 old/new minima；
+  当前 minimum 被撤回时，需要 raw-group recompute 或 ordered auxiliary state。
+- concurrent / batch append ordering：当前 `_add_seq` 只定义单进程顺序 add。
+  并发、同 batch 多 rows、跨 restore writer coordination 需要单独 runtime
+  contract，不能让 policy writer修改 system columns。
