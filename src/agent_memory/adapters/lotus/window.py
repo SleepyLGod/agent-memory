@@ -7,9 +7,9 @@ from typing import Any
 
 import pandas as pd
 
-from agent_memory.logical import QueryExpr
-from agent_memory.query_schema import output_columns
-from agent_memory.window import WINDOW_SOURCE_INPUT, completed_count_windows
+from agent_memory.policy.logical import QueryExpr
+from agent_memory.policy.schema import output_columns
+from agent_memory.runtime.window import WINDOW_SOURCE_INPUT, completed_count_windows
 
 
 def execute_window_source(inputs: Mapping[str, Any]) -> Any:
@@ -73,4 +73,3 @@ def _source_columns(source: Any) -> tuple[str, ...]:
     """Return string column names for a dataframe-like source."""
 
     return tuple(str(column) for column in getattr(source, "columns", ()))
-

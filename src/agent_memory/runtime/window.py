@@ -1,4 +1,4 @@
-"""Deterministic count-window helpers used by runtime and adapters."""
+"""Deterministic window state and frame helpers used during execution."""
 
 from __future__ import annotations
 

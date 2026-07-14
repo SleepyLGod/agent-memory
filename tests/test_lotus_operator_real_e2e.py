@@ -22,8 +22,8 @@ from agent_memory.adapters import LotusAdapter
 from agent_memory.adapters.lotus.context import LotusExecutionConfig
 from agent_memory.adapters.lotus.sem_groupby import GROUP_ID_COLUMN
 from agent_memory.datasets.locomo import ensure_locomo_dataset, load_locomo_rows
-from agent_memory.logical import QueryExpr
-from agent_memory.relation import Relation
+from agent_memory.policy.logical import QueryExpr
+from agent_memory.policy.relation import Relation
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 LOCOMO_CACHE_PATH = PROJECT_ROOT / ".cache" / "agent-memory" / "locomo10.json"
@@ -325,7 +325,7 @@ def test_sem_topk_real_lotus_audit() -> None:
     _write_audit("sem_topk_plain_multicolumn_naive", {"source": source}, result)
 
     quick_adapter = LotusAdapter(
-        config=LotusExecutionConfig(sem_topk_method="quick")
+        config=LotusExecutionConfig(sem_topk_method="pairwise-quick")
     )
     quick_query = _view("source").sem_topk(
         "Which memories are most relevant to document preferences?",

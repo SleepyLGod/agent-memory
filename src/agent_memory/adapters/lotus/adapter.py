@@ -9,14 +9,24 @@ from uuid import uuid4
 
 from agent_memory.adapters.lotus.context import LotusExecutionConfig, LotusExecutionContext
 from agent_memory.adapters.lotus.relational import (
+    execute_agg,
+    execute_alias,
     execute_array_agg,
     execute_array_cat,
+    execute_assign,
     execute_concat,
     execute_drop_duplicates,
+    execute_explode,
+    execute_filter,
+    execute_flatten,
+    execute_group_by,
     execute_join,
+    execute_min,
     execute_select,
     execute_subtract,
+    execute_unnest,
     execute_union,
+    execute_union_by_name,
 )
 from agent_memory.adapters.lotus.sem_agg import execute_sem_agg
 from agent_memory.adapters.lotus.sem_filter import execute_sem_filter
@@ -36,7 +46,7 @@ from agent_memory.adapters.lotus.window import (
     execute_process_window,
     execute_window_source,
 )
-from agent_memory.logical import QueryExpr
+from agent_memory.policy.logical import QueryExpr
 
 DEFAULT_LOTUS_MODEL = "deepseek/deepseek-v4-pro"
 
@@ -66,14 +76,34 @@ class LotusAdapter:
                 return execute_window_source(inputs)
             case "select":
                 return self._execute_traced_relational(query, inputs, execute_select)
+            case "alias":
+                return self._execute_traced_relational(query, inputs, execute_alias)
+            case "assign":
+                return self._execute_traced_relational(query, inputs, execute_assign)
+            case "filter":
+                return self._execute_traced_relational(query, inputs, execute_filter)
+            case "group_by":
+                return self._execute_traced_relational(query, inputs, execute_group_by)
             case "array_agg":
                 return self._execute_traced_relational(query, inputs, execute_array_agg)
             case "array_cat":
                 return self._execute_traced_relational(query, inputs, execute_array_cat)
+            case "min":
+                return self._execute_traced_relational(query, inputs, execute_min)
+            case "flatten":
+                return self._execute_traced_relational(query, inputs, execute_flatten)
+            case "explode":
+                return self._execute_traced_relational(query, inputs, execute_explode)
+            case "unnest":
+                return self._execute_traced_relational(query, inputs, execute_unnest)
+            case "agg":
+                return self._execute_traced_semantic(query, inputs, execute_agg)
             case "concat":
                 return self._execute_traced_relational(query, inputs, execute_concat)
             case "union":
                 return self._execute_traced_relational(query, inputs, execute_union)
+            case "union_by_name":
+                return self._execute_traced_relational(query, inputs, execute_union_by_name)
             case "subtract":
                 return self._execute_traced_relational(query, inputs, execute_subtract)
             case "join":

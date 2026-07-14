@@ -12,6 +12,12 @@ from agent_memory.adapters.lotus.traced_lm import TracedLM
 
 DEFAULT_STRUCTURED_MAX_TOKENS = 8192
 DEFAULT_STRUCTURED_PARSE_RETRIES = 3
+SEM_TOPK_METHODS = (
+    "pairwise-naive",
+    "pairwise-quick",
+    "pairwise-heap",
+    "listwise",
+)
 
 
 @dataclass(frozen=True)
@@ -35,7 +41,7 @@ class LotusExecutionConfig:
     sem_filter_progress_bar_desc: str = "Filtering"
     sem_filter_additional_cot_instructions: str = ""
 
-    sem_topk_method: str = "naive"
+    sem_topk_method: str = "pairwise-naive"
     sem_topk_strategy: Any | None = None
     sem_topk_cascade_threshold: float | None = None
     sem_topk_return_stats: bool = False

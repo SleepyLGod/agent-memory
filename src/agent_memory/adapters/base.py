@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any, Protocol
 
-from agent_memory.logical import QueryExpr
+from agent_memory.policy.logical import QueryExpr
 
 
 class ExecutionAdapter(Protocol):

@@ -3,12 +3,19 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+import re
 from typing import Any
+
+import pandas as pd
 
 from agent_memory.adapters.lotus.context import LotusExecutionConfig, LotusExecutionContext
 from agent_memory.tracing.semantic import write_compact_operator_trace
 from agent_memory.adapters.lotus.structured import examples_dataframe, normalize_strategy
-from agent_memory.logical import QueryExpr
+from agent_memory.policy.logical import QueryExpr
+
+QUALIFIED_PLACEHOLDER_PATTERN = re.compile(
+    r"(?<!\{)\{([A-Za-z_][A-Za-z0-9_]*):([A-Za-z_][A-Za-z0-9_]*)\}(?!\})"
+)
 
 
 def execute_sem_filter(
@@ -21,19 +28,67 @@ def execute_sem_filter(
 
     context.configure()
     source = execute(query.inputs[0], inputs)
-    result = source.sem_filter(
-        query.params["instruction"],
+    lotus_source, instruction, restore_columns = bind_qualified_filter_columns(
+        source,
+        str(query.params["instruction"]),
+    )
+    result = lotus_source.sem_filter(
+        instruction,
         **native_sem_filter_kwargs(context.config),
     )
+    if restore_columns:
+        result = result.rename(columns=restore_columns)
     write_compact_operator_trace(
         context.config.trace_dir(),
         operator="sem_filter",
         event_type="operator_result",
         input_frame=source,
         output_frame=result,
-        payload={"instruction": str(query.params["instruction"])},
+        payload={
+            "instruction": str(query.params["instruction"]),
+            "lowered_instruction": instruction,
+        },
     )
     return result
+
+
+def bind_qualified_filter_columns(
+    source: pd.DataFrame,
+    instruction: str,
+) -> tuple[pd.DataFrame, str, dict[str, str]]:
+    """Bind alias-qualified columns to names accepted by LOTUS formatting."""
+
+    if not QUALIFIED_PLACEHOLDER_PATTERN.search(instruction):
+        return source, instruction, {}
+    if not isinstance(source, pd.DataFrame):
+        raise TypeError("qualified sem_filter placeholders require a DataFrame input")
+
+    used_names = {str(column) for column in source.columns}
+    bindings: dict[str, str] = {}
+
+    def replace(match: re.Match[str]) -> str:
+        base, qualifier = match.groups()
+        source_column = f"{base}:{qualifier}"
+        if source_column not in source.columns:
+            raise ValueError(
+                f"sem_filter qualified input column not found: {source_column!r}"
+            )
+        bound_column = bindings.get(source_column)
+        if bound_column is None:
+            candidate = f"{base}_{qualifier}"
+            suffix = 2
+            while candidate in used_names:
+                candidate = f"{base}_{qualifier}_{suffix}"
+                suffix += 1
+            bindings[source_column] = candidate
+            used_names.add(candidate)
+            bound_column = candidate
+        return f"{{{bound_column}}}"
+
+    lowered_instruction = QUALIFIED_PLACEHOLDER_PATTERN.sub(replace, instruction)
+    bound_source = source.rename(columns=bindings)
+    restore_columns = {bound: original for original, bound in bindings.items()}
+    return bound_source, lowered_instruction, restore_columns
 
 
 def native_sem_filter_kwargs(config: LotusExecutionConfig) -> dict[str, Any]:

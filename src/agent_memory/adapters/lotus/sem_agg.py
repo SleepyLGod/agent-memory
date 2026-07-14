@@ -16,12 +16,14 @@ from agent_memory.adapters.lotus.context import (
 from agent_memory.tracing.semantic import write_structured_generation_trace
 from agent_memory.adapters.lotus.sem_groupby import GROUP_ID_COLUMN
 from agent_memory.adapters.lotus.structured import (
+    escape_structured_formatter_placeholders,
     parse_structured_object_json,
+    structured_scalar_values,
     write_structured_failure_artifacts,
 )
-from agent_memory.logical import ColumnSpec, QueryExpr
-from agent_memory.query_schema import output_columns
-from agent_memory.window import over_frames
+from agent_memory.policy.logical import ColumnSpec, QueryExpr
+from agent_memory.policy.schema import output_columns
+from agent_memory.runtime.window import over_frames
 
 JSON_OBJECT_RESPONSE_FORMAT = {"type": "json_object"}
 
@@ -128,14 +130,16 @@ def execute_native_sem_agg(
     """Execute single-output aggregation through LOTUS sem_agg."""
 
     if source.empty:
-        return pd.DataFrame(columns=[output_col.name])
+        return pd.DataFrame(columns=list(output_columns(query)))
 
     config = config or LotusExecutionConfig()
-    groups = aggregate_groups(source)
-    outputs: list[str] = []
-    for group_index, group in enumerate(groups):
+    rows: list[dict[str, Any]] = []
+    for group_index, (key_values, group) in enumerate(aggregate_groups_with_keys(source)):
         raw_output = execute_native_sem_agg_group(query, group, input_cols, config)
-        outputs.append(raw_output)
+        row = dict(key_values)
+        if output_col.name not in row:
+            row[output_col.name] = raw_output
+        rows.append(row)
         write_sem_agg_audit(
             config,
             query=query,
@@ -146,7 +150,7 @@ def execute_native_sem_agg(
             raw_output=raw_output,
             parsed_output={output_col.name: raw_output},
         )
-    return pd.DataFrame({output_col.name: outputs})
+    return pd.DataFrame(rows, columns=list(output_columns(query)))
 
 
 def execute_native_sem_agg_group(
@@ -189,11 +193,12 @@ def execute_structured_sem_agg(
     """Execute multi-output aggregation with LOTUS-style structured final output."""
 
     if source.empty:
-        return pd.DataFrame(columns=[column.name for column in output_cols])
+        return pd.DataFrame(columns=list(output_columns(query)))
 
     config = config or LotusExecutionConfig()
-    parsed_outputs = [
-        execute_structured_sem_agg_group(
+    rows: list[dict[str, Any]] = []
+    for group_index, (key_values, group) in enumerate(aggregate_groups_with_keys(source)):
+        parsed = execute_structured_sem_agg_group(
             query,
             group,
             input_cols,
@@ -201,9 +206,12 @@ def execute_structured_sem_agg(
             config,
             group_index=group_index,
         )
-        for group_index, group in enumerate(aggregate_groups(source))
-    ]
-    return apply_structured_aggregate_outputs(parsed_outputs, output_cols)
+        row = dict(key_values)
+        for column in output_cols:
+            if column.name not in row:
+                row[column.name] = parsed[column.name]
+        rows.append(row)
+    return pd.DataFrame(rows, columns=list(output_columns(query)))
 
 
 def execute_structured_sem_agg_group(
@@ -214,7 +222,7 @@ def execute_structured_sem_agg_group(
     config: LotusExecutionConfig,
     *,
     group_index: int = 0,
-) -> Mapping[str, str]:
+) -> Mapping[str, Any]:
     """Aggregate one group into declared structured fields."""
 
     instruction = structured_aggregate_instruction(query, input_cols, output_cols)
@@ -321,8 +329,13 @@ def aggregate_instruction(query: QueryExpr, input_cols: Sequence[str]) -> str:
 
     import lotus
 
-    return lotus.nl_expression.nle2str(
+    formatter_instruction = escape_structured_formatter_placeholders(
         str(query.params["instruction"]),
+        input_cols=input_cols,
+        output_cols=aggregate_output_columns(query, input_cols),
+    )
+    return lotus.nl_expression.nle2str(
+        formatter_instruction,
         list(input_cols),
     )
 
@@ -567,14 +580,18 @@ def format_aggregate_doc(tree_level: int, doc: str, counter: int) -> str:
 def parse_structured_sem_agg_output(
     raw_output: Any,
     output_cols: Sequence[ColumnSpec],
-) -> dict[str, str]:
+) -> dict[str, Any]:
     """Parse and validate one structured LOTUS sem_agg output."""
 
     if isinstance(raw_output, Mapping):
         missing = [column.name for column in output_cols if column.name not in raw_output]
         if missing:
             raise ValueError(f"sem_agg JSON output is missing required keys: {missing}")
-        return {column.name: str(raw_output[column.name]) for column in output_cols}
+        return structured_scalar_values(
+            raw_output,
+            output_cols,
+            operator="sem_agg",
+        )
 
     parsed, _explanation = parse_structured_object_json(
         str(raw_output),
@@ -593,10 +610,8 @@ def aggregate_input_columns(
     if input_cols is not None:
         columns = tuple(str(column) for column in input_cols)
     else:
-        groupby_input_cols = tuple(source.attrs.get("agent_memory_groupby_input_cols", ()))
-        excluded = set(groupby_input_cols).union({GROUP_ID_COLUMN})
         columns = tuple(
-            str(column) for column in source.columns if column not in excluded
+            str(column) for column in source.columns if column != GROUP_ID_COLUMN
         )
 
     if not columns:
@@ -622,12 +637,63 @@ def aggregate_output_columns(
 def aggregate_groups(source: pd.DataFrame) -> list[pd.DataFrame]:
     """Return one dataframe per aggregate group without internal group ids."""
 
+    return [group for _key_values, group in aggregate_groups_with_keys(source)]
+
+
+def aggregate_groups_with_keys(
+    source: pd.DataFrame,
+) -> list[tuple[dict[str, Any], pd.DataFrame]]:
+    """Return grouped frames plus deterministic key values to preserve."""
+
+    deterministic_keys = tuple(
+        str(key) for key in source.attrs.get("agent_memory_groupby_keys", ())
+    )
+    partition_keys = tuple(
+        str(key) for key in source.attrs.get("agent_memory_sem_groupby_partition_by", ())
+    )
+    if deterministic_keys:
+        return _aggregate_groups_by_keys(
+            source,
+            group_keys=deterministic_keys,
+            output_keys=deterministic_keys,
+            drop_columns=(),
+        )
     if GROUP_ID_COLUMN not in source.columns:
-        return [source.reset_index(drop=True).copy()]
-    return [
-        group.drop(columns=[GROUP_ID_COLUMN]).reset_index(drop=True)
-        for _group_id, group in source.groupby(GROUP_ID_COLUMN, sort=True)
-    ]
+        return [({}, source.reset_index(drop=True).copy())]
+    return _aggregate_groups_by_keys(
+        source,
+        group_keys=(*partition_keys, GROUP_ID_COLUMN),
+        output_keys=partition_keys,
+        drop_columns=(GROUP_ID_COLUMN,),
+    )
+
+
+def _aggregate_groups_by_keys(
+    source: pd.DataFrame,
+    *,
+    group_keys: Sequence[str],
+    output_keys: Sequence[str],
+    drop_columns: Sequence[str],
+) -> list[tuple[dict[str, Any], pd.DataFrame]]:
+    """Group frames and carry selected key values into aggregate output rows."""
+
+    missing = [column for column in group_keys if column not in source.columns]
+    if missing:
+        raise ValueError(f"aggregate group key columns not found in DataFrame: {missing}")
+    if source.empty:
+        return []
+    groups: list[tuple[dict[str, Any], pd.DataFrame]] = []
+    for key, group in source.groupby(list(group_keys), sort=True, dropna=False):
+        key_values = key if isinstance(key, tuple) else (key,)
+        by_key = dict(zip(group_keys, key_values, strict=True))
+        output_key_values = {key_name: by_key[key_name] for key_name in output_keys}
+        groups.append(
+            (
+                output_key_values,
+                group.drop(columns=list(drop_columns), errors="ignore").reset_index(drop=True),
+            )
+        )
+    return groups
 
 
 def grouped_frames(source: pd.DataFrame) -> list[pd.DataFrame]:
@@ -648,7 +714,7 @@ def aggregate_group_text(
 
 
 def apply_structured_aggregate_outputs(
-    parsed_outputs: Sequence[Mapping[str, str]],
+    parsed_outputs: Sequence[Mapping[str, Any]],
     output_cols: Sequence[ColumnSpec],
 ) -> pd.DataFrame:
     """Convert structured aggregate outputs into a DataFrame."""

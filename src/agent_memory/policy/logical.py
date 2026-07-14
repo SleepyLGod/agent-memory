@@ -1,4 +1,4 @@
-"""Logical query objects for the agent-memory v0.0 interface."""
+"""Logical query objects for declarative memory policies."""
 
 from __future__ import annotations
 
