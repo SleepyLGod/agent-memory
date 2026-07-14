@@ -4,6 +4,13 @@ Status: the current golden line is `docs/optimization/incremental-semantic-view-
 
 ## V0.0 -> V0.1 Interface Contracts
 
+- Shared finite dependency maintenance is represented by `DifferentiatedPolicy`
+  and executed by `PolicyExecutor`; see
+  `policy-differentiation-dataflow-runtime.zh.md`.
+  Remaining scheduler work is recursive/fixpoint support, physical optimization,
+  source deletion, and advanced concurrent/window scheduling, not basic DAG
+  change propagation.
+
 - `Memory.spec()` currently collects only the concrete class body via `vars(cls)`.
   Extending a built-in memory by subclassing is intentionally unsupported for
   now. Example:
@@ -24,10 +31,10 @@ Status: the current golden line is `docs/optimization/incremental-semantic-view-
   decide how query plans are optimized and executed, and whether they need an
   inspectable class-level declaration separate from the Python method body.
 
-- `filter(...)` and `assign(...)` currently accept arbitrary Python values in the
-  current v0.0 interface. Before planner execution, they should be restricted to
-  serializable deterministic column expressions rather than arbitrary callables
-  or closures.
+- `filter(...)`, `assign(...)`, and predicate `join(...)` now use a minimal
+  serializable relation-bound expression subset via `relation.col(...)`.
+  Future work should add only proven deterministic expression needs, not
+  arbitrary Python callables, SQL strings, or tuple predicates.
 
 - Output schema / column inference is a planner prerequisite. Some operators
   expose output columns directly, while others preserve or combine input columns.

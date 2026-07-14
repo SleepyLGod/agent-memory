@@ -16,6 +16,10 @@ topic view 如何对齐 markdown memory 文件。
 - 语义不精确对应的，不硬套、不 monkeypatch、不偷偷改 prompt 后假装等价。
 - Policy author 只写 logical operator API；LOTUS、backend method、cascade、
   examples、safe mode、trace / stats 等执行配置属于 runtime / adapter 层。
+- Whole-policy maintenance 已由 `PolicyDifferentiator` 生成的共享
+  `DifferentiatedPolicy` 执行。Rules 决定 `Q'` 的语义，runtime 只负责
+  topology、change/state、共享 node 和原子提交；详细边界见
+  `policy-differentiation-dataflow-runtime.zh.md`。
 
 ## 1. Implementation Roadmap
 
@@ -26,7 +30,7 @@ storage。推荐里程碑如下：
    operators 都能从 `QueryExpr` 执行到 dataframe result。没有完整 execution
    layer，differential rules 和 Claude policy 都没有可靠执行目标。
 2. **Implement `Q -> Q'` differential rules**：在 full-query operator
-   execution 完整后，再扩展 `DifferentialQueryPlanner`。Rules 只负责 query
+   execution 完整后，再扩展 `QueryDifferentiator`。Rules 只负责 query
    rewrite，不负责 backend lowering。
 3. **Claude policy full-query and differential comparison**：用同一批 log
    rows 比较 `Q(D ∪ ΔD)` 和 differential maintenance 的结果，验证 Claude
@@ -77,9 +81,9 @@ Operator 实现要分清两类：
 native LOTUS options 进入 adapter/runtime config，custom lowering 补 pruning、
 tree fold、audit trace 和大数据量稳定性。
 
-`filter(predicate: Any)` / `assign(**Any)` 暂不属于完整 execution 范围；它们
-需要先收窄成 serializable column expression，不能直接执行 arbitrary Python
-callables。
+`filter(...)` / `assign(...)` 已收窄成最小 serializable relation-bound
+expression subset，通过 `relation.col(...)` 构造 deterministic column
+expressions；不支持 arbitrary Python callables、SQL strings 或 tuple predicates。
 
 `LotusAdapter` 应保持 thin dispatch。具体 lowering 拆进
 `adapters/lotus/` package，每个 semantic op 一个模块。Schema shaping 只有在它属于
@@ -96,9 +100,9 @@ safe mode、stats、trace 等不进入 policy class，也不进入 query tree。
 Differential rules、Claude policy validation 和 storage 要保持顺序和分层：
 
 - Storage 负责持久化 materialized views，不定义 logical query。
-- `DifferentialQueryPlanner` 负责 `Q -> Q'`，不关心 markdown 文件怎么写。
+- `QueryDifferentiator` 负责 `Q -> Q'`，不关心 markdown 文件怎么写。
 - `ExecutionAdapter` 负责执行 `QueryExpr`，不负责 durable persistence。
-- `DifferentialQueryPlanner` 必须在 operator execution 完整后再扩展，否则
+- `QueryDifferentiator` 必须在 operator execution 完整后再扩展，否则
   rewrite 出来的 `Q'` 没有完整 execution target。
 - Claude policy validation 必须在 operator execution 和 rules 之后；它是
   full-query 与 differential result 的对照实验，不是 operator layer 的替代。
@@ -140,7 +144,7 @@ Execution adapter
 本文只讨论最后一层：`Execution adapter` 如何把 `QueryExpr` lower 到
 LOTUS-backed execution。
 
-`DifferentialQueryPlanner` 负责把 view definition query `Q` 变成
+`QueryDifferentiator` 负责把 view definition query `Q` 变成
 differentiated maintenance query `Q'`。它不应该知道 LOTUS 的 pandas accessor
 细节。`LotusAdapter` 负责执行已经生成好的 `QueryExpr`，它不应该修改
 operator 的逻辑语义。
@@ -210,7 +214,7 @@ src/agent_memory/adapters/lotus/
 | `sem_groupby` | 无精确等价 | implemented | semantic group assignment / partition lowering |
 | `sem_agg` 单输出 | LOTUS 部分支持 | implemented | LOTUS lower-level `sem_agg(...)` where semantics match |
 | `sem_agg` 多输出 | 无精确等价 | implemented | agent-memory structured aggregate lowering |
-| `filter(predicate: Any)` / `assign(**Any)` | arbitrary Python today | future | first define serializable expression contract |
+| `filter(...)` / `assign(...)` / predicate `join(...)` | pandas 本地实现 | implemented | minimal relation-bound expression subset via `relation.col(...)` |
 
 ## 8. `sem_map`
 
