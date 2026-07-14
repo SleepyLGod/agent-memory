@@ -19,7 +19,8 @@ runtime plans for cost, latency, and freshness.
 - `Differential query`: the derived maintenance query `Q'` that updates the view
   from new data without recomputing the full history.
 - `Ordinary operator`: deterministic dataframe or relational operation such as
-  `select`, `filter`, `assign`, `concat`, `union`, or `subtract`.
+  `select`, `filter`, `assign`, `join`, `concat`, `union`, `union_by_name`,
+  `explode`, `unnest`, or `subtract`.
 - `Semantic operator`: instruction-driven operation backed by LLMs, embeddings,
   rerankers, DSPy programs, or other semantic execution plans.
 
@@ -73,6 +74,32 @@ Ordinary operators should follow existing DataFrame naming wherever possible.
 They are deterministic and cheap relative to semantic operators, so the runtime
 can push, fuse, or reorder them when it is safe.
 
+### `Log` source metadata
+
+`Log(..., system_columns=True)` adds three framework-owned source columns:
+
+- `_row_id`: UUID string for the appended source row.
+- `_added_at`: UTC time when runtime appended the row.
+- `_add_seq`: zero-based append position in this log.
+
+The default is `system_columns=False`, so existing policies keep their current
+schema. These names are reserved: policy schemas and `Memory.add(...)` callers
+cannot provide them. Derived relations preserve source metadata like ordinary
+columns; they do not receive new row IDs or append times.
+
+```python
+log = am.Log({"content": "Episode content."}, system_columns=True)
+episodes = log.assign(
+    episode_id=log.col("_row_id"),
+    created_at=log.col("_added_at"),
+    add_seq=log.col("_add_seq"),
+)
+```
+
+`_add_seq` is ingestion order, not event time. Policies must keep a separate
+field such as `reference_time` or `valid_at` when real-world temporal order
+matters.
+
 ### `select`
 
 Projection over columns.
@@ -82,31 +109,42 @@ df.select(["topic_name", "topic_content"])
 df[["topic_name", "topic_content"]]
 ```
 
-`select` and bracket selection are equivalent authoring forms. The term
-`projection` may appear in theory docs, but `select` is the public dataframe
-spelling.
+`select` and bracket selection are equivalent authoring forms. The operation is
+relational projection, but `select` is the public dataframe/table spelling used
+by systems such as Spark, Polars, and Flink. SQL also uses `SELECT` for output
+columns/expressions; row filtering is `WHERE` / `filter`.
 
 ### `filter`
 
 Deterministic row filter.
 
 ```python
-changed = rows.filter(lambda row: row["action"] != "keep")
+changed = rows.filter(rows.col("action") != "keep")
+expired = rows.filter(rows.col("invalid_at").is_not_null())
 ```
 
-This is not `sem_filter`. The predicate is ordinary code or a deterministic
-expression over existing columns.
+This is not `sem_filter`. The predicate is a small serializable relational
+expression built from `relation.col(...)`; arbitrary Python callables, tuple
+predicates, and SQL strings are not part of the public contract.
 
 ### `assign`
 
 Deterministic column creation or replacement.
 
 ```python
-rows = rows.assign(action=lambda row: classify_action(row))
+rows = rows.assign(
+    invalid_at=rows.col("valid_at:new"),
+    status="inactive",
+)
 ```
 
 Use `assign` for cheap, deterministic fields. Use `sem_map` when the new fields
-require semantic interpretation.
+require semantic interpretation. Assignment values are scalar literals, column
+expressions, row-wise `array_cat`, or `am.least(...)` expressions.
+
+`am.least(a, b, ...)` is a scalar expression, not an aggregate. It compares two
+or more values in the same row, ignores null operands, and returns null only
+when every operand is null.
 
 ### `concat`
 
@@ -145,6 +183,19 @@ result = left.concat(right).drop_duplicates()
 `union` is exact relational union. It is not `sem_union`; semantic union/upsert
 is backend theory terminology, not a v0 public dataframe operator.
 
+### `union_by_name`
+
+Append rows by column name, optionally filling missing columns with nulls before
+exact deduplication.
+
+```python
+result = left.union_by_name(right, allow_missing_columns=True)
+```
+
+`union_by_name` is useful when two branches have the same logical schema but
+different column order, or when one branch lacks optional columns. It is still a
+deterministic dataframe operation, not a semantic merge.
+
 ### `subtract`
 
 Relational set difference / `EXCEPT`.
@@ -156,19 +207,43 @@ remaining = rows.subtract(rows_to_remove)
 `subtract` removes rows using exact equality or an implementation-defined exact
 key. It is not a semantic delete.
 
-### `join`
+### `alias`, `col`, and `join`
 
-Deterministic relational join on same-named key columns.
+Deterministic relational join. Same-named key joins keep the existing compact
+form:
 
 ```python
 joined = selected.join(topics, on="name", how="inner")
 ```
 
-`join(on=...)` is pandas-backed exact lookup / merge. It does not call an LLM.
-Overlapping non-key columns use the `:left` / `:right` suffix convention. This
-operator is not interchangeable with `sem_join(...)`: `sem_join` asks an LLM
-whether two rows semantically match, while `join(on=...)` requires exact key
-identity.
+Self-join or temporal candidate construction uses relation aliases and
+relation-bound column expressions:
+
+```python
+old = facts.alias("old")
+new = facts.alias("new")
+
+pairs = old.join(
+    new,
+    on=[
+        old.col("fact_id") != new.col("fact_id"),
+        old.col("source_entity_id") == new.col("source_entity_id"),
+        old.col("target_entity_id") == new.col("target_entity_id"),
+        old.col("valid_at") <= new.col("valid_at"),
+    ],
+)
+```
+
+`join(on=...)` is pandas-backed exact lookup / merge or deterministic predicate
+join. It does not call an LLM. Key joins use the `:left` / `:right` suffix
+convention for overlapping non-key columns. Alias predicate joins emit columns
+such as `fact_id:old` and `fact_id:new`. This operator is not interchangeable
+with `sem_join(...)`: `sem_join` asks an LLM whether two rows semantically
+match, while `join(...)` applies deterministic relational predicates.
+
+The expression subset is intentionally small: column references, scalar
+literals, comparisons, boolean `&` / `|` / `~`, `.isin(...)`, `.is_null()`,
+`.is_not_null()`, row-wise `array_cat`, and `am.least(...)`.
 
 ## 3. Aggregate And Window Operators
 
@@ -198,9 +273,77 @@ Contract:
 - output receiver: ordinary `Relation`
 - output columns: one JSON text array-of-records column named by `output_col`
 - value format: stable JSON text array of records
+- missing scalar values: encoded as JSON `null`; non-standard `NaN` is never
+  emitted
 
 `array_agg(columns=...)` preserves row alignment inside each record. It does not
 create one independent array per column.
+
+Grouped receivers also support `array_agg(...)`:
+
+```python
+episode_entities = resolved_mentions.group_by("episode_id").array_agg(
+    columns=("entity_id", "name", "summary"),
+    output_col="entities",
+)
+```
+
+Exact `group_by(...).array_agg(...)` emits group key columns plus the JSON array
+column. Direct `sem_groupby(...).array_agg(...)` is not supported because
+`array_agg` cannot generate semantic key columns. Use mixed
+`sem_groupby(...).agg(sem_agg(...), array_agg(...))` when semantic grouping
+also needs array evidence.
+
+### `collect_list`
+
+Grouped deterministic aggregate that collects one existing column into a JSON
+array of values.
+
+```python
+states = rows.group_by("topic").agg(
+    am.collect_list(column="evidence", output_col="evidence"),
+)
+```
+
+`collect_list` is mainly an implementation-facing aggregate for remerging
+already aggregated array state. Policy authors usually want `array_agg(...)`,
+which stores records, not one scalar value list.
+
+### `min`
+
+Deterministic aggregate that returns either the minimum non-null value or the
+lexicographically minimum complete tuple:
+
+```python
+earliest = rows.min(column="valid_at", output_col="valid_at")
+earliest_by_fact = rows.group_by("fact_id").min(
+    column="invalid_at",
+    output_col="invalid_at",
+)
+entity_identity = rows.group_by("entity_name").min(
+    columns=["add_seq", "entity_ordinal"],
+    output_col="entity_id",
+)
+```
+
+`column=...` and `columns=[...]` are mutually exclusive. The composite form
+compares tuples in declared column order. A row with a null tuple component is
+not eligible; if no complete row remains, the result is null.
+
+`am.min(...)` is the aggregate-spec form for grouped mixed `.agg(...)`. Global
+empty input and an all-null group produce null; grouped empty input produces
+zero groups. Direct
+`sem_groupby(...).min(...)` is unsupported, but `am.min(...)` may appear in a
+mixed semantic `.agg(...)` that also contains the required `sem_agg(...)`.
+
+`min` compares values across rows. `am.least(...)` compares values within one
+row; they are different operators.
+
+Using `(add_seq, ordinal)` as a grouped minimum gives an append-only logical
+occurrence identity. It is stable while earlier occurrences remain in the same
+group, but it is not a permanent UUID: full recomputation may change extraction
+order, and future group merge/split support needs downstream remapping. A
+storage backend may map this logical tuple to a physical UUID later.
 
 ### `array_cat`
 
@@ -220,6 +363,90 @@ Contract:
 
 `array_cat` is not a semantic merge. It concatenates JSON arrays. It currently
 has no generic differential rule beyond the `array_agg` view-boundary rule.
+
+Row-wise array concatenation is available inside `assign(...)`:
+
+```python
+merged = joined.assign(
+    evidence=joined.col("evidence:right").array_cat(joined.col("evidence:left"))
+)
+```
+
+This form concatenates JSON arrays within each joined row. It is used by grouped
+aggregate join-map lowering.
+
+### `flatten`
+
+Flatten one JSON array-of-arrays value into one JSON array value, without
+changing row count.
+
+```python
+flat = rows.flatten(column="evidence")
+```
+
+Example value:
+
+```text
+["[{\"x\": 1}]", "[{\"x\": 2}]"] -> [{"x": 1}, {"x": 2}]
+```
+
+`flatten` is for aggregate-state remerge. It does not emit more rows. It may
+replace its input column in place or write a new column, but it never silently
+overwrites another existing column.
+
+### `explode`
+
+Expand one JSON array column into one row per element.
+
+```python
+exploded = entities.explode(column="mentions", output_col="_mention")
+```
+
+Contract:
+
+- input receiver: ordinary `Relation`
+- input value: JSON array or native list
+- cardinality: one input row to zero or more output rows
+- null or empty arrays: emit zero rows
+- with `output_col=None`: replace the source column with each element
+- with `output_col="..."`: keep the source array column and append the element
+  column
+
+`explode` is deterministic and row-local. It is the dataframe-style collection
+expansion operator; it does not unpack object fields.
+
+### `unnest`
+
+Expand one JSON object / struct column into ordinary columns, without changing
+row count.
+
+```python
+episode_entities = (
+    entities
+    .select(["entity_id", "name", "summary", "mentions"])
+    .explode(column="mentions", output_col="_mention")
+    .unnest(
+        column="_mention",
+        fields={
+            "episode_id": "episode_id",
+            "entity_ordinal": "entity_ordinal",
+            "name": "mention_name",
+        },
+    )
+)
+```
+
+`unnest` is deterministic and row-local. It removes the object column and
+appends the declared fields. Missing fields, non-object values, and output
+column conflicts are errors. Every destination column in `fields` must also be
+unique; hand-written or restored logical IR is validated by both schema
+inference and execution.
+
+`flatten`, `explode`, and `unnest` are intentionally separate:
+
+- `flatten`: array-of-arrays stays in one row.
+- `explode`: array elements become rows.
+- `unnest`: object fields become columns.
 
 ### `count_window`
 
@@ -416,10 +643,11 @@ LOTUS lowering uses native `df.sem_map(...)` when there is one output column.
 For multiple output columns, agent-memory uses structured sem_map lowering:
 the original instruction is preserved, the requested `output_cols` become an
 explicit JSON output contract, and the backend validates that all requested
-keys are present. Backend execution knobs such as examples, system prompts,
-reasoning strategies, raw outputs, and explanations are adapter/runtime
-configuration, not policy API fields. If an explanation is part of the logical
-memory view, declare it explicitly in `output_cols`.
+keys are present. Decoded fields retain JSON scalar types; nested arrays or
+objects are rejected rather than stringified. Backend execution knobs such as
+examples, system prompts, reasoning strategies, raw outputs, and explanations
+are adapter/runtime configuration, not policy API fields. If an explanation is
+part of the logical memory view, declare it explicitly in `output_cols`.
 
 Example:
 
@@ -447,6 +675,7 @@ df.sem_flat_map(
     input_cols=None,
     output_cols=[...] | {"col": "description"},
     instruction="...",
+    ordinal_col=None,
 )
 ```
 
@@ -454,8 +683,17 @@ df.sem_flat_map(
 columns. Use `select` afterward when only the extracted columns should remain.
 Like `sem_map`, its instruction should describe the extraction/transformation;
 for example, `"Extract zero or more durable memory topic candidates from {message}"`.
-LOTUS lowering expects one JSON array of objects per input row. Each object must
-include all declared `output_cols`; an empty array emits zero rows.
+LOTUS lowering expects a JSON object containing a `rows` array for each input
+row. Each emitted object must include all declared `output_cols`; an empty array
+emits zero rows.
+
+When `ordinal_col` is set, execution adds `0, 1, 2, ...` to accepted emitted
+rows, restarting at zero for every source row. The ordinal is deterministic
+runtime metadata analogous to SQL `WITH ORDINALITY` or Spark `posexplode`; it
+is not requested from the LLM and must not conflict with source/output columns.
+Structured fields preserve JSON scalar values (`string`, `number`, `boolean`,
+or `null`). Nested array/object field values are invalid and use the existing
+bounded parse-retry path.
 
 Example:
 
@@ -469,8 +707,9 @@ topic_candidates = (
             "topic_content": "Candidate durable memory content.",
         },
         instruction="Extract zero or more durable memory topic candidates from {message}.",
+        ordinal_col="topic_ordinal",
     )
-    .select(["topic_name", "topic_content"])
+    .select(["topic_ordinal", "topic_name", "topic_content"])
 )
 ```
 
@@ -539,38 +778,71 @@ papers = rows.sem_groupby(
 
 Multi-label and hierarchical labels are not part of the current contract.
 
-Future APIs may add ordinary deterministic grouped aggregates and mixed
-aggregate maps. They are not v0 primary syntax:
+`partition_by` optionally adds deterministic partition keys to semantic
+grouping. The semantic grouping rule is applied only within each partition, and
+partition keys are preserved in the aggregate output.
 
 ```python
-agg=count()
-agg=sum("score")
-agg=max("timestamp")
-agg=list_collect("evidence")
-agg=am.agg.sem_agg(input_cols=["content"], output_cols=["summary"], instruction="Summarize.")
-```
-
-A future mapping form could look like:
-
-```python
-topics = topic_candidates.sem_groupby(
-    input_cols=["topic_name"],
-    instruction="Rows whose {topic_name} values refer to the same durable memory topic belong in one group.",
-    agg={
-        "topic_name": sem_agg(
-            input_cols=["topic_name"],
-            output_cols=["topic_name"],
-            instruction="Choose one canonical topic name.",
-        ),
-        "topic_content": sem_agg(
-            input_cols=["topic_content"],
-            output_cols=["topic_content"],
-            instruction="Merge topic content.",
-        ),
-        "last_seen": max("timestamp"),
-    },
+entities = extracted_entities.sem_groupby(
+    input_cols=["name", "entity_type"],
+    partition_by="group_id",
+    instruction="Rows refer to the same real-world entity.",
 )
 ```
+
+### `group_by(...).agg(...)` and `sem_groupby(...).agg(...)`
+
+Grouped `agg(...)` accepts explicit aggregate specs:
+
+```python
+entities = extracted_entities.sem_groupby(
+    input_cols=["name", "entity_type"],
+    instruction="Rows refer to the same real-world entity.",
+).agg(
+    am.sem_agg(
+        input_cols=["name", "entity_type", "episode_content"],
+        output_cols={
+            "name": "Canonical entity name.",
+            "entity_type": "Canonical entity type.",
+            "summary": "Concise entity summary.",
+        },
+        instruction="Create one canonical entity row.",
+    ),
+    am.array_agg(
+        columns=["episode_id", "entity_ordinal", "name", "entity_type"],
+        output_col="mentions",
+    ),
+    am.min(
+        columns=["add_seq", "entity_ordinal"],
+        output_col="entity_id",
+    ),
+)
+```
+
+Supported aggregate specs:
+
+- `am.sem_agg(...)`: semantic aggregate function.
+- `am.array_agg(columns=..., output_col=...)`: collect grouped rows into one
+  JSON array-of-records column.
+- `am.collect_list(column=..., output_col=...)`: collect one grouped column into
+  a JSON array of values.
+- `am.min(column=..., output_col=...)`: deterministic minimum over one grouped
+  column.
+- `am.min(columns=[...], output_col=...)`: deterministic lexicographic minimum
+  over complete grouped tuples.
+
+For deterministic `group_by(K).agg(...)`, output columns are `K + outputs(A*)`.
+If aggregate output names overlap deterministic keys, the deterministic key
+column wins.
+
+For semantic `sem_groupby(..., partition_by=P).agg(...)`, output columns are
+`P + outputs(A*)`. At least one `sem_agg(...)` spec is required, and the
+semantic key columns named in `input_cols` must be produced by one or more
+`sem_agg.output_cols`. `array_agg` cannot by itself produce canonical semantic
+keys.
+
+Direct `sem_groupby(...).array_agg(...)` is intentionally unsupported. Write
+mixed `.agg(sem_agg(...), array_agg(...))` instead.
 
 ### `sem_agg`
 
@@ -587,8 +859,9 @@ sem_agg(
 Defaults:
 
 - In standalone aggregation, `input_cols=None` means all visible columns.
-- In `GroupedRelation.sem_agg(...)`, `input_cols=None` means all non-grouping
-  visible columns from the grouped relation.
+- In `GroupedRelation.sem_agg(...)`, `input_cols=None` means all visible columns
+  except the internal semantic group-id column. Deterministic keys and semantic
+  key columns remain visible aggregate state.
 - `output_cols=None` means output columns use the same names as `input_cols`.
 
 `input_cols` and `output_cols` are read/write sets, not positional rename lists.
@@ -740,8 +1013,19 @@ V_prime = V.union(delta_D.sem_filter(instruction=instruction))
 V = D.sem_map(output_cols=[...], instruction="...")
 V_prime = V.union(delta_D.sem_map(output_cols=[...], instruction="..."))
 
-V = D.sem_flat_map(output_cols=[...], instruction="...")
-V_prime = V.union(delta_D.sem_flat_map(output_cols=[...], instruction="..."))
+V = D.sem_flat_map(output_cols=[...], instruction="...", ordinal_col="ordinal")
+V_prime = V.union(delta_D.sem_flat_map(output_cols=[...], instruction="...", ordinal_col="ordinal"))
+
+V = D.explode(column="records", output_col="_record").unnest(
+    column="_record",
+    fields={"id": "record_id"},
+)
+V_prime = V.union(
+    delta_D.explode(column="records", output_col="_record").unnest(
+        column="_record",
+        fields={"id": "record_id"},
+    )
+)
 ```
 
 Because `sem_map` and `sem_flat_map` preserve existing columns and add output
