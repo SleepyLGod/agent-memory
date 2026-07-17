@@ -9,6 +9,7 @@ from agent_memory.planner.rules import (
     DifferentialInstructionRewriter,
     DifferentialRules,
 )
+from agent_memory.query_schema import output_columns
 
 
 class DifferentialQueryPlanner:
@@ -34,27 +35,94 @@ class DifferentialQueryPlanner:
     ) -> QueryExpr:
         """Generate differentiated query Q' for one memory view."""
 
-        source_input = QueryExpr(op="log")
+        return self.differentiate_query(
+            view_name=view.name,
+            query=view.query,
+            views=views,
+        )
+
+    def differentiate_query(
+        self,
+        *,
+        view_name: str,
+        query: QueryExpr,
+        views: Mapping[str, MemoryView] | None = None,
+        source_query: QueryExpr | None = None,
+        source_input: QueryExpr | None = None,
+    ) -> QueryExpr:
+        """Generate Q' for one query with an optional explicit source."""
+
+        source_input = source_input or QueryExpr(op="log")
         current_view = QueryExpr(
             op="materialized_view",
             params={
-                "name": view.name,
-                "columns": self._output_columns(view.query),
+                "name": view_name,
+                "columns": self._output_columns(query),
             },
         )
         query = self._bind_materialized_dependencies(
-            view.query,
-            current_view_name=view.name,
+            query,
+            current_view_name=view_name,
             views=views or {},
         )
-        if query != view.query and not self._contains_op(query, "log"):
+        if source_query is not None:
+            source_query = self._bind_materialized_dependencies(
+                source_query,
+                current_view_name=view_name,
+                views=views or {},
+            )
+        contains_source = (
+            self._contains_query(query, source_query)
+            if source_query is not None
+            else self._contains_op(query, "log")
+        )
+        if not contains_source:
             return query
 
         return self._rules.differentiate(
             query,
             source_input=source_input,
             current_view=current_view,
+            source_query=source_query,
             is_view_boundary=True,
+            instruction_rewriter=self._instruction_rewriter,
+        )
+
+    def differentiate_rows(
+        self,
+        *,
+        query: QueryExpr,
+        views: Mapping[str, MemoryView] | None = None,
+        source_query: QueryExpr | None = None,
+        source_input: QueryExpr | None = None,
+    ) -> QueryExpr:
+        """Generate changed-output rows for one query."""
+
+        source_input = source_input or QueryExpr(op="log")
+        current_view = QueryExpr(
+            op="materialized_view",
+            params={
+                "name": "__unused_current_view",
+                "columns": self._output_columns(query),
+            },
+        )
+        query = self._bind_materialized_dependencies(
+            query,
+            current_view_name="__unused_current_view",
+            views=views or {},
+        )
+        if source_query is not None:
+            source_query = self._bind_materialized_dependencies(
+                source_query,
+                current_view_name="__unused_current_view",
+                views=views or {},
+            )
+        return self._rules.differentiate(
+            query,
+            source_input=source_input,
+            current_view=current_view,
+            source_query=source_query,
+            is_view_boundary=False,
             instruction_rewriter=self._instruction_rewriter,
         )
 
@@ -69,7 +137,13 @@ class DifferentialQueryPlanner:
 
         for name, view in views.items():
             if name != current_view_name and query == view.query:
-                return QueryExpr(op="materialized_view", params={"name": name})
+                return QueryExpr(
+                    op="materialized_view",
+                    params={
+                        "name": name,
+                        "columns": self._output_columns(view.query),
+                    },
+                )
 
         if not query.inputs:
             return query
@@ -97,32 +171,13 @@ class DifferentialQueryPlanner:
     def _output_columns(self, query: QueryExpr) -> tuple[str, ...]:
         """Infer output columns for materialized-view placeholders."""
 
-        if query.op == "select":
-            return tuple(str(column) for column in query.params["columns"])
-        if query.op == "log":
-            return tuple(column.name for column in query.params.get("columns", ()))
-        if query.op == "sem_agg":
-            output_cols = query.params.get("output_cols")
-            if output_cols is not None:
-                return tuple(column.name for column in output_cols)
-            input_cols = query.params.get("input_cols")
-            if input_cols is not None:
-                return tuple(str(column) for column in input_cols)
-        if query.op in {"sem_map", "sem_flat_map"}:
-            columns = list(self._output_columns(query.inputs[0]))
-            for column in query.params.get("output_cols") or ():
-                if column.name not in columns:
-                    columns.append(column.name)
-            return tuple(columns)
-        if query.op in {"sem_filter", "sem_groupby", "sem_topk", "drop_duplicates"}:
-            return self._output_columns(query.inputs[0])
-        if query.op in {"union", "concat", "subtract", "sem_join"}:
-            columns: list[str] = []
-            for input_query in query.inputs:
-                for column in self._output_columns(input_query):
-                    if column not in columns:
-                        columns.append(column)
-            return tuple(columns)
-        raise NotImplementedError(
-            f"Cannot infer output columns for QueryExpr op {query.op!r}."
+        return output_columns(query)
+
+    def _contains_query(self, query: QueryExpr, target: QueryExpr | None) -> bool:
+        """Return whether a query tree contains one exact subtree."""
+
+        if target is None:
+            return False
+        return query == target or any(
+            self._contains_query(input_query, target) for input_query in query.inputs
         )

@@ -26,6 +26,7 @@ FLAT_MAP_ROWS_FIELD = "rows"
 STRUCTURED_RESERVED_MODEL_KWARGS = {"progress_bar_desc", "response_format"}
 RAW_OUTPUT_PREVIEW_CHARS = 240
 STRUCTURED_FAILURE_DIR = Path(".memory-test") / "structured-failures" / "latest"
+MARKDOWN_FENCE_RE = re.compile(r"^```(?:json)?\s*\n(.*?)\n```\s*$", re.DOTALL)
 PLACEHOLDER_PATTERN = re.compile(
     r"(?<!\{)\{([A-Za-z_][A-Za-z0-9_]*)(?::(left|right))?\}(?!\})"
 )
@@ -326,11 +327,17 @@ def parse_structured_array_json(
     return rows
 
 
+def _strip_markdown_fence(raw_output: str) -> str:
+    """Strip markdown code fences if present, returning bare JSON string."""
+    m = MARKDOWN_FENCE_RE.match(raw_output.strip())
+    return m.group(1) if m else raw_output
+
+
 def _load_structured_json(raw_output: str, *, operator: str, expected_shape: str) -> Any:
     """Parse JSON with concise operator diagnostics."""
 
     try:
-        return json.loads(raw_output)
+        return json.loads(_strip_markdown_fence(raw_output))
     except json.JSONDecodeError as error:
         raise ValueError(
             f"{operator} returned invalid JSON; expected {expected_shape}; "
@@ -484,9 +491,11 @@ class StructuredLMExecutor:
             show_safe_mode(estimated_cost, len(prompts))
 
         current_max_tokens = int(getattr(lotus.settings.lm, "max_tokens", 512) or 512)
+        effective_max_tokens = max(current_max_tokens, structured_max_tokens)
         lm_kwargs: dict[str, Any] = {
             "progress_bar_desc": progress_bar_desc,
-            "max_tokens": max(current_max_tokens, structured_max_tokens),
+            "max_tokens": effective_max_tokens,
+            "max_completion_tokens": effective_max_tokens,
             **dict(model_kwargs),
             "response_format": {"type": "json_object"},
         }

@@ -95,7 +95,7 @@ class LotusExecutionContext:
         if self.config.lm_rate_limit is not None:
             lm_kwargs["rate_limit"] = self.config.lm_rate_limit
 
-        base_lm = LM(**lm_kwargs)
+        base_lm = LM(max_tokens=self.config.structured_max_tokens, **lm_kwargs)
         trace_dir = self.config.trace_dir()
         lm = TracedLM(base_lm, trace_dir) if trace_dir is not None else base_lm
         lotus.settings.configure(lm=lm)
