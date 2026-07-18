@@ -1,6 +1,6 @@
 """Built-in memory policies."""
 
 from .claude import ClaudeMemory
-from .zep import ZepMemory
+from .zep import ZepMemory, ZepMemoryExtended
 
-__all__ = ["ClaudeMemory", "ZepMemory"]
+__all__ = ["ClaudeMemory", "ZepMemory", "ZepMemoryExtended"]

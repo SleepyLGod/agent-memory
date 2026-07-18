@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -41,7 +42,7 @@ LOCOMO_CACHE_PATH = PROJECT_ROOT / ".cache" / "agent-memory" / "locomo10.json"
 LOCOMO_TIMESTAMP_FORMAT = "%I:%M %p on %d %B, %Y"
 DEFAULT_START_ROW = 26
 DEFAULT_ROW_LIMIT = 3
-PUBLIC_VIEWS = ("episodes", "entities", "facts", "communities")
+PUBLIC_VIEWS = ("episodes", "entities", "facts")
 USAGE_FIELDS = (
     "physical_prompt_tokens",
     "physical_completion_tokens",
@@ -112,15 +113,34 @@ def zep_log_row(row: dict[str, Any]) -> dict[str, Any]:
     """Map one normalized LOCOMO turn to the ZepMemory source schema."""
 
     speaker = str(row.get("speaker", ""))
+    sample_index = row.get("sample_index")
+    if not isinstance(sample_index, int) or isinstance(sample_index, bool):
+        raise ValueError("normalized LOCOMO row requires an integer sample_index")
     session_id = str(row.get("session_id", ""))
-    turn_id = str(row.get("turn_id", ""))
+    session_number = session_id.removeprefix("session_")
+    content = f'{speaker}: {str(row["message"])}'
+    caption = str(row.get("blip_caption", "")).strip()
+    if caption:
+        content += f"\n(description of attached image: {caption})"
     return {
-        "content": str(row["message"]),
+        "content": content,
         "role": speaker,
         "speaker": speaker,
         "reference_time": locomo_reference_time(str(row["timestamp"])),
-        "source_description": f"LOCOMO {session_id} {turn_id}".strip(),
+        "source_description": f"LOCOMO sample {sample_index} session {session_number}",
     }
+
+
+def policy_input_fingerprint(rows: list[dict[str, Any]]) -> str:
+    """Hash the normalized source rows shared with the native baseline."""
+
+    payload = json.dumps(
+        rows,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def selected_rows(
@@ -202,7 +222,7 @@ def usage_delta(before: dict[str, int], after: dict[str, int]) -> dict[str, int]
 
 
 def public_view_counts(memory: am.ZepMemory) -> dict[str, int]:
-    """Return row counts for the four public Zep views."""
+    """Return row counts for the three baseline Zep views."""
 
     state = memory._runtime._state
     return {f"{name}_rows": len(state.get(name, ())) for name in PUBLIC_VIEWS}
@@ -313,6 +333,15 @@ def main() -> None:
             pd.DataFrame(rows),
         ),
     }
+    input_manifest = output_dir / "input" / "manifest.json"
+    input_manifest.write_text(
+        json.dumps(
+            {"policy_input_fingerprint": policy_input_fingerprint(rows)},
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    written["input/manifest"] = input_manifest
     print("ZepMemory real insertion e2e")
     print(f"LOCOMO cache: {dataset_path}")
     print(f"start_row: {args.start_row}")
@@ -329,7 +358,7 @@ def main() -> None:
     current_index = 0
     try:
         for current_index, row in enumerate(rows, start=1):
-            print(f"add[{current_index}]: {row['speaker']}: {row['content'][:100]}")
+            print(f"add[{current_index}]: {row['content'][:100]}")
             before = usage_snapshot()
             started = time.perf_counter()
             with semantic_trace_scope(

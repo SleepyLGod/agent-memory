@@ -6,6 +6,8 @@ import importlib.util
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
+from agent_memory.datasets.locomo import flatten_locomo_rows
+
 
 EXAMPLE_PATH = (
     Path(__file__).resolve().parents[1] / "examples" / "zep" / "e2e_demo.py"
@@ -37,18 +39,59 @@ def test_zep_log_row_preserves_source_identity() -> None:
             "message": "Caroline is researching adoption agencies.",
             "speaker": "Caroline",
             "session_id": "session_2",
+            "sample_index": 0,
+            "sample_id": "conv-26",
             "turn_id": "D2:8",
             "timestamp": "1:14 pm on 25 May, 2023",
+            "blip_caption": "an adoption agency brochure",
         }
     )
 
     assert result == {
-        "content": "Caroline is researching adoption agencies.",
+        "content": (
+            "Caroline: Caroline is researching adoption agencies.\n"
+            "(description of attached image: an adoption agency brochure)"
+        ),
         "role": "Caroline",
         "speaker": "Caroline",
         "reference_time": "2023-05-25T13:14:00",
-        "source_description": "LOCOMO session_2 D2:8",
+        "source_description": "LOCOMO sample 0 session 2",
     }
+    assert example.policy_input_fingerprint([result]) == (
+        "a6e8e8020d4156fac3b7f8828441305e8608e3a9d86f4a6b2d07214df0818e78"
+    )
+
+
+def test_locomo_rows_preserve_sample_identity_and_provenance() -> None:
+    example = _load_example()
+    rows = flatten_locomo_rows(
+        [
+            {
+                "sample_id": "conv-26",
+                "conversation": {
+                    "session_1": [{"speaker": "Alice", "text": "First"}],
+                    "session_1_date_time": "1:00 pm on 1 January, 2026",
+                },
+            },
+            {
+                "sample_id": "conv-27",
+                "conversation": {
+                    "session_2": [{"speaker": "Bob", "text": "Second"}],
+                    "session_2_date_time": "2:00 pm on 2 January, 2026",
+                },
+            },
+        ],
+        sample_limit=2,
+        turn_limit=2,
+    )
+
+    assert [(row["sample_index"], row["sample_id"]) for row in rows] == [
+        (0, "conv-26"),
+        (1, "conv-27"),
+    ]
+    assert example.zep_log_row(rows[1])["source_description"] == (
+        "LOCOMO sample 1 session 2"
+    )
 
 
 def test_failure_artifacts_accept_an_atomically_rolled_back_empty_state(
@@ -64,6 +107,5 @@ def test_failure_artifacts_accept_an_atomically_rolled_back_empty_state(
         "views/episodes",
         "views/entities",
         "views/facts",
-        "views/communities",
     }
     assert all(path.exists() for path in written.values())

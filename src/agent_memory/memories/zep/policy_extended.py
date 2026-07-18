@@ -1,4 +1,4 @@
-"""Zep/Graphiti-style temporal memory policy."""
+"""Extended Zep/Graphiti-style temporal memory policy with communities."""
 
 from __future__ import annotations
 
@@ -12,27 +12,50 @@ _EPISODE_WINDOW_LEN = 3
 
 # Adapted from Graphiti graphiti_core/prompts/extract_nodes.py::extract_message.
 _ENTITY_EXTRACT_INSTRUCTION = """
-Extract every entity explicitly or implicitly mentioned in the current episode
-{content}. Return one row per entity with {name} and {entity_type}.
+Extract entity nodes explicitly mentioned in the CURRENT MESSAGE {content}.
+Return one row per distinct entity with {name}. Use {previous_episodes} only to
+resolve references; never extract an entity that appears only in previous
+messages.
 
-Use {previous_episodes} only to resolve references. Do not extract entities that
-appear only in previous episodes. Avoid pronouns as entity names; use explicit,
-unambiguous names.
+Always extract the speaker, the text before the first colon, as the first
+entity. If the speaker appears again, return it only once. Resolve pronouns to
+explicit names, but never return a pronoun as an entity name.
+
+Never extract abstract concepts or feelings; dates or times; relationships or
+actions; sentence fragments; generic media, events, institutions, common nouns,
+or bare objects. Bare kinship, associate, and pet terms must be qualified with
+their possessor, for example "Nisha's dad" rather than "dad". Extract named
+entities and concrete things only when the standalone name is specific enough
+to distinguish it later. Preserve the most specific form in the message, such
+as "road cycling", "wool coat", or "Gamecube", rather than a generic head
+noun. When in doubt, do not extract.
+
+Example: from "Jordan: We moved to Denver. My spouse joined Lockheed Martin",
+extract Jordan, Denver, and Lockheed Martin. Do not extract spouse, moved, or a
+date.
 """.strip()
 
 
 _ENTITY_GROUP_INSTRUCTION = """
-Rows refer to the same real-world entity when their {name} and {entity_type}
-describe the same object, actor, organization, place, or concept.
+Rows refer to the same real-world entity when their {name} describes the same
+object, actor, organization, place, or concept.
 """.strip()
 
 
 # Adapted from Graphiti's entity summary update prompt. Candidate retrieval and
 # top-1 identity resolution remain outside this declarative approximation.
 _ENTITY_SUMMARY_INSTRUCTION = """
-Create one canonical entity from the grouped mentions. Return canonical {name},
-best {entity_type}, and concise {summary}. Use the episode {content} only as
-evidence and do not invent unsupported details.
+Create one canonical entity from the grouped mentions. Return canonical {name}
+and a concise, information-dense {summary}. Use only durable facts explicitly
+supported by {content}; never infer beyond the evidence.
+
+Preserve material names, roles, relationships, dates, counts, concrete details,
+and changes over time. Prefer newer explicit facts when they conflict with old
+facts. Each input row includes add_seq; a larger add_seq means the evidence was
+ingested later. Do not mention messages, episodes, prompts, summaries, graphs,
+nodes, labels, schemas, or the summarization process. State facts directly
+rather than saying they were mentioned. Do not invent preferences, habits,
+recurrence, causality, or intent from a single weak observation.
 """.strip()
 
 
@@ -46,22 +69,41 @@ entity_ordinal. Return one row per relationship with {source_entity_ordinal},
 Use {previous_episodes} only to resolve references and maintain continuity. Use
 {reference_time} to resolve relative temporal expressions. Use ISO 8601
 timestamps when temporal bounds can be resolved; otherwise return JSON null.
-Both entity ordinals must identify distinct entities in the provided list.
+Both entity ordinals must identify distinct entities in the provided list. An
+ordinal outside that list makes the fact invalid.
+
+Extract only facts clearly stated or unambiguously implied by the current
+message. Use previous episodes only for reference disambiguation and continuity.
+Prefer entity names over pronouns in {fact}. Do not emit semantically redundant
+facts, but treat a later claim with additional concrete detail as a new fact,
+not a duplicate. Preserve every proper noun, brand, model, quantity, count,
+color, material, physical description, location, and named activity; paraphrase
+without generalizing away those details.
+
+Derive {relation_type} from the relationship predicate in
+SCREAMING_SNAKE_CASE. For ongoing present-tense facts, set {valid_at} to the
+episode {reference_time}. Resolve relative time against {reference_time}; set
+{invalid_at} only when a change or termination is expressed. Use ISO 8601 when
+resolvable, assume midnight for date-only values and January 1 for year-only
+values, and return JSON null rather than hallucinating a temporal bound.
 """.strip()
 
 
 # Adapted from Graphiti graphiti_core/prompts/dedupe_edges.py::resolve_edge.
 _FACT_GROUP_INSTRUCTION = """
-Rows belong to one group when {relation_type} and {fact} express the same
-factual information. Similar claims with key numeric, temporal, relational, or
-entity differences are not duplicates.
+Group rows only when {relation_type} and {fact} express identical factual
+information. Never group facts with key differences in numbers, dates, concrete
+qualifiers, specificity, or relationship meaning. "Plays video games" and
+"plays games on a Gamecube" are not duplicates; "plays games on a Gamecube"
+and "plays Gamecube games" are duplicates.
 """.strip()
 
 
 _FACT_CANONICAL_INSTRUCTION = """
 Create one canonical fact row from duplicate claims. Return canonical
-{relation_type} and faithful {fact}. Preserve the original meaning; do not merge
-contradictory claims into one statement.
+{relation_type} and faithful {fact}. Preserve every supported concrete detail.
+Do not generalize the claim and do not merge contradictory or more-specific
+claims into one statement.
 """.strip()
 
 
@@ -70,7 +112,10 @@ contradictory claims into one statement.
 _CONTRADICTORY_FACT_INSTRUCTION = """
 Does {fact:later_added} explicitly contradict, supersede, or make
 {fact:earlier_added} stop being true? Return false for merely related facts or
-facts that can both be true at the same time.
+facts that can both be true at the same time. Different events, dates, counts,
+or qualifiers are not automatically contradictions. A changed role or other
+updated value for the same relationship may be a contradiction even when it is
+not a duplicate.
 """.strip()
 
 
@@ -90,12 +135,12 @@ not implement Graphiti's label-propagation fixpoint.
 """.strip()
 
 
-class ZepMemory(Memory):
-    """Declarative Zep/Graphiti-style memory with temporal facts.
+class ZepMemoryExtended(Memory):
+    """Declarative Zep/Graphiti memory with temporal facts and communities.
 
     This policy describes logical memory state. It intentionally omits
     Graphiti's hybrid candidate search, top-1 entity resolver, graph storage,
-    and community label-propagation lowering.
+    and exact community label-propagation lowering.
     """
 
     # Episodes
@@ -110,7 +155,6 @@ class ZepMemory(Memory):
         },
         system_columns=True,
     )
-
     episodes = log.assign(
         episode_id=log.col("_row_id"),
         created_at=log.col("_added_at"),
@@ -150,11 +194,11 @@ class ZepMemory(Memory):
             input_cols=["content", "previous_episodes"],
             output_cols={
                 "name": "Extracted entity name.",
-                "entity_type": "Entity type label.",
             },
             instruction=_ENTITY_EXTRACT_INSTRUCTION,
             ordinal_col="entity_ordinal",
         )
+        .assign(entity_type="Entity")
         .select(
             [
                 "episode_id",
@@ -170,15 +214,14 @@ class ZepMemory(Memory):
 
     entities = (
         _extracted_entities.sem_groupby(
-            input_cols=["name", "entity_type"],
+            input_cols=["name"],
             instruction=_ENTITY_GROUP_INSTRUCTION,
         )
         .agg(
             sem_agg(
-                input_cols=["name", "entity_type", "content"],
+                input_cols=["name", "content", "add_seq"],
                 output_cols={
                     "name": "Canonical entity name.",
-                    "entity_type": "Canonical entity type.",
                     "summary": "Concise entity summary.",
                 },
                 instruction=_ENTITY_SUMMARY_INSTRUCTION,
@@ -200,6 +243,7 @@ class ZepMemory(Memory):
                 output_col="entity_id",
             ),
         )
+        .assign(entity_type="Entity")
         .select(["entity_id", "name", "entity_type", "summary", "mentions"])
     )
 
@@ -287,6 +331,13 @@ class ZepMemory(Memory):
                 ["episode_id", "target_entity_ordinal", "target_entity_id"]
             ),
             on=["episode_id", "target_entity_ordinal"],
+        )
+    )
+    # Graphiti drops an edge when both mentions resolve to the same entity.
+    _extracted_facts = (
+        _extracted_facts.filter(
+            _extracted_facts.col("source_entity_id")
+            != _extracted_facts.col("target_entity_id")
         )
         .select(
             [

@@ -3263,6 +3263,8 @@ def test_helloworld_locomo_loader_flattens_dialogue_rows() -> None:
         {
             "message": "I prefer concise design docs.",
             "speaker": "Alice",
+            "sample_index": 0,
+            "sample_id": "0",
             "session_id": "session_1",
             "turn_id": "1",
             "timestamp": "2024-01-01",

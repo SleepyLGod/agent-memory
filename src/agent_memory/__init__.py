@@ -1,7 +1,7 @@
 """Semantic memory framework experiments for agent developers."""
 
 from .api import Memory, Message
-from .memories import ClaudeMemory, ZepMemory
+from .memories import ClaudeMemory, ZepMemory, ZepMemoryExtended
 from .planner.differential_policy import DifferentiatedPolicy
 from .policy import Log, UserQuery, array_agg, collect_list, least, min, sem_agg
 
@@ -15,6 +15,7 @@ __all__ = [
     "Message",
     "UserQuery",
     "ZepMemory",
+    "ZepMemoryExtended",
     "__version__",
     "array_agg",
     "collect_list",

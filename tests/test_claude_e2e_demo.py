@@ -79,6 +79,29 @@ def test_example_loader_restores_import_state() -> None:
     assert sys.modules.get("analyze_e2e_output", _MISSING_MODULE) is original_analyzer
 
 
+def test_claude_log_row_ignores_blip_caption() -> None:
+    row = {
+        "message": "hello",
+        "speaker": "Alice",
+        "timestamp": "2026-01-01T00:00:00",
+        "session_id": "session-1",
+        "turn_id": "turn-1",
+        "blip_caption": "an image caption",
+    }
+
+    assert e2e_demo.claude_log_row(row) == {
+        "message": "hello",
+        "role": "Alice",
+        "timestamp": "2026-01-01T00:00:00",
+        "session_id": "session-1",
+        "metadata": {
+            "source": "locomo",
+            "speaker": "Alice",
+            "turn_id": "turn-1",
+        },
+    }
+
+
 def test_full_recompute_uses_an_explicit_adapter_not_runtime_private_state() -> None:
     adapter = _ExampleAdapter()
 
