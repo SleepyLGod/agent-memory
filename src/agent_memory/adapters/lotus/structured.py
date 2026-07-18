@@ -642,6 +642,7 @@ def execute_structured_lm_retry_result(
     require_explanation: bool,
     operator: str,
     max_retries: int,
+    failure_extra_by_index: Mapping[int, Mapping[str, Any]] | None = None,
 ) -> StructuredLMRetryResult:
     """Call the LM and return retry metadata without hiding parse failures."""
 
@@ -689,6 +690,7 @@ def execute_structured_lm_retry_result(
             shape=shape,
             require_explanation=require_explanation,
             operator=operator,
+            extra_by_index=failure_extra_by_index,
         )
         _STRUCTURED_RETRY_STATS.failure_artifacts += len(artifact_paths)
     else:

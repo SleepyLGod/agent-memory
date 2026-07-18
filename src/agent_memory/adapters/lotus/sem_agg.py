@@ -16,8 +16,11 @@ from agent_memory.adapters.lotus.context import (
 from agent_memory.tracing.semantic import write_structured_generation_trace
 from agent_memory.adapters.lotus.sem_groupby import GROUP_ID_COLUMN
 from agent_memory.adapters.lotus.structured import (
+    StructuredLMRetryResult,
     escape_structured_formatter_placeholders,
+    execute_structured_lm_retry_result,
     parse_structured_object_json,
+    structured_parse_error,
     structured_scalar_values,
     write_structured_failure_artifacts,
 )
@@ -226,33 +229,34 @@ def execute_structured_sem_agg_group(
     """Aggregate one group into declared structured fields."""
 
     instruction = structured_aggregate_instruction(query, input_cols, output_cols)
-    raw_output = execute_lotus_style_structured_sem_agg_group(
+    retry_result = execute_lotus_style_structured_sem_agg_group(
         query,
         group,
         input_cols,
         output_cols,
         config,
+        group_index=group_index,
     )
-    try:
-        parsed = parse_structured_sem_agg_output(raw_output, output_cols)
-        write_sem_agg_audit(
-            config,
-            query=query,
-            group=group,
-            input_cols=input_cols,
-            output_cols=output_cols,
-            group_index=group_index,
-            raw_output=raw_output,
-            parsed_output=parsed,
-        )
-        return parsed
-    except ValueError as error:
-        artifact_path = write_sem_agg_failure_artifact(
+    raw_output = str(retry_result.raw_outputs[0])
+    raw_output_attempts = tuple(str(value) for value in retry_result.raw_output_attempts[0])
+    if retry_result.invalid_indices:
+        parse_error = structured_parse_error(
             raw_output,
-            group,
-            output_cols,
-            instruction=instruction,
-            group_index=group_index,
+            output_cols=output_cols,
+            shape="object",
+            require_explanation=False,
+            operator="sem_agg",
+        )
+        artifact_path = (
+            retry_result.failure_artifact_paths[0]
+            if retry_result.failure_artifact_paths
+            else write_sem_agg_failure_artifact(
+                raw_output_attempts,
+                group,
+                output_cols,
+                instruction=instruction,
+                group_index=group_index,
+            )
         )
         write_sem_agg_audit(
             config,
@@ -262,13 +266,26 @@ def execute_structured_sem_agg_group(
             output_cols=output_cols,
             group_index=group_index,
             raw_output=raw_output,
+            raw_output_attempts=raw_output_attempts,
             parsed_output=None,
-            parse_error=str(error),
+            parse_error=parse_error,
             failure_artifact=artifact_path,
         )
-        raise ValueError(
-            f"{error}; structured failure artifact: {artifact_path}"
-        ) from error
+        raise ValueError(f"{parse_error}; structured failure artifact: {artifact_path}")
+
+    parsed = parse_structured_sem_agg_output(raw_output, output_cols)
+    write_sem_agg_audit(
+        config,
+        query=query,
+        group=group,
+        input_cols=input_cols,
+        output_cols=output_cols,
+        group_index=group_index,
+        raw_output=raw_output,
+        raw_output_attempts=raw_output_attempts,
+        parsed_output=parsed,
+    )
+    return parsed
 
 
 def execute_lotus_style_structured_sem_agg_group(
@@ -277,22 +294,32 @@ def execute_lotus_style_structured_sem_agg_group(
     input_cols: Sequence[str],
     output_cols: Sequence[ColumnSpec],
     config: LotusExecutionConfig,
-) -> str:
+    *,
+    group_index: int = 0,
+) -> StructuredLMRetryResult:
     """Run a LOTUS-main-style hierarchical aggregate with final JSON output."""
 
     import lotus
 
     docs = aggregate_group_text(group, input_cols)
     instruction = structured_aggregate_instruction(query, input_cols, output_cols)
-    return lotus_style_sem_agg(
+    return lotus_style_structured_sem_agg(
         docs,
         lotus.settings.lm,
         instruction,
         [0] * len(docs),
         safe_mode=config.sem_agg_safe_mode,
         progress_bar_desc=config.sem_agg_progress_bar_desc,
-        response_format=JSON_OBJECT_RESPONSE_FORMAT,
+        output_cols=output_cols,
+        max_retries=config.structured_parse_retries,
         final_model_kwargs=structured_sem_agg_model_kwargs(config),
+        failure_extra_by_index={
+            0: {
+                "group_index": group_index,
+                "final_instruction": instruction,
+                "group_row_preview": group.head(5).astype(str).to_dict(orient="records"),
+            }
+        },
     )
 
 
@@ -350,6 +377,7 @@ def write_sem_agg_audit(
     group_index: int,
     raw_output: Any,
     parsed_output: Mapping[str, Any] | None,
+    raw_output_attempts: Sequence[str] | None = None,
     parse_error: str = "",
     failure_artifact: Path | str | None = None,
 ) -> None:
@@ -365,6 +393,7 @@ def write_sem_agg_audit(
     input_preview = group.loc[:, list(input_cols)].head(20).astype(str).to_dict(
         orient="records"
     )
+    attempts = [str(value) for value in (raw_output_attempts or (raw_output,))]
     audit_row = {
         "operator": "sem_agg",
         "group_index": group_index,
@@ -379,8 +408,8 @@ def write_sem_agg_audit(
             for column in output_cols
         ],
         "raw_output": str(raw_output),
-        "raw_output_attempts": [str(raw_output)],
-        "parse_retry_attempts": 0,
+        "raw_output_attempts": attempts,
+        "parse_retry_attempts": max(len(attempts) - 1, 0),
         "parsed_output": parsed_output,
         "parse_error": parse_error,
         "failure_artifact": "" if failure_artifact is None else str(failure_artifact),
@@ -406,6 +435,68 @@ def lotus_style_sem_agg(
 ) -> str:
     """Compatibility copy of LOTUS main sem_agg structured-final-pass behavior."""
 
+    output, _retry_result = _execute_lotus_style_sem_agg(
+        docs,
+        model,
+        user_instruction,
+        partition_ids,
+        safe_mode=safe_mode,
+        progress_bar_desc=progress_bar_desc,
+        response_format=response_format,
+        final_model_kwargs=final_model_kwargs,
+    )
+    return output
+
+
+def lotus_style_structured_sem_agg(
+    docs: Sequence[str],
+    model: Any,
+    user_instruction: str,
+    partition_ids: Sequence[int],
+    *,
+    output_cols: Sequence[ColumnSpec],
+    max_retries: int,
+    safe_mode: bool = False,
+    progress_bar_desc: str = "Aggregating",
+    final_model_kwargs: Mapping[str, Any] | None = None,
+    failure_extra_by_index: Mapping[int, Mapping[str, Any]] | None = None,
+) -> StructuredLMRetryResult:
+    """Run a hierarchical aggregate and retry only its final structured call."""
+
+    _output, retry_result = _execute_lotus_style_sem_agg(
+        docs,
+        model,
+        user_instruction,
+        partition_ids,
+        safe_mode=safe_mode,
+        progress_bar_desc=progress_bar_desc,
+        response_format=JSON_OBJECT_RESPONSE_FORMAT,
+        final_model_kwargs=final_model_kwargs,
+        structured_output_cols=output_cols,
+        structured_parse_retries=max_retries,
+        failure_extra_by_index=failure_extra_by_index,
+    )
+    if retry_result is None:
+        raise ValueError("structured sem_agg requires at least one input document")
+    return retry_result
+
+
+def _execute_lotus_style_sem_agg(
+    docs: Sequence[str],
+    model: Any,
+    user_instruction: str,
+    partition_ids: Sequence[int],
+    *,
+    safe_mode: bool,
+    progress_bar_desc: str,
+    response_format: Any,
+    final_model_kwargs: Mapping[str, Any] | None,
+    structured_output_cols: Sequence[ColumnSpec] | None = None,
+    structured_parse_retries: int = 0,
+    failure_extra_by_index: Mapping[int, Mapping[str, Any]] | None = None,
+) -> tuple[str, StructuredLMRetryResult | None]:
+    """Execute LOTUS-style aggregation and expose final structured retry metadata."""
+
     import lotus
 
     if safe_mode:
@@ -414,10 +505,11 @@ def lotus_style_sem_agg(
     doc_list = [str(doc) for doc in docs]
     current_partition_ids = list(partition_ids)
     if not doc_list:
-        return ""
+        return "", None
 
     tree_level = 0
     summaries: list[str] = []
+    structured_retry_result: StructuredLMRetryResult | None = None
     while len(doc_list) != 1 or summaries == []:
         current_partition_id = current_partition_ids[0]
         do_fold = len(current_partition_ids) == len(set(current_partition_ids))
@@ -471,12 +563,29 @@ def lotus_style_sem_agg(
         if is_final_pass and response_format is not None:
             model_kwargs["response_format"] = response_format
 
-        lm_output = model(
-            batch,
-            progress_bar_desc=progress_bar_desc,
-            **model_kwargs,
-        )
-        summaries = [str(output) for output in lm_output.outputs]
+        if is_final_pass and structured_output_cols is not None:
+            structured_retry_result = execute_structured_lm_retry_result(
+                model,
+                batch,
+                lm_kwargs={
+                    "progress_bar_desc": progress_bar_desc,
+                    **model_kwargs,
+                },
+                output_cols=structured_output_cols,
+                shape="object",
+                require_explanation=False,
+                operator="sem_agg",
+                max_retries=structured_parse_retries,
+                failure_extra_by_index=failure_extra_by_index,
+            )
+            summaries = [str(output) for output in structured_retry_result.raw_outputs]
+        else:
+            lm_output = model(
+                batch,
+                progress_bar_desc=progress_bar_desc,
+                **model_kwargs,
+            )
+            summaries = [str(output) for output in lm_output.outputs]
         doc_list = summaries
         current_partition_ids = new_partition_ids
         lotus.logger.debug(f"Model outputs from tree level {tree_level}: {summaries}")
@@ -485,8 +594,8 @@ def lotus_style_sem_agg(
             model.print_total_usage()
 
     if not summaries:
-        return ""
-    return summaries[0]
+        return "", structured_retry_result
+    return summaries[0], structured_retry_result
 
 
 def structured_sem_agg_model_kwargs(
@@ -508,7 +617,7 @@ def structured_sem_agg_model_kwargs(
 
 
 def write_sem_agg_failure_artifact(
-    raw_output: Any,
+    raw_output_attempts: Sequence[str],
     group: pd.DataFrame,
     output_cols: Sequence[ColumnSpec],
     *,
@@ -519,7 +628,7 @@ def write_sem_agg_failure_artifact(
 
     paths = write_structured_failure_artifacts(
         [instruction],
-        [[str(raw_output)]],
+        [list(raw_output_attempts)],
         [0],
         output_cols=output_cols,
         shape="object",
