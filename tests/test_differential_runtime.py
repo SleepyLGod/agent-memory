@@ -791,8 +791,9 @@ def test_claude_runtime_propagates_topic_replacement_without_stale_catalog() -> 
 
 
 class _ZepStubAdapter(LotusAdapter):
-    def __init__(self) -> None:
+    def __init__(self, *, duplicate_entity_mentions: bool = False) -> None:
         super().__init__()
+        self.duplicate_entity_mentions = duplicate_entity_mentions
         self.fact_extraction_episode_ids: list[str] = []
 
     def execute(
@@ -837,11 +838,15 @@ class _ZepStubAdapter(LotusAdapter):
         names = {column.name for column in columns}
         parsed: list[list[dict[str, object]]] = []
         for _, row in source.iterrows():
-            if "entity_type" in names:
+            if names == {"name"}:
                 parsed.append(
                     [
-                        {"name": "Alice", "entity_type": "person"},
-                        {"name": "Tea", "entity_type": "beverage"},
+                        {"name": "Alice"},
+                        {
+                            "name": (
+                                "Alice" if self.duplicate_entity_mentions else "Tea"
+                            )
+                        },
                     ]
                 )
             else:
@@ -952,7 +957,7 @@ def _missing(value: object) -> bool:
 
 def test_zep_runtime_propagates_temporal_fact_and_community_dependencies() -> None:
     adapter = _ZepStubAdapter()
-    memory = am.ZepMemory(adapter=adapter)
+    memory = am.ZepMemoryExtended(adapter=adapter)
 
     memory.add(
         {
@@ -977,9 +982,30 @@ def test_zep_runtime_propagates_temporal_fact_and_community_dependencies() -> No
     assert set(state) == {"log", "episodes", "entities", "facts", "communities"}
     assert len(state["episodes"]) == 2
     assert not state["entities"].empty
+    assert set(state["entities"]["entity_type"]) == {"Entity"}
     assert not state["facts"].empty
     assert not state["communities"].empty
     liked = state["facts"].loc[state["facts"]["relation_type"] == "likes"]
     assert liked["invalid_at"].notna().all()
     assert len(adapter.fact_extraction_episode_ids) == 2
     assert len(set(adapter.fact_extraction_episode_ids)) == 2
+
+
+def test_zep_runtime_drops_distinct_mentions_resolved_to_the_same_entity() -> None:
+    memory = am.ZepMemory(adapter=_ZepStubAdapter(duplicate_entity_mentions=True))
+
+    memory.add(
+        {
+            "content": "Alice refers to herself.",
+            "role": "user",
+            "speaker": "Alice",
+            "reference_time": "2026-01-01T00:00:00Z",
+            "source_description": "conversation",
+        }
+    )
+
+    state = memory._runtime._state
+    assert len(state["entities"]) == 1
+    assert state["entities"].iloc[0]["name"] == "Alice"
+    assert state["entities"].iloc[0]["entity_id"] == (0, 0)
+    assert state["facts"].empty

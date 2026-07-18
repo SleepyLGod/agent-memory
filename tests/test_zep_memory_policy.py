@@ -9,7 +9,7 @@ from agent_memory.policy.aggregates import (
     SemanticAggregateSpec,
 )
 from agent_memory.policy.logical import QueryExpr
-from agent_memory.memories import ZepMemory
+from agent_memory.memories import ZepMemory, ZepMemoryExtended
 from agent_memory.policy.schema import output_columns
 
 
@@ -44,12 +44,12 @@ def test_zep_memory_exports_public_api() -> None:
     assert am.ZepMemory is ZepMemory
 
 
-def test_zep_memory_spec_exposes_only_four_public_views() -> None:
+def test_zep_memory_spec_exposes_only_baseline_public_views() -> None:
     """Only the Zep logical memory state is exposed as public views."""
 
     spec = ZepMemory.spec()
 
-    assert tuple(spec.views) == ("episodes", "entities", "facts", "communities")
+    assert tuple(spec.views) == ("episodes", "entities", "facts")
     assert tuple(spec.private_relations) == (
         "_windowed_episodes",
         "_extracted_entities",
@@ -63,6 +63,16 @@ def test_zep_memory_spec_exposes_only_four_public_views() -> None:
         "_facts_with_invalidations",
     )
     assert "retrieval_query" not in spec.views
+
+
+def test_zep_extended_policy_adds_communities_without_changing_core_queries() -> None:
+    baseline = ZepMemory.spec()
+    extended = ZepMemoryExtended.spec()
+
+    assert am.ZepMemoryExtended is ZepMemoryExtended
+    assert tuple(extended.views) == ("episodes", "entities", "facts", "communities")
+    for name in ("episodes", "entities", "facts"):
+        assert extended.views[name].query == baseline.views[name].query
 
 
 def test_zep_episodes_view_uses_select_not_map() -> None:
@@ -117,8 +127,18 @@ def test_zep_entities_view_uses_context_extraction_and_semantic_aggregation() ->
     assert extraction.params["ordinal_col"] == "entity_ordinal"
     assert tuple(column.name for column in extraction.params["output_cols"]) == (
         "name",
-        "entity_type",
     )
+    entity_type_assignment = next(
+        node
+        for node in _walk(extracted_entities)
+        if node.op == "assign" and "entity_type" in node.params["assignments"]
+    )
+    assert entity_type_assignment.params["assignments"]["entity_type"] == {
+        "kind": "literal",
+        "value": "Entity",
+    }
+    assert "Always extract the speaker" in extraction.params["instruction"]
+    assert "When in doubt, do not extract" in extraction.params["instruction"]
     grouped_agg = next(node for node in _walk(query) if node.op == "agg")
     specs = grouped_agg.params["aggregates"]
     entity_id = next(
@@ -135,9 +155,16 @@ def test_zep_entities_view_uses_context_extraction_and_semantic_aggregation() ->
     )
     assert tuple(column.name for column in semantic.output_cols) == (
         "name",
-        "entity_type",
         "summary",
     )
+    assert semantic.input_cols == ("name", "content", "add_seq")
+    assert "add_seq" in semantic.instruction
+    final_entity_type_assignment = query.inputs[0]
+    assert final_entity_type_assignment.op == "assign"
+    assert final_entity_type_assignment.params["assignments"]["entity_type"] == {
+        "kind": "literal",
+        "value": "Entity",
+    }
 
 
 def test_zep_episode_entity_bridge_uses_deterministic_explode_and_unnest() -> None:
@@ -202,6 +229,15 @@ def test_zep_facts_view_contains_temporal_self_join_paths() -> None:
         node.params["on"] == ("episode_id", "target_entity_ordinal")
         for node in endpoint_joins
     )
+    self_loop_filter = next(
+        node
+        for node in _walk(extracted)
+        if node.op == "filter"
+        and node.params["predicate"].get("op") == "ne"
+        and node.params["predicate"]["left"].get("name") == "source_entity_id"
+        and node.params["predicate"]["right"].get("name") == "target_entity_id"
+    )
+    assert self_loop_filter.inputs[0].op == "join"
     assert "sem_groupby" in _ops(deduplicated)
     deduplicated_agg = next(node for node in _walk(deduplicated) if node.op == "agg")
     fact_grouping = deduplicated_agg.inputs[0]
@@ -298,7 +334,7 @@ def test_zep_facts_view_contains_temporal_self_join_paths() -> None:
 def test_zep_communities_view_is_semantic_grouping_not_label_propagation() -> None:
     """Community view is declarative semantic grouping, not a fixpoint operator."""
 
-    spec = ZepMemory.spec()
+    spec = ZepMemoryExtended.spec()
     query = spec.views["communities"].query
     ops = _ops(query)
 

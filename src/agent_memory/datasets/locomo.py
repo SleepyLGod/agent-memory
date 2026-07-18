@@ -28,7 +28,7 @@ def load_locomo_rows(
     *,
     sample_limit: int,
     turn_limit: int,
-) -> list[dict[str, str]]:
+) -> list[dict[str, Any]]:
     """Load a small LOCOMO dialogue slice as log rows."""
 
     with dataset_path.open(encoding="utf-8") as file:
@@ -45,18 +45,25 @@ def flatten_locomo_rows(
     *,
     sample_limit: int,
     turn_limit: int,
-) -> list[dict[str, str]]:
+) -> list[dict[str, Any]]:
     """Flatten LOCOMO conversation turns into the demo log row shape."""
 
-    rows: list[dict[str, str]] = []
+    rows: list[dict[str, Any]] = []
     samples = dataset if isinstance(dataset, list) else [dataset]
-    for sample in samples[:sample_limit]:
+    for sample_index, sample in enumerate(samples[:sample_limit]):
         if not isinstance(sample, Mapping):
             continue
+        sample_id = str(sample.get("sample_id", sample_index))
         conversation = sample.get("conversation")
         for session_id, timestamp, turns in _iter_locomo_sessions(conversation):
             for turn in turns:
-                row = _locomo_turn_row(turn, session_id=session_id, timestamp=timestamp)
+                row = _locomo_turn_row(
+                    turn,
+                    sample_index=sample_index,
+                    sample_id=sample_id,
+                    session_id=session_id,
+                    timestamp=timestamp,
+                )
                 if row is None:
                     continue
                 rows.append(row)
@@ -89,9 +96,11 @@ def _iter_locomo_sessions(conversation: Any) -> Iterable[tuple[str, str, Iterabl
 def _locomo_turn_row(
     turn: Any,
     *,
+    sample_index: int,
+    sample_id: str,
     session_id: str,
     timestamp: str,
-) -> dict[str, str] | None:
+) -> dict[str, Any] | None:
     """Convert one LOCOMO dialogue turn into a log row."""
 
     if not isinstance(turn, Mapping):
@@ -103,10 +112,16 @@ def _locomo_turn_row(
     if not message:
         return None
 
-    return {
+    row = {
         "message": message,
         "speaker": str(turn.get("speaker", "")),
+        "sample_index": sample_index,
+        "sample_id": sample_id,
         "session_id": session_id,
         "turn_id": str(turn.get("dia_id", turn.get("turn_id", ""))),
         "timestamp": str(turn.get("timestamp", timestamp)),
     }
+    caption = turn.get("blip_caption")
+    if isinstance(caption, str) and caption.strip():
+        row["blip_caption"] = caption.strip()
+    return row
