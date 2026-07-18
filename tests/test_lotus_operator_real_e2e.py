@@ -7,6 +7,8 @@ AGENT_MEMORY_RUN_LOTUS_E2E=1 is set. They write input/output CSV files to
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+import json
 import os
 import re
 from collections.abc import Mapping
@@ -27,8 +29,9 @@ from agent_memory.policy.relation import Relation
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 LOCOMO_CACHE_PATH = PROJECT_ROOT / ".cache" / "agent-memory" / "locomo10.json"
-AUDIT_DIR = Path("/private/tmp/agent-memory-lotus-operator-audit/latest")
-_AUDIT_DIR_CLEANED = False
+AUDIT_DIR = Path("/private/tmp/agent-memory-lotus-operator-audit") / datetime.now(
+    timezone.utc
+).strftime("%Y%m%dT%H%M%S%fZ")
 
 
 def _require_real_lotus() -> None:
@@ -39,19 +42,7 @@ def _require_real_lotus() -> None:
         pytest.skip("set AGENT_MEMORY_RUN_LOTUS_E2E=1 to run real LOTUS audit tests")
     if not os.getenv("DEEPSEEK_API_KEY"):
         pytest.skip("DEEPSEEK_API_KEY is required for real LOTUS audit tests")
-    _clean_output_dir_once()
-
-
-def _clean_output_dir_once() -> None:
-    """Remove stale CSV artifacts before a real audit run."""
-
-    global _AUDIT_DIR_CLEANED
-    if _AUDIT_DIR_CLEANED:
-        return
     AUDIT_DIR.mkdir(parents=True, exist_ok=True)
-    for path in AUDIT_DIR.glob("*.csv"):
-        path.unlink()
-    _AUDIT_DIR_CLEANED = True
 
 
 def _view(name: str) -> Relation:
@@ -532,6 +523,50 @@ def test_sem_groupby_sem_agg_real_lotus_audit() -> None:
     assert not result.empty
     _assert_nonempty_text(result, "body")
     _write_audit("sem_groupby_sem_agg", {"source": source}, result)
+
+
+def test_sem_groupby_pairwise_provider_prompt_real_lotus_audit(
+    tmp_path: Path,
+) -> None:
+    """Prove a real pairwise request contains no unresolved policy placeholders."""
+
+    _require_real_lotus()
+    trace_dir = tmp_path / "trace"
+    adapter = LotusAdapter(
+        config=LotusExecutionConfig(semantic_trace_dir=trace_dir)
+    )
+    source = pd.DataFrame(
+        {
+            "name": ["Alice", "Alice Smith"],
+            "description": [
+                "A person named Alice.",
+                "The same person, referred to by a fuller name.",
+            ],
+        }
+    )
+    query = _view("source").sem_groupby(
+        input_cols=["name", "description"],
+        instruction=(
+            "Rows belong together when {name} and {description} identify the "
+            "same real-world person."
+        ),
+    )
+
+    result = adapter.execute(query.expr, {"source": source})
+
+    assert GROUP_ID_COLUMN in result.columns
+    events = [
+        json.loads(line)
+        for line in (trace_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    llm_events = [event for event in events if event["event_type"] == "llm_call"]
+    assert len(llm_events) == 1
+    prompt_path = tmp_path / str(llm_events[0]["prompt_path"])
+    provider_prompt = prompt_path.read_text(encoding="utf-8")
+    assert "{name}" not in provider_prompt
+    assert "{description}" not in provider_prompt
+    assert "Alice" in provider_prompt
+    assert "Alice Smith" in provider_prompt
 
 
 def test_differential_q_prime_real_lotus_audit() -> None:

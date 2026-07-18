@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
@@ -9,11 +10,14 @@ import pandas as pd
 
 from agent_memory.adapters.lotus.context import LotusExecutionContext
 from agent_memory.adapters.lotus.sem_join import row_text_series
-from agent_memory.tracing.semantic import write_compact_operator_trace, write_pair_trace
 from agent_memory.adapters.lotus.structured import StructuredLMExecutor
 from agent_memory.policy.logical import ColumnSpec, QueryExpr
+from agent_memory.tracing.semantic import write_compact_operator_trace, write_pair_trace
 
 GROUP_ID_COLUMN = "_agent_memory_group_id"
+PAIRWISE_PLACEHOLDER_PATTERN = re.compile(
+    r"(?<!\{)\{([A-Za-z_][A-Za-z0-9_]*)(?::(left|right))?\}(?!\})"
+)
 
 
 def execute_sem_groupby(
@@ -336,9 +340,13 @@ def evaluate_group_matches(
 
     pairs = semantic_pair_candidates(unique_rows, input_cols)
     docs = task_instructions.df2multimodal_info(pairs, ["left", "right"])
+    lowered_instruction = lower_pairwise_grouping_instruction(
+        instruction,
+        input_cols=input_cols,
+    )
     user_instruction = (
         "{left} and {right} satisfy this semantic grouping condition: "
-        f"{instruction}"
+        f"{lowered_instruction}"
     )
     output = sem_filter(
         docs,
@@ -350,6 +358,7 @@ def evaluate_group_matches(
     write_groupby_pair_trace(
         trace_dir,
         pairs,
+        source_instruction=instruction,
         instruction=user_instruction,
         output=output,
         default=default,
@@ -361,10 +370,37 @@ def evaluate_group_matches(
     ]
 
 
+def lower_pairwise_grouping_instruction(
+    instruction: str,
+    *,
+    input_cols: Sequence[str],
+) -> str:
+    """Lower semantic-key placeholders for a two-row grouping predicate."""
+
+    available = {str(column) for column in input_cols}
+
+    def replace(match: re.Match[str]) -> str:
+        column, side = match.groups()
+        if side is not None:
+            raise ValueError(
+                "sem_groupby instructions describe one semantic key and cannot use "
+                f"side-qualified placeholder {match.group(0)!r}"
+            )
+        if column not in available:
+            raise ValueError(
+                f"unknown sem_groupby input column placeholder: {column!r}; "
+                f"available columns are {sorted(available)}"
+            )
+        return column
+
+    return PAIRWISE_PLACEHOLDER_PATTERN.sub(replace, instruction)
+
+
 def write_groupby_pair_trace(
     trace_dir: Any,
     pairs: pd.DataFrame,
     *,
+    source_instruction: str,
     instruction: str,
     output: Any,
     default: bool,
@@ -378,6 +414,7 @@ def write_groupby_pair_trace(
         rows.append(
             {
                 "operator": "sem_groupby",
+                "source_instruction": source_instruction,
                 "instruction": instruction,
                 "left_unique_id": int(pair["_left_unique_id"]),
                 "right_unique_id": int(pair["_right_unique_id"]),

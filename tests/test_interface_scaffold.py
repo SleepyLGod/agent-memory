@@ -78,6 +78,7 @@ from agent_memory.adapters.lotus.sem_groupby import (
     assign_declared_labels,
     assign_semantic_group_ids,
     evaluate_group_matches,
+    lower_pairwise_grouping_instruction,
 )
 from agent_memory.adapters.lotus.sem_join import (
     assemble_join_frame,
@@ -95,6 +96,7 @@ from agent_memory.adapters.lotus.structured import (
     STRUCTURED_RESERVED_MODEL_KWARGS,
     StructuredLMExecutor,
     StructuredGenerationResult,
+    StructuredLMRetryResult,
     execute_structured_lm_with_retries,
     escape_structured_formatter_placeholders,
     parse_structured_object_json,
@@ -126,6 +128,23 @@ def trace_events(trace_dir: Path) -> list[dict[str, Any]]:
         for line in events_path.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
+
+
+def sem_agg_retry_result(
+    raw_output: str,
+    *,
+    attempts: tuple[str, ...] | None = None,
+    invalid: bool = False,
+    failure_artifact_paths: tuple[Path, ...] = (),
+) -> StructuredLMRetryResult:
+    """Build one structured aggregate generation result for focused tests."""
+
+    return StructuredLMRetryResult(
+        raw_outputs=(raw_output,),
+        raw_output_attempts=(attempts or (raw_output,),),
+        invalid_indices=(0,) if invalid else (),
+        failure_artifact_paths=failure_artifact_paths,
+    )
 
 
 def trace_artifact(trace_dir: Path, path_value: str) -> Any:
@@ -6207,6 +6226,7 @@ def test_sem_groupby_pairwise_default_is_false(
     def sem_filter(*args: Any, **kwargs: Any) -> Output:
         captured["default"] = kwargs["default"]
         captured["progress_bar_desc"] = kwargs["progress_bar_desc"]
+        captured["instruction"] = args[2]
         return Output()
 
     monkeypatch.setattr(sem_filter_module, "sem_filter", sem_filter)
@@ -6220,14 +6240,34 @@ def test_sem_groupby_pairwise_default_is_false(
     matches = evaluate_group_matches(
         source,
         input_cols=("name", "description"),
-        instruction="Rows describe the same durable memory topic.",
+        instruction="Rows have the same {name} and compatible {description} meaning.",
     )
 
     assert matches == [(0, 1)]
-    assert captured == {
-        "default": False,
-        "progress_bar_desc": "Grouping comparisons",
-    }
+    assert captured["default"] is False
+    assert captured["progress_bar_desc"] == "Grouping comparisons"
+    assert "{left}" in captured["instruction"]
+    assert "{right}" in captured["instruction"]
+    assert "{name}" not in captured["instruction"]
+    assert "{description}" not in captured["instruction"]
+    assert "same name and compatible description meaning" in captured["instruction"]
+
+
+def test_sem_groupby_pairwise_instruction_rejects_unknown_column_placeholder() -> None:
+    with pytest.raises(ValueError, match="unknown sem_groupby input column"):
+        lower_pairwise_grouping_instruction(
+            "Rows with the same {missing_column} belong together.",
+            input_cols=("name", "description"),
+        )
+
+
+def test_sem_groupby_pairwise_instruction_preserves_escaped_literal_braces() -> None:
+    lowered = lower_pairwise_grouping_instruction(
+        "Treat {{name}} as literal text, but compare {name}.",
+        input_cols=("name",),
+    )
+
+    assert lowered == "Treat {{name}} as literal text, but compare name."
 
 
 def test_sem_groupby_pairwise_trace_writes_all_pairs(
@@ -6515,6 +6555,168 @@ def test_lotus_style_sem_agg_passes_response_format_only_on_final_pass() -> None
     assert calls[1]["max_tokens"] == 1024
 
 
+def test_lotus_style_structured_sem_agg_retries_invalid_final_output() -> None:
+    from agent_memory.adapters.lotus.sem_agg import lotus_style_structured_sem_agg
+
+    calls: list[dict[str, Any]] = []
+    outputs = iter(("", '{"topic": "docs", "body": "summary"}'))
+
+    class Model:
+        max_ctx_len = 4096
+        max_tokens = 512
+
+        def count_tokens(self, value: Any) -> int:
+            return 1
+
+        def __call__(self, batch: list[Any], **kwargs: Any) -> Any:
+            calls.append(dict(kwargs))
+            return SimpleNamespace(outputs=(next(outputs),))
+
+    reset_structured_retry_stats()
+    result = lotus_style_structured_sem_agg(
+        ["doc one"],
+        Model(),
+        "Merge documents.",
+        [0],
+        output_cols=(ColumnSpec("topic"), ColumnSpec("body")),
+        max_retries=1,
+        final_model_kwargs={"max_tokens": 1024},
+    )
+
+    assert result.raw_outputs == ['{"topic": "docs", "body": "summary"}']
+    assert result.raw_output_attempts == (
+        ("", '{"topic": "docs", "body": "summary"}'),
+    )
+    assert result.invalid_indices == ()
+    assert len(calls) == 2
+    assert calls[0]["response_format"] == JSON_OBJECT_RESPONSE_FORMAT
+    assert calls[1]["response_format"] == JSON_OBJECT_RESPONSE_FORMAT
+    assert structured_retry_stats().retry_batches == 1
+
+
+def test_lotus_style_structured_sem_agg_retries_only_final_call() -> None:
+    from agent_memory.adapters.lotus.sem_agg import lotus_style_structured_sem_agg
+
+    calls: list[tuple[int, dict[str, Any]]] = []
+
+    class Model:
+        max_ctx_len = 10
+        max_tokens = 1
+
+        def count_tokens(self, value: Any) -> int:
+            return 100 if "doc two" in str(value) else 1
+
+        def __call__(self, batch: list[Any], **kwargs: Any) -> Any:
+            calls.append((len(batch), dict(kwargs)))
+            if len(calls) == 1:
+                return SimpleNamespace(outputs=("partial one", "partial two"))
+            if len(calls) == 2:
+                return SimpleNamespace(outputs=("",))
+            return SimpleNamespace(
+                outputs=('{"topic": "docs", "body": "summary"}',)
+            )
+
+    reset_structured_retry_stats()
+    result = lotus_style_structured_sem_agg(
+        ["doc one", "doc two"],
+        Model(),
+        "Merge documents.",
+        [0, 0],
+        output_cols=(ColumnSpec("topic"), ColumnSpec("body")),
+        max_retries=1,
+    )
+
+    assert result.raw_output_attempts == (
+        ("", '{"topic": "docs", "body": "summary"}'),
+    )
+    assert [batch_size for batch_size, _kwargs in calls] == [2, 1, 1]
+    assert "response_format" not in calls[0][1]
+    assert calls[1][1]["response_format"] == JSON_OBJECT_RESPONSE_FORMAT
+    assert calls[2][1]["response_format"] == JSON_OBJECT_RESPONSE_FORMAT
+
+
+def test_lotus_style_structured_sem_agg_does_not_retry_valid_output() -> None:
+    from agent_memory.adapters.lotus.sem_agg import lotus_style_structured_sem_agg
+
+    calls: list[dict[str, Any]] = []
+    valid_output = '{"topic": "docs", "body": "summary"}'
+
+    class Model:
+        max_ctx_len = 4096
+        max_tokens = 512
+
+        def count_tokens(self, value: Any) -> int:
+            return 1
+
+        def __call__(self, batch: list[Any], **kwargs: Any) -> Any:
+            calls.append(dict(kwargs))
+            return SimpleNamespace(outputs=(valid_output,))
+
+    reset_structured_retry_stats()
+    result = lotus_style_structured_sem_agg(
+        ["doc one"],
+        Model(),
+        "Merge documents.",
+        [0],
+        output_cols=(ColumnSpec("topic"), ColumnSpec("body")),
+        max_retries=1,
+        final_model_kwargs={"max_tokens": 1024},
+    )
+
+    assert result.raw_outputs == [valid_output]
+    assert result.raw_output_attempts == ((valid_output,),)
+    assert result.invalid_indices == ()
+    assert len(calls) == 1
+    assert structured_retry_stats().retry_batches == 0
+
+
+def test_lotus_style_structured_sem_agg_records_exhausted_retries(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from agent_memory.adapters.lotus.sem_agg import lotus_style_structured_sem_agg
+
+    calls: list[dict[str, Any]] = []
+    outputs = iter(("", ""))
+
+    class Model:
+        max_ctx_len = 4096
+        max_tokens = 512
+
+        def count_tokens(self, value: Any) -> int:
+            return 1
+
+        def __call__(self, batch: list[Any], **kwargs: Any) -> Any:
+            calls.append(dict(kwargs))
+            return SimpleNamespace(outputs=(next(outputs),))
+
+    reset_structured_retry_stats()
+    monkeypatch.setattr(structured_module, "STRUCTURED_FAILURE_DIR", tmp_path)
+    result = lotus_style_structured_sem_agg(
+        ["doc one"],
+        Model(),
+        "Merge documents.",
+        [0],
+        output_cols=(ColumnSpec("topic"), ColumnSpec("body")),
+        max_retries=1,
+        failure_extra_by_index={0: {"group_index": 3}},
+    )
+
+    assert result.raw_outputs == [""]
+    assert result.raw_output_attempts == (("", ""),)
+    assert result.invalid_indices == (0,)
+    assert len(calls) == 2
+    assert len(result.failure_artifact_paths) == 1
+    artifact = json.loads(
+        result.failure_artifact_paths[0].read_text(encoding="utf-8")
+    )
+    assert artifact["raw_outputs"] == ["", ""]
+    assert artifact["group_index"] == 3
+    stats = structured_retry_stats()
+    assert stats.retry_batches == 1
+    assert stats.failure_artifacts == 1
+
+
 def test_sem_agg_model_kwargs_use_structured_max_tokens_by_default() -> None:
     kwargs = structured_sem_agg_model_kwargs(LotusExecutionConfig())
 
@@ -6734,7 +6936,9 @@ def test_sem_agg_grouped_multi_output_returns_one_row_per_group(
         input_cols: tuple[str, ...],
         output_cols: tuple[ColumnSpec, ...],
         config: LotusExecutionConfig,
-    ) -> str:
+        *,
+        group_index: int = 0,
+    ) -> StructuredLMRetryResult:
         structured_calls.append(
             (
                 list(group["body"]),
@@ -6743,10 +6947,10 @@ def test_sem_agg_grouped_multi_output_returns_one_row_per_group(
             )
         )
         index = len(structured_calls) - 1
-        return (
+        return sem_agg_retry_result((
             '{"topic": "docs", "body": "doc one and doc two"}',
             '{"topic": "cooking", "body": "cooking"}',
-        )[index]
+        )[index])
 
     monkeypatch.setattr(
         sem_agg_module,
@@ -6801,9 +7005,13 @@ def test_sem_agg_whole_multi_output_returns_one_row(
         input_cols: tuple[str, ...],
         output_cols: tuple[ColumnSpec, ...],
         config: LotusExecutionConfig,
-    ) -> str:
+        *,
+        group_index: int = 0,
+    ) -> StructuredLMRetryResult:
         structured_calls.append(list(group["body"]))
-        return '{"topic": "docs", "body": "doc one and doc two"}'
+        return sem_agg_retry_result(
+            '{"topic": "docs", "body": "doc one and doc two"}'
+        )
 
     monkeypatch.setattr(
         sem_agg_module,
@@ -6847,8 +7055,13 @@ def test_sem_agg_structured_trace_writes_group_raw_and_parsed_output(
         input_cols: tuple[str, ...],
         output_cols: tuple[ColumnSpec, ...],
         config: LotusExecutionConfig,
-    ) -> str:
-        return '{"topic": "docs", "body": "doc one and doc two"}'
+        *,
+        group_index: int = 0,
+    ) -> StructuredLMRetryResult:
+        return sem_agg_retry_result(
+            '{"topic": "docs", "body": "doc one and doc two"}',
+            attempts=("", '{"topic": "docs", "body": "doc one and doc two"}'),
+        )
 
     monkeypatch.setattr(
         sem_agg_module,
@@ -6877,6 +7090,7 @@ def test_sem_agg_structured_trace_writes_group_raw_and_parsed_output(
     group_snapshot = pd.read_csv(trace_dir_from_event(tmp_path, event["group_snapshot_path"]))
     assert group_snapshot.to_dict("records") == [{"body": "doc one"}, {"body": "doc two"}]
     assert trace_artifact(tmp_path, event["raw_output_path"]) == [
+        "",
         '{"topic": "docs", "body": "doc one and doc two"}'
     ]
     assert trace_artifact(tmp_path, event["parsed_output_path"]) == {
@@ -6884,6 +7098,7 @@ def test_sem_agg_structured_trace_writes_group_raw_and_parsed_output(
         "body": "doc one and doc two",
     }
     assert event["parse_error"] == ""
+    assert event["parse_retry_attempts"] == 1
 
 
 def test_sem_agg_rejects_invalid_structured_json() -> None:
@@ -6938,8 +7153,10 @@ def test_sem_agg_structured_failure_writes_artifact(
         input_cols: tuple[str, ...],
         output_cols: tuple[ColumnSpec, ...],
         config: LotusExecutionConfig,
-    ) -> str:
-        return ""
+        *,
+        group_index: int = 0,
+    ) -> StructuredLMRetryResult:
+        return sem_agg_retry_result("", invalid=True)
 
     monkeypatch.setattr(structured_module, "STRUCTURED_FAILURE_DIR", tmp_path)
     monkeypatch.setattr(
