@@ -10,6 +10,7 @@ from typing import Any
 from .planner.differential_policy import DifferentiatedPolicy, PolicyDifferentiator
 from .policy.logical import MemorySpec, MemoryView, QueryExpr
 from .policy.relation import Log, OverRelation, Relation, WindowedRelation
+from .storage.deployment import StorageDeployment
 
 
 def _freeze_metadata(value: Any) -> Any:
@@ -88,12 +89,26 @@ class Memory:
         ):
             raise TypeError("retrieval_query must be a Relation")
 
-    def __init__(self, *, adapter: Any | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        adapter: Any | None = None,
+        storage: StorageDeployment | None = None,
+    ) -> None:
         from .runtime import MemoryRuntime
 
+        policy = (
+            self.__class__.differentiate_policy()
+            if storage is None
+            else PolicyDifferentiator().differentiate(
+                self.__class__.spec(),
+                statements=storage.statements,
+            )
+        )
         self._runtime = MemoryRuntime(
-            self.__class__.differentiate_policy(),
+            policy,
             adapter=adapter,
+            storage=storage,
         )
 
     def add(self, message: MessageInput) -> None:

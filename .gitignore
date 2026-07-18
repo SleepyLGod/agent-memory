@@ -240,3 +240,4 @@ docs/optimization/*.run.xml
 docs/optimization/*.synctex.gz
 docs/optimization/*.toc
 # docs/optimization/*.pdf
+.github/hooks/dcg.json
