@@ -17,6 +17,7 @@ from agent_memory.planner.rules import (
     DifferentialInstructionRewriter,
     DifferentialRules,
 )
+from agent_memory.storage.statements import StatementSet
 
 _GROUP_CARRIERS = {"group_by", "sem_groupby"}
 _ROW_LOCAL_SEMANTIC_OPS = {"sem_filter", "sem_map", "sem_flat_map"}
@@ -42,6 +43,7 @@ class DifferentiatedPolicy:
     nodes: Mapping[str, DifferentialNode]
     execution_order: tuple[str, ...]
     view_outputs: Mapping[str, str]
+    sink_outputs: Mapping[str, str]
     retrieval_queries: Mapping[str, QueryExpr]
     fingerprint: str
     grouped_agg_rule: str
@@ -50,6 +52,7 @@ class DifferentiatedPolicy:
         object.__setattr__(self, "nodes", MappingProxyType(dict(self.nodes)))
         object.__setattr__(self, "execution_order", tuple(self.execution_order))
         object.__setattr__(self, "view_outputs", MappingProxyType(dict(self.view_outputs)))
+        object.__setattr__(self, "sink_outputs", MappingProxyType(dict(self.sink_outputs)))
         object.__setattr__(
             self,
             "retrieval_queries",
@@ -70,14 +73,27 @@ class PolicyDifferentiator:
             instruction_rewriter=instruction_rewriter,
         )
 
-    def differentiate(self, spec: MemorySpec) -> DifferentiatedPolicy:
-        """Differentiate all public views into one shared executable policy."""
+    def differentiate(
+        self,
+        spec: MemorySpec,
+        *,
+        statements: StatementSet | None = None,
+    ) -> DifferentiatedPolicy:
+        """Differentiate public views and optional storage sinks into one policy."""
 
         dependencies = _view_dependencies(spec)
         view_order = _topological_order(tuple(spec.views), dependencies)
-        nodes, execution_order, view_outputs, fingerprint = _DifferentialPolicyBuilder(
-            self._query_differentiator
-        ).build(spec, view_execution_order=view_order)
+        (
+            nodes,
+            execution_order,
+            view_outputs,
+            sink_outputs,
+            fingerprint,
+        ) = _DifferentialPolicyBuilder(self._query_differentiator).build(
+            spec,
+            view_execution_order=view_order,
+            statements=statements,
+        )
         retrieval_queries = {
             name: _bind_materialized_views(query, spec=spec)
             for name, query in spec.retrieval_queries.items()
@@ -87,6 +103,7 @@ class PolicyDifferentiator:
             nodes=nodes,
             execution_order=execution_order,
             view_outputs=view_outputs,
+            sink_outputs=sink_outputs,
             retrieval_queries=retrieval_queries,
             fingerprint=fingerprint,
             grouped_agg_rule=self._query_differentiator.grouped_agg_rule,
@@ -103,20 +120,29 @@ class _DifferentialPolicyBuilder:
         self._query_nodes: dict[QueryExpr, str] = {}
         self._execution_order: list[str] = []
         self._view_nodes: dict[str, str] = {}
+        self._sink_nodes: dict[str, str] = {}
 
     def build(
         self,
         spec: MemorySpec,
         *,
         view_execution_order: tuple[str, ...],
-    ) -> tuple[dict[str, DifferentialNode], tuple[str, ...], dict[str, str], str]:
-        """Build all public view roots and return the shared graph parts."""
+        statements: StatementSet | None,
+    ) -> tuple[
+        dict[str, DifferentialNode],
+        tuple[str, ...],
+        dict[str, str],
+        dict[str, str],
+        str,
+    ]:
+        """Build public view and storage sink roots into one shared graph."""
 
         self._nodes = {}
         self._node_queries = {}
         self._query_nodes = {}
         self._execution_order = []
         self._view_nodes = {}
+        self._sink_nodes = {}
 
         for view_name in view_execution_order:
             self._view_nodes[view_name] = self._compile_query(
@@ -124,15 +150,25 @@ class _DifferentialPolicyBuilder:
                 spec=spec,
             )
 
+        if statements is not None:
+            for statement in statements.statements:
+                self._sink_nodes[statement.statement_id] = self._compile_query(
+                    statement.query,
+                    spec=spec,
+                )
+
         fingerprint = _plan_fingerprint(
             self._nodes,
             self._execution_order,
             self._view_nodes,
+            sink_outputs=self._sink_nodes,
+            statements=statements,
         )
         return (
             dict(self._nodes),
             tuple(self._execution_order),
             dict(self._view_nodes),
+            dict(self._sink_nodes),
             fingerprint,
         )
 
@@ -510,6 +546,9 @@ def _plan_fingerprint(
     nodes: Mapping[str, DifferentialNode],
     execution_order: list[str],
     view_outputs: Mapping[str, str],
+    *,
+    sink_outputs: Mapping[str, str],
+    statements: StatementSet | None,
 ) -> str:
     """Return a stable digest for checkpoint compatibility validation."""
 
@@ -527,6 +566,15 @@ def _plan_fingerprint(
         ],
         "views": dict(sorted(view_outputs.items())),
     }
+    if statements is not None and statements.statements:
+        payload["sinks"] = [
+            {
+                "id": statement.statement_id,
+                "node": sink_outputs[statement.statement_id],
+                "target": statement.target.to_dict(),
+            }
+            for statement in statements.statements
+        ]
     encoded = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 

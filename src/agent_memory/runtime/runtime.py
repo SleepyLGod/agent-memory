@@ -11,16 +11,25 @@ from agent_memory.planner.legacy import differentiate_legacy_policy
 from agent_memory.policy.logical import QueryExpr
 from agent_memory.runtime.executor import PolicyExecutor
 from agent_memory.runtime.legacy import LegacyViewRuntime
+from agent_memory.storage.deployment import StorageDeployment
 
 
 class MemoryRuntime:
     """Run a policy with the v2 executor or its schema-v1 compatibility engine."""
 
-    def __init__(self, policy: DifferentiatedPolicy, *, adapter: Any | None = None) -> None:
+    def __init__(
+        self,
+        policy: DifferentiatedPolicy,
+        *,
+        adapter: Any | None = None,
+        storage: StorageDeployment | None = None,
+    ) -> None:
         self.policy = policy
+        self.storage = storage
         self._engine: PolicyExecutor | LegacyViewRuntime = PolicyExecutor(
             policy,
             adapter=adapter,
+            storage=storage,
         )
 
     @property
@@ -49,11 +58,13 @@ class MemoryRuntime:
     def snapshot_state(self) -> dict[str, Any]:
         """Return a checkpoint in the active engine's schema."""
 
+        self._require_checkpoint_support()
         return self._engine.snapshot_state()
 
     def restore_state(self, snapshot: Mapping[str, Any]) -> None:
         """Restore v2 directly or route schema-v1 state to the legacy engine."""
 
+        self._require_checkpoint_support()
         schema_version = snapshot.get("schema_version")
         if schema_version == 1:
             legacy_policy = differentiate_legacy_policy(
@@ -70,6 +81,14 @@ class MemoryRuntime:
             self._engine.restore_state(snapshot)
             return
         raise ValueError("Unsupported runtime snapshot schema_version")
+
+    def _require_checkpoint_support(self) -> None:
+        """Reject half-implemented external-storage recovery semantics."""
+
+        if self.storage is not None:
+            raise NotImplementedError(
+                "storage-bound checkpoint and restore require storage recovery support"
+            )
 
     def _query_output_columns(self, query: QueryExpr) -> list[str]:
         """Infer columns through the selected execution engine."""

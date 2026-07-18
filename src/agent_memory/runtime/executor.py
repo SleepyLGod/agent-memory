@@ -22,6 +22,7 @@ from agent_memory.policy.relation import (
 )
 from agent_memory.policy.schema import output_columns
 from agent_memory.runtime.window import WINDOW_SOURCE_INPUT, completed_count_windows
+from agent_memory.storage.deployment import StorageDeployment
 
 
 @dataclass(frozen=True)
@@ -53,10 +54,18 @@ class NodeOutputUpdate:
 class PolicyExecutor:
     """Execute one differentiated policy step and commit all states atomically."""
 
-    def __init__(self, policy: DifferentiatedPolicy, *, adapter: Any | None = None) -> None:
+    def __init__(
+        self,
+        policy: DifferentiatedPolicy,
+        *,
+        adapter: Any | None = None,
+        storage: StorageDeployment | None = None,
+    ) -> None:
         self.policy = policy
         self.spec = policy.spec
         self.adapter = adapter if adapter is not None else self._default_adapter()
+        self.storage = storage
+        self._validate_storage_plan()
         self._state: dict[str, pd.DataFrame] = {}
         self._node_state: dict[str, pd.DataFrame] = {}
         self._semantic_output_cache: dict[
@@ -181,6 +190,7 @@ class PolicyExecutor:
             )
             next_public_state[view_name] = private_view_state.reset_index(drop=True).copy()
 
+        self._write_storage_updates(updates)
         self._state = next_public_state
         self._node_state = staged_node_state
         self._semantic_output_cache = staged_cache
@@ -190,6 +200,7 @@ class PolicyExecutor:
     def snapshot_state(self) -> dict[str, Any]:
         """Return all state required to resume this exact compiled plan."""
 
+        self._require_checkpoint_support()
         return {
             "schema_version": 2,
             "plan_fingerprint": self.policy.fingerprint,
@@ -206,6 +217,7 @@ class PolicyExecutor:
     def restore_state(self, snapshot: Mapping[str, Any]) -> None:
         """Restore a schema-v2 checkpoint for the same compiled policy plan."""
 
+        self._require_checkpoint_support()
         if snapshot.get("schema_version") != 2:
             raise ValueError("PolicyExecutor requires snapshot schema_version 2")
         if snapshot.get("plan_fingerprint") != self.policy.fingerprint:
@@ -229,6 +241,62 @@ class PolicyExecutor:
             str(node_id): int(value) for node_id, value in window_next_start.items()
         }
         self._next_occurrence = next_occurrence
+
+    def _validate_storage_plan(self) -> None:
+        """Ensure the compiled sink mapping matches the runtime deployment."""
+
+        compiled = tuple(self.policy.sink_outputs)
+        deployed = (
+            ()
+            if self.storage is None
+            else tuple(
+                statement.statement_id
+                for statement in self.storage.statements.statements
+            )
+        )
+        if compiled != deployed:
+            raise ValueError(
+                "compiled storage sinks do not match the runtime deployment; "
+                f"compiled={compiled}, deployed={deployed}"
+            )
+
+    def _write_storage_updates(
+        self,
+        updates: Mapping[str, NodeOutputUpdate],
+    ) -> None:
+        """Write changed sink rows before committing in-memory state."""
+
+        if self.storage is None:
+            return
+        writes = [
+            (
+                statement,
+                updates[self.policy.sink_outputs[statement.statement_id]],
+            )
+            for statement in self.storage.statements.statements
+            if not updates[
+                self.policy.sink_outputs[statement.statement_id]
+            ].is_empty
+        ]
+        if not writes:
+            return
+        with self.storage.connector.transaction(
+            namespace=self.storage.namespace
+        ) as transaction:
+            for statement, update in writes:
+                transaction.write(
+                    statement,
+                    inserted_rows=update.inserted_rows.reset_index(drop=True).copy(),
+                    retracted_rows=update.retracted_rows.reset_index(drop=True).copy(),
+                )
+
+    def _require_checkpoint_support(self) -> None:
+        """Reject storage-bound snapshots until recovery is implemented."""
+
+        if self.storage is not None:
+            raise NotImplementedError(
+                "storage-bound checkpoint and restore require storage recovery support"
+            )
 
     def replace_public_state(self, state: Mapping[str, Any]) -> None:
         """Replace public state for retrieval-only artifact inspection."""
