@@ -1,4 +1,4 @@
-"""Mem0-style memory policy."""
+"""Mem0-style memory policy with count-window across-row extraction."""
 
 from __future__ import annotations
 
@@ -35,11 +35,13 @@ ADDITIVE_EXTRACTION_PROMPT = """
 
 # ROLE
 
-You are a Memory Extractor — a precise, evidence-bound processor responsible for extracting rich, contextual memories from a single conversation message. Your sole operation is ADD: identify every piece of memorable information and produce self-contained, contextually rich factual statements.
+You are a Memory Extractor — a precise, evidence-bound processor responsible for extracting rich, contextual memories from a single conversation message within a multi-turn window. Your sole operation is ADD: identify every piece of memorable information and produce self-contained, contextually rich factual statements.
 
 You extract from BOTH user and assistant messages. User messages reveal personal facts, preferences, plans, and experiences. Assistant messages contain recommendations, plans, suggestions, and actionable information the user may later reference.
 
 Accuracy and completeness are critical. Every piece of memorable information in the message must be captured — a missed extraction means lost context that degrades future personalization. When a message covers multiple topics, extract each one separately. Do not let one topic cause you to miss others.
+
+You are processing ONE message from a sliding window that contains this message alongside its surrounding conversation turns. Use surrounding context to enrich extraction — cross-message relationships, topic continuity, and conversational flow help you produce more accurate and contextually grounded facts. However, each fact must still be traceable to the current message as its primary evidence.
 
 # INPUTS
 
@@ -51,7 +53,13 @@ A single conversation message with the following fields:
 - **observation_date** (string): The date the message was sent, e.g. "2023-05-24". This is your ONLY temporal anchor.
 - **current_date** (string): Today's system date, e.g. "2026-02-18". May differ from observation_date.
 
-Extract ONLY from this message.
+Extract primarily from this message. The window provides conversational context for disambiguation and topic continuity.
+
+You are processing within a sliding window of multiple conversation turns. The window provides surrounding messages as context. Use adjacent messages to:
+- Resolve pronouns and ambiguous references
+- Maintain topic continuity across turns
+- Identify relationship dynamics between speakers
+- Detect conversation patterns and evolving topics
 
 Resolve ALL relative time references against observation_date:
 - "yesterday" → day before observation_date
@@ -203,151 +211,151 @@ Capture the EXACT meaning of what was said. Read carefully:
 
 ## Example 1: Multiple Topics in a Single Message
 
-Current Message: {"role": "user", "content": "Hey! I'm Marcus. I just got promoted to Senior Engineer at Shopify last week - been grinding for two years for this. My wife Elena and I celebrated with dinner at Osteria Francescana, it's our go-to spot for special occasions. We're also expecting our first baby in March!", "observation_date": "2025-08-19", "current_date": "2025-08-19"}
+Current Message: {{"role": "user", "content": "Hey! I'm Marcus. I just got promoted to Senior Engineer at Shopify last week - been grinding for two years for this. My wife Elena and I celebrated with dinner at Osteria Francescana, it's our go-to spot for special occasions. We're also expecting our first baby in March!", "observation_date": "2025-08-19", "current_date": "2025-08-19"}}
 
 Output:
-{"rows": [
-  {"id": "0", "text": "User's name is Marcus and was promoted to Senior Engineer at Shopify around August 12, 2025 after working toward it for two years"},
-  {"id": "1", "text": "Marcus has a wife named Elena and they celebrate special occasions at Osteria Francescana, their go-to restaurant"},
-  {"id": "2", "text": "Marcus and his wife Elena are expecting their first baby in March 2026"}
-]}
+{{"rows": [
+  {{"id": "0", "text": "User's name is Marcus and was promoted to Senior Engineer at Shopify around August 12, 2025 after working toward it for two years"}},
+  {{"id": "1", "text": "Marcus has a wife named Elena and they celebrate special occasions at Osteria Francescana, their go-to restaurant"}},
+  {{"id": "2", "text": "Marcus and his wife Elena are expecting their first baby in March 2026"}}
+]}}
 
 Three distinct topics — career, relationship/dining, family milestone — each get their own memory with full context.
 
 
 ## Example 2: User Preference Revealed Through a Request
 
-Current Message: {"role": "user", "content": "Can you recommend some sports documentaries on Netflix with strong storytelling? I love \"The Last Dance\" by Michael Jordan.", "observation_date": "2023-06-01", "current_date": "2023-06-01"}
+Current Message: {{"role": "user", "content": "Can you recommend some sports documentaries on Netflix with strong storytelling? I love \"The Last Dance\" by Michael Jordan.", "observation_date": "2023-06-01", "current_date": "2023-06-01"}}
 
 Output:
-{"rows": [
-  {"id": "0", "text": "User enjoys watching sports documentaries on Netflix with strong storytelling, such as 'The Last Dance' featuring Michael Jordan"}
-]}
+{{"rows": [
+  {{"id": "0", "text": "User enjoys watching sports documentaries on Netflix with strong storytelling, such as 'The Last Dance' featuring Michael Jordan"}}
+]}}
 
 The user's viewing preference is extracted from the request. The request itself is transient; the preference is durable.
 
 
 ## Example 3: Nothing to Extract
 
-Current Message: {"role": "user", "content": "Hey, good morning!", "observation_date": "2025-08-19", "current_date": "2025-08-19"}
+Current Message: {{"role": "user", "content": "Hey, good morning!", "observation_date": "2025-08-19", "current_date": "2025-08-19"}}
 
-Output: {"rows": []}
+Output: {{"rows": []}}
 
 Pure greeting with no extractable facts — no informational content beyond phatic acknowledgment.
 
 
 ## Example 4: Assistant Message with Recommendations
 
-Current Message: {"role": "assistant", "content": "Based on your interest in databases, here are three books I recommend: 1) 'Designing Data-Intensive Applications' by Martin Kleppmann for distributed systems fundamentals, 2) 'Database Internals' by Alex Petrov for storage engine deep-dives, and 3) 'Readings in Database Systems' (the Red Book) for seminal papers.", "observation_date": "2024-06-10", "current_date": "2024-06-10"}
+Current Message: {{"role": "assistant", "content": "Based on your interest in databases, here are three books I recommend: 1) 'Designing Data-Intensive Applications' by Martin Kleppmann for distributed systems fundamentals, 2) 'Database Internals' by Alex Petrov for storage engine deep-dives, and 3) 'Readings in Database Systems' (the Red Book) for seminal papers.", "observation_date": "2024-06-10", "current_date": "2024-06-10"}}
 
 Output:
-{"rows": [
-  {"id": "0", "text": "User was recommended three database books: 'Designing Data-Intensive Applications' by Martin Kleppmann, 'Database Internals' by Alex Petrov, and 'Readings in Database Systems' (the Red Book) for seminal papers"}
-]}
+{{"rows": [
+  {{"id": "0", "text": "User was recommended three database books: 'Designing Data-Intensive Applications' by Martin Kleppmann, 'Database Internals' by Alex Petrov, and 'Readings in Database Systems' (the Red Book) for seminal papers"}}
+]}}
 
 Assistant recommendations are extracted with full book titles and author names preserved.
 
 
 ## Example 5: Extract Durable Facts from Transient Activity
 
-Current Message: {"role": "user", "content": "Just finished my morning run — 5K in 28 minutes, my best time this month!", "observation_date": "2025-06-15", "current_date": "2025-06-15"}
+Current Message: {{"role": "user", "content": "Just finished my morning run — 5K in 28 minutes, my best time this month!", "observation_date": "2025-06-15", "current_date": "2025-06-15"}}
 
 Output:
-{"rows": [
-  {"id": "0", "text": "User runs 5K distances and achieved a personal best time of 28 minutes in June 2025"}
-]}
+{{"rows": [
+  {{"id": "0", "text": "User runs 5K distances and achieved a personal best time of 28 minutes in June 2025"}}
+]}}
 
 The specific event ("just finished my morning run") is transient. The durable facts — distance, pace ability, and personal best milestone — are what get extracted.
 
 
 ## Example 6: Multiple Dimensions in One Message
 
-Current Message: {"role": "user", "content": "As an aspiring actor, I'm looking for advice on improving my craft. Can you recommend some films on Netflix with strong acting performances like Daniel Day-Lewis in 'There Will Be Blood'? I also want to find online resources for acting techniques.", "observation_date": "2023-06-01", "current_date": "2023-06-01"}
+Current Message: {{"role": "user", "content": "As an aspiring actor, I'm looking for advice on improving my craft. Can you recommend some films on Netflix with strong acting performances like Daniel Day-Lewis in 'There Will Be Blood'? I also want to find online resources for acting techniques.", "observation_date": "2023-06-01", "current_date": "2023-06-01"}}
 
 Output:
-{"rows": [
-  {"id": "0", "text": "User is an aspiring actor seeking to improve their craft through studying films with strong performances and acting technique resources"},
-  {"id": "1", "text": "User enjoys watching films on Netflix with outstanding acting, especially performances like Daniel Day-Lewis in 'There Will Be Blood'"}
-]}
+{{"rows": [
+  {{"id": "0", "text": "User is an aspiring actor seeking to improve their craft through studying films with strong performances and acting technique resources"}},
+  {{"id": "1", "text": "User enjoys watching films on Netflix with outstanding acting, especially performances like Daniel Day-Lewis in 'There Will Be Blood'"}}
+]}}
 
 Two dimensions: (1) career aspiration, (2) entertainment viewing preference. Each extracted separately.
 
 
 ## Example 7: Temporal Grounding
 
-Current Message: {"role": "user", "content": "I've actually listened to Ready Player One as an audiobook recently and enjoyed the pop culture references.", "observation_date": "2022-01-16", "current_date": "2026-02-18"}
+Current Message: {{"role": "user", "content": "I've actually listened to Ready Player One as an audiobook recently and enjoyed the pop culture references.", "observation_date": "2022-01-16", "current_date": "2026-02-18"}}
 
 Output:
-{"rows": [{"id": "0", "text": "User listened to the Ready Player One audiobook around early January 2022 and enjoyed the pop culture references"}]}
+{{"rows": [{{"id": "0", "text": "User listened to the Ready Player One audiobook around early January 2022 and enjoyed the pop culture references"}}]}}
 
 "Recently" is grounded to the Observation Date (January 2022), NOT Current Date (February 2026). Always resolve relative time references against Observation Date.
 
 
 ## Example 8: Document / Reference Material — Extract Content, Not Actions
 
-Current Message: {"role": "user", "content": "I want you to remember this case. Bajimaya v Reward Homes Pty Ltd [2021] NSWCATAP 297 — The construction began in 2014, contract signed in 2015 with completion due by October 2015. The plaintiff received keys in December 2016 and found defects including incomplete works, poor workmanship, and non-compliance with the building code. The tribunal found the builder breached contract.", "observation_date": "2024-03-10", "current_date": "2024-03-10"}
+Current Message: {{"role": "user", "content": "I want you to remember this case. Bajimaya v Reward Homes Pty Ltd [2021] NSWCATAP 297 — The construction began in 2014, contract signed in 2015 with completion due by October 2015. The plaintiff received keys in December 2016 and found defects including incomplete works, poor workmanship, and non-compliance with the building code. The tribunal found the builder breached contract.", "observation_date": "2024-03-10", "current_date": "2024-03-10"}}
 
 Output:
-{"rows": [
-  {"id": "0", "text": "Bajimaya v Reward Homes Pty Ltd [2021] NSWCATAP 297: construction of the home began in 2014, contract signed in 2015, with completion due by October 2015. Keys were delivered in December 2016."},
-  {"id": "1", "text": "In Bajimaya v Reward Homes, the plaintiff found defects including incomplete works, poor workmanship, and non-compliance with the Building Code of Australia after receiving the home in December 2016."},
-  {"id": "2", "text": "The tribunal found Reward Homes Pty Ltd breached its contract with Mr. Bajimaya by failing to complete work in a proper and workmanlike manner and failing to comply with plans, specifications, and the Building Code."}
-]}
+{{"rows": [
+  {{"id": "0", "text": "Bajimaya v Reward Homes Pty Ltd [2021] NSWCATAP 297: construction of the home began in 2014, contract signed in 2015, with completion due by October 2015. Keys were delivered in December 2016."}},
+  {{"id": "1", "text": "In Bajimaya v Reward Homes, the plaintiff found defects including incomplete works, poor workmanship, and non-compliance with the Building Code of Australia after receiving the home in December 2016."}},
+  {{"id": "2", "text": "The tribunal found Reward Homes Pty Ltd breached its contract with Mr. Bajimaya by failing to complete work in a proper and workmanlike manner and failing to comply with plans, specifications, and the Building Code."}}
+]}}
 
 Extract the actual factual content — dates, parties, findings — NOT "User shared a case summary."
 
 
 ## Example 9: Structured Data with Counts and Specifics
 
-Current Message: {"role": "user", "content": "Here are the enemy stat blocks for our D&D campaign: Mummies (4): AC 11, HP 45, Speed 20 ft, with Curse of the Pharaohs (DC 15 Wisdom) and Mummy Rot (DC 15 Constitution). Construct Guardians (2): AC 17, HP 110, Speed 30 ft, with Immutable Form, Magic Resistance, and Siege Monster. Skeletal Warriors (6): AC 12, HP 22, Speed 30 ft, with Undead Fortitude.", "observation_date": "2024-01-15", "current_date": "2024-01-15"}
+Current Message: {{"role": "user", "content": "Here are the enemy stat blocks for our D&D campaign: Mummies (4): AC 11, HP 45, Speed 20 ft, with Curse of the Pharaohs (DC 15 Wisdom) and Mummy Rot (DC 15 Constitution). Construct Guardians (2): AC 17, HP 110, Speed 30 ft, with Immutable Form, Magic Resistance, and Siege Monster. Skeletal Warriors (6): AC 12, HP 22, Speed 30 ft, with Undead Fortitude.", "observation_date": "2024-01-15", "current_date": "2024-01-15"}}
 
 Output:
-{"rows": [
-  {"id": "0", "text": "User's D&D campaign encounter includes 4 Mummies (AC 11, 45 HP, Speed 20 ft) with Curse of the Pharaohs (DC 15 Wisdom save) and Mummy Rot (DC 15 Constitution save)"},
-  {"id": "1", "text": "User's D&D campaign encounter includes 2 Construct Guardians (AC 17, 110 HP, Speed 30 ft) with Immutable Form, Magic Resistance, and Siege Monster traits"},
-  {"id": "2", "text": "User's D&D campaign encounter includes 6 Skeletal Warriors (AC 12, 22 HP, Speed 30 ft) with the Undead Fortitude trait"}
-]}
+{{"rows": [
+  {{"id": "0", "text": "User's D&D campaign encounter includes 4 Mummies (AC 11, 45 HP, Speed 20 ft) with Curse of the Pharaohs (DC 15 Wisdom save) and Mummy Rot (DC 15 Constitution save)"}},
+  {{"id": "1", "text": "User's D&D campaign encounter includes 2 Construct Guardians (AC 17, 110 HP, Speed 30 ft) with Immutable Form, Magic Resistance, and Siege Monster traits"}},
+  {{"id": "2", "text": "User's D&D campaign encounter includes 6 Skeletal Warriors (AC 12, 22 HP, Speed 30 ft) with the Undead Fortitude trait"}}
+]}}
 
 Every count and every specific value (AC, HP, DCs, trait names) is preserved.
 
 
 ## Example 10: Emotional and Factual Dimensions
 
-Current Message: {"role": "user", "content": "I'm so relieved my presentation went well today. I've been preparing for weeks and my manager said it was excellent.", "observation_date": "2025-04-20", "current_date": "2025-04-20"}
+Current Message: {{"role": "user", "content": "I'm so relieved my presentation went well today. I've been preparing for weeks and my manager said it was excellent.", "observation_date": "2025-04-20", "current_date": "2025-04-20"}}
 
 Output:
-{"rows": [
-  {"id": "0", "text": "User gave a presentation on April 20, 2025 that their manager rated excellent after weeks of preparation"},
-  {"id": "1", "text": "User felt relieved after their presentation went well and was praised by their manager"}
-]}
+{{"rows": [
+  {{"id": "0", "text": "User gave a presentation on April 20, 2025 that their manager rated excellent after weeks of preparation"}},
+  {{"id": "1", "text": "User felt relieved after their presentation went well and was praised by their manager"}}
+]}}
 
 Extract both the factual event and the emotional context. Both are valuable for future recall.
 
 
 ## Example 11: Multi-Fact Dense Message
 
-Current Message: {"role": "user", "content": "I adopted a puppy named Max last weekend! He's a beagle mix. Oh, and I also started pottery classes on Tuesdays — made a mug with my daughter's face on it. My sister just moved to Portland too, and my boss gave me a promotion to team lead last week.", "observation_date": "2025-03-10", "current_date": "2025-03-10"}
+Current Message: {{"role": "user", "content": "I adopted a puppy named Max last weekend! He's a beagle mix. Oh, and I also started pottery classes on Tuesdays — made a mug with my daughter's face on it. My sister just moved to Portland too, and my boss gave me a promotion to team lead last week.", "observation_date": "2025-03-10", "current_date": "2025-03-10"}}
 
 Output:
-{"rows": [
-  {"id": "0", "text": "User adopted a beagle mix puppy named Max around March 1-2, 2025"},
-  {"id": "1", "text": "User started taking pottery classes on Tuesdays"},
-  {"id": "2", "text": "User made a ceramic mug with their daughter's face on it in pottery class"},
-  {"id": "3", "text": "User's sister recently moved to Portland"},
-  {"id": "4", "text": "User was promoted to team lead around March 3, 2025"}
-]}
+{{"rows": [
+  {{"id": "0", "text": "User adopted a beagle mix puppy named Max around March 1-2, 2025"}},
+  {{"id": "1", "text": "User started taking pottery classes on Tuesdays"}},
+  {{"id": "2", "text": "User made a ceramic mug with their daughter's face on it in pottery class"}},
+  {{"id": "3", "text": "User's sister recently moved to Portland"}},
+  {{"id": "4", "text": "User was promoted to team lead around March 3, 2025"}}
+]}}
 
 Five distinct topics in one message — each extracted separately. Do not stop after the first topic.
 
 
 ## Example 12: Named Speaker in Assistant Role
 
-Current Message: {"role": "assistant", "content": "Maria: That sounds amazing! I actually just got a new cat named Bailey last week — she's been such a joy already. Camping with pets is so soul-nourishing.", "observation_date": "2023-08-11", "current_date": "2023-08-11"}
+Current Message: {{"role": "assistant", "content": "Maria: That sounds amazing! I actually just got a new cat named Bailey last week — she's been such a joy already. Camping with pets is so soul-nourishing.", "observation_date": "2023-08-11", "current_date": "2023-08-11"}}
 
 Output:
-{"rows": [
-  {"id": "0", "text": "Maria got a new cat named Bailey around early August 2023 and describes her as a joy"}
-]}
+{{"rows": [
+  {{"id": "0", "text": "Maria got a new cat named Bailey around early August 2023 and describes her as a joy"}}
+]}}
 
 Maria is a named speaker within the assistant role sharing a personal fact — this MUST be extracted. Her echo and commentary ("that sounds amazing", "camping with pets is soul-nourishing") are skipped. One message, one new fact, correct attribution by speaker name.
 
@@ -358,12 +366,12 @@ Return ONLY valid JSON parsable by json.loads(). No text, reasoning, explanation
 
 ## Structure
 
-{
+{{
   "rows": [
-    {"id": "0", "text": "First extracted memory", "attributed_to": "user"},
-    {"id": "1", "text": "Second extracted memory", "attributed_to": "assistant"}
+    {{"id": "0", "text": "First extracted memory", "attributed_to": "user"}},
+    {{"id": "1", "text": "Second extracted memory", "attributed_to": "assistant"}}
   ]
-}
+}}
 
 ## Fields
 
@@ -374,14 +382,25 @@ Return ONLY valid JSON parsable by json.loads(). No text, reasoning, explanation
 ## Rules
 
 - Extract every piece of memorable information as a separate memory object.
-- If nothing is worth extracting, return: {"rows": []}
+- If nothing is worth extracting, return: {{"rows": []}}
 - No duplicate IDs. Use double quotes. No trailing commas.
 
 
 """.strip()
 
+
+_MEM0_WINDOW_SIZE = 5
+_MEM0_WINDOW_SLIDE = 5
+
+
 class Mem0Memory(Memory):
-    """Built-in Mem0-style memory policy."""
+    """Built-in Mem0-style memory policy.
+
+    Extraction uses count_window(...).process_window(...) so the policy
+    compiler can derive per-window differential plans. Each completed window
+    of {size} rows is processed through sem_flat_map to extract zero or more
+    facts from every row in that window, and exact duplicate rows are removed.
+    """.replace("{size}", str(_MEM0_WINDOW_SIZE))
 
     log = Log(
         {
@@ -389,7 +408,7 @@ class Mem0Memory(Memory):
             "role": "Conversation role, typically user or assistant; system/tool may exist upstream.",
             "name": "Optional actor name for multi-speaker scenarios.",
             "session_id": "Conversation or session identifier.",
-            "created_at": "ISO-8601 timestamp of the turn; converted to observation_date by the runtime caller.",
+            "timestamp": "Event timestamp.",
             "metadata": "Optional extra structured metadata.",
             "observation_date": "Date the message was sent (YYYY-MM-DD), derived from created_at.",
             "current_date": "Today's system date (YYYY-MM-DD), set by the runtime caller.",
@@ -398,16 +417,22 @@ class Mem0Memory(Memory):
 
     facts = (
         log
-        .sem_flat_map(
-            input_cols=["content", "role", "observation_date", "current_date"],
-            output_cols={
-                "id": "Sequential integer identifier as string, starting at '0'.",
-                "text": "Self-contained, contextually rich factual statement.",
-                "attributed_to": "Speaker attribution: user or assistant.",
-            },
-            instruction=ADDITIVE_EXTRACTION_PROMPT,
+        .count_window(size=_MEM0_WINDOW_SIZE, slide=_MEM0_WINDOW_SLIDE)
+        .process_window(
+            lambda window_source: window_source
+            .select(["content", "role", "observation_date", "current_date"])
+            .sem_flat_map(
+                input_cols=["content", "role", "observation_date", "current_date"],
+                output_cols={
+                    "id": "Sequential integer identifier as string, starting at '0'.",
+                    "text": "Self-contained, contextually rich factual statement.",
+                    "attributed_to": "Speaker attribution: user or assistant.",
+                },
+                instruction=ADDITIVE_EXTRACTION_PROMPT,
+            )
         )
         .select(["text", "attributed_to"])
+        .drop_duplicates()
     )
 
     retrieval_query = facts.sem_topk(UserQuery(), 10)
