@@ -84,7 +84,7 @@ def execute_concat(
 
     left, right = _execute_binary_inputs(query, inputs, execute)
     _require_matching_columns(left, right, op="concat")
-    return pd.concat([left, right], ignore_index=True)
+    return _concat_rows(left, right)
 
 
 def execute_union(
@@ -112,7 +112,7 @@ def execute_union_by_name(
     columns = _union_by_name_columns(left, right, allow_missing_columns=allow_missing)
     left_aligned = _align_columns_by_name(left, columns, allow_missing_columns=allow_missing)
     right_aligned = _align_columns_by_name(right, columns, allow_missing_columns=allow_missing)
-    concatenated = pd.concat([left_aligned, right_aligned], ignore_index=True)
+    concatenated = _concat_rows(left_aligned, right_aligned)
     return concatenated.drop_duplicates(ignore_index=True)
 
 
@@ -600,6 +600,28 @@ def _execute_binary_inputs(
     if len(query.inputs) != 2:
         raise ValueError(f"{query.op} expects exactly two inputs")
     return execute(query.inputs[0], inputs), execute(query.inputs[1], inputs)
+
+
+def _concat_rows(*frames: pd.DataFrame) -> pd.DataFrame:
+    """Append aligned rows without pandas' deprecated all-null dtype inference."""
+
+    if not frames:
+        raise ValueError("row concatenation requires at least one DataFrame")
+    columns = list(frames[0].columns)
+    non_empty_frames = tuple(frame for frame in frames if not frame.empty)
+    if not non_empty_frames:
+        return frames[0].copy().reset_index(drop=True)
+    if not columns:
+        return pd.DataFrame(index=range(sum(len(frame) for frame in non_empty_frames)))
+    return pd.DataFrame(
+        {
+            column: pd.concat(
+                [frame[column] for frame in non_empty_frames],
+                ignore_index=True,
+            )
+            for column in columns
+        }
+    )
 
 
 def _require_matching_columns(left: Any, right: Any, *, op: str) -> None:

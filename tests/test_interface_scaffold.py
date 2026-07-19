@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import warnings
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -4198,6 +4199,81 @@ def test_union_by_name_aligns_missing_columns_and_deduplicates() -> None:
         {"name": "caroline", "body": "Adoption goal.", "type": None},
         {"name": "caroline_values", "body": "Values LGBTQ+ inclusion.", "type": "user"},
     ]
+
+
+def test_row_append_preserves_all_null_columns_without_future_warning() -> None:
+    left = QueryExpr(op="materialized_view", params={"name": "left"})
+    right = QueryExpr(op="materialized_view", params={"name": "right"})
+    inputs = {
+        "left": pd.DataFrame(
+            {"fact": ["old"], "invalid_at": [None], "score": [None]}
+        ),
+        "right": pd.DataFrame(
+            {
+                "fact": ["new"],
+                "invalid_at": [pd.Timestamp("2026-01-01")],
+                "score": [1.5],
+            }
+        ),
+    }
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", FutureWarning)
+        concatenated = execute_concat(
+            QueryExpr(op="concat", inputs=(left, right)),
+            inputs,
+            LotusAdapter().execute,
+        )
+        unioned = execute_union_by_name(
+            QueryExpr(op="union_by_name", inputs=(left, right)),
+            inputs,
+            LotusAdapter().execute,
+        )
+
+    for result in (concatenated, unioned):
+        assert list(result.columns) == ["fact", "invalid_at", "score"]
+        assert result["fact"].tolist() == ["old", "new"]
+        assert pd.isna(result.loc[0, "invalid_at"])
+        assert result.loc[1, "invalid_at"] == pd.Timestamp("2026-01-01")
+        assert pd.isna(result.loc[0, "score"])
+        assert result.loc[1, "score"] == 1.5
+
+
+def test_row_append_ignores_empty_inputs_for_dtype_inference() -> None:
+    left = QueryExpr(op="materialized_view", params={"name": "left"})
+    right = QueryExpr(op="materialized_view", params={"name": "right"})
+    inputs = {
+        "left": pd.DataFrame(
+            {
+                "fact": pd.Series(dtype=object),
+                "invalid_at": pd.Series(dtype=object),
+            }
+        ),
+        "right": pd.DataFrame(
+            {
+                "fact": ["new"],
+                "invalid_at": [pd.Timestamp("2026-01-01")],
+            }
+        ),
+    }
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", FutureWarning)
+        concatenated = execute_concat(
+            QueryExpr(op="concat", inputs=(left, right)),
+            inputs,
+            LotusAdapter().execute,
+        )
+        unioned = execute_union_by_name(
+            QueryExpr(op="union_by_name", inputs=(left, right)),
+            inputs,
+            LotusAdapter().execute,
+        )
+
+    for result in (concatenated, unioned):
+        assert result.to_dict(orient="records") == [
+            {"fact": "new", "invalid_at": pd.Timestamp("2026-01-01")}
+        ]
 
 
 def test_union_by_name_rejects_missing_columns_when_strict() -> None:

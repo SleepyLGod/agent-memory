@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, Mapping
 
 if TYPE_CHECKING:
     from .api import Log
+    from .retrieval import RetrievalQuery
 
 
 # These helpers keep logical plans immutable and cache-safe. This is the same
@@ -99,7 +100,9 @@ class MemorySpec:
     log: "Log"
     views: Mapping[str, MemoryView]
     private_relations: Mapping[str, QueryExpr]
-    retrieval_queries: Mapping[str, QueryExpr] = field(default_factory=dict)
+    retrieval_queries: Mapping[str, QueryExpr | "RetrievalQuery"] = field(
+        default_factory=dict
+    )
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "views", MappingProxyType(dict(self.views)))

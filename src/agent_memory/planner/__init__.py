@@ -6,6 +6,7 @@ from .differential_policy import (
     PolicyDifferentiator,
 )
 from .differential_query import QueryDifferentiator
+from .retrieval import RetrievalNode, RetrievalPlan, RetrievalPlanner
 from .rules import DifferentialInstructionRewriter, DifferentialRules
 
 __all__ = [
@@ -15,4 +16,7 @@ __all__ = [
     "DifferentiatedPolicy",
     "PolicyDifferentiator",
     "QueryDifferentiator",
+    "RetrievalNode",
+    "RetrievalPlan",
+    "RetrievalPlanner",
 ]

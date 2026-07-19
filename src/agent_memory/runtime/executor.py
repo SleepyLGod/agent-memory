@@ -13,7 +13,9 @@ import pandas as pd
 
 from agent_memory.api import Message, MessageInput
 from agent_memory.planner.differential_policy import DifferentiatedPolicy
+from agent_memory.planner.retrieval import RetrievalPlan
 from agent_memory.policy.logical import MemoryView, QueryExpr, UserQuery
+from agent_memory.policy.retrieval import RetrievalResult
 from agent_memory.policy.relation import (
     LOG_ADDED_AT_COLUMN,
     LOG_ADD_SEQ_COLUMN,
@@ -22,7 +24,12 @@ from agent_memory.policy.relation import (
 )
 from agent_memory.policy.schema import output_columns
 from agent_memory.runtime.window import WINDOW_SOURCE_INPUT, completed_count_windows
+from agent_memory.storage.connector import (
+    StorageCommit,
+    StorageConflictError,
+)
 from agent_memory.storage.deployment import StorageDeployment
+from agent_memory.storage.search import SearchBatch, SearchRequest
 
 
 @dataclass(frozen=True)
@@ -74,6 +81,18 @@ class PolicyExecutor:
         ] = {}
         self._window_next_start: dict[str, int] = {}
         self._next_occurrence = 0
+        self._storage_commit = (
+            None
+            if storage is None
+            else StorageCommit(
+                plan_fingerprint=policy.fingerprint,
+                lineage_id=str(uuid4()),
+                commit_sequence=0,
+                source_row_count=0,
+            )
+        )
+        if storage is not None:
+            storage.connector.prepare(storage.statements)
 
     @property
     def node_state(self) -> Mapping[str, pd.DataFrame]:
@@ -190,18 +209,21 @@ class PolicyExecutor:
             )
             next_public_state[view_name] = private_view_state.reset_index(drop=True).copy()
 
-        self._write_storage_updates(updates)
+        next_storage_commit = self._next_storage_commit(
+            source_row_count=len(next_log)
+        )
+        self._write_storage_updates(updates, next_commit=next_storage_commit)
         self._state = next_public_state
         self._node_state = staged_node_state
         self._semantic_output_cache = staged_cache
         self._window_next_start = staged_window_start
         self._next_occurrence = staged_next_occurrence
+        self._storage_commit = next_storage_commit
 
     def snapshot_state(self) -> dict[str, Any]:
         """Return all state required to resume this exact compiled plan."""
 
-        self._require_checkpoint_support()
-        return {
+        snapshot = {
             "schema_version": 2,
             "plan_fingerprint": self.policy.fingerprint,
             "state": dict(self._state),
@@ -213,11 +235,42 @@ class PolicyExecutor:
             "window_next_start": dict(self._window_next_start),
             "next_occurrence": self._next_occurrence,
         }
+        if self.storage is not None:
+            commit = self._require_storage_commit()
+            if commit.is_initial:
+                source_node_ids = tuple(
+                    node_id
+                    for node_id in self.policy.execution_order
+                    if self.policy.nodes[node_id].execution_kind == "source"
+                )
+                if len(source_node_ids) != 1:
+                    raise RuntimeError(
+                        "storage checkpoints require exactly one source node"
+                    )
+                source_node_id = source_node_ids[0]
+                empty_log = self._empty_node_frame(source_node_id)
+                snapshot["state"] = {**snapshot["state"], "log": empty_log.copy()}
+                complete_node_state = dict(snapshot["node_state"])
+                complete_node_state.setdefault(source_node_id, empty_log.copy())
+                for node_id in self.policy.sink_outputs.values():
+                    complete_node_state.setdefault(
+                        node_id,
+                        self._empty_node_frame(node_id),
+                    )
+                snapshot["node_state"] = complete_node_state
+            physical_commit = self.storage.connector.read_commit(
+                namespace=self.storage.namespace
+            )
+            if physical_commit != self._expected_physical_commit():
+                raise StorageConflictError(
+                    "storage commit marker does not match the runtime checkpoint"
+                )
+            snapshot["storage_commit"] = commit.to_dict()
+        return snapshot
 
     def restore_state(self, snapshot: Mapping[str, Any]) -> None:
         """Restore a schema-v2 checkpoint for the same compiled policy plan."""
 
-        self._require_checkpoint_support()
         if snapshot.get("schema_version") != 2:
             raise ValueError("PolicyExecutor requires snapshot schema_version 2")
         if snapshot.get("plan_fingerprint") != self.policy.fingerprint:
@@ -231,16 +284,57 @@ class PolicyExecutor:
         if not isinstance(next_occurrence, int) or next_occurrence < 0:
             raise ValueError("Runtime snapshot next_occurrence must be a non-negative int")
 
-        self._state = dict(state)
-        self._node_state = dict(node_state)
-        self._semantic_output_cache = {
+        staged_state = dict(state)
+        staged_node_state = dict(node_state)
+        staged_semantic_output_cache = {
             str(node_id): dict(_require_nested_mapping(cache, "semantic output cache"))
             for node_id, cache in semantic_output_cache.items()
         }
-        self._window_next_start = {
+        staged_window_next_start = {
             str(node_id): int(value) for node_id, value in window_next_start.items()
         }
+
+        staged_storage_commit: StorageCommit | None = None
+        if self.storage is not None:
+            raw_commit = snapshot.get("storage_commit")
+            if not isinstance(raw_commit, Mapping):
+                raise ValueError("storage-bound snapshot requires storage_commit")
+            staged_storage_commit = StorageCommit.from_dict(raw_commit)
+            if staged_storage_commit.plan_fingerprint != self.policy.fingerprint:
+                raise ValueError(
+                    "storage commit plan fingerprint does not match this policy"
+                )
+            log_rows = staged_state.get("log")
+            if not isinstance(log_rows, pd.DataFrame):
+                raise ValueError("storage-bound snapshot requires DataFrame log state")
+            if staged_storage_commit.source_row_count != len(log_rows):
+                raise ValueError(
+                    "storage commit source row count does not match snapshot log"
+                )
+            physical_commit = self.storage.connector.read_commit(
+                namespace=self.storage.namespace
+            )
+            if physical_commit != self._checkpoint_physical_commit(
+                staged_storage_commit
+            ):
+                self.storage.connector.rebuild(
+                    namespace=self.storage.namespace,
+                    statements=self.storage.statements,
+                    rows_by_statement=self._sink_rows(staged_node_state),
+                    expected_commit=physical_commit,
+                    next_commit=staged_storage_commit,
+                )
+        elif "storage_commit" in snapshot:
+            raise ValueError(
+                "storage-bound snapshot requires a matching storage deployment"
+            )
+
+        self._state = staged_state
+        self._node_state = staged_node_state
+        self._semantic_output_cache = staged_semantic_output_cache
+        self._window_next_start = staged_window_next_start
         self._next_occurrence = next_occurrence
+        self._storage_commit = staged_storage_commit
 
     def _validate_storage_plan(self) -> None:
         """Ensure the compiled sink mapping matches the runtime deployment."""
@@ -263,11 +357,15 @@ class PolicyExecutor:
     def _write_storage_updates(
         self,
         updates: Mapping[str, NodeOutputUpdate],
+        *,
+        next_commit: StorageCommit | None,
     ) -> None:
         """Write changed sink rows before committing in-memory state."""
 
         if self.storage is None:
             return
+        if next_commit is None:
+            raise RuntimeError("storage update requires a next commit")
         writes = [
             (
                 statement,
@@ -278,10 +376,10 @@ class PolicyExecutor:
                 self.policy.sink_outputs[statement.statement_id]
             ].is_empty
         ]
-        if not writes:
-            return
         with self.storage.connector.transaction(
-            namespace=self.storage.namespace
+            namespace=self.storage.namespace,
+            expected_commit=self._expected_physical_commit(),
+            next_commit=next_commit,
         ) as transaction:
             for statement, update in writes:
                 transaction.write(
@@ -290,13 +388,57 @@ class PolicyExecutor:
                     retracted_rows=update.retracted_rows.reset_index(drop=True).copy(),
                 )
 
-    def _require_checkpoint_support(self) -> None:
-        """Reject storage-bound snapshots until recovery is implemented."""
+    def _next_storage_commit(
+        self,
+        *,
+        source_row_count: int,
+    ) -> StorageCommit | None:
+        """Return the marker committed with the staged runtime step."""
 
-        if self.storage is not None:
-            raise NotImplementedError(
-                "storage-bound checkpoint and restore require storage recovery support"
-            )
+        if self.storage is None:
+            return None
+        current = self._require_storage_commit()
+        return StorageCommit(
+            plan_fingerprint=current.plan_fingerprint,
+            lineage_id=current.lineage_id,
+            commit_sequence=current.commit_sequence + 1,
+            source_row_count=source_row_count,
+        )
+
+    def _require_storage_commit(self) -> StorageCommit:
+        if self._storage_commit is None:
+            raise RuntimeError("storage deployment is missing runtime commit state")
+        return self._storage_commit
+
+    def _expected_physical_commit(self) -> StorageCommit | None:
+        commit = self._require_storage_commit()
+        return self._checkpoint_physical_commit(commit)
+
+    @staticmethod
+    def _checkpoint_physical_commit(
+        commit: StorageCommit,
+    ) -> StorageCommit | None:
+        if commit.is_initial:
+            return None
+        return commit
+
+    def _sink_rows(
+        self,
+        node_state: Mapping[str, Any],
+    ) -> dict[str, pd.DataFrame]:
+        storage = self.storage
+        if storage is None:
+            raise RuntimeError("sink rows require a storage deployment")
+        rows: dict[str, pd.DataFrame] = {}
+        for statement in storage.statements.statements:
+            node_id = self.policy.sink_outputs[statement.statement_id]
+            value = node_state.get(node_id)
+            if not isinstance(value, pd.DataFrame):
+                raise ValueError(
+                    f"snapshot is missing sink node state for {statement.statement_id!r}"
+                )
+            rows[statement.statement_id] = value.reset_index(drop=True).copy()
+        return rows
 
     def replace_public_state(self, state: Mapping[str, Any]) -> None:
         """Replace public state for retrieval-only artifact inspection."""
@@ -320,8 +462,104 @@ class PolicyExecutor:
             raise NotImplementedError(
                 f"Memory policy does not declare a retrieval query named {name!r}."
             )
-        query = self._bind_user_query(self.policy.retrieval_queries[name], text)
+        retrieval = self.policy.retrieval_queries[name]
+        if isinstance(retrieval, RetrievalPlan):
+            return self._execute_retrieval_plan(retrieval, text)
+        query = self._bind_user_query(retrieval, text)
         return self.adapter.execute(query, self._state)
+
+    def _execute_retrieval_plan(
+        self,
+        plan: RetrievalPlan,
+        text: str,
+    ) -> RetrievalResult:
+        """Execute one storage-backed retrieval DAG in topological order."""
+
+        if self.storage is None:
+            raise NotImplementedError(
+                "RetrievalQuery requires a storage backend; in-memory scan fallback "
+                "is not supported"
+            )
+        search = getattr(self.storage.connector, "search", None)
+        if not callable(search):
+            raise NotImplementedError(
+                "Storage connector is not retrieval-capable"
+            )
+
+        statements = {
+            statement.statement_id: statement
+            for statement in self.storage.statements.statements
+        }
+        outputs: dict[str, pd.DataFrame] = {}
+        metrics: dict[str, Mapping[str, Any]] = {}
+        for node_id in plan.execution_order:
+            node = plan.nodes[node_id]
+            if node.execution_kind == "search":
+                if node.statement_id is None or node.statement_id not in statements:
+                    raise RuntimeError(
+                        "Retrieval search node is not bound to the active storage plan"
+                    )
+                origin_record_ids: list[str] = []
+                for input_node_id in node.input_node_ids:
+                    frame = outputs[input_node_id]
+                    if "record_id" not in frame.columns:
+                        raise ValueError(
+                            "BFS origin relation must include a record_id column"
+                        )
+                    for value in frame["record_id"].dropna().tolist():
+                        record_id = str(value)
+                        if record_id not in origin_record_ids:
+                            origin_record_ids.append(record_id)
+                statement = statements[node.statement_id]
+                batch = search(
+                    SearchRequest(
+                        statement_id=node.statement_id,
+                        target=statement.target,
+                        namespace=self.storage.namespace,
+                        query=text,
+                        methods=tuple(node.query.params["methods"]),
+                        reranker=node.query.params["reranker"],
+                        limit=int(node.query.params["limit"]),
+                        output_columns=node.required_columns,
+                        origin_record_ids=tuple(origin_record_ids),
+                    )
+                )
+                if not isinstance(batch, SearchBatch):
+                    raise TypeError("storage search must return a SearchBatch")
+                missing = set(node.required_columns).difference(batch.rows.columns)
+                if missing:
+                    raise ValueError(
+                        "storage search result is missing logical columns: "
+                        f"{sorted(missing)}"
+                    )
+                outputs[node_id] = batch.rows.loc[:, node.required_columns].copy()
+                if batch.metrics:
+                    metrics[node_id] = batch.metrics
+                continue
+            if node.execution_kind != "relational":
+                raise RuntimeError(
+                    f"Unknown retrieval execution kind: {node.execution_kind!r}"
+                )
+            inputs = {
+                input_node_id: outputs[input_node_id]
+                for input_node_id in node.input_node_ids
+            }
+            outputs[node_id] = self.adapter.execute(node.query, inputs)
+            if len(node.input_node_ids) == 1 and node.input_node_ids[0] in metrics:
+                metrics[node_id] = metrics[node.input_node_ids[0]]
+
+        return RetrievalResult(
+            query=text,
+            channels={
+                name: outputs[node_id]
+                for name, node_id in plan.channel_outputs.items()
+            },
+            metrics={
+                name: metrics[node_id]
+                for name, node_id in plan.channel_outputs.items()
+                if node_id in metrics
+            },
+        )
 
     def query_output_columns(self, query: QueryExpr) -> list[str]:
         """Infer output columns, resolving public materialized-view leaves."""

@@ -999,7 +999,81 @@ optimizer concerns. When used as a memory retrieval template, the `instruction`
 argument is typically `am.UserQuery()`, which runtime binds to the end-user
 query text. `k` is the policy author's initial retrieval width.
 
-## 6. Differential Maintenance Notes
+## 6. Retrieval Queries
+
+### `search` and `RetrievalQuery`
+
+`Relation.search(...)` declares an index-backed, storage-only search and returns
+a `SearchRelation`:
+
+```python
+_retrieved_entities = entities.search(
+    am.UserQuery(),
+    methods=[am.BM25(), am.CosineSimilarity()],
+    reranker=am.RRF(),
+    limit=20,
+).select(["record_id", "name", "summary", "rank", "score"])
+
+retrieval_query = am.RetrievalQuery(
+    entities=_retrieved_entities,
+    facts=facts.search(
+        am.UserQuery(),
+        methods=[
+            am.BM25(),
+            am.CosineSimilarity(),
+            am.BFS(origins=_retrieved_entities, max_depth=3),
+        ],
+        reranker=am.CrossEncoder(model="BAAI/bge-reranker-v2-m3"),
+        limit=20,
+    ).select(
+        [
+            "record_id",
+            "fact",
+            "valid_at",
+            "invalid_at",
+            "expired_at",
+            "rank",
+            "score",
+        ]
+    ),
+)
+```
+
+The search result logically preserves readable source columns and adds:
+
+- `record_id`: opaque stable identity supplied by the physical backend;
+- `rank`: final one-based result rank;
+- `score`: final reranker score.
+
+`RetrievalQuery` is the single retrieval root and contains ordered named
+channels. A relation handle such as `_retrieved_entities` is a shared node in
+the retrieval DAG, not a memory view or storage sink. `BFS.origins` therefore
+accepts a real `SearchRelation`; it does not accept a channel-name string.
+
+The retrieval planner continues to use the ordinary immutable `QueryExpr` IR;
+there is no parallel `SearchExpr` tree. It pushes required columns into the
+physical search request. The first implementation accepts post-search
+`select`, `filter`, `assign`, `alias`, and `drop_duplicates` only when their
+input-column dependencies can be derived exactly. Other post-search operators
+are rejected at compile time rather than silently fetching or evaluating an
+incorrect shape.
+
+Search is retrieval-only:
+
+- it cannot appear in a maintained view or a `StatementSet` sink;
+- it requires exactly one matching materialized storage sink;
+- it has a separate retrieval fingerprint and is not checkpointed as memory
+  state;
+- it has no in-memory full-scan or `sem_topk` fallback;
+- execution returns `RetrievalResult`, whose channels are DataFrames and whose
+  per-channel metrics retain method candidates, BFS origins, reranker scores,
+  and physical latency when supplied by the connector.
+
+`sem_topk` remains an ordinary semantic relation operator. It is not used to
+lower `search(...)`, and the Graphiti-compatible Zep retrieval path performs no
+generative LLM call.
+
+## 7. Differential Maintenance Notes
 
 The API is designed so full view definitions and differential maintenance can be
 discussed in the same dataframe language.
@@ -1105,7 +1179,7 @@ V_prime = V.subtract(delta_minus).concat(delta_plus)
 `sem_union` may be useful as backend theory terminology for semantic upsert or
 semantic union-distinct, but it is not a public v0 operator in this API.
 
-## 7. LOTUS Alignment
+## 8. LOTUS Alignment
 
 This API follows the LOTUS direction closely:
 

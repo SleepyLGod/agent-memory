@@ -35,9 +35,9 @@ storage。推荐里程碑如下：
 3. **Claude policy full-query and differential comparison**：用同一批 log
    rows 比较 `Q(D ∪ ΔD)` 和 differential maintenance 的结果，验证 Claude
    policy 的语义和 `Q -> Q'` 是否对齐。
-4. **StorageBackend + MarkdownStorageBackend**：最后接 durable
-   materialization。Storage 持久化 materialized views，不定义 logical
-   query 语义，也不替代 operator/rule correctness。
+4. **StatementSet + storage connectors**：最后接 durable materialization。
+   Storage 持久化 materialized relations，不定义 logical query 语义，也不替代
+   operator/rule correctness；Markdown 只是未来的一个 connector/profile。
 
 这个顺序避免把四个问题混在一起：operator 是否能执行、`Q -> Q'` 是否正确、
 Claude policy 是否合理、view 是否能持久化。
@@ -382,40 +382,18 @@ partition ids 的 tree fold。因此：
 
 ## 13. Storage Backend and Claude Markdown Materialization
 
-Storage 是 durable materialization 层，不应该定义 logical query 语义，也
-不应该塞进 `LotusAdapter`。Runtime 负责维护 materialized state，storage
-backend 负责把这些 state 落到 durable 介质。
+本节早期提出的 `StorageBackend.load_state/save_view` 草案已被
+[`zep-graphiti-storage-retrieval-benchmark.zh.md`](./zep-graphiti-storage-retrieval-benchmark.zh.md)
+中的通用 storage contract 取代，不应实现成第二套平行接口。
 
-第一版可以保留很小的泛化接口：
+当前统一边界是：policy writer 通过 immutable `StatementSet` 声明 relation sink；
+`StorageDeployment` 绑定 connector 和 namespace；planner 将 sink roots 编译进共享 DAG；
+runtime 把该 DAG 产生的 inserted/retracted rows 事务性写入 connector。Storage 仍然不定义
+logical query 语义，也不进入 `LotusAdapter`。
 
-```python
-class StorageBackend(Protocol):
-    def load_state(self, spec: MemorySpec) -> dict[str, Any]: ...
-    def save_log(self, frame: Any) -> None: ...
-    def save_view(self, view: MemoryView, frame: Any) -> None: ...
-```
-
-Claude Code markdown storage 是这个接口的一个具体实现，而不是 runtime 的
-内置行为。建议未来实现为：
-
-```text
-src/agent_memory/storage/
-  __init__.py
-  base.py
-  markdown.py
-```
-
-`MarkdownStorageBackend` 负责 Claude Code memory directory layout：
-
-- topic files 使用 markdown frontmatter + body。
-- `MEMORY.md` 是 catalog / index materialization。
-- filename / path derivation 属于 storage config，不属于 logical topic view。
-- storage config 第一版放在 `MarkdownStorageBackend` 内部或构造参数里，不放
-  进 public policy API。
-
-后续如果需要让 policy 声明 view fields 如何映射到 physical markdown fields，
-再提升成正式 storage annotation / materialization config。不要在当前阶段把
-这套 config 塞进 `MemoryView`。
+未来 Claude Markdown materialization 应实现为同一 contract 下的 connector/profile，
+而不是恢复这里的 `load_state/save_view` 接口。Topic files、`MEMORY.md` layout 和 path
+derivation 都属于该 physical profile，不属于 `MemoryView`。
 
 ## 14. 工程原则
 
