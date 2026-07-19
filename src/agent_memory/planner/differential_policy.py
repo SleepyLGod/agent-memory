@@ -5,14 +5,17 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Mapping
-from dataclasses import dataclass, fields, is_dataclass
+from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any
 
 from agent_memory.policy.aggregates import SemanticAggregateSpec
 from agent_memory.policy.logical import MemorySpec, MemoryView, QueryExpr
+from agent_memory.policy.retrieval import RetrievalQuery
 from agent_memory.policy.schema import output_columns
 from agent_memory.planner.differential_query import QueryDifferentiator
+from agent_memory.planner.retrieval import RetrievalPlan, RetrievalPlanner
+from agent_memory.planner.serialization import stable_json, stable_value
 from agent_memory.planner.rules import (
     DifferentialInstructionRewriter,
     DifferentialRules,
@@ -44,7 +47,7 @@ class DifferentiatedPolicy:
     execution_order: tuple[str, ...]
     view_outputs: Mapping[str, str]
     sink_outputs: Mapping[str, str]
-    retrieval_queries: Mapping[str, QueryExpr]
+    retrieval_queries: Mapping[str, QueryExpr | RetrievalPlan]
     fingerprint: str
     grouped_agg_rule: str
 
@@ -94,10 +97,16 @@ class PolicyDifferentiator:
             view_execution_order=view_order,
             statements=statements,
         )
-        retrieval_queries = {
-            name: _bind_materialized_views(query, spec=spec)
-            for name, query in spec.retrieval_queries.items()
-        }
+        retrieval_planner = RetrievalPlanner()
+        retrieval_queries: dict[str, QueryExpr | RetrievalPlan] = {}
+        for name, query in spec.retrieval_queries.items():
+            if isinstance(query, RetrievalQuery):
+                retrieval_queries[name] = retrieval_planner.plan(
+                    query,
+                    statements=statements,
+                )
+            else:
+                retrieval_queries[name] = _bind_materialized_views(query, spec=spec)
         return DifferentiatedPolicy(
             spec=spec,
             nodes=nodes,
@@ -201,6 +210,10 @@ class _DifferentialPolicyBuilder:
         if query.op == "sem_topk":
             raise NotImplementedError(
                 "View-time sem_topk is not supported by policy differentiation"
+            )
+        if query.op == "search":
+            raise NotImplementedError(
+                "Search is retrieval-only and cannot be maintained as a view or storage sink"
             )
         if query.op in _GROUP_CARRIERS | {"count_window", "over", "window_source"}:
             raise ValueError(
@@ -449,7 +462,7 @@ class _DifferentialPolicyBuilder:
     def _node_id(self, query: QueryExpr) -> str:
         """Return a deterministic identifier for one structural query node."""
 
-        digest = hashlib.sha256(_stable_json(query).encode("utf-8")).hexdigest()[:16]
+        digest = hashlib.sha256(stable_json(query).encode("utf-8")).hexdigest()[:16]
         return f"{query.op}-{digest}"
 
     def _is_grouped_aggregate(self, query: QueryExpr) -> bool:
@@ -556,8 +569,8 @@ def _plan_fingerprint(
         "nodes": [
             {
                 "id": node_id,
-                "query": _stable_value(nodes[node_id].query),
-                "maintenance_query": _stable_value(nodes[node_id].maintenance_query),
+                "query": stable_value(nodes[node_id].query),
+                "maintenance_query": stable_value(nodes[node_id].maintenance_query),
                 "inputs": nodes[node_id].input_node_ids,
                 "kind": nodes[node_id].execution_kind,
                 "outputs": nodes[node_id].output_columns,
@@ -577,43 +590,3 @@ def _plan_fingerprint(
         ]
     encoded = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
-
-
-def _stable_json(value: Any) -> str:
-    """Serialize planner values without process-specific object identities."""
-
-    return json.dumps(
-        _stable_value(value),
-        ensure_ascii=True,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-
-
-def _stable_value(value: Any) -> Any:
-    """Convert immutable query values into deterministic JSON data."""
-
-    if isinstance(value, QueryExpr):
-        return {
-            "op": value.op,
-            "inputs": [_stable_value(item) for item in value.inputs],
-            "params": _stable_value(value.params),
-        }
-    if isinstance(value, Mapping):
-        return {
-            str(key): _stable_value(item)
-            for key, item in sorted(value.items(), key=lambda item: str(item[0]))
-        }
-    if isinstance(value, (tuple, list)):
-        return [_stable_value(item) for item in value]
-    if is_dataclass(value):
-        return {
-            "type": type(value).__qualname__,
-            "fields": {
-                field.name: _stable_value(getattr(value, field.name))
-                for field in fields(value)
-            },
-        }
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
-    return {"type": type(value).__qualname__, "repr": repr(value)}

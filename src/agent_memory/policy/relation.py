@@ -198,6 +198,43 @@ class Relation(RelationHandle):
             )
         )
 
+    def search(
+        self,
+        query: UserQuery,
+        *,
+        methods: Sequence[Any],
+        reranker: Any,
+        limit: int,
+    ) -> "SearchRelation":
+        """Build one storage-backed ranked search relation."""
+
+        from .retrieval import normalize_search
+
+        if not isinstance(query, UserQuery):
+            raise TypeError("search query must be UserQuery")
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+            raise ValueError("search limit must be a positive integer")
+        source_columns = output_columns(self.expr)
+        metadata_columns = {"record_id", "rank", "score"}
+        conflicts = sorted(metadata_columns.intersection(source_columns))
+        if conflicts:
+            raise ValueError(
+                f"search metadata columns conflict with source columns: {conflicts}"
+            )
+        method_specs, reranker_spec, dependencies = normalize_search(methods, reranker)
+        return SearchRelation(
+            QueryExpr(
+                op="search",
+                inputs=(self.expr, *dependencies),
+                params={
+                    "query": query,
+                    "methods": method_specs,
+                    "reranker": reranker_spec,
+                    "limit": limit,
+                },
+            )
+        )
+
     def select(self, columns: Sequence[str]) -> "Relation":
         """Project relation columns."""
 
@@ -563,6 +600,25 @@ class Relation(RelationHandle):
             input_cols=_normalize_input_cols(input_cols),
             output_cols=_normalize_output_cols(output_cols),
             instruction=instruction,
+        )
+
+
+class SearchRelation(Relation):
+    """Query-time relation handle that never becomes maintained memory state."""
+
+    def _derive(
+        self,
+        op: str,
+        *,
+        inputs: Sequence[QueryExpr] | None = None,
+        **params: Any,
+    ) -> "SearchRelation":
+        return SearchRelation(
+            QueryExpr(
+                op=op,
+                inputs=tuple(inputs) if inputs is not None else (self.expr,),
+                params=params,
+            )
         )
 
 

@@ -10,7 +10,10 @@ from agent_memory.policy.aggregates import (
 )
 from agent_memory.policy.logical import QueryExpr
 from agent_memory.memories import ZepMemory, ZepMemoryExtended
+from agent_memory.planner import PolicyDifferentiator, RetrievalPlan
+from agent_memory.policy.retrieval import RetrievalQuery
 from agent_memory.policy.schema import output_columns
+from agent_memory.memories.zep.storage import GRAPHITI_NEO4J_STATEMENTS
 
 
 def _walk(query: QueryExpr) -> tuple[QueryExpr, ...]:
@@ -63,6 +66,8 @@ def test_zep_memory_spec_exposes_only_baseline_public_views() -> None:
         "_facts_with_invalidations",
     )
     assert "retrieval_query" not in spec.views
+    assert "_retrieved_entities" not in spec.private_relations
+    assert tuple(spec.retrieval_queries) == ("default",)
 
 
 def test_zep_extended_policy_adds_communities_without_changing_core_queries() -> None:
@@ -73,6 +78,55 @@ def test_zep_extended_policy_adds_communities_without_changing_core_queries() ->
     assert tuple(extended.views) == ("episodes", "entities", "facts", "communities")
     for name in ("episodes", "entities", "facts"):
         assert extended.views[name].query == baseline.views[name].query
+    assert extended.retrieval_queries == baseline.retrieval_queries
+
+
+def test_zep_retrieval_is_one_two_channel_storage_backed_dag() -> None:
+    spec = ZepMemory.spec()
+    retrieval = spec.retrieval_queries["default"]
+
+    assert isinstance(retrieval, RetrievalQuery)
+    assert tuple(retrieval.channels) == ("entities", "facts")
+    entity_channel = retrieval.channels["entities"]
+    fact_channel = retrieval.channels["facts"]
+    assert output_columns(entity_channel) == (
+        "record_id",
+        "name",
+        "summary",
+        "rank",
+        "score",
+    )
+    assert output_columns(fact_channel) == (
+        "record_id",
+        "fact",
+        "valid_at",
+        "invalid_at",
+        "expired_at",
+        "rank",
+        "score",
+    )
+    fact_search = fact_channel.inputs[0]
+    assert fact_search.op == "search"
+    assert tuple(method.kind for method in fact_search.params["methods"]) == (
+        "bm25",
+        "cosine_similarity",
+        "bfs",
+    )
+    assert fact_search.inputs[1] == entity_channel
+
+    policy = PolicyDifferentiator().differentiate(
+        spec,
+        statements=GRAPHITI_NEO4J_STATEMENTS,
+    )
+    plan = policy.retrieval_queries["default"]
+    assert isinstance(plan, RetrievalPlan)
+    assert len(
+        [node for node in plan.nodes.values() if node.execution_kind == "search"]
+    ) == 2
+    assert policy.fingerprint == PolicyDifferentiator().differentiate(
+        spec,
+        statements=GRAPHITI_NEO4J_STATEMENTS,
+    ).fingerprint
 
 
 def test_zep_episodes_view_uses_select_not_map() -> None:
@@ -159,6 +213,8 @@ def test_zep_entities_view_uses_context_extraction_and_semantic_aggregation() ->
     )
     assert semantic.input_cols == ("name", "content", "add_seq")
     assert "add_seq" in semantic.instruction
+    assert "only from the grouped {name} values" in semantic.instruction
+    assert "Never derive the entity name" in semantic.instruction
     final_entity_type_assignment = query.inputs[0]
     assert final_entity_type_assignment.op == "assign"
     assert final_entity_type_assignment.params["assignments"]["entity_type"] == {

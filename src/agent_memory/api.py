@@ -9,7 +9,8 @@ from typing import Any
 
 from .planner.differential_policy import DifferentiatedPolicy, PolicyDifferentiator
 from .policy.logical import MemorySpec, MemoryView, QueryExpr
-from .policy.relation import Log, OverRelation, Relation, WindowedRelation
+from .policy.relation import Log, OverRelation, Relation, SearchRelation, WindowedRelation
+from .policy.retrieval import RetrievalQuery
 from .storage.deployment import StorageDeployment
 
 
@@ -85,9 +86,9 @@ class Memory:
             )
         if "retrieval_query" in cls.__dict__ and not isinstance(
             cls.__dict__["retrieval_query"],
-            Relation,
+            (Relation, RetrievalQuery),
         ):
-            raise TypeError("retrieval_query must be a Relation")
+            raise TypeError("retrieval_query must be a Relation or RetrievalQuery")
 
     def __init__(
         self,
@@ -159,7 +160,7 @@ class Memory:
     def _collect_spec(cls) -> MemorySpec:
         log: Log | None = None
         private_relations: dict[str, QueryExpr] = {}
-        retrieval_queries: dict[str, QueryExpr] = {}
+        retrieval_queries: dict[str, QueryExpr | RetrievalQuery] = {}
         views: dict[str, MemoryView] = {}
 
         for name, value in vars(cls).items():
@@ -170,9 +171,19 @@ class Memory:
                 continue
 
             if name == "retrieval_query":
-                if not isinstance(value, Relation):
-                    raise TypeError("retrieval_query must be a Relation")
-                retrieval_queries["default"] = value.expr
+                if isinstance(value, RetrievalQuery):
+                    retrieval_queries["default"] = value
+                elif isinstance(value, Relation):
+                    retrieval_queries["default"] = value.expr
+                else:
+                    raise TypeError("retrieval_query must be a Relation or RetrievalQuery")
+                continue
+
+            if isinstance(value, SearchRelation):
+                if not name.startswith("_"):
+                    raise TypeError(
+                        f"{name} is a SearchRelation; declare it through retrieval_query"
+                    )
                 continue
 
             if not isinstance(value, Relation):

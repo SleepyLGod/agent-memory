@@ -31,6 +31,19 @@ def output_columns(
         )
     if query.op == "materialized_view":
         return tuple(str(column) for column in query.params.get("columns", ()))
+    if query.op == "search":
+        source_columns = output_columns(
+            query.inputs[0],
+            window_source_columns=window_source_columns,
+        )
+        metadata_columns = ("record_id", "rank", "score")
+        conflicts = sorted(set(source_columns).intersection(metadata_columns))
+        if conflicts:
+            raise ValueError(
+                "search metadata columns conflict with source columns: "
+                f"{conflicts}"
+            )
+        return source_columns + metadata_columns
     if query.op in {"alias", "group_by"}:
         return output_columns(query.inputs[0], window_source_columns=window_source_columns)
     if query.op == "over":

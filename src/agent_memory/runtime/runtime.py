@@ -58,15 +58,17 @@ class MemoryRuntime:
     def snapshot_state(self) -> dict[str, Any]:
         """Return a checkpoint in the active engine's schema."""
 
-        self._require_checkpoint_support()
         return self._engine.snapshot_state()
 
     def restore_state(self, snapshot: Mapping[str, Any]) -> None:
         """Restore v2 directly or route schema-v1 state to the legacy engine."""
 
-        self._require_checkpoint_support()
         schema_version = snapshot.get("schema_version")
         if schema_version == 1:
+            if self.storage is not None:
+                raise NotImplementedError(
+                    "schema-v1 checkpoints cannot be restored with storage"
+                )
             legacy_policy = differentiate_legacy_policy(
                 self.policy.spec,
                 grouped_agg_rule=self.policy.grouped_agg_rule,
@@ -77,18 +79,14 @@ class MemoryRuntime:
             return
         if schema_version == 2:
             if not isinstance(self._engine, PolicyExecutor):
-                self._engine = PolicyExecutor(self.policy, adapter=self._engine.adapter)
+                self._engine = PolicyExecutor(
+                    self.policy,
+                    adapter=self._engine.adapter,
+                    storage=self.storage,
+                )
             self._engine.restore_state(snapshot)
             return
         raise ValueError("Unsupported runtime snapshot schema_version")
-
-    def _require_checkpoint_support(self) -> None:
-        """Reject half-implemented external-storage recovery semantics."""
-
-        if self.storage is not None:
-            raise NotImplementedError(
-                "storage-bound checkpoint and restore require storage recovery support"
-            )
 
     def _query_output_columns(self, query: QueryExpr) -> list[str]:
         """Infer columns through the selected execution engine."""

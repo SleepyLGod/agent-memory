@@ -4,7 +4,16 @@ from __future__ import annotations
 
 from agent_memory.policy.aggregates import array_agg, min, sem_agg
 from agent_memory.api import Log, Memory
+from agent_memory.policy.logical import UserQuery
 from agent_memory.policy.expressions import least
+from agent_memory.policy.retrieval import (
+    BFS,
+    BM25,
+    RRF,
+    CosineSimilarity,
+    CrossEncoder,
+    RetrievalQuery,
+)
 
 
 _EPISODE_WINDOW_LEN = 3
@@ -48,6 +57,10 @@ _ENTITY_SUMMARY_INSTRUCTION = """
 Create one canonical entity from the grouped mentions. Return canonical {name}
 and a concise, information-dense {summary}. Use only durable facts explicitly
 supported by {content}; never infer beyond the evidence.
+
+Choose the canonical name only from the grouped {name} values. Preserve the
+original name unless another grouped mention provides a more complete name.
+Never derive the entity name from the speaker or other entities in {content}.
 
 Preserve material names, roles, relationships, dates, counts, concrete details,
 and changes over time. Prefer newer explicit facts when they conflict with old
@@ -484,4 +497,37 @@ class ZepMemory(Memory):
             "created_at",
             "add_seq",
         ]
+    )
+
+    # Retrieval
+
+    _retrieved_entities = entities.search(
+        UserQuery(),
+        methods=[BM25(), CosineSimilarity()],
+        reranker=RRF(),
+        limit=20,
+    ).select(["record_id", "name", "summary", "rank", "score"])
+
+    retrieval_query = RetrievalQuery(
+        entities=_retrieved_entities,
+        facts=facts.search(
+            UserQuery(),
+            methods=[
+                BM25(),
+                CosineSimilarity(),
+                BFS(origins=_retrieved_entities, max_depth=3),
+            ],
+            reranker=CrossEncoder(model="BAAI/bge-reranker-v2-m3"),
+            limit=20,
+        ).select(
+            [
+                "record_id",
+                "fact",
+                "valid_at",
+                "invalid_at",
+                "expired_at",
+                "rank",
+                "score",
+            ]
+        ),
     )

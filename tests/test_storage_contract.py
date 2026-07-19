@@ -19,10 +19,16 @@ from agent_memory.policy.schema import output_columns
 from agent_memory.storage import (
     Schema,
     StatementSet,
+    StorageCommit,
+    StorageConflictError,
     StorageDeployment,
     TableDescriptor,
 )
 from agent_memory.storage.statements import InsertStatement
+from agent_memory.storage.neo4j import (
+    Neo4jNodeMapping,
+    Neo4jRelationshipMapping,
+)
 
 
 def _target() -> TableDescriptor:
@@ -195,12 +201,38 @@ def test_zep_storage_profile_binds_public_and_private_relation_roots() -> None:
     )
 
     statements = GRAPHITI_NEO4J_STATEMENTS.statements
-    assert [statement.target.options["kind"] for statement in statements] == [
-        "node",
-        "node",
-        "relationship",
-        "relationship",
+    mappings = [statement.target.mapping for statement in statements]
+    assert [type(mapping) for mapping in mappings] == [
+        Neo4jNodeMapping,
+        Neo4jNodeMapping,
+        Neo4jRelationshipMapping,
+        Neo4jRelationshipMapping,
     ]
+    assert [
+        mapping.label for mapping in mappings if isinstance(mapping, Neo4jNodeMapping)
+    ] == ["Episodic", "Entity"]
+    assert [
+        mapping.relationship_type
+        for mapping in mappings
+        if isinstance(mapping, Neo4jRelationshipMapping)
+    ] == ["RELATES_TO", "MENTIONS"]
+    entity_mapping = mappings[1]
+    fact_mapping = mappings[2]
+    mention_mapping = mappings[3]
+    assert isinstance(entity_mapping, Neo4jNodeMapping)
+    assert entity_mapping.embedding is not None
+    assert entity_mapping.embedding.source_column == "name"
+    assert entity_mapping.embedding.model == "BAAI/bge-m3"
+    assert isinstance(fact_mapping, Neo4jRelationshipMapping)
+    assert fact_mapping.embedding is not None
+    assert fact_mapping.embedding.source_column == "fact"
+    assert fact_mapping.nested_properties[0].property_name == "episodes"
+    assert isinstance(mention_mapping, Neo4jRelationshipMapping)
+    assert mention_mapping.identity.columns == ("episode_id", "entity_ordinal")
+    assert statements[3].target.schema.primary_key == (
+        "episode_id",
+        "entity_ordinal",
+    )
     assert statements[0].query == ZepMemory.episodes.expr
     assert statements[1].query == ZepMemory.entities.expr
     assert statements[2].query == ZepMemory.facts.expr
@@ -228,8 +260,18 @@ def test_no_storage_policy_fingerprint_is_unchanged() -> None:
 
 
 class _RecordingTransaction(AbstractContextManager["_RecordingTransaction"]):
-    def __init__(self, connector: "_RecordingConnector") -> None:
+    def __init__(
+        self,
+        connector: "_RecordingConnector",
+        *,
+        namespace: str,
+        expected_commit: StorageCommit | None,
+        next_commit: StorageCommit,
+    ) -> None:
         self.connector = connector
+        self.namespace = namespace
+        self.expected_commit = expected_commit
+        self.next_commit = next_commit
         self.pending: list[tuple[InsertStatement, pd.DataFrame, pd.DataFrame]] = []
 
     def __enter__(self) -> "_RecordingTransaction":
@@ -249,25 +291,79 @@ class _RecordingTransaction(AbstractContextManager["_RecordingTransaction"]):
         )
 
     def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> bool:
-        if exc_type is None:
-            self.connector.commits.append(self.pending)
-        else:
+        if exc_type is not None:
             self.connector.rollbacks += 1
+            return False
+        if self.connector.markers.get(self.namespace) != self.expected_commit:
+            self.connector.rollbacks += 1
+            raise StorageConflictError("storage commit marker changed")
+        self.connector.commits.append(self.pending)
+        self.connector.markers[self.namespace] = self.next_commit
         return False
 
 
 class _RecordingConnector:
-    def __init__(self, *, fail_writes: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        fail_writes: bool = False,
+        fail_rebuild: bool = False,
+    ) -> None:
         self.fail_writes = fail_writes
+        self.fail_rebuild = fail_rebuild
+        self.prepared: list[StatementSet] = []
         self.namespaces: list[str] = []
         self.commits: list[
             list[tuple[InsertStatement, pd.DataFrame, pd.DataFrame]]
         ] = []
+        self.markers: dict[str, StorageCommit] = {}
+        self.rebuilds: list[dict[str, pd.DataFrame]] = []
         self.rollbacks = 0
 
-    def transaction(self, *, namespace: str) -> _RecordingTransaction:
+    def prepare(self, statements: StatementSet) -> None:
+        self.prepared.append(statements)
+
+    def read_commit(self, *, namespace: str) -> StorageCommit | None:
+        return self.markers.get(namespace)
+
+    def transaction(
+        self,
+        *,
+        namespace: str,
+        expected_commit: StorageCommit | None,
+        next_commit: StorageCommit,
+    ) -> _RecordingTransaction:
         self.namespaces.append(namespace)
-        return _RecordingTransaction(self)
+        return _RecordingTransaction(
+            self,
+            namespace=namespace,
+            expected_commit=expected_commit,
+            next_commit=next_commit,
+        )
+
+    def rebuild(
+        self,
+        *,
+        namespace: str,
+        statements: StatementSet,
+        rows_by_statement: dict[str, pd.DataFrame],
+        expected_commit: StorageCommit | None,
+        next_commit: StorageCommit,
+    ) -> None:
+        if self.fail_rebuild:
+            raise RuntimeError("storage rebuild failed")
+        if self.markers.get(namespace) != expected_commit:
+            raise StorageConflictError("storage commit marker changed")
+        assert {item.statement_id for item in statements.statements} == set(
+            rows_by_statement
+        )
+        self.rebuilds.append(
+            {name: rows.copy() for name, rows in rows_by_statement.items()}
+        )
+        if next_commit.is_initial:
+            self.markers.pop(namespace, None)
+        else:
+            self.markers[namespace] = next_commit
 
 
 def _stored_memory(connector: _RecordingConnector) -> am.Memory:
@@ -373,10 +469,147 @@ def test_storage_failure_rolls_back_without_committing_memory_state() -> None:
     assert memory._runtime._state == {}
 
 
-def test_storage_bound_runtime_rejects_checkpoint_and_restore() -> None:
+def test_storage_bound_checkpoint_records_and_validates_commit_marker() -> None:
+    connector = _RecordingConnector()
+    memory = _stored_memory(connector)
+    memory.add({"value": 7})
+
+    snapshot = memory._runtime.snapshot_state()
+
+    assert snapshot["schema_version"] == 2
+    assert StorageCommit.from_dict(snapshot["storage_commit"]) == connector.markers[
+        "test"
+    ]
+    connector.markers["test"] = StorageCommit(
+        plan_fingerprint=snapshot["plan_fingerprint"],
+        lineage_id="another-lineage",
+        commit_sequence=1,
+        source_row_count=1,
+    )
+    with pytest.raises(StorageConflictError, match="does not match"):
+        memory._runtime.snapshot_state()
+
+
+@pytest.mark.parametrize("marker_state", ["missing", "behind", "ahead"])
+def test_storage_restore_rebuilds_when_marker_does_not_match(
+    marker_state: str,
+) -> None:
+    source_connector = _RecordingConnector()
+    source = _stored_memory(source_connector)
+    source.add({"value": 7})
+    snapshot = source._runtime.snapshot_state()
+    checkpoint_commit = StorageCommit.from_dict(snapshot["storage_commit"])
+
+    target_connector = _RecordingConnector()
+    if marker_state == "behind":
+        target_connector.markers["test"] = StorageCommit(
+            plan_fingerprint=checkpoint_commit.plan_fingerprint,
+            lineage_id=checkpoint_commit.lineage_id,
+            commit_sequence=0,
+            source_row_count=0,
+        )
+    elif marker_state == "ahead":
+        target_connector.markers["test"] = StorageCommit(
+            plan_fingerprint=checkpoint_commit.plan_fingerprint,
+            lineage_id=checkpoint_commit.lineage_id,
+            commit_sequence=2,
+            source_row_count=2,
+        )
+    restored = _stored_memory(target_connector)
+
+    restored._runtime.restore_state(snapshot)
+
+    assert target_connector.markers["test"] == checkpoint_commit
+    assert len(target_connector.rebuilds) == 1
+    assert target_connector.rebuilds[0]["sink_0000"].to_dict("records") == [
+        {"value": 7}
+    ]
+    assert restored._runtime._state["rows"].to_dict("records") == [{"value": 7}]
+
+
+def test_storage_restore_with_matching_marker_does_not_rebuild() -> None:
+    connector = _RecordingConnector()
+    source = _stored_memory(connector)
+    source.add({"value": 7})
+    snapshot = source._runtime.snapshot_state()
+    restored = _stored_memory(connector)
+
+    restored._runtime.restore_state(snapshot)
+
+    assert connector.rebuilds == []
+    assert restored._runtime._state["rows"].to_dict("records") == [{"value": 7}]
+
+
+def test_empty_storage_checkpoint_replaces_namespace_and_can_continue() -> None:
+    source = _stored_memory(_RecordingConnector())
+    snapshot = source._runtime.snapshot_state()
+    connector = _RecordingConnector()
+    connector.markers["test"] = StorageCommit(
+        plan_fingerprint=snapshot["plan_fingerprint"],
+        lineage_id="stale-lineage",
+        commit_sequence=2,
+        source_row_count=2,
+    )
+    restored = _stored_memory(connector)
+
+    restored._runtime.restore_state(snapshot)
+    restored.add({"value": 7})
+
+    assert len(connector.rebuilds) == 1
+    assert StorageCommit.from_dict(snapshot["storage_commit"]).is_initial
+    assert connector.markers["test"].commit_sequence == 1
+    assert restored._runtime._state["rows"].to_dict("records") == [{"value": 7}]
+
+
+def test_storage_rebuild_failure_does_not_mutate_runtime_state() -> None:
+    source_connector = _RecordingConnector()
+    source = _stored_memory(source_connector)
+    source.add({"value": 7})
+    snapshot = source._runtime.snapshot_state()
+    connector = _RecordingConnector(fail_rebuild=True)
+    restored = _stored_memory(connector)
+
+    with pytest.raises(RuntimeError, match="storage rebuild failed"):
+        restored._runtime.restore_state(snapshot)
+
+    assert restored._runtime._state == {}
+
+
+def test_storage_restore_rejects_commit_source_count_mismatch() -> None:
+    connector = _RecordingConnector()
+    source = _stored_memory(connector)
+    source.add({"value": 7})
+    snapshot = source._runtime.snapshot_state()
+    snapshot["storage_commit"] = {
+        **snapshot["storage_commit"],
+        "source_row_count": 2,
+    }
+    restored = _stored_memory(_RecordingConnector())
+
+    with pytest.raises(ValueError, match="source row count"):
+        restored._runtime.restore_state(snapshot)
+
+    assert restored._runtime._state == {}
+
+
+def test_fresh_storage_runtime_does_not_overwrite_existing_namespace() -> None:
+    connector = _RecordingConnector()
+    connector.markers["test"] = StorageCommit(
+        plan_fingerprint="another-plan",
+        lineage_id="another-lineage",
+        commit_sequence=5,
+        source_row_count=5,
+    )
+    memory = _stored_memory(connector)
+
+    with pytest.raises(StorageConflictError, match="storage commit marker"):
+        memory.add({"value": 7})
+
+    assert memory._runtime._state == {}
+
+
+def test_schema_v1_restore_with_storage_remains_unsupported() -> None:
     memory = _stored_memory(_RecordingConnector())
 
-    with pytest.raises(NotImplementedError, match="storage-bound checkpoint"):
-        memory._runtime.snapshot_state()
-    with pytest.raises(NotImplementedError, match="storage-bound checkpoint"):
-        memory._runtime.restore_state({"schema_version": 2})
+    with pytest.raises(NotImplementedError, match="schema-v1"):
+        memory._runtime.restore_state({"schema_version": 1})

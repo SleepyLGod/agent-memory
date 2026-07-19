@@ -1,8 +1,9 @@
-"""Run a real LOTUS-backed ZepMemory insertion smoke over LOCOMO rows."""
+"""Run the real Zep LOCOMO storage and retrieval acceptance smoke."""
 
 from __future__ import annotations
 
 import argparse
+from collections.abc import Mapping, Sequence
 from datetime import datetime
 import hashlib
 import json
@@ -12,6 +13,7 @@ import pickle
 from sys import path
 import time
 from typing import Any
+from uuid import uuid4
 import warnings
 
 from dotenv import load_dotenv
@@ -21,7 +23,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 path.insert(0, str(PROJECT_ROOT / "src"))
 
 import agent_memory as am  # noqa: E402
-from agent_memory.adapters.lotus import DEFAULT_LOTUS_MODEL, LotusAdapter  # noqa: E402
+from agent_memory.adapters.lotus import LotusAdapter  # noqa: E402
 from agent_memory.adapters.lotus.context import LotusExecutionConfig  # noqa: E402
 from agent_memory.adapters.lotus.structured import (  # noqa: E402
     reset_structured_retry_stats,
@@ -31,6 +33,17 @@ from agent_memory.datasets.locomo import (  # noqa: E402
     DEFAULT_LOCOMO_URL,
     ensure_locomo_dataset,
     load_locomo_rows,
+)
+from agent_memory.memories.zep.storage import (  # noqa: E402
+    GRAPHITI_BGE_M3,
+    GRAPHITI_NEO4J_SCHEMA,
+    GRAPHITI_NEO4J_STATEMENTS,
+)
+from agent_memory.storage import StorageDeployment  # noqa: E402
+from agent_memory.storage.neo4j import (  # noqa: E402
+    Neo4jConnector,
+    SentenceTransformerCrossEncoderProvider,
+    SentenceTransformerEmbeddingProvider,
 )
 from agent_memory.tracing.semantic import (  # noqa: E402
     append_trace_metrics,
@@ -42,6 +55,8 @@ LOCOMO_CACHE_PATH = PROJECT_ROOT / ".cache" / "agent-memory" / "locomo10.json"
 LOCOMO_TIMESTAMP_FORMAT = "%I:%M %p on %d %B, %Y"
 DEFAULT_START_ROW = 26
 DEFAULT_ROW_LIMIT = 3
+DEFAULT_ZEP_MODEL = "deepseek/deepseek-v4-flash"
+DEFAULT_RETRIEVAL_QUERY = "What is Caroline researching and why?"
 PUBLIC_VIEWS = ("episodes", "entities", "facts")
 USAGE_FIELDS = (
     "physical_prompt_tokens",
@@ -57,6 +72,7 @@ USAGE_FIELDS = (
 )
 
 
+# Input normalization and run configuration.
 def default_output_dir() -> Path:
     """Return a fresh timestamped output path for one real run."""
 
@@ -64,21 +80,26 @@ def default_output_dir() -> Path:
     return PROJECT_ROOT / ".memory-test" / "zep-e2e" / timestamp
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """Parse command-line options for the Zep insertion smoke."""
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--start-row", type=int, default=DEFAULT_START_ROW)
     parser.add_argument("--row-limit", type=int, default=DEFAULT_ROW_LIMIT)
     parser.add_argument("--sample-limit", type=int, default=1)
-    parser.add_argument("--model", default=DEFAULT_LOTUS_MODEL)
+    parser.add_argument("--model", default=DEFAULT_ZEP_MODEL)
     parser.add_argument("--output-dir", type=Path, default=default_output_dir())
+    parser.add_argument(
+        "--namespace",
+        help="Fresh Neo4j namespace; generated automatically when omitted.",
+    )
+    parser.add_argument("--query", default=DEFAULT_RETRIEVAL_QUERY)
     parser.add_argument(
         "--trace",
         action="store_true",
         help="Write real LLM request/output trace artifacts under trace/.",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def require_environment() -> None:
@@ -92,6 +113,15 @@ def require_environment() -> None:
     )
     if not os.getenv("DEEPSEEK_API_KEY"):
         raise SystemExit("DEEPSEEK_API_KEY is required for the real Zep e2e demo")
+    missing = [
+        name
+        for name in ("AGENT_MEMORY_NEO4J_URI", "AGENT_MEMORY_NEO4J_PASSWORD")
+        if not os.getenv(name)
+    ]
+    if missing:
+        raise SystemExit(
+            "Neo4j retrieval requires environment variables: " + ", ".join(missing)
+        )
 
 
 def prepare_output_dir(output_dir: Path) -> None:
@@ -131,7 +161,7 @@ def zep_log_row(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def policy_input_fingerprint(rows: list[dict[str, Any]]) -> str:
+def policy_input_fingerprint(rows: Sequence[Mapping[str, Any]]) -> str:
     """Hash the normalized source rows shared with the native baseline."""
 
     payload = json.dumps(
@@ -171,12 +201,73 @@ def selected_rows(
     return dataset_path, selected, [zep_log_row(row) for row in selected]
 
 
+# Acceptance artifacts and retrieval assertions.
 def write_csv(path_value: Path, frame: pd.DataFrame) -> Path:
     """Write one inspectable CSV artifact."""
 
     path_value.parent.mkdir(parents=True, exist_ok=True)
     frame.to_csv(path_value, index=False)
     return path_value
+
+
+def write_json(path_value: Path, value: Any) -> Path:
+    """Write one UTF-8 JSON artifact without assuming JSON-native mappings."""
+
+    path_value.parent.mkdir(parents=True, exist_ok=True)
+    path_value.write_text(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            indent=2,
+            default=lambda item: dict(item) if isinstance(item, Mapping) else str(item),
+        ),
+        encoding="utf-8",
+    )
+    return path_value
+
+
+def write_input_artifacts(
+    output_dir: Path,
+    *,
+    raw_rows: Sequence[Mapping[str, Any]],
+    rows: Sequence[Mapping[str, Any]],
+) -> dict[str, Path]:
+    """Write the exact source rows and normalized policy input."""
+
+    return {
+        "input/locomo_rows": write_csv(
+            output_dir / "input" / "locomo_rows.csv",
+            pd.DataFrame(raw_rows),
+        ),
+        "input/zep_rows": write_csv(
+            output_dir / "input" / "zep_rows.csv",
+            pd.DataFrame(rows),
+        ),
+        "input/manifest": write_json(
+            output_dir / "input" / "manifest.json",
+            {"policy_input_fingerprint": policy_input_fingerprint(rows)},
+        ),
+    }
+
+
+def print_run_configuration(
+    *,
+    dataset_path: Path,
+    row_count: int,
+    args: argparse.Namespace,
+    output_dir: Path,
+    namespace: str,
+) -> None:
+    """Print the small set of values needed to identify one acceptance run."""
+
+    print("ZepMemory real storage and retrieval e2e")
+    print(f"LOCOMO cache: {dataset_path}")
+    print(f"start_row: {args.start_row}")
+    print(f"rows: {row_count}")
+    print(f"model: {args.model}")
+    print(f"output_dir: {output_dir}")
+    print(f"neo4j_namespace: {namespace}")
+    print(f"retrieval_query: {args.query}")
 
 
 def usage_snapshot() -> dict[str, int]:
@@ -219,6 +310,121 @@ def usage_delta(before: dict[str, int], after: dict[str, int]) -> dict[str, int]
     """Return non-negative usage changes for one add step."""
 
     return {field: max(0, after[field] - before[field]) for field in USAGE_FIELDS}
+
+
+def add_step_metric(
+    memory: am.ZepMemory,
+    *,
+    add_index: int,
+    row: Mapping[str, Any],
+    started: float,
+    before_usage: dict[str, int],
+) -> dict[str, Any]:
+    """Collect one insertion's latency, usage, and resulting view sizes."""
+
+    return {
+        "add_index": add_index,
+        "source_description": row["source_description"],
+        "latency_sec": round(time.perf_counter() - started, 4),
+        **usage_delta(before_usage, usage_snapshot()),
+        **public_view_counts(memory),
+    }
+
+
+def assert_no_semantic_usage(
+    before: dict[str, int],
+    after: dict[str, int],
+) -> None:
+    """Fail if a storage retrieval unexpectedly invokes a semantic LLM operator."""
+
+    changed = {
+        field: (before[field], after[field])
+        for field in USAGE_FIELDS
+        if before[field] != after[field]
+    }
+    if changed:
+        raise RuntimeError(f"retrieval changed semantic LLM usage: {changed}")
+
+
+def validate_retrieval_result(result: am.RetrievalResult) -> None:
+    """Require both Zep channels to be non-empty and ranked from one."""
+
+    if tuple(result.channels) != ("entities", "facts"):
+        raise RuntimeError("Zep retrieval must return entities and facts channels")
+    for name, frame in result.channels.items():
+        if frame.empty:
+            raise RuntimeError(f"Zep retrieval channel {name!r} is empty")
+        ranks = frame["rank"].tolist()
+        if ranks != list(range(1, len(frame) + 1)):
+            raise RuntimeError(
+                f"Zep retrieval channel {name!r} has invalid ranks: {ranks}"
+            )
+
+
+def assert_same_retrieval(
+    before: am.RetrievalResult,
+    after: am.RetrievalResult,
+) -> None:
+    """Verify checkpoint restore preserves result identities and ordering."""
+
+    if tuple(before.channels) != tuple(after.channels):
+        raise RuntimeError("retrieval channels changed after checkpoint restore")
+    for name in before.channels:
+        before_ids = before.channels[name]["record_id"].tolist()
+        after_ids = after.channels[name]["record_id"].tolist()
+        if before_ids != after_ids:
+            raise RuntimeError(
+                f"retrieval order changed after restore for {name!r}: "
+                f"{before_ids!r} != {after_ids!r}"
+            )
+
+
+def write_retrieval_artifacts(
+    result: am.RetrievalResult,
+    *,
+    label: str,
+    output_dir: Path,
+) -> dict[str, Path]:
+    """Write retrieval channels and physical search metrics."""
+
+    written = {
+        f"retrieval/{label}/{name}": write_csv(
+            output_dir / "retrieval" / label / f"{name}.csv",
+            frame,
+        )
+        for name, frame in result.channels.items()
+    }
+    written[f"retrieval/{label}/metrics"] = write_json(
+        output_dir / "retrieval" / label / "metrics.json",
+        {"query": result.query, "channels": result.metrics},
+    )
+    return written
+
+
+# Physical deployment and checkpoint round trip.
+def create_storage_deployment(namespace: str) -> StorageDeployment:
+    """Create the real CPU-only Graphiti-compatible Neo4j deployment."""
+
+    connector = Neo4jConnector(
+        uri=os.environ["AGENT_MEMORY_NEO4J_URI"],
+        auth=(
+            os.getenv("AGENT_MEMORY_NEO4J_USER", "neo4j"),
+            os.environ["AGENT_MEMORY_NEO4J_PASSWORD"],
+        ),
+        database=os.getenv("AGENT_MEMORY_NEO4J_DATABASE", "neo4j"),
+        embedding_provider=SentenceTransformerEmbeddingProvider(GRAPHITI_BGE_M3),
+        reranker_provider=SentenceTransformerCrossEncoderProvider(),
+        schema=GRAPHITI_NEO4J_SCHEMA,
+    )
+    try:
+        return StorageDeployment(
+            connector=connector,
+            statements=GRAPHITI_NEO4J_STATEMENTS,
+            namespace=namespace,
+        )
+    except Exception:
+        connector.close()
+        raise
 
 
 def public_view_counts(memory: am.ZepMemory) -> dict[str, int]:
@@ -271,12 +477,41 @@ def write_metrics(
     }
 
 
-def save_and_verify_checkpoint(
+def write_failure_artifacts(
+    error: Exception,
+    *,
+    memory: am.ZepMemory | None,
+    add_index: int,
+    phase: str,
+    step_metrics: list[dict[str, Any]],
+    model: str,
+    output_dir: Path,
+) -> dict[str, Path]:
+    """Preserve setup or execution diagnostics without assuming memory exists."""
+
+    written: dict[str, Path] = {}
+    if memory is not None:
+        written.update(write_state_artifacts(memory, output_dir))
+    written.update(write_metrics(step_metrics, model=model, output_dir=output_dir))
+    written["diagnostics/failure"] = write_json(
+        output_dir / "diagnostics" / "failure.json",
+        {
+            "add_index": add_index,
+            "phase": phase,
+            "error_type": type(error).__name__,
+            "error": str(error),
+        },
+    )
+    return written
+
+
+def save_and_restore_checkpoint(
     memory: am.ZepMemory,
     *,
     adapter: LotusAdapter,
     output_dir: Path,
-) -> dict[str, Path]:
+    storage: StorageDeployment,
+) -> tuple[dict[str, Path], am.ZepMemory]:
     """Save a v2 checkpoint and verify a no-LLM restore round trip."""
 
     checkpoint_dir = output_dir / "checkpoint"
@@ -284,7 +519,7 @@ def save_and_verify_checkpoint(
     snapshot = memory._runtime.snapshot_state()
     state_path = checkpoint_dir / "state.pkl"
     state_path.write_bytes(pickle.dumps(snapshot))
-    restored = am.ZepMemory(adapter=adapter)
+    restored = am.ZepMemory(adapter=adapter, storage=storage)
     restored._runtime.restore_state(pickle.loads(state_path.read_bytes()))
     for name in PUBLIC_VIEWS:
         pd.testing.assert_frame_equal(
@@ -297,20 +532,26 @@ def save_and_verify_checkpoint(
             {
                 "schema_version": snapshot["schema_version"],
                 "policy_fingerprint": memory._runtime.policy.fingerprint,
+                "storage_bound": True,
+                "storage_commit": snapshot.get("storage_commit"),
                 "round_trip_verified": True,
             },
             indent=2,
         ),
         encoding="utf-8",
     )
-    return {
-        "checkpoint/state": state_path,
-        "checkpoint/metadata": metadata_path,
-    }
+    return (
+        {
+            "checkpoint/state": state_path,
+            "checkpoint/metadata": metadata_path,
+        },
+        restored,
+    )
 
 
+# End-to-end acceptance flow.
 def main() -> None:
-    """Run sequential real Zep insertion and write inspectable artifacts."""
+    """Run real Zep add, retrieval, and checkpoint verification."""
 
     args = parse_args()
     require_environment()
@@ -323,40 +564,38 @@ def main() -> None:
         row_limit=args.row_limit,
         sample_limit=args.sample_limit,
     )
-    written = {
-        "input/locomo_rows": write_csv(
-            output_dir / "input" / "locomo_rows.csv",
-            pd.DataFrame(raw_rows),
-        ),
-        "input/zep_rows": write_csv(
-            output_dir / "input" / "zep_rows.csv",
-            pd.DataFrame(rows),
-        ),
-    }
-    input_manifest = output_dir / "input" / "manifest.json"
-    input_manifest.write_text(
-        json.dumps(
-            {"policy_input_fingerprint": policy_input_fingerprint(rows)},
-            indent=2,
-        ),
-        encoding="utf-8",
+    namespace = args.namespace or f"zep-e2e-{uuid4()}"
+    written = write_input_artifacts(
+        output_dir,
+        raw_rows=raw_rows,
+        rows=rows,
     )
-    written["input/manifest"] = input_manifest
-    print("ZepMemory real insertion e2e")
-    print(f"LOCOMO cache: {dataset_path}")
-    print(f"start_row: {args.start_row}")
-    print(f"rows: {len(rows)}")
-    print(f"model: {args.model}")
-    print(f"output_dir: {output_dir}")
-
-    adapter = LotusAdapter(
-        model=args.model,
-        config=LotusExecutionConfig(semantic_trace_dir=trace_dir),
+    print_run_configuration(
+        dataset_path=dataset_path,
+        row_count=len(rows),
+        args=args,
+        output_dir=output_dir,
+        namespace=namespace,
     )
-    memory = am.ZepMemory(adapter=adapter)
+    storage: StorageDeployment | None = None
+    memory: am.ZepMemory | None = None
     step_metrics: list[dict[str, Any]] = []
     current_index = 0
+    current_phase = "setup_storage"
     try:
+        # Setup belongs to the same ownership boundary as execution and cleanup.
+        storage = create_storage_deployment(namespace)
+
+        current_phase = "setup_adapter"
+        adapter = LotusAdapter(
+            model=args.model,
+            config=LotusExecutionConfig(semantic_trace_dir=trace_dir),
+        )
+        current_phase = "setup_memory"
+        memory = am.ZepMemory(adapter=adapter, storage=storage)
+
+        # Materialize each source episode before exercising physical retrieval.
+        current_phase = "add"
         for current_index, row in enumerate(rows, start=1):
             print(f"add[{current_index}]: {row['content'][:100]}")
             before = usage_snapshot()
@@ -368,13 +607,13 @@ def main() -> None:
                 source_description=row["source_description"],
             ):
                 memory.add(row)
-            metric = {
-                "add_index": current_index,
-                "source_description": row["source_description"],
-                "latency_sec": round(time.perf_counter() - started, 4),
-                **usage_delta(before, usage_snapshot()),
-                **public_view_counts(memory),
-            }
+            metric = add_step_metric(
+                memory,
+                add_index=current_index,
+                row=row,
+                started=started,
+                before_usage=before,
+            )
             step_metrics.append(metric)
             print(
                 "  rows: "
@@ -382,38 +621,85 @@ def main() -> None:
                     f"{name}={metric[f'{name}_rows']}" for name in PUBLIC_VIEWS
                 )
             )
-    except Exception as error:
-        written.update(write_state_artifacts(memory, output_dir))
-        written.update(write_metrics(step_metrics, model=args.model, output_dir=output_dir))
-        failure_path = output_dir / "diagnostics" / "failure.json"
-        failure_path.parent.mkdir(parents=True, exist_ok=True)
-        failure_path.write_text(
-            json.dumps(
-                {
-                    "add_index": current_index,
-                    "error_type": type(error).__name__,
-                    "error": str(error),
-                },
-                ensure_ascii=False,
-                indent=2,
-            ),
-            encoding="utf-8",
+
+        # Retrieval is storage-backed and must not invoke semantic LLM operators.
+        current_phase = "retrieval_before_checkpoint"
+        before_usage = usage_snapshot()
+        before_retrieval = memory.query(args.query)
+        after_usage = usage_snapshot()
+        assert_no_semantic_usage(before_usage, after_usage)
+        validate_retrieval_result(before_retrieval)
+        written.update(
+            write_retrieval_artifacts(
+                before_retrieval,
+                label="before_checkpoint",
+                output_dir=output_dir,
+            )
         )
+
+        # Restore the same logical and physical commit before querying again.
+        current_phase = "checkpoint"
+        checkpoint_artifacts, restored = save_and_restore_checkpoint(
+            memory,
+            adapter=adapter,
+            output_dir=output_dir,
+            storage=storage,
+        )
+        written.update(checkpoint_artifacts)
+
+        current_phase = "retrieval_after_restore"
+        before_usage = usage_snapshot()
+        after_retrieval = restored.query(args.query)
+        after_usage = usage_snapshot()
+        assert_no_semantic_usage(before_usage, after_usage)
+        validate_retrieval_result(after_retrieval)
+        assert_same_retrieval(before_retrieval, after_retrieval)
+        written.update(
+            write_retrieval_artifacts(
+                after_retrieval,
+                label="after_restore",
+                output_dir=output_dir,
+            )
+        )
+        written["retrieval/summary"] = write_json(
+            output_dir / "retrieval" / "summary.json",
+            {
+                "query": args.query,
+                "namespace": namespace,
+                "semantic_llm_usage_changed": False,
+                "checkpoint_order_verified": True,
+            },
+        )
+
+        written.update(write_state_artifacts(memory, output_dir))
+        written.update(
+            write_metrics(step_metrics, model=args.model, output_dir=output_dir)
+        )
+        if trace_dir is not None:
+            append_trace_metrics(trace_dir, step_metrics)
+            written["trace"] = trace_dir
+
+        print("\nwrote Zep e2e artifacts:")
+        for name, path_value in written.items():
+            print(f"- {name}: {path_value}")
+    except Exception as error:
+        written.update(
+            write_failure_artifacts(
+                error,
+                memory=memory,
+                add_index=current_index,
+                phase=current_phase,
+                step_metrics=step_metrics,
+                model=args.model,
+                output_dir=output_dir,
+            )
+        )
+        failure_path = written["diagnostics/failure"]
         print(f"failure artifact: {failure_path}")
         raise
-
-    written.update(write_state_artifacts(memory, output_dir))
-    written.update(write_metrics(step_metrics, model=args.model, output_dir=output_dir))
-    written.update(
-        save_and_verify_checkpoint(memory, adapter=adapter, output_dir=output_dir)
-    )
-    if trace_dir is not None:
-        append_trace_metrics(trace_dir, step_metrics)
-        written["trace"] = trace_dir
-
-    print("\nwrote Zep e2e artifacts:")
-    for name, path_value in written.items():
-        print(f"- {name}: {path_value}")
+    finally:
+        if storage is not None:
+            storage.connector.close()
 
 
 if __name__ == "__main__":
