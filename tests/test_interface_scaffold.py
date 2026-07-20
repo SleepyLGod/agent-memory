@@ -2569,6 +2569,8 @@ def test_lotus_execution_context_passes_backend_lm_options(
             lm_timeout=120,
             lm_max_batch_size=4,
             lm_rate_limit=10,
+            lm_model_kwargs={"extra_body": {"thinking": {"type": "enabled"}}},
+            lm_enable_cache=False,
         ),
     )
     context.configure()
@@ -2579,8 +2581,10 @@ def test_lotus_execution_context_passes_backend_lm_options(
         "num_retries": 2,
         "timeout": 120,
         "rate_limit": 10,
+        "extra_body": {"thinking": {"type": "enabled"}},
     }
     assert isinstance(captured["configure_kwargs"]["lm"], FakeLM)
+    assert captured["configure_kwargs"]["enable_cache"] is False
 
 
 def test_lotus_execution_context_wraps_lm_only_when_trace_enabled(
@@ -2613,6 +2617,35 @@ def test_lotus_execution_context_wraps_lm_only_when_trace_enabled(
     assert configured_lm.kwargs == {
         "model": "deepseek/example",
         "max_batch_size": 64,
+    }
+
+
+def test_lotus_execution_context_rejects_owned_lm_kwargs() -> None:
+    context = LotusExecutionContext(
+        model="deepseek/example",
+        config=LotusExecutionConfig(lm_model_kwargs={"model": "other"}),
+    )
+
+    with pytest.raises(ValueError, match="cannot override.*model"):
+        context.configure()
+
+
+def test_provider_trace_only_exposes_thinking_type_from_extra_body() -> None:
+    from agent_memory.adapters.lotus.provider_usage_lm import _safe_provider_kwargs
+
+    safe = _safe_provider_kwargs(
+        {
+            "extra_body": {
+                "thinking": {"type": "enabled", "private": "hidden"},
+                "api_key": "secret",
+            },
+            "max_tokens": 8192,
+        }
+    )
+
+    assert safe == {
+        "max_tokens": 8192,
+        "thinking": {"type": "enabled"},
     }
 
 
@@ -2721,6 +2754,8 @@ def test_lotus_execution_config_keeps_retry_defaults_disabled() -> None:
     assert config.lm_timeout is None
     assert config.lm_max_batch_size == 64
     assert config.lm_rate_limit is None
+    assert config.lm_model_kwargs == {}
+    assert config.lm_enable_cache is None
     assert config.semantic_trace_dir is None
     assert config.structured_parse_retries == DEFAULT_STRUCTURED_PARSE_RETRIES
     assert config.sem_topk_method == "pairwise-naive"

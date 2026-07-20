@@ -42,7 +42,13 @@ def normalize_locomo_sample(
     """Normalize one official LOCOMO sample into benchmark events and questions."""
 
     sample_id = str(sample.get("sample_id") or f"sample-{sample_index}")
-    events = tuple(_conversation_events(sample, sample_id=sample_id))
+    events = tuple(
+        _conversation_events(
+            sample,
+            sample_id=sample_id,
+            sample_index=sample_index,
+        )
+    )
     questions = tuple(_questions(sample, sample_id=sample_id))
     return LocomoBenchmarkSample(sample_id=sample_id, events=events, questions=questions)
 
@@ -97,18 +103,23 @@ def _conversation_events(
     sample: Mapping[str, Any],
     *,
     sample_id: str,
+    sample_index: int,
 ) -> Iterable[BenchmarkEvent]:
     """Yield normalized conversation events from common LOCOMO JSON shapes."""
 
     conversation = sample.get("conversation")
+    row_number = 0
     for session_id, timestamp, turns in _iter_sessions(conversation):
         for turn_index, turn in enumerate(turns, start=1):
+            row_number += 1
             event = _turn_event(
                 turn,
                 sample_id=sample_id,
+                sample_index=sample_index,
                 session_id=session_id,
                 timestamp=timestamp,
                 fallback_index=turn_index,
+                row_number=row_number,
             )
             if event is not None:
                 yield event
@@ -139,9 +150,11 @@ def _turn_event(
     turn: Any,
     *,
     sample_id: str,
+    sample_index: int,
     session_id: str,
     timestamp: str,
     fallback_index: int,
+    row_number: int,
 ) -> BenchmarkEvent | None:
     """Convert one LOCOMO dialogue turn into a benchmark event."""
 
@@ -151,6 +164,14 @@ def _turn_event(
     if not text:
         return None
     event_id = str(turn.get("dia_id") or turn.get("turn_id") or f"{session_id}:{fallback_index}")
+    caption = turn.get("blip_caption")
+    metadata: dict[str, Any] = {
+        "sample_index": sample_index,
+        "row_number": row_number,
+        "session_number": _session_number(session_id),
+    }
+    if isinstance(caption, str) and caption.strip():
+        metadata["blip_caption"] = caption.strip()
     return BenchmarkEvent(
         sample_id=sample_id,
         event_id=event_id,
@@ -158,6 +179,7 @@ def _turn_event(
         text=text,
         session_id=session_id,
         timestamp=str(turn.get("timestamp", timestamp)),
+        metadata=metadata,
     )
 
 
@@ -195,4 +217,15 @@ def _questions(
             gold_answer=row.get("answer", ""),
             evidence_event_ids=evidence_ids,
             category=str(row.get("category", "")),
+            metadata={
+                "question_number": index,
+                "adversarial_answer": row.get("adversarial_answer"),
+            },
         )
+
+
+def _session_number(session_id: str) -> int:
+    """Return the numeric LOCOMO session suffix when available."""
+
+    suffix = session_id.removeprefix("session_")
+    return int(suffix) if suffix.isdigit() else 0
