@@ -18,6 +18,13 @@ SEM_TOPK_METHODS = (
     "pairwise-heap",
     "listwise",
 )
+_LM_OWNED_KWARGS = {
+    "max_batch_size",
+    "model",
+    "num_retries",
+    "rate_limit",
+    "timeout",
+}
 
 
 @dataclass(frozen=True)
@@ -28,6 +35,8 @@ class LotusExecutionConfig:
     lm_timeout: float | int | None = None
     lm_max_batch_size: int = 64
     lm_rate_limit: int | None = None
+    lm_model_kwargs: Mapping[str, Any] = field(default_factory=dict)
+    lm_enable_cache: bool | None = None
     structured_max_tokens: int = DEFAULT_STRUCTURED_MAX_TOKENS
     structured_parse_retries: int = DEFAULT_STRUCTURED_PARSE_RETRIES
     semantic_trace_dir: Path | str | None = None
@@ -101,6 +110,13 @@ class LotusExecutionContext:
             lm_kwargs["timeout"] = self.config.lm_timeout
         if self.config.lm_rate_limit is not None:
             lm_kwargs["rate_limit"] = self.config.lm_rate_limit
+        conflicting = sorted(_LM_OWNED_KWARGS & self.config.lm_model_kwargs.keys())
+        if conflicting:
+            raise ValueError(
+                "lm_model_kwargs cannot override execution-owned options: "
+                + ", ".join(conflicting)
+            )
+        lm_kwargs.update(self.config.lm_model_kwargs)
 
         trace_dir = self.config.trace_dir()
         base_lm = (
@@ -109,5 +125,8 @@ class LotusExecutionContext:
             else LM(**lm_kwargs)
         )
         lm = TracedLM(base_lm, trace_dir) if trace_dir is not None else base_lm
-        lotus.settings.configure(lm=lm)
+        settings_kwargs: dict[str, Any] = {"lm": lm}
+        if self.config.lm_enable_cache is not None:
+            settings_kwargs["enable_cache"] = self.config.lm_enable_cache
+        lotus.settings.configure(**settings_kwargs)
         self._configured = True

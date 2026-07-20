@@ -42,7 +42,8 @@ class ProviderUsageTracingMixin:
     ) -> list[Any]:
         """Call LOTUS normally, then trace raw provider usage from responses."""
 
-        responses = super()._process_uncached_messages(
+        parent: Any = super()
+        responses = parent._process_uncached_messages(
             uncached_data,
             all_kwargs,
             show_progress_bar,
@@ -51,7 +52,7 @@ class ProviderUsageTracingMixin:
         try:
             write_provider_usage_trace(
                 self._provider_usage_trace_dir,
-                model=str(self.model),
+                model=str(getattr(self, "model", "")),
                 responses=responses,
                 request_metadata={
                     "provider_batch_size": len(uncached_data),
@@ -66,7 +67,13 @@ class ProviderUsageTracingMixin:
 def _safe_provider_kwargs(all_kwargs: Mapping[str, Any]) -> dict[str, Any]:
     """Return non-sensitive request tuning kwargs for trace metadata."""
 
-    return {key: all_kwargs[key] for key in SAFE_PROVIDER_KWARGS if key in all_kwargs}
+    safe = {key: all_kwargs[key] for key in SAFE_PROVIDER_KWARGS if key in all_kwargs}
+    extra_body = all_kwargs.get("extra_body")
+    if isinstance(extra_body, Mapping):
+        thinking = extra_body.get("thinking")
+        if isinstance(thinking, Mapping) and isinstance(thinking.get("type"), str):
+            safe["thinking"] = {"type": thinking["type"]}
+    return safe
 
 
 def provider_usage_tracing_lm_class(base_lm_class: type[Any]) -> type[Any]:
