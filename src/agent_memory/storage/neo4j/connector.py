@@ -355,7 +355,7 @@ class SentenceTransformerCrossEncoderProvider:
         model: str,
         query: str,
         passages: list[str],
-    ) -> list[tuple[str, float]]:
+    ) -> list[tuple[int, float]]:
         """Score query/passage pairs and return descending results."""
 
         if model != self.model:
@@ -365,8 +365,8 @@ class SentenceTransformerCrossEncoderProvider:
         scores = self._model.predict([[query, passage] for passage in passages])
         return sorted(
             (
-                (passage, float(score))
-                for passage, score in zip(passages, scores, strict=True)
+                (index, float(score))
+                for index, score in enumerate(scores)
             ),
             key=lambda item: item[1],
             reverse=True,

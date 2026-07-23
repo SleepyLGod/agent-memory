@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
-from typing import Any
-
 import pandas as pd
 
 from agent_memory.adapters.lotus.context import LotusExecutionContext

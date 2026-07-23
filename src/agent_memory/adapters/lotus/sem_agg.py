@@ -330,8 +330,6 @@ def structured_aggregate_instruction(
 ) -> str:
     """Build a structured aggregate instruction after resolving input placeholders."""
 
-    import lotus
-
     instruction = aggregate_instruction(query, input_cols)
     field_lines = "\n".join(
         f"- {column.name}: {column.description or 'string'}"

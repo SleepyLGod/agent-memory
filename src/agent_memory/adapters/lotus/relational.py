@@ -21,7 +21,6 @@ from agent_memory.adapters.lotus.sem_agg import (
     execute_native_sem_agg_group,
     execute_structured_sem_agg_group,
 )
-from agent_memory.adapters.lotus.sem_groupby import GROUP_ID_COLUMN
 from agent_memory.policy.expressions import (
     ArrayCatExpr,
     BooleanExpr,
