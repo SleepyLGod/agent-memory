@@ -16,6 +16,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+benchmarks = [
+  "editdistance>=0.8.1",
+  "pyarrow>=18.0.0",
+  "tiktoken>=0.8.0",
+]
 zep = [
     "neo4j>=5.26,<7",
     "sentence-transformers==3.4.1",
@@ -31,5 +36,41 @@ dev = [
     "nbclient>=0.10.4",
     "nbformat>=5.10.4",
     "notebook>=7.5.6",
+    "pyright>=1.1.411",
     "pytest>=9.0.3",
+    "ruff>=0.15.22",
+]
+
+[tool.ruff]
+target-version = "py313"
+
+[tool.pyright]
+pythonVersion = "3.13"
+include = [
+    "src/agent_memory/evaluation/agent_memory_drivers.py",
+    "src/agent_memory/evaluation/artifacts.py",
+    "src/agent_memory/evaluation/bundle.py",
+    "src/agent_memory/evaluation/comparison.py",
+    "src/agent_memory/evaluation/harness.py",
+    "src/agent_memory/evaluation/longmemeval",
+    "src/agent_memory/evaluation/memory_agent_bench",
+    "src/agent_memory/evaluation/metrics.py",
+    "src/agent_memory/evaluation/models.py",
+    "src/agent_memory/evaluation/pricing.py",
+    "src/agent_memory/evaluation/run.py",
+    "src/agent_memory/evaluation/trace_metrics.py",
+    "src/agent_memory/evaluation/types.py",
+    "src/agent_memory/evaluation/zep/artifacts.py",
+    "tests/test_agent_memory_benchmark_drivers.py",
+    "tests/test_benchmark_bundle.py",
+    "tests/test_benchmark_cli.py",
+    "tests/test_benchmark_comparison.py",
+    "tests/test_benchmark_harness.py",
+    "tests/test_benchmark_model.py",
+    "tests/test_benchmark_trace_metrics.py",
+    "tests/test_longmemeval_benchmark.py",
+    "tests/test_memory_agent_bench.py",
+    "tools/evaluation/compare_memory_systems.py",
+    "tools/evaluation/longmemeval.py",
+    "tools/evaluation/memory_agent_bench.py",
 ]
