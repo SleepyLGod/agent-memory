@@ -102,6 +102,7 @@ def execute_search(
         "bfs_origins": list(request.origin_record_ids),
         "reranker": {
             "kind": request.reranker.kind,
+            "input_candidate_ids": list(candidates),
             "candidate_ids": ordered_ids[: request.limit],
             "scores": scores[: request.limit],
         },
@@ -318,20 +319,27 @@ def _rerank(
             f"cross-encoder source column {source_column!r} is not readable"
         )
     property_name = readable_properties[source_column]
-    candidate_ids = list(candidates)[: request.limit]
-    passage_to_id: dict[str, str] = {}
+    candidate_ids = list(candidates)
+    passages: list[str] = []
     for record_id in candidate_ids:
         passage = candidates[record_id]["properties"].get(property_name)
         if not isinstance(passage, str):
             raise TypeError("cross-encoder passages must be strings")
-        passage_to_id[passage] = record_id
+        passages.append(passage)
     ranked = reranker_provider.rank(
         model=str(request.reranker.params["model"]),
         query=request.query,
-        passages=list(passage_to_id),
+        passages=passages,
     )
+    ranked_indexes = [index for index, _ in ranked]
+    if (
+        len(ranked_indexes) != len(candidate_ids)
+        or len(set(ranked_indexes)) != len(candidate_ids)
+        or any(index < 0 or index >= len(candidate_ids) for index in ranked_indexes)
+    ):
+        raise ValueError("cross-encoder must rank every candidate index exactly once")
     return (
-        [passage_to_id[passage] for passage, _ in ranked],
+        [candidate_ids[index] for index in ranked_indexes],
         [float(score) for _, score in ranked],
     )
 

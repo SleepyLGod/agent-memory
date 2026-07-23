@@ -2182,7 +2182,9 @@ def test_differential_query_planner_recomputes_views_from_materialized_dependenc
     )
 
     assert differentiated.op == "select"
-    sem_map_expr = differentiated.inputs[0]
+    assign_expr = differentiated.inputs[0]
+    assert assign_expr.op == "assign"
+    sem_map_expr = assign_expr.inputs[0]
     assert sem_map_expr.op == "sem_map"
     _assert_materialized_view(
         sem_map_expr.inputs[0],
@@ -2299,7 +2301,15 @@ def test_catalog_expression_maps_from_topics() -> None:
 
     assert catalog_expr.op == "select"
     assert catalog_expr.params["columns"] == ("catalog_title", "name", "hook")
-    sem_map_expr = catalog_expr.inputs[0]
+    assign_expr = catalog_expr.inputs[0]
+    assert assign_expr.op == "assign"
+    catalog_title_expr = assign_expr.params["assignments"]["catalog_title"]
+    assert dict(catalog_title_expr) == {
+        "kind": "column",
+        "name": "name",
+        "qualifier": None,
+    }
+    sem_map_expr = assign_expr.inputs[0]
     assert sem_map_expr.op == "sem_map"
     assert sem_map_expr.params["input_cols"] == (
         "name",
@@ -2307,19 +2317,61 @@ def test_catalog_expression_maps_from_topics() -> None:
         "type",
         "body",
     )
-    assert tuple(col.name for col in sem_map_expr.params["output_cols"]) == (
-        "catalog_title",
-        "hook",
-    )
+    assert tuple(col.name for col in sem_map_expr.params["output_cols"]) == ("hook",)
+    assert single_output_column(sem_map_expr).name == "hook"
 
     catalog_instruction = " ".join(sem_map_expr.params["instruction"].split())
-    assert "MEMORY.md" in catalog_instruction
-    assert "index, not a memory" in catalog_instruction
-    assert "one line" in catalog_instruction
+    assert "plain-text relevance hook" in catalog_instruction
     assert "150 characters" in catalog_instruction
-    assert "{catalog_title}" in catalog_instruction
-    assert "{hook}" in catalog_instruction
-    assert "Do not generate filesystem paths" in catalog_instruction
+    assert "{name}" in catalog_instruction
+    assert "{description}" in catalog_instruction
+    assert "{type}" in catalog_instruction
+    assert "{body}" in catalog_instruction
+    assert "Do not return JSON" in catalog_instruction
+    assert "multiple catalog entries" in catalog_instruction
+
+
+def test_catalog_sem_map_dispatches_to_native_single_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import agent_memory.adapters.lotus.sem_map as sem_map_module
+
+    catalog_expr = am.ClaudeMemory.spec().views["catalog"].query
+    sem_map_expr = catalog_expr.inputs[0].inputs[0]
+    source = pd.DataFrame(
+        [
+            {
+                "name": "Fresh Earth",
+                "description": "A canonical topic about soil renewal.",
+                "type": "project",
+                "body": "Track experiments that improve depleted soil.",
+            }
+        ]
+    )
+    calls: list[str] = []
+
+    def native(*args: Any) -> pd.DataFrame:
+        calls.append("native")
+        return source.assign(hook="Useful when discussing soil renewal experiments.")
+
+    def structured(*args: Any) -> pd.DataFrame:
+        raise AssertionError("single-output catalog must not use structured sem_map")
+
+    monkeypatch.setattr(sem_map_module, "execute_native_sem_map", native)
+    monkeypatch.setattr(sem_map_module, "execute_structured_sem_map", structured)
+    context = SimpleNamespace(config=LotusExecutionConfig(), configure=lambda: None)
+
+    result = sem_map_module.execute_sem_map(
+        sem_map_expr,
+        {},
+        lambda query, inputs: source,
+        context,
+    )
+
+    assert calls == ["native"]
+    assert result["hook"].tolist() == [
+        "Useful when discussing soil renewal experiments."
+    ]
 
 
 def test_differentiated_policy_compiles_views_and_retrieval_templates() -> None:
@@ -3398,12 +3450,6 @@ def test_sem_map_query_expr_keeps_only_logical_params() -> None:
 
 
 def test_native_sem_map_kwargs_forwards_adapter_config_options() -> None:
-    query = QueryExpr(
-        op="sem_map",
-        params={
-            "output_cols": (ColumnSpec("label", "Short label."),),
-        },
-    )
     config = LotusExecutionConfig(
         sem_map_system_prompt="Use terse labels.",
         sem_map_examples=({"message": "hello", "Answer": "greeting"},),

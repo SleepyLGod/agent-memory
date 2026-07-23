@@ -88,8 +88,8 @@ class CrossEncoderProvider(Protocol):
         model: str,
         query: str,
         passages: list[str],
-    ) -> list[tuple[str, float]]:
-        """Return passages and scores in descending relevance order."""
+    ) -> list[tuple[int, float]]:
+        """Return passage indexes and scores in descending relevance order."""
 
         ...
 

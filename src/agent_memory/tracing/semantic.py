@@ -14,8 +14,6 @@ from threading import Lock
 from typing import Any, Iterator
 from uuid import uuid4
 
-import pandas as pd
-
 TRACE_EVENTS_FILE = "events.jsonl"
 TRACE_METRICS_FILE = "metrics.csv"
 TRACE_PROMPTS_DIR = "prompts"

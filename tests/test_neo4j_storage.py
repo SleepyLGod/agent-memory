@@ -261,18 +261,22 @@ class _SearchEmbeddingProvider:
 
 
 class _RerankerProvider:
+    def __init__(self) -> None:
+        self.passages: list[str] = []
+
     def rank(
         self,
         *,
         model: str,
         query: str,
         passages: list[str],
-    ) -> list[tuple[str, float]]:
+    ) -> list[tuple[int, float]]:
         assert model == "BAAI/bge-reranker-v2-m3"
         assert query == "Where does Alice live?"
+        self.passages = list(passages)
         scores = {"Alice lives in Paris": 0.9, "Alice likes running": 0.2}
         return sorted(
-            ((passage, scores[passage]) for passage in passages),
+            ((index, scores[passage]) for index, passage in enumerate(passages)),
             key=lambda item: item[1],
             reverse=True,
         )
@@ -524,6 +528,172 @@ def test_neo4j_fact_search_uses_bfs_origins_and_cross_encoder() -> None:
     bfs_call = next(call for call in session.calls if "UNWIND $origin_record_ids" in call[0])
     assert bfs_call[1]["origin_record_ids"] == ["entity-a"]
     assert batch.metrics["bfs_origins"] == ["entity-a"]
+
+
+def test_cross_encoder_reranks_the_full_candidate_union_before_limit() -> None:
+    embedding = EmbeddingSpec(
+        source_column="fact",
+        property_name="fact_embedding",
+        model="test-embedding",
+        revision="revision-a",
+        dimensions=2,
+        normalize=True,
+    )
+    target = _search_target(
+        Neo4jRelationshipMapping(
+            relationship_type="RELATES_TO",
+            identity=Neo4jIdentity(("fact_id",), "fact"),
+            source=Neo4jIdentity(("source_entity_id",), "entity"),
+            target=Neo4jIdentity(("target_entity_id",), "entity"),
+            properties={"fact": "fact"},
+            embedding=embedding,
+        )
+    )
+
+    class CandidateSession(_SearchSession):
+        def run(self, query: str, **parameters: Any) -> _SearchResult:
+            self.calls.append((query, dict(parameters)))
+            if "queryRelationships" in query:
+                rows = [
+                    {
+                        "record_id": "fact-first",
+                        "properties": {"fact": "irrelevant first"},
+                        "method_score": 3.0,
+                    },
+                    {
+                        "record_id": "fact-second",
+                        "properties": {"fact": "irrelevant second"},
+                        "method_score": 2.0,
+                    },
+                ]
+            elif "MATCH ()-[record:RELATES_TO]" in query:
+                rows = [
+                    {
+                        "record_id": "fact-best",
+                        "properties": {"fact": "best answer"},
+                        "method_score": 0.9,
+                    }
+                ]
+            else:
+                rows = []
+            return _SearchResult(rows)
+
+    class BestLastProvider:
+        def __init__(self) -> None:
+            self.passages: list[str] = []
+
+        def rank(
+            self,
+            *,
+            model: str,
+            query: str,
+            passages: list[str],
+        ) -> list[tuple[int, float]]:
+            del model, query
+            self.passages = list(passages)
+            return [(2, 1.0), (0, 0.2), (1, 0.1)]
+
+    provider = BestLastProvider()
+    batch = execute_search(
+        CandidateSession(),
+        SearchRequest(
+            statement_id="sink_0002",
+            target=target,
+            namespace="sample-0",
+            query="best answer",
+            methods=(
+                SearchMethodSpec("bm25"),
+                SearchMethodSpec("cosine_similarity"),
+            ),
+            reranker=RerankerSpec(
+                "cross_encoder", {"model": "BAAI/bge-reranker-v2-m3"}
+            ),
+            limit=1,
+            output_columns=("record_id", "fact", "rank", "score"),
+        ),
+        schema=GRAPHITI_NEO4J_SCHEMA,
+        embedding_provider=_SearchEmbeddingProvider(),
+        reranker_provider=provider,
+    )
+
+    assert provider.passages == ["irrelevant first", "irrelevant second", "best answer"]
+    assert batch.rows.to_dict("records") == [
+        {"record_id": "fact-best", "fact": "best answer", "rank": 1, "score": 1.0}
+    ]
+
+
+def test_cross_encoder_preserves_records_with_duplicate_passages() -> None:
+    embedding = EmbeddingSpec(
+        source_column="fact",
+        property_name="fact_embedding",
+        model="test-embedding",
+        revision="revision-a",
+        dimensions=2,
+        normalize=True,
+    )
+    target = _search_target(
+        Neo4jRelationshipMapping(
+            relationship_type="RELATES_TO",
+            identity=Neo4jIdentity(("fact_id",), "fact"),
+            source=Neo4jIdentity(("source_entity_id",), "entity"),
+            target=Neo4jIdentity(("target_entity_id",), "entity"),
+            properties={"fact": "fact"},
+            embedding=embedding,
+        )
+    )
+
+    class DuplicateSession(_SearchSession):
+        def run(self, query: str, **parameters: Any) -> _SearchResult:
+            self.calls.append((query, dict(parameters)))
+            if "queryRelationships" in query:
+                rows = [
+                    {
+                        "record_id": "fact-a",
+                        "properties": {"fact": "same text"},
+                        "method_score": 2.0,
+                    },
+                    {
+                        "record_id": "fact-b",
+                        "properties": {"fact": "same text"},
+                        "method_score": 1.0,
+                    },
+                ]
+            else:
+                rows = []
+            return _SearchResult(rows)
+
+    class DuplicateProvider:
+        def rank(
+            self,
+            *,
+            model: str,
+            query: str,
+            passages: list[str],
+        ) -> list[tuple[int, float]]:
+            del model, query
+            assert passages == ["same text", "same text"]
+            return [(1, 0.9), (0, 0.8)]
+
+    batch = execute_search(
+        DuplicateSession(),
+        SearchRequest(
+            statement_id="sink_0002",
+            target=target,
+            namespace="sample-0",
+            query="same text",
+            methods=(SearchMethodSpec("bm25"),),
+            reranker=RerankerSpec(
+                "cross_encoder", {"model": "BAAI/bge-reranker-v2-m3"}
+            ),
+            limit=2,
+            output_columns=("record_id", "fact", "rank", "score"),
+        ),
+        schema=GRAPHITI_NEO4J_SCHEMA,
+        embedding_provider=None,
+        reranker_provider=DuplicateProvider(),
+    )
+
+    assert batch.rows["record_id"].tolist() == ["fact-b", "fact-a"]
 
 
 def test_neo4j_search_rejects_logical_columns_not_readable_from_mapping() -> None:
