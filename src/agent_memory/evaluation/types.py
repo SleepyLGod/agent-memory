@@ -34,6 +34,39 @@ class BenchmarkQuestion:
 
 
 @dataclass(frozen=True)
+class BenchmarkCase:
+    """One isolated memory history followed by one or more questions."""
+
+    case_id: str
+    task_id: str
+    events: tuple[BenchmarkEvent, ...]
+    questions: tuple[BenchmarkQuestion, ...]
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.case_id:
+            raise ValueError("case_id must be non-empty")
+        if not self.task_id:
+            raise ValueError("task_id must be non-empty")
+        if not self.events:
+            raise ValueError("a benchmark case must contain at least one event")
+        if not self.questions:
+            raise ValueError("a benchmark case must contain at least one question")
+
+        event_ids = [event.event_id for event in self.events]
+        if len(event_ids) != len(set(event_ids)):
+            raise ValueError(f"case {self.case_id!r} contains duplicate event IDs")
+        question_ids = [question.question_id for question in self.questions]
+        if len(question_ids) != len(set(question_ids)):
+            raise ValueError(f"case {self.case_id!r} contains duplicate question IDs")
+
+        if any(event.sample_id != self.case_id for event in self.events):
+            raise ValueError("all benchmark events must belong to their case_id")
+        if any(question.sample_id != self.case_id for question in self.questions):
+            raise ValueError("all benchmark questions must belong to their case_id")
+
+
+@dataclass(frozen=True)
 class RetrievalRequest:
     """Runtime retrieval request derived from a benchmark question."""
 
