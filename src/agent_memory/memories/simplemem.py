@@ -24,7 +24,12 @@ def _now_date() -> str:
 
 
 SIMPLEMEM_EXTRACTION_PROMPT = r"""
+You are a professional information extraction assistant, skilled at extracting structured, unambiguous information from conversations. You must output valid JSON format.
+
 Your task is to extract all valuable information from the following dialogues and convert them into structured memory entries.
+
+[Overlap Awareness]
+Dialogue windows may partially overlap with the previous window. Facts that relate exclusively to dialogues appearing in prior windows may have already been captured. Focus on extracting NEW information not previously covered.
 
 [Current Window Dialogues]
 {dialogues}
@@ -41,52 +46,35 @@ Your task is to extract all valuable information from the following dialogues an
    - entities: Companies, products, organizations, etc.
    - topic: The topic of this information
 
-[Output Format]
-Return a JSON object with a "rows" array. Each row is a memory entry:
-
-{{
-  "rows": [
-    {{
-      "lossless_restatement": "Complete unambiguous restatement (must include all subjects, objects, time, location, etc.)",
-      "keywords": ["keyword1", "keyword2"],
-      "timestamp": "YYYY-MM-DDTHH:MM:SS or null",
-      "location": "location name or null",
-      "persons": ["name1", "name2"],
-      "entities": ["entity1", "entity2"],
-      "topic": "topic phrase"
-    }}
-  ]
-}}
-
 [Example]
 Dialogues:
-[{{"speaker": "Alice", "content": "Bob, let's meet at Starbucks tomorrow at 2pm to discuss the new product", "timestamp": "2025-11-15"}}, {{"speaker": "Bob", "content": "Okay, I'll prepare the materials", "timestamp": "2025-11-15"}}]
+[{{"content": "Bob, let's meet at Starbucks tomorrow at 2pm to discuss the new product", "speaker": "Alice", "timestamp": "2025-11-15"}}, {{"content": "Okay, I'll prepare the materials", "speaker": "Bob", "timestamp": "2025-11-15"}}]
 
 Output:
 {{
   "rows": [
     {{
       "lossless_restatement": "Alice suggested at 2025-11-15 to meet with Bob at Starbucks on 2025-11-16 at 14:00 to discuss the new product.",
-      "keywords": ["Alice", "Bob", "Starbucks", "new product", "meeting"],
+      "keywords": "Alice, Bob, Starbucks, new product, meeting",
       "timestamp": "2025-11-16T14:00:00",
       "location": "Starbucks",
-      "persons": ["Alice", "Bob"],
-      "entities": ["new product"],
+      "persons": "Alice, Bob",
+      "entities": "new product",
       "topic": "Product discussion meeting arrangement"
     }},
     {{
       "lossless_restatement": "Bob agreed to attend the meeting and committed to prepare relevant materials.",
-      "keywords": ["Bob", "prepare materials", "agree"],
+      "keywords": "Bob, prepare materials, agree",
       "timestamp": null,
       "location": null,
-      "persons": ["Bob"],
-      "entities": [],
+      "persons": "Bob",
+      "entities": null,
       "topic": "Meeting preparation confirmation"
     }}
   ]
 }}
 
-Now process the above dialogues. Return ONLY the JSON object, no text, reasoning, explanations, or wrappers.
+Now process the above dialogues.
 """.strip()
 
 
@@ -114,11 +102,11 @@ class SimpleMemMemory(Memory):
                 input_cols=["dialogues"],
                 output_cols={
                     "lossless_restatement": "Complete unambiguous restatement with no pronouns and absolute timestamps.",
-                    "keywords": "JSON array of core keywords for exact matching.",
+                    "keywords": "Comma-separated core keywords for exact matching.",
                     "timestamp": "ISO 8601 absolute time or null.",
                     "location": "Location name or null.",
-                    "persons": "JSON array of person names mentioned.",
-                    "entities": "JSON array of entities (companies, products, etc.).",
+                    "persons": "Comma-separated list of person names mentioned, or null.",
+                    "entities": "Comma-separated list of entities (companies, products, etc.), or null.",
                     "topic": "Concise topic phrase.",
                 },
                 instruction=SIMPLEMEM_EXTRACTION_PROMPT,
