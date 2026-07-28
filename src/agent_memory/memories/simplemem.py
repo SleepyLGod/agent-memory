@@ -115,6 +115,7 @@ class SimpleMemMemory(Memory):
                 "lossless_restatement", "keywords", "timestamp",
                 "location", "persons", "entities", "topic",
             ])
+            .drop_duplicates()
         )
     )
 
