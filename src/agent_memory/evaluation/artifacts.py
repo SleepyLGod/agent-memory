@@ -197,7 +197,7 @@ class BenchmarkArtifactStore:
         judge_model_id: str,
         contract_fingerprints: Mapping[str, str],
         answer_prompt_digests: Mapping[str, str],
-        scorer_contracts: Mapping[str, Mapping[str, str]],
+        scorer_contracts: Mapping[str, Mapping[str, Any]],
         runtime_provenance: Mapping[str, Any] | None = None,
         storage_provenance: Mapping[str, Any] | None = None,
         run_mode: str = "full",
@@ -231,6 +231,9 @@ class BenchmarkArtifactStore:
             "input_adapter_digest": system_contract.input_adapter_digest,
             "retrieval_recipe_id": system_contract.retrieval_recipe_id,
             "retrieval_recipe_digest": system_contract.retrieval_recipe_digest,
+            "maintenance_policy_id": (
+                system_contract.effective_maintenance_policy_id
+            ),
             "maintenance_rule": system_contract.maintenance_rule,
             "maintenance_fingerprint": system_contract.maintenance_fingerprint,
             "thinking_enabled": system_contract.thinking_enabled,
@@ -360,6 +363,9 @@ class BenchmarkArtifactStore:
             "bundle_fingerprint": bundle.fingerprint,
             "policy_input_fingerprint": bundle.policy_input_fingerprint,
             "system_id": system_contract.system_id,
+            "maintenance_policy_id": (
+                system_contract.effective_maintenance_policy_id
+            ),
             "memory_model_id": system_contract.memory_model_id,
             "memory_provider_model_id": system_contract.memory_provider_model_id,
             "input_adapter_id": system_contract.input_adapter_id,
@@ -409,11 +415,22 @@ class BenchmarkArtifactStore:
             raise ValueError("checkpoint current pointer is missing checkpoint_id")
         snapshot = checkpoint_root / "snapshots" / checkpoint_id
         manifest = json.loads((snapshot / "manifest.json").read_text(encoding="utf-8"))
+        checkpoint_maintenance_policy_id = manifest.get(
+            "maintenance_policy_id",
+            manifest.get("system_id"),
+        )
+        if (
+            checkpoint_maintenance_policy_id
+            != system_contract.effective_maintenance_policy_id
+        ):
+            raise ValueError(
+                "checkpoint does not match current run contract: "
+                "maintenance_policy_id"
+            )
         expected_contract = {
             "case_id": case.case_id,
             "bundle_fingerprint": bundle.fingerprint,
             "policy_input_fingerprint": bundle.policy_input_fingerprint,
-            "system_id": system_contract.system_id,
             "memory_model_id": system_contract.memory_model_id,
             "memory_provider_model_id": system_contract.memory_provider_model_id,
             "input_adapter_id": system_contract.input_adapter_id,
@@ -617,6 +634,7 @@ class BenchmarkArtifactStore:
         """Rebuild run summaries from completed case artifacts and trace evidence."""
 
         question_rows: list[dict[str, Any]] = []
+        grade_rows: list[dict[str, Any]] = []
         completed_cases = 0
         failed_cases = 0
         empty_retrievals = 0
@@ -645,14 +663,23 @@ class BenchmarkArtifactStore:
                 row["question_id"]: row
                 for row in _read_jsonl(case_dir / "answers.jsonl")
             }
-            grades = {
-                row["question_id"]: row
-                for row in _read_jsonl(case_dir / "grades.jsonl")
-            }
-            for question_id in sorted(set(retrievals) | set(answers) | set(grades)):
+            grades_by_question: dict[str, list[dict[str, Any]]] = {}
+            for row in _read_jsonl(case_dir / "grades.jsonl"):
+                grades_by_question.setdefault(str(row["question_id"]), []).append(row)
+            for question_id in sorted(
+                set(retrievals) | set(answers) | set(grades_by_question)
+            ):
                 retrieval = retrievals.get(question_id, {})
                 answer = answers.get(question_id, {})
-                grade = grades.get(question_id, {})
+                question_grades = grades_by_question.get(question_id, [])
+                primary_grades = [
+                    row for row in question_grades if row.get("primary", True)
+                ]
+                if len(primary_grades) > 1:
+                    raise ValueError(
+                        f"question {question_id!r} has multiple primary grades"
+                    )
+                grade = primary_grades[0] if primary_grades else {}
                 retrieval_status = str(retrieval.get("status") or "success")
                 if retrieval_status == "system_error":
                     retrieval_system_errors += 1
@@ -690,10 +717,10 @@ class BenchmarkArtifactStore:
                         "retrieval_latency_ms": retrieval.get("latency_ms", ""),
                         "retrieval_returned_count": returned_count,
                         "answer_latency_ms": answer.get("latency_ms", ""),
-                        "grading_latency_ms": grade.get("latency_ms", ""),
+                        "primary_grading_latency_ms": grade.get("latency_ms", ""),
                         "answer": answer_text,
-                        "scorer_id": grade.get("scorer_id", ""),
-                        "score": grade.get("score", ""),
+                        "primary_scorer_id": grade.get("scorer_id", ""),
+                        "primary_score": grade.get("score", ""),
                         "exact_match": int(normalized_answer == normalized_reference),
                         "contains_match": int(
                             bool(normalized_reference)
@@ -702,9 +729,84 @@ class BenchmarkArtifactStore:
                         "token_f1": _token_f1(answer_text, reference),
                     }
                 )
+                for grade_row in question_grades:
+                    grade_rows.append(
+                        {
+                            "case_id": status.get("case_id"),
+                            "question_id": question_id,
+                            "scorer_id": grade_row.get("scorer_id", ""),
+                            "score": grade_row.get("score", ""),
+                            "label": grade_row.get("label", ""),
+                            "primary": bool(grade_row.get("primary", True)),
+                            "grading_latency_ms": grade_row.get("latency_ms", ""),
+                        }
+                    )
 
-        self._write_csv(self.output_dir / "metrics" / "per_question.csv", question_rows)
         trace_rows = _read_jsonl(self.trace_dir / "events.jsonl")
+        embedding_rows = [
+            {
+                "trace_id": row.get("trace_id", ""),
+                "case_id": row.get("case_id", ""),
+                "event_id": row.get("event_id", ""),
+                "question_id": row.get("question_id", ""),
+                "phase": row.get("phase", ""),
+                "operation": row.get("operation", ""),
+                "attempt": row.get("attempt", ""),
+                "status": row.get("status", ""),
+                "model": row.get("model", ""),
+                "revision": row.get("revision", ""),
+                "source_column": row.get("source_column", ""),
+                "property_name": row.get("property_name", ""),
+                "batch_size": row.get("batch_size", ""),
+                "dimensions": row.get("dimensions", ""),
+                "result_count": row.get("result_count", ""),
+                "result_dimensions": row.get("result_dimensions", ""),
+                "normalize": row.get("normalize", ""),
+                "device": row.get("device", ""),
+                "latency_ms": row.get("latency_ms", ""),
+                "input_path": row.get("input_path", ""),
+                "error_type": row.get("error_type", ""),
+                "error_message": row.get("error_message", ""),
+            }
+            for row in trace_rows
+            if row.get("event_type") == "embedding_call"
+        ]
+        self._write_csv(
+            self.output_dir / "metrics" / "embedding_usage.csv",
+            embedding_rows,
+        )
+        embedding_by_event: dict[tuple[str, str, int], list[dict[str, Any]]] = {}
+        embedding_by_question: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        for row in embedding_rows:
+            case_id = str(row.get("case_id") or "")
+            event_id = str(row.get("event_id") or "")
+            question_id = str(row.get("question_id") or "")
+            attempt = int(row.get("attempt") or 1)
+            if event_id:
+                embedding_by_event.setdefault(
+                    (case_id, event_id, attempt),
+                    [],
+                ).append(row)
+            if question_id:
+                embedding_by_question.setdefault(
+                    (case_id, question_id),
+                    [],
+                ).append(row)
+        for row in question_rows:
+            calls = embedding_by_question.get(
+                (str(row.get("case_id") or ""), str(row.get("question_id") or "")),
+                [],
+            )
+            row["embedding_call_count"] = len(calls)
+            row["embedding_error_count"] = sum(
+                call.get("status") == "error" for call in calls
+            )
+            row["embedding_latency_sum_ms"] = round(
+                sum(float(call.get("latency_ms") or 0) for call in calls),
+                3,
+            )
+        self._write_csv(self.output_dir / "metrics" / "per_question.csv", question_rows)
+        self._write_csv(self.output_dir / "metrics" / "per_grade.csv", grade_rows)
         pricing = PricingSnapshot.deepseek_2026_07_17()
         provider_rows = normalize_provider_calls(
             trace_rows,
@@ -737,6 +839,10 @@ class BenchmarkArtifactStore:
             event_occurrences[occurrence_key] = occurrence
             attempt = int(event.get("attempt") or 1)
             calls = provider_by_event.get((case_id, event_id, attempt), [])
+            embedding_calls = embedding_by_event.get(
+                (case_id, event_id, attempt),
+                [],
+            )
             shape = {
                 key: int(value)
                 for key, value in event.items()
@@ -766,6 +872,18 @@ class BenchmarkArtifactStore:
                     "error_type": event.get("error_type", ""),
                     "error": event.get("error", ""),
                     **_provider_rollup(calls),
+                    "embedding_call_count": len(embedding_calls),
+                    "embedding_error_count": sum(
+                        call.get("status") == "error"
+                        for call in embedding_calls
+                    ),
+                    "embedding_latency_sum_ms": round(
+                        sum(
+                            float(call.get("latency_ms") or 0)
+                            for call in embedding_calls
+                        ),
+                        3,
+                    ),
                     **shape,
                     **deltas,
                 }
@@ -871,18 +989,26 @@ class BenchmarkArtifactStore:
                 str(row.get("logical_call_id") or row.get("trace_id") or "")
                 for row in rows
             }
-            batch_count = len(logical_calls)
+            framework_batches = {
+                str(row.get("framework_batch_id") or row.get("trace_id") or "")
+                for row in rows
+            }
+            retry_rows = [row for row in rows if (row.get("attempt") or 1) > 1]
+            retry_batches = {
+                str(row.get("framework_batch_id") or row.get("trace_id") or "")
+                for row in retry_rows
+            }
+            batch_count = len(framework_batches)
             operator_rows.append(
                 {
                     "phase": phase,
                     "operator": operator,
-                    "logical_call_count": batch_count,
+                    "logical_call_count": len(logical_calls),
                     "physical_batch_count": batch_count,
                     "physical_item_count": len(rows),
                     "items_per_batch": round(len(rows) / max(1, batch_count), 3),
-                    "retry_count": sum(
-                        (row.get("attempt") or 1) > 1 for row in rows
-                    ),
+                    "retry_provider_call_count": len(retry_rows),
+                    "retry_batch_count": len(retry_batches),
                     **_provider_rollup(rows),
                 }
             )
@@ -908,7 +1034,18 @@ class BenchmarkArtifactStore:
         ]
         self._write_csv(self.output_dir / "metrics" / "state_shape.csv", state_rows)
 
-        scores = [float(row["score"]) for row in question_rows if row["score"] != ""]
+        scores = [
+            float(row["primary_score"])
+            for row in question_rows
+            if row["primary_score"] != ""
+        ]
+        scores_by_scorer: dict[str, list[float]] = {}
+        for row in grade_rows:
+            if row["score"] in {"", None}:
+                continue
+            scores_by_scorer.setdefault(str(row["scorer_id"]), []).append(
+                float(row["score"])
+            )
         provider_summary = summarize_provider_calls(provider_rows)
         insertion_latencies = [
             float(row["wall_latency_ms"])
@@ -925,11 +1062,16 @@ class BenchmarkArtifactStore:
             for row in question_rows
             if row.get("answer_latency_ms") not in {"", None}
         ]
-        grading_latencies = [
-            float(row["grading_latency_ms"])
-            for row in question_rows
-            if row.get("grading_latency_ms") not in {"", None}
-        ]
+        grading_latencies_by_scorer: dict[str, list[float]] = {}
+        for row in grade_rows:
+            latency = row.get("grading_latency_ms")
+            if latency is None or latency == "":
+                continue
+            if not isinstance(latency, int | float | str):
+                raise TypeError("grading latency must be numeric")
+            grading_latencies_by_scorer.setdefault(
+                str(row["scorer_id"]), []
+            ).append(float(latency))
         consolidation_latencies = [
             float(row["consolidation_wall_latency_ms"])
             for row in consolidation_rows
@@ -940,6 +1082,48 @@ class BenchmarkArtifactStore:
             for row in checkpoint_rows
             if row.get("wall_latency_ms") not in {"", None}
         ]
+        embedding_latencies = [
+            float(row["latency_ms"])
+            for row in embedding_rows
+            if row.get("latency_ms") not in {"", None}
+        ]
+        embedding_rows_by_phase: dict[str, list[dict[str, Any]]] = {}
+        for row in embedding_rows:
+            embedding_rows_by_phase.setdefault(
+                str(row.get("phase") or "unknown"),
+                [],
+            ).append(row)
+        embedding_phases = {
+            phase: {
+                "call_count": len(rows),
+                "error_count": sum(row.get("status") == "error" for row in rows),
+                "latency_sum_ms": round(
+                    sum(float(row.get("latency_ms") or 0) for row in rows),
+                    3,
+                ),
+                "latency": _latency_stats(
+                    [
+                        float(row["latency_ms"])
+                        for row in rows
+                        if row.get("latency_ms") not in {"", None}
+                    ]
+                ),
+            }
+            for phase, rows in sorted(embedding_rows_by_phase.items())
+        }
+        driver_setup_rows = [
+            row
+            for row in trace_rows
+            if row.get("event_type") == "driver_setup_result"
+        ]
+        driver_setup_latencies = [
+            float(row["latency_ms"])
+            for row in driver_setup_rows
+            if row.get("latency_ms") not in {"", None}
+        ]
+        driver_setup_by_case = {
+            str(row.get("case_id") or ""): row for row in driver_setup_rows
+        }
         manifest = json.loads(
             (self.output_dir / "manifest.json").read_text(encoding="utf-8")
         )
@@ -962,9 +1146,9 @@ class BenchmarkArtifactStore:
             case_provider_rollup = _provider_rollup(case_provider)
             case_cost = case_provider_rollup["estimated_cost_usd"]
             case_scores = [
-                float(row["score"])
+                float(row["primary_score"])
                 for row in case_questions
-                if row.get("score") not in {"", None}
+                if row.get("primary_score") not in {"", None}
             ]
             phase_costs: dict[str, float | None] = {}
             for phase in (
@@ -996,6 +1180,10 @@ class BenchmarkArtifactStore:
                     "system_error_question_count": sum(
                         bool(row.get("system_error_phase")) for row in case_questions
                     ),
+                    "driver_setup_wall_latency_ms": driver_setup_by_case.get(
+                        case_id,
+                        {},
+                    ).get("latency_ms", ""),
                     "insertion_wall_latency_ms": round(
                         sum(float(row.get("wall_latency_ms") or 0) for row in case_events),
                         3,
@@ -1010,13 +1198,6 @@ class BenchmarkArtifactStore:
                     "answering_wall_latency_ms": round(
                         sum(
                             float(row.get("answer_latency_ms") or 0)
-                            for row in case_questions
-                        ),
-                        3,
-                    ),
-                    "grading_wall_latency_ms": round(
-                        sum(
-                            float(row.get("grading_latency_ms") or 0)
                             for row in case_questions
                         ),
                         3,
@@ -1038,6 +1219,13 @@ class BenchmarkArtifactStore:
             "failed_cases": failed_cases,
             "question_count": len(question_rows),
             "mean_score": sum(scores) / len(scores) if scores else None,
+            "scores_by_scorer": {
+                scorer_id: {
+                    "grade_count": len(values),
+                    "mean_score": sum(values) / len(values),
+                }
+                for scorer_id, values in sorted(scores_by_scorer.items())
+            },
             "empty_retrieval_count": empty_retrievals,
             "retrieval_system_error_count": retrieval_system_errors,
             "memory_system_error_case_count": len(memory_system_error_cases),
@@ -1046,11 +1234,27 @@ class BenchmarkArtifactStore:
             "insertion_wall_latency": _latency_stats(insertion_latencies),
             "retrieval_wall_latency": _latency_stats(retrieval_latencies),
             "answering_wall_latency": _latency_stats(answer_latencies),
-            "grading_wall_latency": _latency_stats(grading_latencies),
+            "grading_wall_latency_by_scorer": {
+                scorer_id: _latency_stats(latencies)
+                for scorer_id, latencies in sorted(
+                    grading_latencies_by_scorer.items()
+                )
+            },
             "consolidation_wall_latency": _latency_stats(
                 consolidation_latencies
             ),
             "checkpoint_wall_latency": _latency_stats(checkpoint_latencies),
+            "driver_setup_wall_latency": _latency_stats(driver_setup_latencies),
+            "driver_setup_error_count": sum(
+                row.get("status") == "error" for row in driver_setup_rows
+            ),
+            "embedding_call_count": len(embedding_rows),
+            "embedding_error_count": sum(
+                row.get("status") == "error" for row in embedding_rows
+            ),
+            "embedding_latency_sum_ms": round(sum(embedding_latencies), 3),
+            "embedding_wall_latency": _latency_stats(embedding_latencies),
+            "embedding_phases": embedding_phases,
             "pricing": pricing.to_dict(),
             **provider_summary,
         }
@@ -1093,6 +1297,23 @@ class BenchmarkArtifactStore:
                     "completion_tokens": provider_summary["completion_tokens"],
                     "reasoning_tokens": provider_summary["reasoning_tokens"],
                     "estimated_cost_usd": provider_summary["estimated_cost_usd"],
+                    "driver_setup_mean_latency_ms": _latency_stats(
+                        driver_setup_latencies
+                    )["mean_ms"],
+                    "driver_setup_median_latency_ms": _latency_stats(
+                        driver_setup_latencies
+                    )["median_ms"],
+                    "driver_setup_p95_latency_ms": _latency_stats(
+                        driver_setup_latencies
+                    )["p95_ms"],
+                    "driver_setup_error_count": summary[
+                        "driver_setup_error_count"
+                    ],
+                    "embedding_call_count": summary["embedding_call_count"],
+                    "embedding_error_count": summary["embedding_error_count"],
+                    "embedding_latency_sum_ms": summary[
+                        "embedding_latency_sum_ms"
+                    ],
                     "insertion_mean_latency_ms": _latency_stats(
                         insertion_latencies
                     )["mean_ms"],
@@ -1120,15 +1341,6 @@ class BenchmarkArtifactStore:
                     "answering_p95_latency_ms": _latency_stats(
                         answer_latencies
                     )["p95_ms"],
-                    "grading_mean_latency_ms": _latency_stats(
-                        grading_latencies
-                    )["mean_ms"],
-                    "grading_median_latency_ms": _latency_stats(
-                        grading_latencies
-                    )["median_ms"],
-                    "grading_p95_latency_ms": _latency_stats(
-                        grading_latencies
-                    )["p95_ms"],
                 }
             ],
         )
@@ -1145,6 +1357,10 @@ class BenchmarkArtifactStore:
                     "provider_error_count": provider_summary[
                         "provider_error_count"
                     ],
+                    "driver_setup_error_count": summary[
+                        "driver_setup_error_count"
+                    ],
+                    "embedding_error_count": summary["embedding_error_count"],
                     "usage_complete": provider_summary["usage_complete"],
                     "empty_retrieval_count": empty_retrievals,
                     "retrieval_system_error_count": retrieval_system_errors,

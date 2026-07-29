@@ -12,6 +12,7 @@ from agent_memory.evaluation.artifacts import BenchmarkArtifactStore
 from agent_memory.evaluation.bundle import BenchmarkBundle
 from agent_memory.evaluation.harness import (
     BenchmarkRunner,
+    GradeContract,
     GradeResult,
     JudgeStep,
     MemorySystemContract,
@@ -21,7 +22,7 @@ from agent_memory.evaluation.harness import (
     TaskContract,
 )
 from agent_memory.evaluation.types import BenchmarkCase, BenchmarkEvent, BenchmarkQuestion
-from agent_memory.tracing.semantic import active_trace_scope
+from agent_memory.tracing.semantic import active_trace_scope, write_trace_event
 
 
 def _bundle() -> BenchmarkBundle:
@@ -213,7 +214,11 @@ def test_runner_injects_once_queries_many_and_writes_contract(tmp_path) -> None:
     assert manifest["question_ids"] == ["q1", "q2"]
     assert manifest["answer_prompt_digests"] == {"task-1": "answer-digest"}
     assert manifest["scorer_contracts"] == {
-        "task-1": {"scorer_id": "exact", "scorer_digest": "score-digest"}
+        "task-1": {
+            "scorer_id": "exact",
+            "scorer_digest": "score-digest",
+            "additional_graders": [],
+        }
     }
     assert summary["completed_cases"] == 1
     assert summary["failed_cases"] == 0
@@ -222,6 +227,10 @@ def test_runner_injects_once_queries_many_and_writes_contract(tmp_path) -> None:
     assert summary["provider_error_count"] == 0
     assert summary["question_count"] == 2
     assert summary["estimated_cost_usd"] == 1.12e-06
+    assert summary["driver_setup_error_count"] == 0
+    assert summary["driver_setup_wall_latency"]["mean_ms"] is not None
+    assert summary["embedding_call_count"] == 0
+    assert summary["embedding_error_count"] == 0
     assert summary["phases"]["answering"]["prompt_tokens"] == 4
     for filename in (
         "overview.csv",
@@ -229,6 +238,7 @@ def test_runner_injects_once_queries_many_and_writes_contract(tmp_path) -> None:
         "per_session.csv",
         "per_question.csv",
         "provider_usage.csv",
+        "embedding_usage.csv",
         "operation_usage.csv",
         "per_case.csv",
         "state_shape.csv",
@@ -246,6 +256,97 @@ def test_runner_injects_once_queries_many_and_writes_contract(tmp_path) -> None:
         case_metric = next(csv.DictReader(stream))
     assert float(case_metric["estimated_cost_usd"]) == 1.12e-06
     assert float(case_metric["cost_per_question_usd"]) == 5.6e-07
+
+
+def test_runner_answers_once_and_records_primary_and_secondary_graders(
+    tmp_path: Path,
+) -> None:
+    case = replace(_bundle().cases[0], questions=(_bundle().cases[0].questions[0],))
+    bundle = replace(_bundle(), cases=(case,))
+    contract = replace(
+        _contract(),
+        additional_graders=(
+            GradeContract(
+                scorer_id="secondary",
+                scorer_digest="secondary-digest",
+                deterministic_scorer=lambda question, answer: GradeResult(
+                    scorer_id="secondary",
+                    score=float(answer == question.gold_answer),
+                ),
+            ),
+        ),
+    )
+    model = _Model(["one"])
+
+    BenchmarkRunner(
+        system_contract=_system_contract(),
+        contracts={"task-1": contract},
+        driver_factory=lambda case_id, state_dir, trace_dir: _Driver(state_dir),
+        answer_model=model,
+        judge_model=model,
+        artifacts=BenchmarkArtifactStore(tmp_path),
+    ).run(bundle)
+
+    assert model.calls == [("answer", 1)]
+    case_dir = BenchmarkArtifactStore(tmp_path).case_dir("case-1")
+    grades = [
+        json.loads(line)
+        for line in (case_dir / "grades.jsonl").read_text().splitlines()
+    ]
+    assert [(row["scorer_id"], row["primary"]) for row in grades] == [
+        ("exact", True),
+        ("secondary", False),
+    ]
+    summary = json.loads((tmp_path / "metrics" / "summary.json").read_text())
+    assert summary["question_count"] == 1
+    assert summary["mean_score"] == 1.0
+    assert summary["scores_by_scorer"] == {
+        "exact": {"grade_count": 1, "mean_score": 1.0},
+        "secondary": {"grade_count": 1, "mean_score": 1.0},
+    }
+
+    grade_path = case_dir / "grades.jsonl"
+    grade_rows = [json.loads(line) for line in grade_path.read_text().splitlines()]
+    grade_rows[0]["latency_ms"] = 0.7
+    grade_rows[1]["latency_ms"] = 860.0
+    grade_path.write_text(
+        "".join(json.dumps(row) + "\n" for row in grade_rows),
+        encoding="utf-8",
+    )
+    BenchmarkArtifactStore(tmp_path).finalize_metrics()
+
+    summary = json.loads((tmp_path / "metrics" / "summary.json").read_text())
+    assert "grading_wall_latency" not in summary
+    assert summary["grading_wall_latency_by_scorer"] == {
+        "exact": {
+            "mean_ms": 0.7,
+            "median_ms": 0.7,
+            "p95_ms": 0.7,
+        },
+        "secondary": {
+            "mean_ms": 860.0,
+            "median_ms": 860.0,
+            "p95_ms": 860.0,
+        },
+    }
+    with (tmp_path / "metrics" / "per_question.csv").open(
+        newline="", encoding="utf-8"
+    ) as stream:
+        question_row = next(csv.DictReader(stream))
+    assert question_row["primary_scorer_id"] == "exact"
+    assert question_row["primary_grading_latency_ms"] == "0.7"
+    assert "scorer_id" not in question_row
+    assert "grading_latency_ms" not in question_row
+    with (tmp_path / "metrics" / "per_case.csv").open(
+        newline="", encoding="utf-8"
+    ) as stream:
+        case_row = next(csv.DictReader(stream))
+    assert "grading_wall_latency_ms" not in case_row
+    with (tmp_path / "metrics" / "overview.csv").open(
+        newline="", encoding="utf-8"
+    ) as stream:
+        overview_row = next(csv.DictReader(stream))
+    assert not any(key.startswith("grading_") for key in overview_row)
 
 
 def test_driver_setup_failure_records_zero_side_effect_boundary(tmp_path) -> None:
@@ -285,6 +386,157 @@ def test_driver_setup_failure_records_zero_side_effect_boundary(tmp_path) -> Non
     assert status["add_count"] == 0
     assert status["storage_transaction_count"] == 0
     assert not (case_dir / "checkpoints/current.json").exists()
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "trace" / "events.jsonl").read_text().splitlines()
+    ]
+    setup = next(row for row in events if row["event_type"] == "driver_setup_result")
+    assert setup["status"] == "error"
+    assert setup["error_type"] == "NotImplementedError"
+
+
+def test_embedding_usage_metrics_remain_separate_from_provider_costs(
+    tmp_path: Path,
+) -> None:
+    class EmbeddingDriver(_Driver):
+        trace_dir: Path
+
+        def add(self, event: BenchmarkEvent) -> dict[str, int]:
+            write_trace_event(
+                self.trace_dir,
+                operator="embedding",
+                event_type="embedding_call",
+                payload={
+                    "status": "success",
+                    "model": "BAAI/bge-m3",
+                    "revision": "revision",
+                    "batch_size": 1,
+                    "dimensions": 1024,
+                    "result_count": 1,
+                    "result_dimensions": 1024,
+                    "normalize": True,
+                    "device": "cpu",
+                    "latency_ms": 2.5,
+                    "input_path": "trace/prompts/input.json",
+                },
+            )
+            return super().add(event)
+
+    def factory(case_id: str, state_dir: Path, trace_dir: Path) -> _Driver:
+        del case_id
+        driver = EmbeddingDriver(state_dir)
+        driver.trace_dir = trace_dir
+        return driver
+
+    BenchmarkRunner(
+        system_contract=_system_contract(),
+        contracts={"task-1": _contract()},
+        driver_factory=factory,
+        answer_model=_Model(),
+        judge_model=_Model(),
+        artifacts=BenchmarkArtifactStore(tmp_path),
+    ).run(_bundle())
+
+    summary = json.loads((tmp_path / "metrics" / "summary.json").read_text())
+    assert summary["embedding_call_count"] == 2
+    assert summary["embedding_error_count"] == 0
+    assert summary["embedding_latency_sum_ms"] == 5.0
+    assert summary["embedding_phases"]["insertion"]["call_count"] == 2
+    assert summary["provider_call_count"] == 2
+    with (tmp_path / "metrics" / "embedding_usage.csv").open(
+        newline="",
+        encoding="utf-8",
+    ) as stream:
+        embedding_rows = list(csv.DictReader(stream))
+    assert len(embedding_rows) == 2
+    with (tmp_path / "metrics" / "per_event.csv").open(
+        newline="",
+        encoding="utf-8",
+    ) as stream:
+        event_rows = list(csv.DictReader(stream))
+    assert [row["embedding_call_count"] for row in event_rows] == ["1", "1"]
+    assert all(row["estimated_cost_usd"] == "0.0" for row in event_rows)
+
+
+def test_operation_usage_separates_calls_batches_and_provider_responses(
+    tmp_path: Path,
+) -> None:
+    class ProviderTracingDriver(_Driver):
+        trace_dir: Path
+
+        def retrieve(self, request):
+            for batch_id, size in (("batch-1", 3), ("batch-2", 2), ("batch-3", 1)):
+                for item_index in range(size):
+                    write_trace_event(
+                        self.trace_dir,
+                        operator="sem_topk",
+                        event_type="provider_usage",
+                        payload={
+                            "operator_call_id": "logical-1",
+                            "provider_batch_id": batch_id,
+                            "provider_item_index": item_index,
+                            "provider_usage_available": True,
+                            "provider_prompt_tokens": 10,
+                            "provider_prompt_cache_hit_tokens": 6,
+                            "provider_prompt_cache_miss_tokens": 4,
+                            "provider_completion_tokens": 2,
+                            "model": "deepseek-v4-flash",
+                        },
+                    )
+            return super().retrieve(request)
+
+    def factory(case_id: str, state_dir: Path, trace_dir: Path) -> _Driver:
+        del case_id
+        driver = ProviderTracingDriver(state_dir)
+        driver.trace_dir = trace_dir
+        return driver
+
+    case = replace(_bundle().cases[0], questions=(_bundle().cases[0].questions[0],))
+    BenchmarkRunner(
+        system_contract=_system_contract(),
+        contracts={"task-1": _contract()},
+        driver_factory=factory,
+        answer_model=_Model(["one"]),
+        judge_model=_Model(),
+        artifacts=BenchmarkArtifactStore(tmp_path),
+    ).run(replace(_bundle(), cases=(case,)))
+
+    with (tmp_path / "metrics" / "operation_usage.csv").open(
+        newline="", encoding="utf-8"
+    ) as stream:
+        rows = list(csv.DictReader(stream))
+    row = next(
+        item
+        for item in rows
+        if item["phase"] == "retrieval" and item["operator"] == "sem_topk"
+    )
+    assert row["logical_call_count"] == "1"
+    assert row["physical_batch_count"] == "3"
+    assert row["provider_call_count"] == "6"
+    assert row["physical_item_count"] == "6"
+    assert row["items_per_batch"] == "2.0"
+    assert row["retry_provider_call_count"] == "0"
+    assert row["retry_batch_count"] == "0"
+    assert row["prompt_tokens"] == "60"
+    assert row["completion_tokens"] == "12"
+    assert row["estimated_cost_usd"] == "6.8208e-06"
+
+
+def test_default_condition_id_uses_maintenance_and_retrieval_contract() -> None:
+    quick = replace(
+        _system_contract(),
+        maintenance_rule="rule-join-map",
+        retrieval_recipe_id="semantic-topk:pairwise-quick",
+    )
+    listwise = replace(
+        quick,
+        retrieval_recipe_id="semantic-topk:listwise",
+    )
+    regroup = replace(quick, maintenance_rule="rule-re-group")
+
+    assert quick.effective_condition_id != listwise.effective_condition_id
+    assert quick.effective_condition_id != regroup.effective_condition_id
+    assert replace(quick, condition_id="JM-Q").effective_condition_id == "JM-Q"
 
 
 def test_completed_case_resume_does_not_recreate_driver_or_model(tmp_path) -> None:
@@ -1126,6 +1378,171 @@ def test_final_maintenance_checkpoint_is_reused_read_only_for_retrieval(
     )
     assert retrieval_drivers[0].queries == ["query:first?"]
     assert pointer_path.read_bytes() == pointer_before
+
+
+def test_checkpoint_restore_propagates_trace_phase_to_driver(
+    tmp_path: Path,
+) -> None:
+    bundle = _session_bundle()
+    maintenance_dir = tmp_path / "maintenance"
+    BenchmarkRunner(
+        system_contract=_system_contract(),
+        contracts={"task-1": _contract()},
+        driver_factory=lambda case_id, state_dir, trace_dir: _Driver(state_dir),
+        answer_model=_Model(),
+        judge_model=_Model(),
+        artifacts=BenchmarkArtifactStore(maintenance_dir),
+        maintenance_only=True,
+    ).run(bundle)
+
+    class RestoreTracingDriver(_Driver):
+        trace_dir: Path
+
+        def restore_state(
+            self,
+            directory: Path,
+            completed_events: tuple[BenchmarkEvent, ...],
+        ) -> None:
+            write_trace_event(
+                self.trace_dir,
+                operator="embedding",
+                event_type="embedding_call",
+                payload={
+                    "status": "success",
+                    "model": "BAAI/bge-m3",
+                    "revision": "revision",
+                    "batch_size": 1,
+                    "dimensions": 1024,
+                    "latency_ms": 1.0,
+                    "input_path": "trace/prompts/restore.json",
+                },
+            )
+            super().restore_state(directory, completed_events)
+
+    def factory(case_id: str, state_dir: Path, trace_dir: Path) -> _Driver:
+        del case_id
+        driver = RestoreTracingDriver(state_dir)
+        driver.trace_dir = trace_dir
+        return driver
+
+    output_dir = tmp_path / "retrieval"
+    BenchmarkRunner(
+        system_contract=_system_contract(),
+        contracts={"task-1": _contract()},
+        driver_factory=factory,
+        answer_model=_Model(["one"]),
+        judge_model=_Model(),
+        artifacts=BenchmarkArtifactStore(output_dir),
+        maintenance_checkpoint_source=BenchmarkArtifactStore(maintenance_dir),
+    ).run(bundle)
+
+    with (output_dir / "metrics" / "embedding_usage.csv").open(
+        newline="",
+        encoding="utf-8",
+    ) as stream:
+        rows = list(csv.DictReader(stream))
+    assert len(rows) == 1
+    assert rows[0]["phase"] == "checkpoint"
+    assert rows[0]["operation"] == "restore"
+
+
+def test_explicit_maintenance_policy_id_allows_cross_system_checkpoint_reuse(
+    tmp_path: Path,
+) -> None:
+    bundle = _session_bundle()
+    base_contract = replace(
+        _system_contract(),
+        system_id="mem0-memory",
+        condition_id="AM-Mem0-Maintenance",
+        maintenance_policy_id="mem0-memory",
+        input_adapter_id="benchmark-event-to-mem0-message:v1",
+        retrieval_recipe_id="mem0-base-bge-m3-cosine:v1",
+        maintenance_rule="mem0-additive-view:v1",
+    )
+    enhanced_contract = replace(
+        base_contract,
+        system_id="mem0-enhanced",
+        condition_id="AM-Mem0-Enhanced",
+        retrieval_recipe_id="mem0-enhanced-sem-topk:v1:pairwise-quick",
+    )
+    assert base_contract.maintenance_fingerprint == (
+        enhanced_contract.maintenance_fingerprint
+    )
+
+    maintenance_dir = tmp_path / "maintenance"
+    BenchmarkRunner(
+        system_contract=base_contract,
+        contracts={"task-1": _contract()},
+        driver_factory=lambda case_id, state_dir, trace_dir: _Driver(
+            state_dir,
+            system_id="mem0-memory",
+        ),
+        answer_model=_Model(),
+        judge_model=_Model(),
+        artifacts=BenchmarkArtifactStore(maintenance_dir),
+        maintenance_only=True,
+    ).run(bundle)
+
+    retrieval_drivers: list[_Driver] = []
+    BenchmarkRunner(
+        system_contract=enhanced_contract,
+        contracts={"task-1": _contract()},
+        driver_factory=lambda case_id, state_dir, trace_dir: (
+            retrieval_drivers.append(
+                _Driver(state_dir, system_id="mem0-enhanced")
+            )
+            or retrieval_drivers[-1]
+        ),
+        answer_model=_Model(["one"]),
+        judge_model=_Model(),
+        artifacts=BenchmarkArtifactStore(tmp_path / "enhanced"),
+        maintenance_checkpoint_source=BenchmarkArtifactStore(maintenance_dir),
+    ).run(bundle)
+
+    assert retrieval_drivers[0].restored_event_ids == (
+        "event-1",
+        "event-2",
+        "event-3",
+        "event-4",
+    )
+    assert retrieval_drivers[0].queries == ["query:first?"]
+
+
+def test_cross_system_checkpoint_without_shared_maintenance_identity_is_rejected(
+    tmp_path: Path,
+) -> None:
+    bundle = _session_bundle()
+    source_contract = replace(_system_contract(), system_id="source")
+    source_dir = tmp_path / "source"
+    BenchmarkRunner(
+        system_contract=source_contract,
+        contracts={"task-1": _contract()},
+        driver_factory=lambda case_id, state_dir, trace_dir: _Driver(
+            state_dir,
+            system_id="source",
+        ),
+        answer_model=_Model(),
+        judge_model=_Model(),
+        artifacts=BenchmarkArtifactStore(source_dir),
+        maintenance_only=True,
+    ).run(bundle)
+
+    target_contract = replace(source_contract, system_id="target")
+    runner = BenchmarkRunner(
+        system_contract=target_contract,
+        contracts={"task-1": _contract()},
+        driver_factory=lambda case_id, state_dir, trace_dir: _Driver(
+            state_dir,
+            system_id="target",
+        ),
+        answer_model=_Model(["one"]),
+        judge_model=_Model(),
+        artifacts=BenchmarkArtifactStore(tmp_path / "target"),
+        maintenance_checkpoint_source=BenchmarkArtifactStore(source_dir),
+    )
+
+    with pytest.raises(ValueError, match="maintenance_policy_id"):
+        runner.run(bundle)
 
 
 def test_zep_maintenance_checkpoint_restore_does_not_replay_events(

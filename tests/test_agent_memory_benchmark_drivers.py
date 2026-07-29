@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from hashlib import sha256
+import json
 from pathlib import Path
 
 import pandas as pd
@@ -15,6 +16,7 @@ from agent_memory.evaluation.agent_memory_drivers import (
     event_to_zep_log_row,
 )
 from agent_memory.evaluation.bundle import BenchmarkBundle
+from agent_memory.evaluation.embedding_trace import TracingEmbeddingProvider
 from agent_memory.evaluation.run import run_agent_memory_bundle
 from agent_memory.evaluation.types import (
     BenchmarkCase,
@@ -23,6 +25,8 @@ from agent_memory.evaluation.types import (
     RetrievalRequest,
 )
 from agent_memory.policy.retrieval import RetrievalResult
+from agent_memory.storage.embedding import EmbeddingSpec
+from agent_memory.tracing.semantic import semantic_trace_scope
 
 
 class _Memory:
@@ -203,6 +207,7 @@ def test_case_factories_create_isolated_policy_instances(monkeypatch, tmp_path) 
     class FakeConnector:
         def __init__(self) -> None:
             self.closed = 0
+            self.embedding_provider = object()
 
         def close(self) -> None:
             self.closed += 1
@@ -253,6 +258,7 @@ def test_case_factories_create_isolated_policy_instances(monkeypatch, tmp_path) 
     }
 
     connector = FakeConnector()
+    original_embedding_provider = connector.embedding_provider
     zep_factory = ZepMemoryDriverFactory(
         connector=connector,
         base_namespace="benchmark-run",
@@ -283,8 +289,74 @@ def test_case_factories_create_isolated_policy_instances(monkeypatch, tmp_path) 
         "prefer-join-map",
         storage.statements,
     )
+    assert isinstance(connector.embedding_provider, TracingEmbeddingProvider)
+    assert connector.embedding_provider._provider is original_embedding_provider
+
+    first_tracing_provider = connector.embedding_provider
+    zep_factory(
+        case.case_id,
+        tmp_path / "attempt-0003",
+        tmp_path / "trace-2",
+    )
+    assert isinstance(connector.embedding_provider, TracingEmbeddingProvider)
+    assert connector.embedding_provider is not first_tracing_provider
+    assert connector.embedding_provider._provider is original_embedding_provider
     zep_factory.close()
     assert connector.closed == 1
+
+
+def test_embedding_trace_decorator_records_success_and_error(tmp_path: Path) -> None:
+    spec = EmbeddingSpec(
+        source_column="text",
+        property_name="embedding",
+        model="test-model",
+        revision="test-revision",
+        dimensions=2,
+        normalize=True,
+    )
+
+    class Provider:
+        def __init__(self) -> None:
+            self.fail = False
+
+        def embed(
+            self,
+            spec: EmbeddingSpec,
+            texts: list[str],
+        ) -> list[list[float]]:
+            assert spec.model == "test-model"
+            if self.fail:
+                raise RuntimeError("embedding failed")
+            return [[1.0, 0.0] for _ in texts]
+
+    provider = Provider()
+    traced = TracingEmbeddingProvider(provider, trace_dir=tmp_path / "trace")
+    with semantic_trace_scope(
+        phase="retrieval",
+        case_id="case-1",
+        question_id="q1",
+    ):
+        assert traced.embed(spec, ["one", "two"]) == [
+            [1.0, 0.0],
+            [1.0, 0.0],
+        ]
+        provider.fail = True
+        with pytest.raises(RuntimeError, match="embedding failed"):
+            traced.embed(spec, ["three"])
+
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "trace" / "events.jsonl").read_text().splitlines()
+    ]
+    assert [row["status"] for row in rows] == ["success", "error"]
+    assert all(row["phase"] == "retrieval" for row in rows)
+    assert all(row["case_id"] == "case-1" for row in rows)
+    assert all(row["question_id"] == "q1" for row in rows)
+    assert rows[0]["batch_size"] == 2
+    assert rows[0]["dimensions"] == 2
+    assert rows[0]["result_count"] == 2
+    assert rows[0]["result_dimensions"] == 2
+    assert rows[1]["error_type"] == "RuntimeError"
 
 
 def test_zep_factory_reports_physical_storage_provenance(monkeypatch) -> None:

@@ -71,6 +71,40 @@ def compare_benchmark_runs(
                     f"{run_dir}"
                 )
 
+    mem0_manifests = [
+        (run_dir, manifest)
+        for run_dir, manifest in zip(run_dirs, manifests, strict=True)
+        if manifest.get("system_id")
+        in {"native-mem0", "mem0-memory", "mem0-enhanced"}
+    ]
+    if len(mem0_manifests) > 1:
+        required = (
+            "connector",
+            "mode",
+            "driver_version",
+            "embedding_runtime_version",
+            "embedding_model",
+            "embedding_revision",
+            "dimensions",
+            "device",
+            "bm25_enabled",
+            "entity_boost_enabled",
+            "reranker_enabled",
+        )
+        reference_storage = mem0_manifests[0][1].get("storage_provenance")
+        if not isinstance(reference_storage, dict):
+            raise ValueError("Mem0 comparison requires storage_provenance")
+        expected = {field: reference_storage.get(field) for field in required}
+        for run_dir, manifest in mem0_manifests[1:]:
+            storage = manifest.get("storage_provenance")
+            if not isinstance(storage, dict) or {
+                field: storage.get(field) for field in required
+            } != expected:
+                raise ValueError(
+                    "Mem0 benchmark comparison mismatch for storage_provenance: "
+                    f"{run_dir}"
+                )
+
     if output_dir.exists() and any(output_dir.iterdir()):
         raise FileExistsError(f"comparison output is not empty: {output_dir}")
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -207,6 +241,31 @@ def _validate_provenance(run_dir: Path, manifest: dict[str, Any]) -> None:
             raise ValueError(
                 f"graph benchmark run has invalid storage_provenance: {run_dir}"
             )
+    if manifest.get("system_id") in {
+        "native-mem0",
+        "mem0-memory",
+        "mem0-enhanced",
+    }:
+        storage = manifest.get("storage_provenance")
+        required = (
+            "connector",
+            "mode",
+            "driver_version",
+            "embedding_runtime_version",
+            "embedding_model",
+            "embedding_revision",
+            "dimensions",
+            "device",
+            "bm25_enabled",
+            "entity_boost_enabled",
+            "reranker_enabled",
+        )
+        if not isinstance(storage, dict) or any(
+            storage.get(field) in {None, ""} for field in required
+        ):
+            raise ValueError(
+                f"Mem0 benchmark run has invalid storage_provenance: {run_dir}"
+            )
 
 
 def _logical_condition_metrics(run_dir: Path) -> dict[str, Any]:
@@ -261,36 +320,42 @@ def _phase_metrics(summary: dict[str, Any], phase: str) -> dict[str, Any]:
 
 
 def _paired_delta_rows(
-    result_sets: list[dict[tuple[str, str], dict[str, Any]]],
+    result_sets: list[dict[tuple[str, str, str], dict[str, Any]]],
     conditions: list[str],
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for left_index, right_index in combinations(range(len(conditions)), 2):
         left = result_sets[left_index]
         right = result_sets[right_index]
-        deltas = [
-            float(right[key]["score"]) - float(left[key]["score"])
-            for key in sorted(left)
-        ]
-        lower, upper = _bootstrap_mean_interval(deltas)
         left_condition = conditions[left_index]
         right_condition = conditions[right_index]
-        rows.append(
-            {
-                "condition_a": left_condition,
-                "condition_b": right_condition,
-                "comparison_type": _comparison_type(
-                    left_condition, right_condition
-                ),
-                "question_count": len(deltas),
-                "wins_b": sum(delta > 0 for delta in deltas),
-                "ties": sum(delta == 0 for delta in deltas),
-                "losses_b": sum(delta < 0 for delta in deltas),
-                "mean_score_delta_b_minus_a": mean(deltas) if deltas else None,
-                "bootstrap_95_ci_lower": lower,
-                "bootstrap_95_ci_upper": upper,
-            }
-        )
+        scorer_ids = sorted({key[2] for key in left})
+        for scorer_id in scorer_ids:
+            keys = sorted(key for key in left if key[2] == scorer_id)
+            deltas = [
+                float(right[key]["score"]) - float(left[key]["score"])
+                for key in keys
+            ]
+            lower, upper = _bootstrap_mean_interval(deltas)
+            rows.append(
+                {
+                    "condition_a": left_condition,
+                    "condition_b": right_condition,
+                    "comparison_type": _comparison_type(
+                        left_condition, right_condition
+                    ),
+                    "scorer_id": scorer_id,
+                    "question_count": len(deltas),
+                    "wins_b": sum(delta > 0 for delta in deltas),
+                    "ties": sum(delta == 0 for delta in deltas),
+                    "losses_b": sum(delta < 0 for delta in deltas),
+                    "mean_score_delta_b_minus_a": (
+                        mean(deltas) if deltas else None
+                    ),
+                    "bootstrap_95_ci_lower": lower,
+                    "bootstrap_95_ci_upper": upper,
+                }
+            )
     return rows
 
 
@@ -324,8 +389,8 @@ def _comparison_type(left: str, right: str) -> str:
 def _read_run_results(
     run_dir: Path,
     condition_id: str,
-) -> dict[tuple[str, str], dict[str, Any]]:
-    results: dict[tuple[str, str], dict[str, Any]] = {}
+) -> dict[tuple[str, str, str], dict[str, Any]]:
+    results: dict[tuple[str, str, str], dict[str, Any]] = {}
     for case_dir in sorted((run_dir / "cases").glob("*")):
         status_path = case_dir / "status.json"
         if not status_path.is_file():
@@ -336,26 +401,36 @@ def _read_run_results(
             raise ValueError(f"benchmark run contains incomplete case {case_id!r}")
         retrievals = _rows_by_question(case_dir / "retrieval.jsonl")
         answers = _rows_by_question(case_dir / "answers.jsonl")
-        grades = _rows_by_question(case_dir / "grades.jsonl")
-        question_ids = set(retrievals) | set(answers) | set(grades)
+        grades = _grade_rows(case_dir / "grades.jsonl")
+        question_ids = set(retrievals) | set(answers) | {
+            question_id for question_id, _ in grades
+        }
         for question_id in question_ids:
-            key = case_id, question_id
-            if key in results:
-                raise ValueError(f"duplicate benchmark result {key!r}")
             retrieval = retrievals.get(question_id, {})
             answer = answers.get(question_id, {})
-            grade = grades.get(question_id, {})
-            results[key] = {
-                "case_id": case_id,
-                "question_id": question_id,
-                "condition_id": condition_id,
-                "answer": _csv_value(answer.get("answer")),
-                "scorer_id": grade.get("scorer_id", ""),
-                "score": grade.get("score", ""),
-                "label": grade.get("label", ""),
-                "retrieval_latency_ms": retrieval.get("latency_ms", ""),
-                "answer_latency_ms": answer.get("latency_ms", ""),
-            }
+            question_grades = [
+                grade
+                for (grade_question_id, _), grade in grades.items()
+                if grade_question_id == question_id
+            ]
+            if not question_grades:
+                raise ValueError(f"benchmark result has no grade for {question_id!r}")
+            for grade in question_grades:
+                scorer_id = str(grade.get("scorer_id") or "")
+                key = case_id, question_id, scorer_id
+                if key in results:
+                    raise ValueError(f"duplicate benchmark result {key!r}")
+                results[key] = {
+                    "case_id": case_id,
+                    "question_id": question_id,
+                    "condition_id": condition_id,
+                    "answer": _csv_value(answer.get("answer")),
+                    "scorer_id": scorer_id,
+                    "score": grade.get("score", ""),
+                    "label": grade.get("label", ""),
+                    "retrieval_latency_ms": retrieval.get("latency_ms", ""),
+                    "answer_latency_ms": answer.get("latency_ms", ""),
+                }
     return results
 
 
@@ -375,6 +450,31 @@ def _rows_by_question(path: Path) -> dict[str, dict[str, Any]]:
         if question_id in rows:
             raise ValueError(f"{path} contains duplicate question_id {question_id!r}")
         rows[question_id] = row
+    return rows
+
+
+def _grade_rows(path: Path) -> dict[tuple[str, str], dict[str, Any]]:
+    rows: dict[tuple[str, str], dict[str, Any]] = {}
+    if not path.is_file():
+        return rows
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        if not isinstance(row, dict):
+            raise ValueError(f"{path}:{line_number} must contain a JSON object")
+        question_id = row.get("question_id")
+        scorer_id = row.get("scorer_id")
+        if not isinstance(question_id, str) or not question_id:
+            raise ValueError(f"{path}:{line_number} requires question_id")
+        if not isinstance(scorer_id, str) or not scorer_id:
+            raise ValueError(f"{path}:{line_number} requires scorer_id")
+        key = question_id, scorer_id
+        if key in rows:
+            raise ValueError(
+                f"{path} contains duplicate question/scorer result {key!r}"
+            )
+        rows[key] = row
     return rows
 
 

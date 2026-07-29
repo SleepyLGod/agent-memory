@@ -12,6 +12,11 @@ from urllib.request import urlopen
 from agent_memory.evaluation.bundle import BenchmarkBundle
 from agent_memory.evaluation.types import BenchmarkCase, BenchmarkEvent, BenchmarkQuestion
 
+from .infbench_prompts import (
+    INF_BENCH_FLUENCY_PROMPT,
+    INF_BENCH_PRECISION_PROMPT,
+    INF_BENCH_RECALL_PROMPT,
+)
 from .tasks import MEMORY_AGENT_TASKS
 
 MEMORY_AGENT_BENCH_REVISION = "7ea066982b140a19337e17e60d45d4076e042faf"
@@ -37,6 +42,7 @@ MEMORY_AGENT_BENCH_SHA256 = "badf304c8e66ab531f3f96420d52164f8d18be6f010c715618c
 MEMORY_AGENT_BENCH_MOVIE_MAPPING_SHA256 = (
     "63353aca481bc9558b502f91cb98f6fa26438796fdd7e0bc06b5a1532126e8b5"
 )
+MEMORY_AGENT_BENCH_SCORER_COMMIT = "455306dcabc3842526eb83cd4e225e5d486c5c5d"
 SMOKE_SOURCES = (
     "eventqa_65536",
     "icl_banking77_5900shot_balance",
@@ -395,6 +401,24 @@ def normalize_memory_agent_bench(
                 split: contract["sha256"]
                 for split, contract in MEMORY_AGENT_BENCH_SPLITS.items()
             },
+            "task_contracts": {
+                source: {
+                    "contract_id": task.contract_id,
+                    "system_prompt": task.system_prompt,
+                    "query_template": task.query_template,
+                    "scorer": task.scorer,
+                }
+                for source, task in sorted(MEMORY_AGENT_TASKS.items())
+            },
+            "scorer_contract": {
+                "official_commit": MEMORY_AGENT_BENCH_SCORER_COMMIT,
+                "movie_mapping_sha256": MEMORY_AGENT_BENCH_MOVIE_MAPPING_SHA256,
+                "infbench_prompts": {
+                    "fluency": INF_BENCH_FLUENCY_PROMPT,
+                    "recall": INF_BENCH_RECALL_PROMPT,
+                    "precision": INF_BENCH_PRECISION_PROMPT,
+                },
+            },
             **({"run_mode": run_mode} if run_mode is not None else {}),
         },
     )
@@ -442,6 +466,7 @@ def load_memory_agent_bench(
 __all__ = [
     "MEMORY_AGENT_BENCH_MOVIE_MAPPING_SHA256",
     "MEMORY_AGENT_BENCH_REVISION",
+    "MEMORY_AGENT_BENCH_SCORER_COMMIT",
     "MEMORY_AGENT_BENCH_SHA256",
     "MEMORY_AGENT_BENCH_SPLITS",
     "SMOKE_SOURCES",

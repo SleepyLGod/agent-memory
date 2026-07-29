@@ -28,10 +28,12 @@ def normalize_provider_calls(
     output_dir: Path,
     pricing: PricingSnapshot | None = None,
 ) -> list[dict[str, Any]]:
-    """Return one normalized row per physical provider attempt.
+    """Return one normalized row per provider response.
 
     LOTUS writes both semantic call metadata and a provider-usage event. The
     provider event is authoritative when both exist, avoiding double counting.
+    Responses retain their framework batch identity so reports can distinguish
+    logical operator calls, framework batches, and provider calls.
     """
 
     pricing = pricing or PricingSnapshot.deepseek_2026_07_17()
@@ -229,6 +231,13 @@ def _row(
             event.get("operator_call_id")
             or event.get("logical_call_id")
             or event.get("llm_batch_id")
+            or ""
+        ),
+        "framework_batch_id": str(
+            event.get("provider_batch_id")
+            or event.get("llm_batch_id")
+            or event.get("trace_id")
+            or event.get("logical_call_id")
             or ""
         ),
         "case_id": str(event.get("case_id") or ""),

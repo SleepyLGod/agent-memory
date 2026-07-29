@@ -6,6 +6,8 @@ repositories and are compared only after all runs finish.
 
 - `claude-memory`
 - `zep-memory`
+- `mem0-memory`
+- `mem0-enhanced`
 
 Dataset adapters prepare evidence. Task contracts define prompts and scoring.
 System drivers only add events and retrieve context. The runner owns case
@@ -23,6 +25,43 @@ hidden or silently changed by the CLI.
 ```bash
 uv sync --frozen --extra benchmarks --extra zep
 ```
+
+Mem0 runs use the isolated environment described by the Mem0 design:
+
+```bash
+UV_PROJECT_ENVIRONMENT=.venv-mem0 \
+  uv sync --frozen --extra benchmarks --extra mem0
+```
+
+This does not modify the existing Claude/Zep `.venv`.
+
+## LOCOMO
+
+Prepare the fixed rows 26-28, one-question integration smoke:
+
+```bash
+UV_PROJECT_ENVIRONMENT=.venv-mem0 uv run --extra benchmarks --extra mem0 \
+  python tools/evaluation/locomo.py prepare \
+  --smoke \
+  --bundle-dir .memory-test/bundles/locomo-mem0-smoke
+```
+
+Run Agent Mem0 against that bundle:
+
+```bash
+UV_PROJECT_ENVIRONMENT=.venv-mem0 uv run --extra benchmarks --extra mem0 \
+  python tools/evaluation/locomo.py run \
+  --bundle-dir .memory-test/bundles/locomo-mem0-smoke \
+  --system mem0-memory \
+  --output-dir .memory-test/runs/locomo-am-mem0
+```
+
+Use `--system mem0-enhanced` for the same additive view with LLM-ranked
+retrieval. Its default method is `pairwise-quick`; an explicit
+`--sem-topk-method` selects another LOTUS implementation.
+
+The answer is generated once. `grades.jsonl` stores the official LOCOMO score
+and, for categories 1-4, the Zep judge result as separate scorer rows.
 
 Real runs require `DEEPSEEK_API_KEY`. Zep runs additionally require the
 `AGENT_MEMORY_NEO4J_*` variables. Native Graphiti uses `NEO4J_URI`,
@@ -68,6 +107,11 @@ uv run --env-file /path/to/.env --extra benchmarks --extra zep \
   --judge-model deepseek/deepseek-v4-flash \
   --output-dir .memory-test/runs/longmemeval-claude
 ```
+
+Use `--system mem0-memory` from `.venv-mem0` for Base cosine retrieval, or
+`--system mem0-enhanced` for semantic top-k retrieval. Both reject grouped-rule
+options. Base rejects `--sem-topk-method`; Enhanced accepts it and defaults to
+`pairwise-quick`.
 
 Successful runs also write `official_hypotheses.jsonl` so the official
 evaluator can be run later without repeating memory insertion or answering.
@@ -134,6 +178,12 @@ uv run --env-file /path/to/.env --extra benchmarks --extra zep \
   --system claude-memory \
   --output-dir .memory-test/runs/mab-claude
 ```
+
+For Agent Mem0, run the same command from `.venv-mem0` with
+`--system mem0-memory` or `--system mem0-enhanced`. Each case owns a separate
+embedded Qdrant path; chunks are injected once and all questions reuse that
+state. A maintenance-only Mem0 checkpoint can feed both retrieval recipes
+because both policies declare the same maintenance identity and storage mapping.
 
 ## Native Claude
 
