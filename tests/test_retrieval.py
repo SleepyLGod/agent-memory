@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
 from contextlib import contextmanager
-from typing import Any
+from typing import Any, cast
 
 import pandas as pd
 import pytest
@@ -156,6 +156,67 @@ def test_retrieval_descriptors_are_frozen_and_validate_arguments() -> None:
         CrossEncoder(model="")
     with pytest.raises(ValueError, match="positive"):
         BFS(origins=_entity_search(am.Log({"name": "Name."})), max_depth=0)
+
+
+def test_cosine_search_supports_candidate_depth_threshold_and_no_reranker() -> None:
+    source = am.Log({"memory": "Memory text."})
+
+    result = source.search(
+        am.UserQuery(),
+        methods=[CosineSimilarity(candidate_limit=80, min_score=0.1)],
+        reranker=None,
+        limit=20,
+    )
+
+    assert result.expr.params["methods"][0].params == {
+        "candidate_limit": 80,
+        "min_score": 0.1,
+    }
+    assert result.expr.params["reranker"] is None
+    assert CosineSimilarity().candidate_limit is None
+    assert CosineSimilarity().min_score is None
+    assert _entity_search(am.Log({"name": "Name."})).expr.params[
+        "methods"
+    ][1].params == {}
+
+    request = SearchRequest(
+        statement_id="sink_0000",
+        target=_target("memory"),
+        namespace="mem0-test",
+        query="What does the user remember?",
+        methods=tuple(result.expr.params["methods"]),
+        reranker=None,
+        limit=20,
+        output_columns=("record_id", "memory", "rank", "score"),
+    )
+    assert request.reranker is None
+
+
+@pytest.mark.parametrize("candidate_limit", [True, 0, -1, 1.5])
+def test_cosine_search_rejects_invalid_candidate_limit(
+    candidate_limit: Any,
+) -> None:
+    with pytest.raises(ValueError, match="positive integer"):
+        CosineSimilarity(candidate_limit=candidate_limit)
+
+
+@pytest.mark.parametrize("min_score", [True, "0.1", float("inf"), -1.1, 1.1])
+def test_cosine_search_rejects_invalid_min_score(min_score: Any) -> None:
+    error = TypeError if isinstance(min_score, str) else (TypeError, ValueError)
+    with pytest.raises(error, match="min_score"):
+        CosineSimilarity(min_score=cast(Any, min_score))
+
+
+def test_search_without_reranker_rejects_ambiguous_multi_method_fusion() -> None:
+    source = am.Log({"memory": "Memory text."})
+
+    with pytest.raises(ValueError, match="exactly one method"):
+        source.search(
+            am.UserQuery(),
+            methods=[BM25(), CosineSimilarity()],
+            reranker=None,
+            limit=20,
+        )
 
 
 def test_retrieval_query_is_the_only_collected_retrieval_root() -> None:

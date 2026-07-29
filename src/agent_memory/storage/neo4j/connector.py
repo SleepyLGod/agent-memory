@@ -9,6 +9,10 @@ from typing import Any
 import pandas as pd
 
 from agent_memory.storage.connector import StorageCommit
+from agent_memory.storage.embedding import (
+    EmbeddingProvider,
+    SentenceTransformerEmbeddingProvider,
+)
 from agent_memory.storage.statements import InsertStatement, StatementSet
 from agent_memory.storage.search import (
     CrossEncoderProvider,
@@ -16,11 +20,7 @@ from agent_memory.storage.search import (
     SearchRequest,
 )
 
-from .mapping import (
-    EmbeddingSpec,
-    Neo4jNodeMapping,
-    Neo4jRelationshipMapping,
-)
+from .mapping import Neo4jNodeMapping, Neo4jRelationshipMapping
 from .recovery import (
     clear_namespace,
     compare_and_set_commit,
@@ -31,7 +31,7 @@ from .recovery import (
 )
 from .schema import Neo4jSchema
 from .search import execute_search
-from .sink import EmbeddingProvider, PreparedWrite, apply_writes, materialize_rows
+from .sink import PreparedWrite, apply_writes, materialize_rows
 
 
 class Neo4jConnector:
@@ -295,51 +295,6 @@ class _Neo4jStorageTransaction:
         with self.connector._driver.session(database=self.connector.database) as session:
             session.execute_write(commit_transaction)
         return False
-
-
-class SentenceTransformerEmbeddingProvider:
-    """CPU sentence-transformers provider for one pinned embedding spec."""
-
-    def __init__(self, spec: EmbeddingSpec, *, device: str = "cpu") -> None:
-        if not isinstance(spec, EmbeddingSpec):
-            raise TypeError("embedding provider spec must be EmbeddingSpec")
-        if device != "cpu":
-            raise ValueError("Zep baseline embeddings are fixed to CPU")
-        try:
-            from sentence_transformers import SentenceTransformer
-        except ImportError as exc:
-            raise ImportError(
-                "BGE-M3 embeddings require the optional 'zep' dependency extra"
-            ) from exc
-        self.spec = spec
-        self._model = SentenceTransformer(
-            spec.model,
-            revision=spec.revision,
-            device=device,
-        )
-
-    def embed(self, spec: EmbeddingSpec, texts: list[str]) -> list[list[float]]:
-        """Embed texts with the configured pinned model."""
-
-        if (
-            spec.model,
-            spec.revision,
-            spec.dimensions,
-            spec.normalize,
-        ) != (
-            self.spec.model,
-            self.spec.revision,
-            self.spec.dimensions,
-            self.spec.normalize,
-        ):
-            raise ValueError("embedding request does not match the configured model")
-        values = self._model.encode(
-            texts,
-            normalize_embeddings=spec.normalize,
-            convert_to_numpy=True,
-            show_progress_bar=False,
-        )
-        return values.tolist()
 
 
 class SentenceTransformerCrossEncoderProvider:

@@ -7,32 +7,20 @@ import math
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import date, datetime
 from types import MappingProxyType
-from typing import Any, Protocol
-from uuid import NAMESPACE_URL, uuid5
+from typing import Any
 
 import pandas as pd
 
+from agent_memory.storage.embedding import EmbeddingProvider
+from agent_memory.storage.identity import physical_uuid
+
 from .mapping import (
-    EmbeddingSpec,
     Neo4jIdentity,
     Neo4jNestedProperty,
     Neo4jNodeMapping,
     Neo4jRelationshipMapping,
 )
-
-
-_AGENT_MEMORY_UUID_NAMESPACE = uuid5(NAMESPACE_URL, "agent-memory")
-
-
-class EmbeddingProvider(Protocol):
-    """Runtime provider for one pinned physical embedding specification."""
-
-    def embed(self, spec: EmbeddingSpec, texts: list[str]) -> list[list[float]]:
-        """Embed texts in input order."""
-
-        ...
 
 
 @dataclass(frozen=True)
@@ -95,25 +83,6 @@ class PreparedWrite:
             for item in (*self.inserted, *self.retracted)
         ):
             raise TypeError("prepared Neo4j writes must contain graph objects")
-
-
-def physical_uuid(namespace: str, kind: str, values: Sequence[Any]) -> str:
-    """Return a namespace- and kind-isolated deterministic UUIDv5."""
-
-    if not isinstance(namespace, str) or not namespace:
-        raise ValueError("physical UUID namespace must be a non-empty string")
-    if not isinstance(kind, str) or not kind:
-        raise ValueError("physical UUID kind must be a non-empty string")
-    normalized = [_json_identity_value(value) for value in values]
-    namespace_uuid = uuid5(_AGENT_MEMORY_UUID_NAMESPACE, namespace)
-    identity = json.dumps(
-        {"kind": kind, "values": normalized},
-        ensure_ascii=False,
-        allow_nan=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    )
-    return str(uuid5(namespace_uuid, identity))
 
 
 def materialize_rows(
@@ -346,26 +315,6 @@ def _normalize_property(value: Any) -> Any:
     if callable(item):
         return _normalize_property(item())
     return value
-
-
-def _json_identity_value(value: Any) -> Any:
-    value = _normalize_property(value)
-    if value is None or isinstance(value, (str, int, bool)):
-        return value
-    if isinstance(value, float):
-        if not math.isfinite(value):
-            raise ValueError("physical UUID values must be finite")
-        return value
-    if isinstance(value, (datetime, date)):
-        return value.isoformat()
-    if isinstance(value, list):
-        return [_json_identity_value(item) for item in value]
-    if isinstance(value, Mapping):
-        return {
-            str(key): _json_identity_value(item)
-            for key, item in sorted(value.items(), key=lambda item: str(item[0]))
-        }
-    raise TypeError(f"unsupported physical UUID value: {type(value).__name__}")
 
 
 def _finite_float(value: Any) -> float:

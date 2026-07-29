@@ -4236,11 +4236,32 @@ def test_relational_execution_ops_follow_dataframe_semantics() -> None:
         inputs,
         execute,
     )
+    deduped_by_message = execute_drop_duplicates(
+        QueryExpr(
+            op="drop_duplicates",
+            inputs=(right,),
+            params={"subset": ("message",)},
+        ),
+        {
+            **inputs,
+            "right": pd.DataFrame(
+                {
+                    "message": ["hello", "hello", "world"],
+                    "source": ["first", "second", "third"],
+                }
+            ),
+        },
+        execute,
+    )
 
     assert list(concatenated["message"]) == ["hello", "hello", "hello", "world"]
     assert list(unioned["message"]) == ["hello", "world"]
     assert subtracted.empty
     assert list(deduped["message"]) == ["hello"]
+    assert deduped_by_message.to_dict("records") == [
+        {"message": "hello", "source": "first"},
+        {"message": "world", "source": "third"},
+    ]
 
 
 def test_union_by_name_aligns_missing_columns_and_deduplicates() -> None:

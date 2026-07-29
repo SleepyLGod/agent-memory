@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
 
@@ -21,6 +22,7 @@ from agent_memory.storage.neo4j import (
     Neo4jNestedProperty,
     Neo4jNodeMapping,
     Neo4jRelationshipMapping,
+    SentenceTransformerEmbeddingProvider,
 )
 from agent_memory.policy.retrieval import RerankerSpec, SearchMethodSpec
 from agent_memory.memories.zep.storage import (
@@ -62,6 +64,78 @@ def _embedding(*, revision: str = "revision-a") -> EmbeddingSpec:
         dimensions=1024,
         normalize=True,
     )
+
+
+class _EncodedValues:
+    def tolist(self) -> list[list[float]]:
+        return [[1.0, 2.0]]
+
+
+class _SentenceTransformerModel:
+    def __init__(self) -> None:
+        self.calls: list[tuple[list[str], bool]] = []
+
+    def encode(
+        self,
+        texts: list[str],
+        *,
+        normalize_embeddings: bool,
+        convert_to_numpy: bool,
+        show_progress_bar: bool,
+    ) -> _EncodedValues:
+        assert convert_to_numpy is True
+        assert show_progress_bar is False
+        self.calls.append((list(texts), normalize_embeddings))
+        return _EncodedValues()
+
+
+def _embedding_provider() -> tuple[
+    SentenceTransformerEmbeddingProvider,
+    _SentenceTransformerModel,
+]:
+    provider = object.__new__(SentenceTransformerEmbeddingProvider)
+    provider.spec = _embedding()
+    provider.device = "cpu"
+    model = _SentenceTransformerModel()
+    setattr(provider, "_model", model)
+    return provider, model
+
+
+def test_embedding_provider_reuses_model_for_different_mapping_columns() -> None:
+    provider, model = _embedding_provider()
+    fact_embedding = replace(
+        _embedding(),
+        source_column="fact",
+        property_name="fact_embedding",
+    )
+
+    assert provider.embed(fact_embedding, ["Alice lives in Paris"]) == [
+        [1.0, 2.0]
+    ]
+    assert model.calls == [(["Alice lives in Paris"], True)]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("model", "another-model"),
+        ("revision", "revision-b"),
+        ("dimensions", 768),
+        ("normalize", False),
+    ),
+)
+def test_embedding_provider_rejects_different_model_configuration(
+    field: str,
+    value: object,
+) -> None:
+    provider, _ = _embedding_provider()
+    incompatible = replace(_embedding(), **{field: value})
+
+    with pytest.raises(
+        ValueError,
+        match="embedding request does not match the configured model",
+    ):
+        provider.embed(incompatible, ["Alice"])
 
 
 def test_table_descriptor_serializes_typed_connector_mapping() -> None:
@@ -475,6 +549,55 @@ def test_neo4j_entity_search_fuses_bm25_and_cosine_with_stable_rrf() -> None:
     ]
     assert all(parameters["namespace"] == "sample-0" for _, parameters in session.calls)
     assert batch.metrics["methods"][0]["candidate_ids"] == ["entity-a", "entity-b"]
+
+
+def test_neo4j_single_cosine_honors_depth_threshold_without_reranker() -> None:
+    embedding = EmbeddingSpec(
+        source_column="name",
+        property_name="name_embedding",
+        model="test-embedding",
+        revision="revision-a",
+        dimensions=2,
+        normalize=True,
+    )
+    target = _search_target(
+        Neo4jNodeMapping(
+            label="Entity",
+            identity=Neo4jIdentity(("entity_id",), "entity"),
+            properties={"name": "name", "summary": "summary"},
+            embedding=embedding,
+        )
+    )
+    session = _SearchSession()
+
+    batch = execute_search(
+        session,
+        SearchRequest(
+            statement_id="sink_0001",
+            target=target,
+            namespace="sample-0",
+            query="Where does Alice live?",
+            methods=(
+                SearchMethodSpec(
+                    "cosine_similarity",
+                    {"candidate_limit": 80, "min_score": 0.1},
+                ),
+            ),
+            reranker=None,
+            limit=20,
+            output_columns=("record_id", "name", "summary", "rank", "score"),
+        ),
+        schema=GRAPHITI_NEO4J_SCHEMA,
+        embedding_provider=_SearchEmbeddingProvider(),
+        reranker_provider=None,
+    )
+
+    assert batch.rows["record_id"].tolist() == ["entity-b", "entity-a"]
+    assert batch.rows["score"].tolist() == [0.9, 0.8]
+    assert session.calls[0][1]["candidate_limit"] == 80
+    assert session.calls[0][1]["minimum_score"] == 0.1
+    assert ">= $minimum_score" in session.calls[0][0]
+    assert batch.metrics["reranker"] is None
 
 
 def test_neo4j_fact_search_uses_bfs_origins_and_cross_encoder() -> None:

@@ -230,7 +230,12 @@ def execute_drop_duplicates(
     """Execute exact duplicate-row removal."""
 
     source = execute(query.inputs[0], inputs)
-    return source.drop_duplicates(ignore_index=True)
+    subset = query.params.get("subset")
+    return source.drop_duplicates(
+        subset=list(subset) if subset is not None else None,
+        keep="first",
+        ignore_index=True,
+    )
 
 
 def execute_array_agg(

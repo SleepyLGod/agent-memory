@@ -22,7 +22,7 @@ class SearchRequest:
     namespace: str
     query: str
     methods: tuple[SearchMethodSpec, ...]
-    reranker: RerankerSpec
+    reranker: RerankerSpec | None
     limit: int
     output_columns: tuple[str, ...]
     origin_record_ids: tuple[str, ...] = ()
@@ -40,7 +40,9 @@ class SearchRequest:
             isinstance(method, SearchMethodSpec) for method in self.methods
         ):
             raise TypeError("search methods must contain SearchMethodSpec values")
-        if not isinstance(self.reranker, RerankerSpec):
+        if self.reranker is not None and not isinstance(
+            self.reranker, RerankerSpec
+        ):
             raise TypeError("search reranker must be a RerankerSpec")
         if isinstance(self.limit, bool) or not isinstance(self.limit, int) or self.limit <= 0:
             raise ValueError("search limit must be a positive integer")

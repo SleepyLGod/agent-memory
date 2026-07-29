@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from math import isfinite
 from types import MappingProxyType
 from typing import Any
 
@@ -56,7 +57,27 @@ class BM25:
 class CosineSimilarity:
     """Embedding cosine-similarity retrieval method."""
 
+    candidate_limit: int | None = None
+    min_score: float | None = None
     kind: str = field(default="cosine_similarity", init=False)
+
+    def __post_init__(self) -> None:
+        if self.candidate_limit is not None and (
+            isinstance(self.candidate_limit, bool)
+            or not isinstance(self.candidate_limit, int)
+            or self.candidate_limit <= 0
+        ):
+            raise ValueError("cosine candidate_limit must be a positive integer")
+        if self.min_score is None:
+            return
+        if isinstance(self.min_score, bool) or not isinstance(
+            self.min_score, (int, float)
+        ):
+            raise TypeError("cosine min_score must be a number")
+        normalized_score = float(self.min_score)
+        if not isfinite(normalized_score) or not -1.0 <= normalized_score <= 1.0:
+            raise ValueError("cosine min_score must be between -1 and 1")
+        object.__setattr__(self, "min_score", normalized_score)
 
 
 @dataclass(frozen=True)
@@ -105,8 +126,12 @@ Reranker = RRF | CrossEncoder
 
 def normalize_search(
     methods: Sequence[SearchMethod],
-    reranker: Reranker,
-) -> tuple[tuple[SearchMethodSpec, ...], RerankerSpec, tuple[QueryExpr, ...]]:
+    reranker: Reranker | None,
+) -> tuple[
+    tuple[SearchMethodSpec, ...],
+    RerankerSpec | None,
+    tuple[QueryExpr, ...],
+]:
     """Normalize public descriptors and expose search dependencies as inputs."""
 
     normalized_methods = tuple(methods)
@@ -118,7 +143,12 @@ def normalize_search(
         if isinstance(method, BM25):
             method_specs.append(SearchMethodSpec(kind=method.kind))
         elif isinstance(method, CosineSimilarity):
-            method_specs.append(SearchMethodSpec(kind=method.kind))
+            params: dict[str, Any] = {}
+            if method.candidate_limit is not None:
+                params["candidate_limit"] = method.candidate_limit
+            if method.min_score is not None:
+                params["min_score"] = method.min_score
+            method_specs.append(SearchMethodSpec(kind=method.kind, params=params))
         elif isinstance(method, BFS):
             origin = method.origins.expr
             try:
@@ -138,7 +168,13 @@ def normalize_search(
         else:
             raise TypeError("search methods must be BM25, CosineSimilarity, or BFS")
 
-    if isinstance(reranker, RRF):
+    if reranker is None:
+        if len(normalized_methods) != 1:
+            raise ValueError(
+                "search without a reranker requires exactly one method"
+            )
+        reranker_spec = None
+    elif isinstance(reranker, RRF):
         reranker_spec = RerankerSpec(kind=reranker.kind)
     elif isinstance(reranker, CrossEncoder):
         reranker_spec = RerankerSpec(
