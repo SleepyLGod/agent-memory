@@ -255,6 +255,7 @@ def _normalize_row(
                 event_id=f"{case_id}:chunk:{chunk_index}",
                 speaker="user",
                 text=task.format_event(chunk, timestamp),
+                session_id=case_id,
                 timestamp=timestamp,
                 metadata={"chunk_index": chunk_index, "source": source},
             )
@@ -335,6 +336,7 @@ def normalize_memory_agent_bench(
     sources: Sequence[str] | None = None,
     max_cases_per_source: int | None = None,
     max_questions_per_case: int | None = None,
+    run_mode: str | None = None,
     chunker: Callable[[str], Sequence[str]] = chunk_text_into_sentences,
 ) -> BenchmarkBundle:
     """Normalize all selected official sources into inject-once/query-many cases."""
@@ -384,10 +386,16 @@ def normalize_memory_agent_bench(
         cases=tuple(cases),
         metadata={
             "source": "ai-hyz/MemoryAgentBench",
+            "chunking": {
+                "sentence_tokenizer": "nltk.punkt_tab",
+                "tokenizer_model": "gpt-4o-mini",
+                "max_tokens": 4096,
+            },
             "split_sha256": {
                 split: contract["sha256"]
                 for split, contract in MEMORY_AGENT_BENCH_SPLITS.items()
             },
+            **({"run_mode": run_mode} if run_mode is not None else {}),
         },
     )
 

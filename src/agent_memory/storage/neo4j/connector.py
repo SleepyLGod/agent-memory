@@ -149,6 +149,21 @@ class Neo4jConnector:
 
         self._driver.close()
 
+    def server_version(self) -> str:
+        """Return the server version reported by the configured database."""
+
+        records, _, _ = self._driver.execute_query(
+            """
+            CALL dbms.components()
+            YIELD versions
+            RETURN versions[0] AS version
+            """,
+            database_=self.database,
+        )
+        if len(records) != 1 or not isinstance(records[0].get("version"), str):
+            raise RuntimeError("Neo4j did not report exactly one server version")
+        return records[0]["version"]
+
     def search(self, request: SearchRequest) -> SearchBatch:
         """Execute one namespace-scoped physical retrieval request."""
 

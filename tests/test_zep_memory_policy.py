@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import agent_memory as am
+import pytest
 from agent_memory.policy.aggregates import (
     ArrayAggregateSpec,
     MinAggregateSpec,
@@ -10,7 +11,11 @@ from agent_memory.policy.aggregates import (
 )
 from agent_memory.policy.logical import QueryExpr
 from agent_memory.memories import ZepMemory, ZepMemoryExtended
-from agent_memory.planner import PolicyDifferentiator, RetrievalPlan
+from agent_memory.planner import (
+    DifferentialRules,
+    PolicyDifferentiator,
+    RetrievalPlan,
+)
 from agent_memory.policy.retrieval import RetrievalQuery
 from agent_memory.policy.schema import output_columns
 from agent_memory.memories.zep.storage import GRAPHITI_NEO4J_STATEMENTS
@@ -127,6 +132,49 @@ def test_zep_retrieval_is_one_two_channel_storage_backed_dag() -> None:
         spec,
         statements=GRAPHITI_NEO4J_STATEMENTS,
     ).fingerprint
+
+
+def test_prefer_join_map_selects_rules_by_grouping_capability() -> None:
+    policy = PolicyDifferentiator(
+        rules=DifferentialRules(grouped_agg_rule="prefer-join-map")
+    ).differentiate(
+        ZepMemory.spec(),
+        statements=GRAPHITI_NEO4J_STATEMENTS,
+    )
+    grouped_nodes = [
+        node
+        for node in policy.nodes.values()
+        if node.execution_kind == "semantic_state"
+        and node.query.op == "agg"
+        and node.query.inputs[0].op == "sem_groupby"
+    ]
+    unpartitioned = next(
+        node
+        for node in grouped_nodes
+        if not node.query.inputs[0].params.get("partition_by")
+    )
+    partitioned = next(
+        node
+        for node in grouped_nodes
+        if node.query.inputs[0].params.get("partition_by")
+    )
+
+    assert policy.grouped_agg_rule == "prefer-join-map"
+    assert unpartitioned.maintenance_query is not None
+    assert "sem_join" in _ops(unpartitioned.maintenance_query)
+    assert partitioned.maintenance_query is not None
+    assert "sem_join" not in _ops(partitioned.maintenance_query)
+    assert "concat" in _ops(partitioned.maintenance_query)
+
+
+def test_strict_join_map_still_rejects_partitioned_zep_facts() -> None:
+    with pytest.raises(NotImplementedError, match="partition_by.*rule-join-map"):
+        PolicyDifferentiator(
+            rules=DifferentialRules(grouped_agg_rule="rule-join-map")
+        ).differentiate(
+            ZepMemory.spec(),
+            statements=GRAPHITI_NEO4J_STATEMENTS,
+        )
 
 
 def test_zep_episodes_view_uses_select_not_map() -> None:

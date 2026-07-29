@@ -30,6 +30,9 @@ def _run(
     judge_model_id: str = "judge",
     score: float = 1.0,
     label: str = "",
+    run_mode: str = "integration-smoke",
+    dirty: bool = False,
+    storage_provenance: dict[str, object] | None = None,
 ) -> Path:
     _write_json(
         root / "manifest.json",
@@ -45,13 +48,26 @@ def _run(
             "system_id": system_id,
             "condition_id": system_id,
             "memory_model_id": "memory",
+            "thinking_enabled": False,
             "memory_provider_model_id": f"provider-{system_id}",
             "input_adapter_id": f"input-{system_id}:v1",
             "input_adapter_digest": f"input-digest-{system_id}",
             "retrieval_recipe_id": f"retrieval-{system_id}:v1",
             "retrieval_recipe_digest": f"retrieval-digest-{system_id}",
             "answer_model_id": "answer",
+            "answer_thinking_enabled": False,
             "judge_model_id": judge_model_id,
+            "judge_thinking_enabled": False,
+            "run_mode": run_mode,
+            "source_provenance": {"commit": f"commit-{system_id}", "dirty": dirty},
+            "runtime_provenance": {
+                "language": "python",
+                "language_version": "3.13",
+                "lockfile": "uv.lock",
+                "lockfile_sha256": f"lock-{system_id}",
+                "dependencies": {"benchmark-runtime": "1.0.0"},
+            },
+            "storage_provenance": storage_provenance,
             "contract_fingerprints": {"task": "contract"},
             "answer_prompt_digests": {"task": "answer"},
             "scorer_contracts": {
@@ -201,3 +217,72 @@ def test_comparison_counts_shared_maintenance_once(tmp_path: Path) -> None:
     assert summary["metrics"]["JM-Q"]["logical_total_cost_usd"] == 0.35
     assert summary["metrics"]["JM-L"]["logical_total_cost_usd"] == 0.35
     assert summary["actual_paid_experiment_cost_usd"] == 0.6
+
+
+def test_comparison_rejects_missing_runtime_provenance(tmp_path: Path) -> None:
+    first = _run(tmp_path / "first", system_id="first")
+    second = _run(tmp_path / "second", system_id="second")
+    manifest = json.loads((second / "manifest.json").read_text())
+    manifest.pop("runtime_provenance")
+    _write_json(second / "manifest.json", manifest)
+
+    with pytest.raises(ValueError, match="runtime_provenance"):
+        compare_benchmark_runs((first, second), tmp_path / "comparison")
+
+
+def test_comparison_rejects_missing_dependency_versions(tmp_path: Path) -> None:
+    first = _run(tmp_path / "first", system_id="first")
+    second = _run(tmp_path / "second", system_id="second")
+    manifest = json.loads((second / "manifest.json").read_text())
+    manifest["runtime_provenance"]["dependencies"] = {}
+    _write_json(second / "manifest.json", manifest)
+
+    with pytest.raises(ValueError, match="dependency versions"):
+        compare_benchmark_runs((first, second), tmp_path / "comparison")
+
+
+def test_comparison_rejects_dirty_formal_run(tmp_path: Path) -> None:
+    first = _run(
+        tmp_path / "first",
+        system_id="first",
+        run_mode="full",
+        dirty=True,
+    )
+    second = _run(tmp_path / "second", system_id="second", run_mode="full")
+
+    with pytest.raises(ValueError, match="dirty source"):
+        compare_benchmark_runs((first, second), tmp_path / "comparison")
+
+
+def test_comparison_rejects_thinking_mismatch(tmp_path: Path) -> None:
+    first = _run(tmp_path / "first", system_id="first")
+    second = _run(tmp_path / "second", system_id="second")
+    manifest = json.loads((second / "manifest.json").read_text())
+    manifest["thinking_enabled"] = True
+    _write_json(second / "manifest.json", manifest)
+
+    with pytest.raises(ValueError, match="thinking_enabled"):
+        compare_benchmark_runs((first, second), tmp_path / "comparison")
+
+
+def test_comparison_rejects_graph_storage_mismatch(tmp_path: Path) -> None:
+    storage = {
+        "connector": "neo4j",
+        "image": "neo4j:5.26.2",
+        "image_digest": "sha256:image",
+        "server_version": "5.26.2",
+        "driver_version": "6.1.0",
+    }
+    first = _run(
+        tmp_path / "first",
+        system_id="native-graphiti",
+        storage_provenance=storage,
+    )
+    second = _run(
+        tmp_path / "second",
+        system_id="zep-memory",
+        storage_provenance={**storage, "driver_version": "6.2.0"},
+    )
+
+    with pytest.raises(ValueError, match="storage_provenance"):
+        compare_benchmark_runs((first, second), tmp_path / "comparison")

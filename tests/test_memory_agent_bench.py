@@ -83,6 +83,18 @@ def test_official_chunking_preserves_sentence_boundaries() -> None:
     assert chunks == ("One two. Three four.", "Five six.")
 
 
+def test_mab_contract_uses_event_checkpoints_and_scores_memory_errors_zero() -> None:
+    contracts = memory_agent_bench_task_contracts()
+
+    assert contracts
+    assert {contract.checkpoint_boundary for contract in contracts.values()} == {
+        "event"
+    }
+    assert {contract.memory_system_error_score for contract in contracts.values()} == {
+        0.0
+    }
+
+
 def test_missing_official_sentence_model_has_clear_setup_error() -> None:
     def missing(_: str) -> list[str]:
         raise LookupError("punkt_tab")
@@ -234,6 +246,7 @@ def test_contract_answer_prompt_uses_official_task_instruction_and_context() -> 
     }
     assert "Retrieved Memory:\nFact 2 is newer" in prompt.messages[1]["content"]
     assert "larger serial number" in prompt.messages[1]["content"]
+    assert prompt.thinking_enabled is False
 
 
 def test_infbench_contract_keeps_three_official_judge_calls() -> None:
@@ -269,6 +282,7 @@ def test_infbench_contract_keeps_three_official_judge_calls() -> None:
         "memory_agent_bench.infbench.precision",
     ]
     assert all(step.prompt.temperature == 0 for step in steps)
+    assert all(step.prompt.thinking_enabled is False for step in steps)
     assert "The protagonist leaves home." in steps[1].prompt.messages[0]["content"]
     assert question.gold_answer[0] in steps[2].prompt.messages[0]["content"]
 
@@ -345,3 +359,16 @@ def test_recsys_contract_uses_official_movie_mapping_for_recall_at_5() -> None:
         "Arrival",
         "Moonlight",
     ]
+
+
+def test_memory_agent_bench_smoke_bundle_records_run_mode() -> None:
+    bundle = normalize_memory_agent_bench(
+        _split_rows("eventqa_65536", questions=["What happened?"]),
+        sources=["eventqa_65536"],
+        max_cases_per_source=1,
+        max_questions_per_case=1,
+        run_mode="integration-smoke",
+        chunker=_chunker,
+    )
+
+    assert bundle.metadata["run_mode"] == "integration-smoke"

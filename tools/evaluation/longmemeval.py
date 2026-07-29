@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from sys import path
+import sys
 from typing import Sequence
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-path.insert(0, str(PROJECT_ROOT / "src"))
+sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from agent_memory.evaluation.bundle import read_bundle, write_bundle  # noqa: E402
 from agent_memory.evaluation.longmemeval import (  # noqa: E402
@@ -22,8 +22,10 @@ from agent_memory.evaluation.longmemeval import (  # noqa: E402
     write_official_hypotheses,
 )
 from agent_memory.evaluation.run import (  # noqa: E402
+    AGENT_MEMORY_SYSTEMS,
     run_agent_memory_bundle,
 )
+from agent_memory.planner import GROUPED_AGG_RULES  # noqa: E402
 
 DEFAULT_MEMORY_MODEL_ID = "deepseek-v4-flash"
 DEFAULT_PROVIDER_MODEL = "deepseek/deepseek-v4-flash"
@@ -47,20 +49,27 @@ _PILOT_CONDITIONS = {
 def _condition_id(args: argparse.Namespace) -> str:
     if args.condition_id:
         return str(args.condition_id)
+    if args.system == "zep-memory":
+        suffix = "-maintenance" if args.maintenance_only else ""
+        return f"zep-memory-{args.grouped_agg_rule}{suffix}"
     if args.maintenance_only:
         return {
             "rule-join-map": "JM-M",
             "rule-re-group": "RG-M",
-        }.get(args.grouped_agg_rule, "claude-memory-maintenance")
+        }.get(
+            args.grouped_agg_rule,
+            f"claude-memory-{args.grouped_agg_rule}-maintenance",
+        )
     return _PILOT_CONDITIONS.get(
         (args.grouped_agg_rule, args.sem_topk_method),
-        "claude-memory",
+        f"claude-memory-{args.grouped_agg_rule}-{args.sem_topk_method}",
     )
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """Parse canonical bundle preparation and agent-memory execution commands."""
 
+    raw_args = tuple(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
 
@@ -80,9 +89,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Select the fixed evidence-complete 8-event integration smoke.",
     )
 
-    run = commands.add_parser("run")
+    run = commands.add_parser("run", allow_abbrev=False)
     run.add_argument("--bundle-dir", type=Path, required=True)
     run.add_argument("--output-dir", type=Path, required=True)
+    run.add_argument(
+        "--system",
+        choices=AGENT_MEMORY_SYSTEMS,
+        default="claude-memory",
+    )
     run.add_argument("--memory-model-id", default=DEFAULT_MEMORY_MODEL_ID)
     run.add_argument("--memory-model", default=DEFAULT_PROVIDER_MODEL)
     run.add_argument("--answer-model", default=DEFAULT_PROVIDER_MODEL)
@@ -92,7 +106,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     run.add_argument("--max-new-cases", type=int)
     run.add_argument(
         "--grouped-agg-rule",
-        choices=("rule-all-group", "rule-join-map", "rule-re-group"),
+        choices=GROUPED_AGG_RULES,
         default="rule-all-group",
     )
     run.add_argument(
@@ -107,9 +121,23 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     run.add_argument("--maintenance-checkpoint-output-dir", type=Path)
     run.add_argument("--maintenance-only", action="store_true")
-    args = parser.parse_args(argv)
+    args = parser.parse_args(raw_args)
     if getattr(args, "question_ids", None) is not None:
         args.question_ids = tuple(args.question_ids)
+    if args.command == "run" and args.system == "zep-memory":
+        explicit_claude_options = [
+            option
+            for option in ("--sem-topk-method",)
+            if any(
+                argument == option or argument.startswith(f"{option}=")
+                for argument in raw_args
+            )
+        ]
+        if explicit_claude_options:
+            parser.error(
+                f"{', '.join(explicit_claude_options)} is only valid with "
+                "--system claude-memory"
+            )
     return args
 
 
@@ -146,7 +174,7 @@ def main(argv: Sequence[str] | None = None) -> Path:
                 judge_model_id=args.judge_model
             )
         },
-        system_id="claude-memory",
+        system_id=args.system,
         output_dir=args.output_dir,
         memory_model_id=args.memory_model_id,
         memory_provider_model_id=args.memory_model,

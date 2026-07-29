@@ -379,6 +379,25 @@ class _SearchDriver:
         return None
 
 
+def test_neo4j_connector_reports_the_configured_server_version() -> None:
+    class Driver:
+        def execute_query(self, query: str, *, database_: str):
+            assert "dbms.components" in query
+            assert database_ == "benchmark"
+            return ([{"version": "5.26.2"}], object(), ())
+
+        def close(self) -> None:
+            return None
+
+    connector = Neo4jConnector(
+        driver=Driver(),
+        database="benchmark",
+        schema=GRAPHITI_NEO4J_SCHEMA,
+    )
+
+    assert connector.server_version() == "5.26.2"
+
+
 def _search_target(mapping: Neo4jNodeMapping | Neo4jRelationshipMapping) -> TableDescriptor:
     schema = (
         _entity_schema()

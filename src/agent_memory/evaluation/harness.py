@@ -225,6 +225,8 @@ class TaskContract:
     answer_prompt_digest: str
     scorer_id: str
     scorer_digest: str
+    checkpoint_boundary: str = "session"
+    memory_system_error_score: float | None = None
     deterministic_scorer: Callable[[BenchmarkQuestion, str], GradeResult] | None = None
     judge_plan: Callable[[BenchmarkQuestion, str], tuple[JudgeStep, ...]] | None = None
     judge_reducer: Callable[
@@ -234,6 +236,10 @@ class TaskContract:
     def __post_init__(self) -> None:
         if not self.task_id:
             raise ValueError("task_id must be non-empty")
+        if self.checkpoint_boundary not in {"session", "event"}:
+            raise ValueError("checkpoint_boundary must be 'session' or 'event'")
+        if self.memory_system_error_score is not None and not 0 <= self.memory_system_error_score <= 1:
+            raise ValueError("memory_system_error_score must be between 0 and 1")
         deterministic = self.deterministic_scorer is not None
         judged = self.judge_plan is not None or self.judge_reducer is not None
         if deterministic == judged:
@@ -253,6 +259,8 @@ class TaskContract:
                 "answer_prompt_digest": self.answer_prompt_digest,
                 "scorer_id": self.scorer_id,
                 "scorer_digest": self.scorer_digest,
+                "checkpoint_boundary": self.checkpoint_boundary,
+                "memory_system_error_score": self.memory_system_error_score,
             }
         )
 
@@ -276,6 +284,8 @@ class BenchmarkRunner:
         maintenance_only: bool = False,
         maintenance_checkpoint_source: BenchmarkArtifactStore | None = None,
         max_new_cases: int | None = None,
+        runtime_provenance: Mapping[str, Any] | None = None,
+        storage_provenance: Mapping[str, Any] | None = None,
     ) -> None:
         if parse_attempts < 1:
             raise ValueError("parse_attempts must be positive")
@@ -300,6 +310,10 @@ class BenchmarkRunner:
         self.maintenance_only = maintenance_only
         self.maintenance_checkpoint_source = maintenance_checkpoint_source
         self.max_new_cases = max_new_cases
+        self.runtime_provenance = dict(runtime_provenance or {})
+        self.storage_provenance = (
+            dict(storage_provenance) if storage_provenance is not None else None
+        )
 
     def run(self, bundle: BenchmarkBundle) -> None:
         """Run incomplete cases and rebuild aggregate metrics."""
@@ -324,8 +338,12 @@ class BenchmarkRunner:
             for task_id in sorted(required_task_ids)
         }
         bundle_run_mode = bundle.metadata.get("run_mode")
-        if bundle_run_mode is not None and not isinstance(bundle_run_mode, str):
-            raise TypeError("benchmark bundle run_mode metadata must be a string")
+        if bundle_run_mode is not None and (
+            not isinstance(bundle_run_mode, str) or not bundle_run_mode
+        ):
+            raise TypeError(
+                "benchmark bundle run_mode metadata must be a non-empty string"
+            )
         run_mode = bundle_run_mode or (
             "maintenance" if self.maintenance_only else "full"
         )
@@ -339,6 +357,8 @@ class BenchmarkRunner:
             contract_fingerprints=selected_contracts,
             answer_prompt_digests=answer_prompt_digests,
             scorer_contracts=scorer_contracts,
+            runtime_provenance=self.runtime_provenance,
+            storage_provenance=self.storage_provenance,
             run_mode=run_mode,
             maintenance_checkpoint_source=(
                 str(self.maintenance_checkpoint_source.output_dir.resolve())
@@ -380,7 +400,26 @@ class BenchmarkRunner:
         state_dir = self.artifacts.start_case(case, contract.fingerprint)
         attempt = int(state_dir.name.removeprefix("attempt-"))
         # Drivers receive only an opaque case identity, never questions or gold labels.
-        driver = self.driver_factory(case.case_id, state_dir, self.artifacts.trace_dir)
+        try:
+            driver = self.driver_factory(
+                case.case_id,
+                state_dir,
+                self.artifacts.trace_dir,
+            )
+        except BaseException as error:
+            self.artifacts.fail_case(
+                case,
+                contract.fingerprint,
+                error,
+                details={
+                    "failure_phase": "driver_setup",
+                    "requested_strategy": self.system_contract.maintenance_rule,
+                    "policy_id": self.system_id,
+                    "add_count": 0,
+                    "storage_transaction_count": 0,
+                },
+            )
+            raise
         if driver.system_id != self.system_id:
             raise ValueError(
                 f"driver system_id {driver.system_id!r} does not match run "
@@ -435,13 +474,27 @@ class BenchmarkRunner:
                 start=completed_count,
             ):
                 started = perf_counter()
-                with semantic_trace_scope(
-                    phase="insertion",
-                    case_id=case.case_id,
-                    event_id=event.event_id,
-                    attempt=attempt,
-                ):
-                    metrics = driver.add(event)
+                try:
+                    with semantic_trace_scope(
+                        phase="insertion",
+                        case_id=case.case_id,
+                        event_id=event.event_id,
+                        attempt=attempt,
+                    ):
+                        metrics = driver.add(event)
+                except Exception as error:
+                    if contract.memory_system_error_score is None:
+                        raise
+                    self._record_case_system_error(
+                        case=case,
+                        contract=contract,
+                        phase="insertion",
+                        error=error,
+                        latency_ms=(perf_counter() - started) * 1000,
+                        event_id=event.event_id,
+                    )
+                    self.artifacts.complete_case(case, contract.fingerprint)
+                    return
                 self.artifacts.trace_stage(
                     phase="insertion",
                     case_id=case.case_id,
@@ -458,11 +511,26 @@ class BenchmarkRunner:
                     if event_index + 1 < len(case.events)
                     else None
                 )
-                if self.system_contract.checkpoint_enabled and (
+                session_finished = (
                     next_event is None or next_event.session_id != event.session_id
-                ):
+                )
+                if session_finished:
                     finish_started = perf_counter()
-                    finish_metrics = driver.finish_session(event.session_id)
+                    try:
+                        finish_metrics = driver.finish_session(event.session_id)
+                    except Exception as error:
+                        if contract.memory_system_error_score is None:
+                            raise
+                        self._record_case_system_error(
+                            case=case,
+                            contract=contract,
+                            phase="consolidation",
+                            error=error,
+                            latency_ms=(perf_counter() - finish_started) * 1000,
+                            event_id=event.event_id,
+                        )
+                        self.artifacts.complete_case(case, contract.fingerprint)
+                        return
                     if finish_metrics:
                         self.artifacts.trace_stage(
                             phase="consolidation",
@@ -476,6 +544,9 @@ class BenchmarkRunner:
                                 **dict(finish_metrics),
                             },
                         )
+                if self.system_contract.checkpoint_enabled and (
+                    contract.checkpoint_boundary == "event" or session_finished
+                ):
                     checkpoint_started = perf_counter()
                     checkpoint = self.artifacts.save_checkpoint(
                         bundle=bundle,
@@ -505,8 +576,41 @@ class BenchmarkRunner:
             if self.maintenance_only:
                 self.artifacts.complete_maintenance(case, contract.fingerprint)
                 return
-            for question in case.questions:
-                self._run_question(case, question, contract, driver)
+            if contract.memory_system_error_score is not None:
+                prepared_retrievals: list[
+                    tuple[BenchmarkQuestion, str, RetrievalOutput, float]
+                ] = []
+                for question in case.questions:
+                    started = perf_counter()
+                    try:
+                        prepared_retrievals.append(
+                            (
+                                question,
+                                *self._retrieve_question(case, question, contract, driver),
+                            )
+                        )
+                    except Exception as error:
+                        self._record_case_system_error(
+                            case=case,
+                            contract=contract,
+                            phase="retrieval",
+                            error=error,
+                            latency_ms=(perf_counter() - started) * 1000,
+                            event_id=None,
+                        )
+                        self.artifacts.complete_case(case, contract.fingerprint)
+                        return
+                for question, query_text, retrieval, latency_ms in prepared_retrievals:
+                    self._run_question(
+                        case,
+                        question,
+                        contract,
+                        driver,
+                        prepared_retrieval=(query_text, retrieval, latency_ms),
+                    )
+            else:
+                for question in case.questions:
+                    self._run_question(case, question, contract, driver)
             self.artifacts.complete_case(case, contract.fingerprint)
         except BaseException as error:
             primary_error = error
@@ -524,54 +628,33 @@ class BenchmarkRunner:
         question: BenchmarkQuestion,
         contract: TaskContract,
         driver: MemorySystemDriver,
+        *,
+        prepared_retrieval: tuple[str, RetrievalOutput, float] | None = None,
     ) -> None:
-        query_text = contract.retrieval_query(question)
-        started = perf_counter()
-        try:
-            with semantic_trace_scope(
-                phase="retrieval",
-                case_id=case.case_id,
-                question_id=question.question_id,
-            ):
-                retrieval = driver.retrieve(
-                    RetrievalRequest(
-                        question_id=question.question_id,
-                        query_text=query_text,
-                    )
+        if prepared_retrieval is None:
+            started = perf_counter()
+            try:
+                query_text, retrieval, retrieval_latency = self._retrieve_question(
+                    case, question, contract, driver
                 )
-        except Exception as error:
-            self._record_retrieval_system_error(
-                case=case,
-                question=question,
-                contract=contract,
-                query_text=query_text,
-                error=error,
-                latency_ms=(perf_counter() - started) * 1000,
-            )
-            return
-        retrieval_latency = (perf_counter() - started) * 1000
-        self.artifacts.append_case_row(
-            case.case_id,
-            "retrieval",
-            {
-                "question_id": question.question_id,
-                "query": query_text,
-                "context": retrieval.context,
-                "channels": retrieval.channels,
-                "metrics": retrieval.metrics,
-                "latency_ms": round(retrieval_latency, 3),
-            },
-        )
-        self.artifacts.trace_stage(
-            phase="retrieval",
-            case_id=case.case_id,
-            payload={
-                "question_id": question.question_id,
-                "latency_ms": round(retrieval_latency, 3),
-                "channels": {
-                    name: len(rows) for name, rows in retrieval.channels.items()
-                },
-            },
+            except Exception as error:
+                self._record_retrieval_system_error(
+                    case=case,
+                    question=question,
+                    contract=contract,
+                    query_text=contract.retrieval_query(question),
+                    error=error,
+                    latency_ms=(perf_counter() - started) * 1000,
+                )
+                return
+        else:
+            query_text, retrieval, retrieval_latency = prepared_retrieval
+        self._record_retrieval_success(
+            case=case,
+            question=question,
+            query_text=query_text,
+            retrieval=retrieval,
+            latency_ms=retrieval_latency,
         )
 
         answer_prompt = contract.answer_prompt(question, retrieval.context)
@@ -623,6 +706,63 @@ class BenchmarkRunner:
                 "label": grade.label,
                 "details": grade.details,
                 "latency_ms": round((perf_counter() - grade_started) * 1000, 3),
+            },
+        )
+
+    def _retrieve_question(
+        self,
+        case: BenchmarkCase,
+        question: BenchmarkQuestion,
+        contract: TaskContract,
+        driver: MemorySystemDriver,
+    ) -> tuple[str, RetrievalOutput, float]:
+        """Execute one retrieval without applying benchmark failure policy."""
+
+        query_text = contract.retrieval_query(question)
+        started = perf_counter()
+        with semantic_trace_scope(
+            phase="retrieval",
+            case_id=case.case_id,
+            question_id=question.question_id,
+        ):
+            retrieval = driver.retrieve(
+                RetrievalRequest(
+                    question_id=question.question_id,
+                    query_text=query_text,
+                )
+            )
+        return query_text, retrieval, (perf_counter() - started) * 1000
+
+    def _record_retrieval_success(
+        self,
+        *,
+        case: BenchmarkCase,
+        question: BenchmarkQuestion,
+        query_text: str,
+        retrieval: RetrievalOutput,
+        latency_ms: float,
+    ) -> None:
+        self.artifacts.append_case_row(
+            case.case_id,
+            "retrieval",
+            {
+                "question_id": question.question_id,
+                "query": query_text,
+                "context": retrieval.context,
+                "channels": retrieval.channels,
+                "metrics": retrieval.metrics,
+                "latency_ms": round(latency_ms, 3),
+            },
+        )
+        self.artifacts.trace_stage(
+            phase="retrieval",
+            case_id=case.case_id,
+            payload={
+                "question_id": question.question_id,
+                "latency_ms": round(latency_ms, 3),
+                "channels": {
+                    name: len(rows) for name, rows in retrieval.channels.items()
+                },
             },
         )
 
@@ -699,6 +839,84 @@ class BenchmarkRunner:
                 "channels": {},
             },
         )
+
+    def _record_case_system_error(
+        self,
+        *,
+        case: BenchmarkCase,
+        contract: TaskContract,
+        phase: str,
+        error: Exception,
+        latency_ms: float,
+        event_id: str | None,
+    ) -> None:
+        """Score all questions zero when a declared memory operation fails."""
+
+        assert contract.memory_system_error_score is not None
+        error_type = type(error).__name__
+        error_message = str(error)
+        rounded_latency = round(latency_ms, 3)
+        self.artifacts.trace_stage(
+            phase=phase,
+            case_id=case.case_id,
+            payload={
+                "status": "system_error",
+                "event_id": event_id,
+                "error_type": error_type,
+                "error": error_message,
+                "latency_ms": rounded_latency,
+            },
+        )
+        for question in case.questions:
+            query_text = contract.retrieval_query(question)
+            self.artifacts.append_case_row(
+                case.case_id,
+                "retrieval",
+                {
+                    "question_id": question.question_id,
+                    "query": query_text,
+                    "status": "system_error",
+                    "context": "",
+                    "channels": {},
+                    "metrics": {
+                        "status": "system_error",
+                        "failed_phase": phase,
+                        "error_type": error_type,
+                        "error": error_message,
+                    },
+                    "error_type": error_type,
+                    "error": error_message,
+                    "latency_ms": None,
+                },
+            )
+            self.artifacts.append_case_row(
+                case.case_id,
+                "answers",
+                {
+                    "question_id": question.question_id,
+                    "status": f"skipped_due_to_{phase}_error",
+                    "answer": "",
+                    "latency_ms": None,
+                },
+            )
+            self.artifacts.append_case_row(
+                case.case_id,
+                "grades",
+                {
+                    "question_id": question.question_id,
+                    "scorer_id": contract.scorer_id,
+                    "score": contract.memory_system_error_score,
+                    "label": "system_error",
+                    "details": {
+                        "grade_source": "benchmark_failure_policy",
+                        "failed_phase": phase,
+                        "event_id": event_id,
+                        "error_type": error_type,
+                        "error": error_message,
+                    },
+                    "latency_ms": None,
+                },
+            )
 
     def _complete_and_parse(
         self,

@@ -100,6 +100,7 @@ class _Driver:
     closed: bool = False
     fail_retrieval: bool = False
     fail_event_id: str | None = None
+    fail_finish: bool = False
     restored_event_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
@@ -126,6 +127,8 @@ class _Driver:
         )
 
     def finish_session(self, session_id: str) -> dict[str, str]:
+        if self.fail_finish:
+            raise RuntimeError("consolidation failed")
         return {"session_id": session_id}
 
     def close(self) -> None:
@@ -188,13 +191,14 @@ def test_runner_injects_once_queries_many_and_writes_contract(tmp_path) -> None:
         return driver
 
     model = _Model()
+    artifacts = BenchmarkArtifactStore(tmp_path)
     runner = BenchmarkRunner(
         system_contract=_system_contract(),
         contracts={"task-1": _contract()},
         driver_factory=factory,
         answer_model=model,
         judge_model=model,
-        artifacts=BenchmarkArtifactStore(tmp_path),
+        artifacts=artifacts,
     )
     runner.run(_bundle())
 
@@ -225,7 +229,8 @@ def test_runner_injects_once_queries_many_and_writes_contract(tmp_path) -> None:
         "per_session.csv",
         "per_question.csv",
         "provider_usage.csv",
-        "operator_usage.csv",
+        "operation_usage.csv",
+        "per_case.csv",
         "state_shape.csv",
         "reliability.csv",
         "checkpoint_metrics.csv",
@@ -235,6 +240,51 @@ def test_runner_injects_once_queries_many_and_writes_contract(tmp_path) -> None:
     assert len(
         (tmp_path / "metrics" / "checkpoint_metrics.csv").read_text().splitlines()
     ) == 2
+    with (tmp_path / "metrics" / "per_case.csv").open(
+        encoding="utf-8", newline=""
+    ) as stream:
+        case_metric = next(csv.DictReader(stream))
+    assert float(case_metric["estimated_cost_usd"]) == 1.12e-06
+    assert float(case_metric["cost_per_question_usd"]) == 5.6e-07
+
+
+def test_driver_setup_failure_records_zero_side_effect_boundary(tmp_path) -> None:
+    contract = replace(
+        _system_contract(),
+        system_id="zep-memory",
+        maintenance_rule="rule-join-map",
+    )
+
+    def fail_compilation(case_id, state_dir, trace_dir):
+        del case_id, state_dir, trace_dir
+        raise NotImplementedError(
+            "sem_groupby partition_by is not supported by rule-join-map"
+        )
+
+    artifacts = BenchmarkArtifactStore(tmp_path)
+    runner = BenchmarkRunner(
+        system_contract=contract,
+        contracts={"task-1": _contract()},
+        driver_factory=fail_compilation,
+        answer_model=_Model(),
+        judge_model=_Model(),
+        artifacts=artifacts,
+    )
+
+    with pytest.raises(NotImplementedError, match="partition_by.*rule-join-map"):
+        runner.run(_bundle())
+
+    manifest = json.loads((tmp_path / "manifest.json").read_text())
+    case_dir = artifacts.case_dir("case-1")
+    status = json.loads((case_dir / "status.json").read_text())
+    assert manifest["system_id"] == "zep-memory"
+    assert manifest["maintenance_rule"] == "rule-join-map"
+    assert status["failure_phase"] == "driver_setup"
+    assert status["requested_strategy"] == "rule-join-map"
+    assert status["policy_id"] == "zep-memory"
+    assert status["add_count"] == 0
+    assert status["storage_transaction_count"] == 0
+    assert not (case_dir / "checkpoints/current.json").exists()
 
 
 def test_completed_case_resume_does_not_recreate_driver_or_model(tmp_path) -> None:
@@ -341,6 +391,8 @@ def test_retrieval_system_error_scores_zero_and_completed_case_is_skipped(
     assert summary["question_count"] == 2
     assert summary["mean_score"] == 0.0
     assert summary["retrieval_system_error_count"] == 2
+    assert summary["memory_system_error_case_count"] == 1
+    assert summary["memory_system_error_question_count"] == 2
     with (tmp_path / "metrics" / "per_question.csv").open(
         newline="", encoding="utf-8"
     ) as handle:
@@ -358,6 +410,8 @@ def test_retrieval_system_error_scores_zero_and_completed_case_is_skipped(
     ) as handle:
         reliability = list(csv.DictReader(handle))
     assert reliability[0]["retrieval_system_error_count"] == "2"
+    assert reliability[0]["memory_system_error_case_count"] == "1"
+    assert reliability[0]["memory_system_error_question_count"] == "2"
 
 
 def test_retrieval_system_error_does_not_stop_later_cases(tmp_path: Path) -> None:
@@ -412,6 +466,192 @@ def test_retrieval_system_error_does_not_stop_later_cases(tmp_path: Path) -> Non
     assert summary["question_count"] == 2
     assert summary["retrieval_system_error_count"] == 1
     assert summary["mean_score"] == 0.5
+
+
+def test_case_scoped_retrieval_failure_skips_all_answering(
+    tmp_path: Path,
+) -> None:
+    class SecondRetrievalFails(_Driver):
+        def retrieve(self, request):
+            assert self.queries is not None
+            if len(self.queries) == 1:
+                raise RuntimeError("second retrieval failed")
+            return super().retrieve(request)
+
+    driver: SecondRetrievalFails | None = None
+
+    def factory(case_id, state_dir, trace_dir):
+        nonlocal driver
+        del case_id, trace_dir
+        driver = SecondRetrievalFails(state_dir)
+        return driver
+
+    model = _Model()
+    runner = BenchmarkRunner(
+        system_contract=_system_contract(),
+        contracts={
+            "task-1": replace(_contract(), memory_system_error_score=0.0)
+        },
+        driver_factory=factory,
+        answer_model=model,
+        judge_model=model,
+        artifacts=BenchmarkArtifactStore(tmp_path),
+    )
+
+    runner.run(_bundle())
+
+    assert driver is not None
+    assert driver.queries == ["query:first?"]
+    assert model.calls == []
+    case_dir = tmp_path / "cases" / "case-1-ba225b98"
+    grades = [
+        json.loads(line)
+        for line in (case_dir / "grades.jsonl").read_text().splitlines()
+    ]
+    assert [row["score"] for row in grades] == [0.0, 0.0]
+    assert {row["details"]["failed_phase"] for row in grades} == {"retrieval"}
+
+
+def test_declared_insertion_system_error_scores_case_zero_and_completes(
+    tmp_path: Path,
+) -> None:
+    drivers: list[_Driver] = []
+
+    def factory(case_id, state_dir, trace_dir):
+        del case_id, trace_dir
+        driver = _Driver(state_dir, fail_event_id="event-2")
+        drivers.append(driver)
+        return driver
+
+    contract = replace(
+        _contract(),
+        checkpoint_boundary="event",
+        memory_system_error_score=0.0,
+    )
+    model = _Model()
+    runner = BenchmarkRunner(
+        system_contract=_system_contract(),
+        contracts={"task-1": contract},
+        driver_factory=factory,
+        answer_model=model,
+        judge_model=model,
+        artifacts=BenchmarkArtifactStore(tmp_path),
+    )
+
+    runner.run(_bundle())
+    runner.run(_bundle())
+
+    assert len(drivers) == 1
+    assert drivers[0].events == ["event-1"]
+    assert drivers[0].queries == []
+    assert model.calls == []
+    case_dir = tmp_path / "cases" / "case-1-ba225b98"
+    status = json.loads((case_dir / "status.json").read_text())
+    grades = [
+        json.loads(line)
+        for line in (case_dir / "grades.jsonl").read_text().splitlines()
+    ]
+    assert status["status"] == "completed"
+    assert [row["score"] for row in grades] == [0.0, 0.0]
+    assert {row["details"]["failed_phase"] for row in grades} == {"insertion"}
+    current = json.loads(
+        (case_dir / "checkpoints" / "current.json").read_text(encoding="utf-8")
+    )
+    checkpoint = json.loads(
+        (
+            case_dir
+            / "checkpoints"
+            / "snapshots"
+            / current["checkpoint_id"]
+            / "manifest.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert checkpoint["completed_event_ids"] == ["event-1"]
+
+
+def test_event_checkpoint_boundary_is_independent_of_session_boundary(
+    tmp_path: Path,
+) -> None:
+    drivers: list[_Driver] = []
+
+    def factory(case_id, state_dir, trace_dir):
+        del case_id, trace_dir
+        driver = _Driver(
+            state_dir,
+            fail_event_id="event-2" if not drivers else None,
+        )
+        drivers.append(driver)
+        return driver
+
+    contract = replace(_contract(), checkpoint_boundary="event")
+    runner = BenchmarkRunner(
+        system_contract=_system_contract(),
+        contracts={"task-1": contract},
+        driver_factory=factory,
+        answer_model=_Model(["one", "two"]),
+        judge_model=_Model(),
+        artifacts=BenchmarkArtifactStore(tmp_path),
+    )
+
+    with pytest.raises(RuntimeError, match="failed to add event-2"):
+        runner.run(_bundle())
+    runner.run(_bundle())
+
+    assert drivers[1].restored_event_ids == ("event-1",)
+    assert drivers[1].events == ["event-1", "event-2"]
+
+
+def test_declared_consolidation_error_scores_zero_without_answering(
+    tmp_path: Path,
+) -> None:
+    model = _Model()
+    contract = replace(_contract(), memory_system_error_score=0.0)
+    runner = BenchmarkRunner(
+        system_contract=_system_contract(),
+        contracts={"task-1": contract},
+        driver_factory=lambda case_id, state_dir, trace_dir: _Driver(
+            state_dir,
+            fail_finish=True,
+        ),
+        answer_model=model,
+        judge_model=model,
+        artifacts=BenchmarkArtifactStore(tmp_path),
+    )
+
+    runner.run(_bundle())
+
+    grades = [
+        json.loads(line)
+        for line in (
+            tmp_path / "cases" / "case-1-ba225b98" / "grades.jsonl"
+        ).read_text().splitlines()
+    ]
+    assert {row["details"]["failed_phase"] for row in grades} == {
+        "consolidation"
+    }
+    assert model.calls == []
+
+
+def test_control_signal_is_never_converted_to_system_error(tmp_path: Path) -> None:
+    class InterruptingDriver(_Driver):
+        def add(self, event: BenchmarkEvent) -> dict[str, int]:
+            del event
+            raise KeyboardInterrupt
+
+    contract = replace(_contract(), memory_system_error_score=0.0)
+    runner = BenchmarkRunner(
+        system_contract=_system_contract(),
+        contracts={"task-1": contract},
+        driver_factory=lambda case_id, state_dir, trace_dir: InterruptingDriver(
+            state_dir
+        ),
+        answer_model=_Model(),
+        judge_model=_Model(),
+        artifacts=BenchmarkArtifactStore(tmp_path),
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        runner.run(_bundle())
 
 
 def test_invalid_answer_retries_only_current_model_step(tmp_path) -> None:
@@ -888,6 +1128,69 @@ def test_final_maintenance_checkpoint_is_reused_read_only_for_retrieval(
     assert pointer_path.read_bytes() == pointer_before
 
 
+def test_zep_maintenance_checkpoint_restore_does_not_replay_events(
+    tmp_path: Path,
+) -> None:
+    bundle = _session_bundle()
+    contract = replace(
+        _system_contract(),
+        system_id="zep-memory",
+        input_adapter_id="benchmark-event-to-zep-log:v1",
+        retrieval_recipe_id="zep-memory-entity-rrf-fact-bfs-cross-encoder:v1",
+        maintenance_rule="rule-re-group",
+    )
+    maintenance_dir = tmp_path / "maintenance"
+    maintenance_drivers: list[_Driver] = []
+    BenchmarkRunner(
+        system_contract=contract,
+        contracts={"task-1": _contract()},
+        driver_factory=lambda case_id, state_dir, trace_dir: (
+            maintenance_drivers.append(
+                _Driver(state_dir, system_id="zep-memory")
+            )
+            or maintenance_drivers[-1]
+        ),
+        answer_model=_Model(),
+        judge_model=_Model(),
+        artifacts=BenchmarkArtifactStore(maintenance_dir),
+        maintenance_only=True,
+    ).run(bundle)
+
+    retrieval_drivers: list[_Driver] = []
+    BenchmarkRunner(
+        system_contract=contract,
+        contracts={"task-1": _contract()},
+        driver_factory=lambda case_id, state_dir, trace_dir: (
+            retrieval_drivers.append(_Driver(state_dir, system_id="zep-memory"))
+            or retrieval_drivers[-1]
+        ),
+        answer_model=_Model(["one"]),
+        judge_model=_Model(),
+        artifacts=BenchmarkArtifactStore(tmp_path / "retrieval"),
+        maintenance_checkpoint_source=BenchmarkArtifactStore(maintenance_dir),
+    ).run(bundle)
+
+    assert maintenance_drivers[0].events == [
+        "event-1",
+        "event-2",
+        "event-3",
+        "event-4",
+    ]
+    assert retrieval_drivers[0].restored_event_ids == (
+        "event-1",
+        "event-2",
+        "event-3",
+        "event-4",
+    )
+    assert retrieval_drivers[0].events == [
+        "event-1",
+        "event-2",
+        "event-3",
+        "event-4",
+    ]
+    assert retrieval_drivers[0].queries == ["query:first?"]
+
+
 def test_maintenance_fingerprint_separates_rules_but_not_retrieval() -> None:
     join_map = replace(
         _system_contract(),
@@ -899,6 +1202,9 @@ def test_maintenance_fingerprint_separates_rules_but_not_retrieval() -> None:
         retrieval_recipe_id="claude-memory:listwise",
     )
     re_group = replace(join_map, maintenance_rule="rule-re-group")
+    preferred = replace(join_map, maintenance_rule="prefer-join-map")
 
     assert join_map.maintenance_fingerprint == join_map_listwise.maintenance_fingerprint
     assert join_map.maintenance_fingerprint != re_group.maintenance_fingerprint
+    assert preferred.maintenance_fingerprint != join_map.maintenance_fingerprint
+    assert preferred.maintenance_fingerprint != re_group.maintenance_fingerprint
