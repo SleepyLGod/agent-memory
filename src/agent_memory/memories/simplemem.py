@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 
 from agent_memory.api import Log, Memory
 from agent_memory.policy.logical import UserQuery
+from agent_memory.policy.retrieval import BM25, CosineSimilarity, RRF
 
 
 WINDOW_SIZE = 40
@@ -48,11 +49,11 @@ Return a JSON object with a "rows" array. Each row is a memory entry:
   "rows": [
     {{
       "lossless_restatement": "Complete unambiguous restatement (must include all subjects, objects, time, location, etc.)",
-      "keywords": ["keyword1", "keyword2"],
+      "keywords": "JSON array of strings as a string, e.g. \"[\\\"keyword1\\\", \\\"keyword2\\\"]\"",
       "timestamp": "YYYY-MM-DDTHH:MM:SS or null",
       "location": "location name or null",
-      "persons": ["name1", "name2"],
-      "entities": ["entity1", "entity2"],
+      "persons": "JSON array of strings as a string, e.g. \"[\\\"name1\\\", \\\"name2\\\"]\"",
+      "entities": "JSON array of strings as a string, e.g. \"[\\\"entity1\\\", \\\"entity2\\\"]\"",
       "topic": "topic phrase"
     }}
   ]
@@ -67,20 +68,20 @@ Output:
   "rows": [
     {{
       "lossless_restatement": "Alice suggested at 2025-11-15 to meet with Bob at Starbucks on 2025-11-16 at 14:00 to discuss the new product.",
-      "keywords": ["Alice", "Bob", "Starbucks", "new product", "meeting"],
+      "keywords": "[\"Alice\", \"Bob\", \"Starbucks\", \"new product\", \"meeting\"]",
       "timestamp": "2025-11-16T14:00:00",
       "location": "Starbucks",
-      "persons": ["Alice", "Bob"],
-      "entities": ["new product"],
+      "persons": "[\"Alice\", \"Bob\"]",
+      "entities": "[\"new product\"]",
       "topic": "Product discussion meeting arrangement"
     }},
     {{
       "lossless_restatement": "Bob agreed to attend the meeting and committed to prepare relevant materials.",
-      "keywords": ["Bob", "prepare materials", "agree"],
+      "keywords": "[\"Bob\", \"prepare materials\", \"agree\"]",
       "timestamp": null,
       "location": null,
-      "persons": ["Bob"],
-      "entities": [],
+      "persons": "[\"Bob\"]",
+      "entities": "[]",
       "topic": "Meeting preparation confirmation"
     }}
   ]
@@ -114,11 +115,11 @@ class SimpleMemMemory(Memory):
                 input_cols=["dialogues"],
                 output_cols={
                     "lossless_restatement": "Complete unambiguous restatement with no pronouns and absolute timestamps.",
-                    "keywords": "JSON array of core keywords for exact matching.",
+                    "keywords": "JSON array of core keywords for exact matching, JSON-encoded as a string.",
                     "timestamp": "ISO 8601 absolute time or null.",
                     "location": "Location name or null.",
-                    "persons": "JSON array of person names mentioned.",
-                    "entities": "JSON array of entities (companies, products, etc.).",
+                    "persons": "JSON array of person names mentioned, JSON-encoded as a string.",
+                    "entities": "JSON array of entities (companies, products, etc.), JSON-encoded as a string.",
                     "topic": "Concise topic phrase.",
                 },
                 instruction=SIMPLEMEM_EXTRACTION_PROMPT,
@@ -130,4 +131,9 @@ class SimpleMemMemory(Memory):
         )
     )
 
-    retrieval_query = facts.sem_topk(UserQuery(), 25)
+    retrieval_query = facts.search(
+        UserQuery(),
+        methods=[BM25(), CosineSimilarity()],
+        reranker=RRF(),
+        limit=25,
+    )
