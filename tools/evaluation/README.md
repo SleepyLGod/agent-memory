@@ -11,6 +11,13 @@ Dataset adapters prepare evidence. Task contracts define prompts and scoring.
 System drivers only add events and retrieve context. The runner owns case
 isolation, resume, answering, grading, trace, and artifacts.
 
+All agent-memory runners accept the planner's complete
+`--grouped-agg-rule` choice set. In particular, `rule-re-group`,
+`rule-join-map`, and `prefer-join-map` have the same meaning for every policy
+and benchmark. A strict strategy remains selectable even when a particular
+policy cannot compile it; that run fails before insertion instead of being
+hidden or silently changed by the CLI.
+
 ## Install
 
 ```bash

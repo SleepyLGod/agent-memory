@@ -26,6 +26,7 @@ from agent_memory.evaluation.run import (  # noqa: E402
     AGENT_MEMORY_SYSTEMS,
     run_agent_memory_bundle,
 )
+from agent_memory.planner import GROUPED_AGG_RULES  # noqa: E402
 
 DEFAULT_MODEL = "deepseek/deepseek-v4-flash"
 DEFAULT_DATASET_DIR = (
@@ -63,6 +64,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     run.add_argument("--output-dir", type=Path, required=True)
     run.add_argument("--model", default=DEFAULT_MODEL)
     run.add_argument("--namespace")
+    run.add_argument(
+        "--grouped-agg-rule",
+        choices=GROUPED_AGG_RULES,
+        default="rule-all-group",
+    )
     return parser.parse_args(argv)
 
 
@@ -86,6 +92,7 @@ def main(argv: Sequence[str] | None = None) -> Path:
             max_questions_per_case=(
                 1 if args.smoke else args.max_questions_per_case
             ),
+            run_mode="integration-smoke" if args.smoke else None,
             chunker=partial(
                 chunk_text_into_sentences,
                 nltk_data_dir=args.nltk_data_dir,
@@ -110,6 +117,8 @@ def main(argv: Sequence[str] | None = None) -> Path:
         answer_model_id=args.model,
         judge_model_id=args.model,
         base_namespace=args.namespace,
+        grouped_agg_rule=args.grouped_agg_rule,
+        memory_thinking_enabled=False,
     )
 
 

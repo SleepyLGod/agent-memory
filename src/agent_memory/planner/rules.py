@@ -37,6 +37,7 @@ GROUPED_AGG_RULES = (
     "join-map",
     "rule-join-map",
     "rule-re-group",
+    "prefer-join-map",
     "rule-all-group",
     "rule-all-group-optimized",
 )
@@ -155,6 +156,15 @@ class DifferentialRules:
         """Return the canonical grouped aggregate rule name."""
 
         return self._grouped_agg_rule
+
+    def _grouped_agg_rule_for(self, groupby: QueryExpr) -> str:
+        """Select a supported grouped rule without executing a speculative rewrite."""
+
+        if self._grouped_agg_rule != "prefer-join-map":
+            return self._grouped_agg_rule
+        if groupby.op == "sem_groupby" and groupby.params.get("partition_by"):
+            return "rule-re-group"
+        return "rule-join-map"
 
     def differentiate(
         self,
@@ -435,7 +445,7 @@ class DifferentialRules:
             )
             keys = tuple(str(key) for key in source.params["keys"])
             output_col = str(aggregate.params["output_col"])
-            if self._grouped_agg_rule == "rule-join-map":
+            if self._grouped_agg_rule_for(source) == "rule-join-map":
                 joined = QueryExpr(
                     op="join",
                     inputs=(changed_aggregate, current_view),
@@ -610,7 +620,7 @@ class DifferentialRules:
             source_query=source_query,
             instruction_rewriter=instruction_rewriter,
         )
-        if self._grouped_agg_rule == "rule-join-map":
+        if self._grouped_agg_rule_for(groupby) == "rule-join-map":
             return self._build_grouped_agg_join_map_candidate(
                 aggregate=aggregate,
                 groupby=groupby,
@@ -883,7 +893,8 @@ class DifferentialRules:
             instruction_rewriter=instruction_rewriter,
         )
 
-        if self._grouped_agg_rule == "rule-re-group":
+        selected_rule = self._grouped_agg_rule_for(groupby)
+        if selected_rule == "rule-re-group":
             return self._build_grouped_sem_agg_re_group_candidate(
                 aggregate=aggregate,
                 groupby=groupby,
@@ -892,7 +903,7 @@ class DifferentialRules:
                 final_columns=final_columns,
                 instruction_rewriter=instruction_rewriter,
             )
-        if self._grouped_agg_rule == "rule-all-group-optimized":
+        if selected_rule == "rule-all-group-optimized":
             return self._build_sem_groupby_agg_changed_aware_candidate(
                 aggregate=aggregate,
                 groupby=groupby,
@@ -900,7 +911,7 @@ class DifferentialRules:
                 current_view=current_view,
                 final_columns=final_columns,
             )
-        if self._grouped_agg_rule == "rule-join-map":
+        if selected_rule == "rule-join-map":
             return self._build_sem_groupby_agg_join_map_candidate(
                 query,
                 changed_group_input=changed_group_input,

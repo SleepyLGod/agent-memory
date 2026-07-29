@@ -71,6 +71,7 @@ def _answer_prompt(task: MemoryAgentTask, prompt_digest: str):
             prompt_digest=prompt_digest,
             temperature=0,
             max_tokens=8192,
+            thinking_enabled=False,
         )
 
     return build
@@ -240,6 +241,7 @@ def _infbench_plan(
                 prompt_digest=prompt_digest,
                 temperature=0,
                 max_tokens=8192,
+                thinking_enabled=False,
             ),
             parse=parse,
         )
@@ -309,6 +311,8 @@ def _task_contract(
         "answer_parser": _parse_nonempty,
         "retrieval_query": _retrieval_query,
         "answer_prompt_digest": answer_digest,
+        "checkpoint_boundary": "event",
+        "memory_system_error_score": 0.0,
     }
     if task.scorer == "longmemeval_v4_flash_judge":
         return TaskContract(

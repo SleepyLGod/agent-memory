@@ -19,8 +19,12 @@ _CONTRACT_FIELDS = (
     "case_ids",
     "question_ids",
     "memory_model_id",
+    "thinking_enabled",
     "answer_model_id",
+    "answer_thinking_enabled",
     "judge_model_id",
+    "judge_thinking_enabled",
+    "run_mode",
     "contract_fingerprints",
     "answer_prompt_digests",
     "scorer_contracts",
@@ -36,6 +40,8 @@ def compare_benchmark_runs(
     if len(run_dirs) < 2:
         raise ValueError("comparison requires at least two benchmark runs")
     manifests = [_read_object(path / "manifest.json") for path in run_dirs]
+    for run_dir, manifest in zip(run_dirs, manifests, strict=True):
+        _validate_provenance(run_dir, manifest)
     conditions = [str(manifest.get("condition_id") or "") for manifest in manifests]
     if any(not condition for condition in conditions) or len(conditions) != len(
         set(conditions)
@@ -49,6 +55,20 @@ def compare_benchmark_runs(
             if manifest.get(field) != expected:
                 raise ValueError(
                     f"benchmark comparison mismatch for {field}: {run_dir}"
+                )
+
+    graph_manifests = [
+        (run_dir, manifest)
+        for run_dir, manifest in zip(run_dirs, manifests, strict=True)
+        if manifest.get("system_id") in {"native-graphiti", "zep-memory"}
+    ]
+    if len(graph_manifests) > 1:
+        reference_storage = graph_manifests[0][1]["storage_provenance"]
+        for run_dir, manifest in graph_manifests[1:]:
+            if manifest["storage_provenance"] != reference_storage:
+                raise ValueError(
+                    "benchmark comparison mismatch for storage_provenance: "
+                    f"{run_dir}"
                 )
 
     if output_dir.exists() and any(output_dir.iterdir()):
@@ -118,6 +138,9 @@ def compare_benchmark_runs(
                     "retrieval_recipe_digest": manifest.get(
                         "retrieval_recipe_digest"
                     ),
+                    "source_provenance": manifest["source_provenance"],
+                    "runtime_provenance": manifest["runtime_provenance"],
+                    "storage_provenance": manifest.get("storage_provenance"),
                 }
                 for condition_id, manifest in zip(
                     conditions, manifests, strict=True
@@ -130,6 +153,60 @@ def compare_benchmark_runs(
         },
     )
     return output_dir
+
+
+def _validate_provenance(run_dir: Path, manifest: dict[str, Any]) -> None:
+    source = manifest.get("source_provenance")
+    runtime = manifest.get("runtime_provenance")
+    if not isinstance(source, dict):
+        raise ValueError(f"benchmark run is missing source_provenance: {run_dir}")
+    if not isinstance(runtime, dict):
+        raise ValueError(f"benchmark run is missing runtime_provenance: {run_dir}")
+    if not isinstance(source.get("commit"), str) or not source["commit"]:
+        raise ValueError(f"benchmark run has invalid source commit: {run_dir}")
+    if not isinstance(source.get("dirty"), bool):
+        raise ValueError(f"benchmark run has invalid dirty state: {run_dir}")
+    if not isinstance(runtime.get("language"), str) or not runtime["language"]:
+        raise ValueError(f"benchmark run has invalid runtime language: {run_dir}")
+    if (
+        not isinstance(runtime.get("language_version"), str)
+        or not runtime["language_version"]
+    ):
+        raise ValueError(f"benchmark run has invalid runtime version: {run_dir}")
+    if (
+        not isinstance(runtime.get("lockfile_sha256"), str)
+        or not runtime["lockfile_sha256"]
+    ):
+        raise ValueError(f"benchmark run has invalid lockfile digest: {run_dir}")
+    dependencies = runtime.get("dependencies")
+    if (
+        not isinstance(dependencies, dict)
+        or not dependencies
+        or any(
+            not isinstance(value, str) or not value
+            for value in dependencies.values()
+        )
+    ):
+        raise ValueError(f"benchmark run has invalid dependency versions: {run_dir}")
+    run_mode = manifest.get("run_mode")
+    if not isinstance(run_mode, str) or not run_mode:
+        raise ValueError(f"benchmark run has invalid run_mode: {run_dir}")
+    if not run_mode.startswith("integration-smoke") and source["dirty"]:
+        raise ValueError(f"formal benchmark run used dirty source: {run_dir}")
+    if manifest.get("system_id") in {"native-graphiti", "zep-memory"}:
+        storage = manifest.get("storage_provenance")
+        if not isinstance(storage, dict):
+            raise ValueError(
+                f"graph benchmark run is missing storage_provenance: {run_dir}"
+            )
+        required = ("image", "image_digest", "server_version", "driver_version")
+        if any(
+            not isinstance(storage.get(field), str) or not storage[field]
+            for field in required
+        ):
+            raise ValueError(
+                f"graph benchmark run has invalid storage_provenance: {run_dir}"
+            )
 
 
 def _logical_condition_metrics(run_dir: Path) -> dict[str, Any]:

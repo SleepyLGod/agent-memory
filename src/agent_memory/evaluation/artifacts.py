@@ -15,6 +15,7 @@ from uuid import uuid4
 
 from agent_memory.evaluation.bundle import BenchmarkBundle, write_bundle
 from agent_memory.evaluation.pricing import PricingSnapshot
+from agent_memory.evaluation.provenance import collect_runtime_provenance
 from agent_memory.evaluation.trace_metrics import (
     normalize_provider_calls,
     summarize_provider_calls,
@@ -197,11 +198,18 @@ class BenchmarkArtifactStore:
         contract_fingerprints: Mapping[str, str],
         answer_prompt_digests: Mapping[str, str],
         scorer_contracts: Mapping[str, Mapping[str, str]],
+        runtime_provenance: Mapping[str, Any] | None = None,
+        storage_provenance: Mapping[str, Any] | None = None,
         run_mode: str = "full",
         maintenance_checkpoint_source: str | None = None,
     ) -> None:
         """Create or validate the immutable run contract and normalized input."""
 
+        provenance = runtime_provenance or collect_runtime_provenance(
+            Path(__file__).resolve().parents[3],
+            lockfile="uv.lock",
+            dependencies=("agent-memory",),
+        )
         expected = {
             "schema_version": 3,
             "benchmark_id": bundle.benchmark_id,
@@ -232,14 +240,21 @@ class BenchmarkArtifactStore:
             "checkpoint_enabled": system_contract.checkpoint_enabled,
             "answer_model_id": answer_model_id,
             "answer_provider_model_id": answer_model_id,
+            "answer_thinking_enabled": False,
             "judge_model_id": judge_model_id,
             "judge_provider_model_id": judge_model_id,
+            "judge_thinking_enabled": False,
             "contract_fingerprints": dict(sorted(contract_fingerprints.items())),
             "answer_prompt_digests": dict(sorted(answer_prompt_digests.items())),
             "scorer_contracts": {
                 task_id: dict(scorer_contracts[task_id])
                 for task_id in sorted(scorer_contracts)
             },
+            "source_provenance": dict(provenance["source"]),
+            "runtime_provenance": dict(provenance["runtime"]),
+            "storage_provenance": (
+                dict(storage_provenance) if storage_provenance is not None else None
+            ),
             "run_mode": run_mode,
             "maintenance_checkpoint_source": maintenance_checkpoint_source,
         }
@@ -480,6 +495,8 @@ class BenchmarkArtifactStore:
         case: BenchmarkCase,
         contract_fingerprint: str,
         error: BaseException,
+        *,
+        details: Mapping[str, Any] | None = None,
     ) -> None:
         """Persist enough failure evidence to rerun the case from fresh state."""
 
@@ -493,6 +510,7 @@ class BenchmarkArtifactStore:
             status_path,
             {
                 **current,
+                **dict(details or {}),
                 "status": "failed",
                 "case_id": case.case_id,
                 "contract_fingerprint": contract_fingerprint,
@@ -603,6 +621,8 @@ class BenchmarkArtifactStore:
         failed_cases = 0
         empty_retrievals = 0
         retrieval_system_errors = 0
+        memory_system_error_questions = 0
+        memory_system_error_cases: set[str] = set()
         input_questions = {
             row["question_id"]: row
             for row in _read_jsonl(self.output_dir / "input" / "questions.jsonl")
@@ -636,6 +656,17 @@ class BenchmarkArtifactStore:
                 retrieval_status = str(retrieval.get("status") or "success")
                 if retrieval_status == "system_error":
                     retrieval_system_errors += 1
+                grade_details = grade.get("details", {})
+                failed_phase = (
+                    str(grade_details.get("failed_phase") or "")
+                    if isinstance(grade_details, Mapping)
+                    else ""
+                )
+                if grade.get("label") == "system_error":
+                    memory_system_error_questions += 1
+                    case_id = status.get("case_id")
+                    if isinstance(case_id, str) and case_id:
+                        memory_system_error_cases.add(case_id)
                 reference = input_questions.get(question_id, {}).get("gold_answer", "")
                 answer_text = answer.get("answer", "")
                 channels = retrieval.get("channels", {})
@@ -655,6 +686,7 @@ class BenchmarkArtifactStore:
                         "retrieval_status": retrieval_status,
                         "retrieval_error_type": retrieval.get("error_type", ""),
                         "retrieval_error": retrieval.get("error", ""),
+                        "system_error_phase": failed_phase,
                         "retrieval_latency_ms": retrieval.get("latency_ms", ""),
                         "retrieval_returned_count": returned_count,
                         "answer_latency_ms": answer.get("latency_ms", ""),
@@ -730,6 +762,9 @@ class BenchmarkArtifactStore:
                     "attempt": attempt,
                     "replayed": occurrence > 1,
                     "wall_latency_ms": event.get("latency_ms", ""),
+                    "status": event.get("status", "success"),
+                    "error_type": event.get("error_type", ""),
+                    "error": event.get("error", ""),
                     **_provider_rollup(calls),
                     **shape,
                     **deltas,
@@ -852,7 +887,7 @@ class BenchmarkArtifactStore:
                 }
             )
         self._write_csv(
-            self.output_dir / "metrics" / "operator_usage.csv", operator_rows
+            self.output_dir / "metrics" / "operation_usage.csv", operator_rows
         )
 
         latest_state: dict[str, dict[str, Any]] = {}
@@ -908,6 +943,95 @@ class BenchmarkArtifactStore:
         manifest = json.loads(
             (self.output_dir / "manifest.json").read_text(encoding="utf-8")
         )
+        case_rows: list[dict[str, Any]] = []
+        case_ids = sorted(
+            {
+                str(row.get("case_id") or "")
+                for row in (*per_event_rows, *question_rows, *provider_rows)
+                if row.get("case_id")
+            }
+        )
+        for case_id in case_ids:
+            case_questions = [
+                row for row in question_rows if row.get("case_id") == case_id
+            ]
+            case_events = [row for row in per_event_rows if row.get("case_id") == case_id]
+            case_provider = [
+                row for row in provider_rows if row.get("case_id") == case_id
+            ]
+            case_provider_rollup = _provider_rollup(case_provider)
+            case_cost = case_provider_rollup["estimated_cost_usd"]
+            case_scores = [
+                float(row["score"])
+                for row in case_questions
+                if row.get("score") not in {"", None}
+            ]
+            phase_costs: dict[str, float | None] = {}
+            for phase in (
+                "insertion",
+                "consolidation",
+                "retrieval",
+                "answering",
+                "grading",
+            ):
+                values = [
+                    row.get("estimated_cost_usd")
+                    for row in case_provider
+                    if row.get("phase") == phase
+                ]
+                known_values = [float(value) for value in values if value is not None]
+                phase_costs[f"{phase}_cost_usd"] = (
+                    round(sum(known_values), 12)
+                    if values and len(known_values) == len(values)
+                    else (0.0 if not values else None)
+                )
+            case_rows.append(
+                {
+                    "case_id": case_id,
+                    "event_count": len(case_events),
+                    "question_count": len(case_questions),
+                    "mean_score": (
+                        sum(case_scores) / len(case_scores) if case_scores else None
+                    ),
+                    "system_error_question_count": sum(
+                        bool(row.get("system_error_phase")) for row in case_questions
+                    ),
+                    "insertion_wall_latency_ms": round(
+                        sum(float(row.get("wall_latency_ms") or 0) for row in case_events),
+                        3,
+                    ),
+                    "retrieval_wall_latency_ms": round(
+                        sum(
+                            float(row.get("retrieval_latency_ms") or 0)
+                            for row in case_questions
+                        ),
+                        3,
+                    ),
+                    "answering_wall_latency_ms": round(
+                        sum(
+                            float(row.get("answer_latency_ms") or 0)
+                            for row in case_questions
+                        ),
+                        3,
+                    ),
+                    "grading_wall_latency_ms": round(
+                        sum(
+                            float(row.get("grading_latency_ms") or 0)
+                            for row in case_questions
+                        ),
+                        3,
+                    ),
+                    **case_provider_rollup,
+                    "cost_per_question_usd": (
+                        float(case_cost) / len(case_questions)
+                        if isinstance(case_cost, int | float)
+                        and case_questions
+                        else None
+                    ),
+                    **phase_costs,
+                }
+            )
+        self._write_csv(self.output_dir / "metrics" / "per_case.csv", case_rows)
         summary = {
             "condition_id": manifest.get("condition_id"),
             "completed_cases": completed_cases,
@@ -916,6 +1040,8 @@ class BenchmarkArtifactStore:
             "mean_score": sum(scores) / len(scores) if scores else None,
             "empty_retrieval_count": empty_retrievals,
             "retrieval_system_error_count": retrieval_system_errors,
+            "memory_system_error_case_count": len(memory_system_error_cases),
+            "memory_system_error_question_count": memory_system_error_questions,
             "framework_cache_mode": manifest.get("framework_cache_mode"),
             "insertion_wall_latency": _latency_stats(insertion_latencies),
             "retrieval_wall_latency": _latency_stats(retrieval_latencies),
@@ -942,6 +1068,12 @@ class BenchmarkArtifactStore:
                     "question_count": len(question_rows),
                     "mean_score": summary["mean_score"],
                     "retrieval_system_error_count": retrieval_system_errors,
+                    "memory_system_error_case_count": len(
+                        memory_system_error_cases
+                    ),
+                    "memory_system_error_question_count": (
+                        memory_system_error_questions
+                    ),
                     "provider_call_count": provider_summary["provider_call_count"],
                     "prompt_tokens": provider_summary["prompt_tokens"],
                     "cache_hit_tokens": provider_summary["cache_hit_tokens"],
@@ -1016,6 +1148,12 @@ class BenchmarkArtifactStore:
                     "usage_complete": provider_summary["usage_complete"],
                     "empty_retrieval_count": empty_retrievals,
                     "retrieval_system_error_count": retrieval_system_errors,
+                    "memory_system_error_case_count": len(
+                        memory_system_error_cases
+                    ),
+                    "memory_system_error_question_count": (
+                        memory_system_error_questions
+                    ),
                     "replay_event_count": sum(
                         bool(row.get("replayed")) for row in per_event_rows
                     ),

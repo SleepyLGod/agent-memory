@@ -42,7 +42,11 @@ from agent_memory.evaluation.metrics import (
     summarize_question_metrics,
 )
 from agent_memory.evaluation.types import BenchmarkEvent, BenchmarkQuestion
-from agent_memory.planner import DifferentialRules, PolicyDifferentiator
+from agent_memory.planner import (
+    GROUPED_AGG_RULES,
+    DifferentialRules,
+    PolicyDifferentiator,
+)
 from agent_memory.runtime import MemoryRuntime
 from agent_memory.tracing.semantic import semantic_trace_scope
 
@@ -56,7 +60,6 @@ RUN_MARKER_SCHEMA_VERSION = 1
 RUN_MARKER_FILENAME = ".agent-memory-locomo-run.json"
 BENCHMARK_CONTRACT = "message_with_event_context:v1"
 POLICY_CONTRACT = "claude_memory_policy:v1"
-GROUPED_AGG_RULES = ("compressed", "changed-aware", "join-map")
 SCORER_CONTRACT = "locomo_official_compatible_category_logic:v1"
 USAGE_FIELDS = (
     "physical_prompt_tokens",

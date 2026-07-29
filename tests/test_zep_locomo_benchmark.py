@@ -38,6 +38,7 @@ from agent_memory.evaluation.zep.locomo import (
     validate_pinned_dataset,
 )
 from agent_memory.evaluation.zep.scoring import OfficialGrade, ZepJudgeGrade
+from agent_memory.planner.rules import GROUPED_AGG_RULES
 from agent_memory.policy.retrieval import RetrievalResult
 
 TOOL_PATH = Path(__file__).resolve().parents[1] / "tools/evaluation/zep_locomo.py"
@@ -95,6 +96,30 @@ def test_cli_has_explicit_smoke_and_full_benchmark_defaults(tmp_path: Path) -> N
     assert (benchmark.start_row, benchmark.row_limit) == (1, None)
     assert (benchmark.question_start, benchmark.question_limit) == (1, None)
     assert benchmark.include_adversarial is True
+    assert smoke.grouped_agg_rule == "rule-re-group"
+
+
+@pytest.mark.parametrize("grouped_agg_rule", GROUPED_AGG_RULES)
+def test_cli_accepts_every_planner_grouped_aggregate_strategy(
+    tmp_path: Path,
+    grouped_agg_rule: str,
+) -> None:
+    spec = importlib.util.spec_from_file_location("zep_locomo_tool", TOOL_PATH)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    args = module.parse_args(
+        [
+            "smoke",
+            "--output-dir",
+            str(tmp_path / "run"),
+            "--grouped-agg-rule",
+            grouped_agg_rule,
+        ]
+    )
+
+    assert args.grouped_agg_rule == grouped_agg_rule
 
 
 def test_cli_accepts_exact_question_numbers_and_rejects_range_mix(tmp_path: Path) -> None:

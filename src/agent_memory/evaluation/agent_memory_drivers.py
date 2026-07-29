@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from hashlib import sha256
+from importlib.metadata import version
 import json
 import os
 from pathlib import Path
@@ -314,14 +315,26 @@ class ZepMemoryDriverFactory:
         connector: Any,
         base_namespace: str,
         model_id: str = "deepseek/deepseek-v4-flash",
+        grouped_agg_rule: str = "rule-re-group",
         thinking_enabled: bool = True,
+        neo4j_image: str,
+        neo4j_image_digest: str,
     ) -> None:
+        from agent_memory.planner.rules import GROUPED_AGG_RULES
+
         if not base_namespace:
             raise ValueError("Zep benchmark base_namespace must be non-empty")
+        if grouped_agg_rule not in GROUPED_AGG_RULES:
+            raise ValueError(
+                "grouped_agg_rule must be one of: " + ", ".join(GROUPED_AGG_RULES)
+            )
         self.connector = connector
         self.base_namespace = base_namespace
         self.model_id = model_id
+        self.grouped_agg_rule = grouped_agg_rule
         self.thinking_enabled = thinking_enabled
+        self.neo4j_image = neo4j_image
+        self.neo4j_image_digest = neo4j_image_digest
         self._closed = False
 
     @classmethod
@@ -330,9 +343,18 @@ class ZepMemoryDriverFactory:
         *,
         base_namespace: str,
         model_id: str = "deepseek/deepseek-v4-flash",
+        grouped_agg_rule: str = "rule-re-group",
         thinking_enabled: bool = True,
     ) -> ZepMemoryDriverFactory:
         """Create the pinned Graphiti-compatible CPU deployment connector."""
+
+        neo4j_image = os.getenv("AGENT_MEMORY_NEO4J_IMAGE")
+        neo4j_image_digest = os.getenv("AGENT_MEMORY_NEO4J_IMAGE_DIGEST")
+        if not neo4j_image or not neo4j_image_digest:
+            raise RuntimeError(
+                "Zep benchmarks require AGENT_MEMORY_NEO4J_IMAGE and "
+                "AGENT_MEMORY_NEO4J_IMAGE_DIGEST"
+            )
 
         from agent_memory.memories.zep.storage import (
             GRAPHITI_BGE_M3,
@@ -359,8 +381,22 @@ class ZepMemoryDriverFactory:
             connector=connector,
             base_namespace=base_namespace,
             model_id=model_id,
+            grouped_agg_rule=grouped_agg_rule,
             thinking_enabled=thinking_enabled,
+            neo4j_image=neo4j_image,
+            neo4j_image_digest=neo4j_image_digest,
         )
+
+    def runtime_provenance(self) -> dict[str, Any]:
+        """Return physical Neo4j evidence before benchmark insertion begins."""
+
+        return {
+            "connector": "neo4j",
+            "image": self.neo4j_image,
+            "image_digest": self.neo4j_image_digest,
+            "server_version": self.connector.server_version(),
+            "driver_version": version("neo4j"),
+        }
 
     def __call__(
         self,
@@ -374,6 +410,8 @@ class ZepMemoryDriverFactory:
         from agent_memory.adapters.lotus import LotusAdapter
         from agent_memory.adapters.lotus.context import LotusExecutionConfig
         from agent_memory.memories.zep.storage import GRAPHITI_NEO4J_STATEMENTS
+        from agent_memory.planner import DifferentialRules, PolicyDifferentiator
+        from agent_memory.runtime import MemoryRuntime
         from agent_memory.storage import StorageDeployment
 
         case_digest = sha256(case_id.encode("utf-8")).hexdigest()[:16]
@@ -399,8 +437,20 @@ class ZepMemoryDriverFactory:
                 structured_max_tokens=BENCHMARK_STRUCTURED_MAX_TOKENS,
             ),
         )
+        policy = PolicyDifferentiator(
+            rules=DifferentialRules(grouped_agg_rule=self.grouped_agg_rule)
+        ).differentiate(
+            am.ZepMemory.spec(),
+            statements=storage.statements,
+        )
+        memory = am.ZepMemory(adapter=adapter)
+        memory._runtime = MemoryRuntime(
+            policy,
+            adapter=adapter,
+            storage=storage,
+        )
         return ZepMemoryDriver(
-            am.ZepMemory(adapter=adapter, storage=storage),
+            memory,
             trace_dir=trace_dir,
         )
 

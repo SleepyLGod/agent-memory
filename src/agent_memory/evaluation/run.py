@@ -16,10 +16,12 @@ from .artifacts import BenchmarkArtifactStore
 from .bundle import BenchmarkBundle
 from .harness import BenchmarkRunner, MemorySystemContract, TaskContract
 from .models import LiteLLMBenchmarkModel
+from .provenance import collect_runtime_provenance, validate_run_provenance
 
 AGENT_MEMORY_SYSTEMS = ("claude-memory", "zep-memory")
 DEFAULT_MEMORY_MODEL_ID = "deepseek-v4-flash"
 DEFAULT_PROVIDER_MODEL_ID = "deepseek/deepseek-v4-flash"
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
 _BUILT_IN_CONTRACTS = {
     "claude-memory": (
@@ -76,6 +78,27 @@ def run_agent_memory_bundle(
 
     if system_id not in AGENT_MEMORY_SYSTEMS:
         raise ValueError(f"unsupported agent-memory benchmark system {system_id!r}")
+    bundle_run_mode = bundle.metadata.get("run_mode")
+    if bundle_run_mode is not None and (
+        not isinstance(bundle_run_mode, str) or not bundle_run_mode
+    ):
+        raise TypeError(
+            "benchmark bundle run_mode metadata must be a non-empty string"
+        )
+    run_mode = bundle_run_mode or ("maintenance" if maintenance_only else "full")
+    if maintenance_only and bundle_run_mode:
+        run_mode = f"{bundle_run_mode}-maintenance"
+    runtime_provenance = collect_runtime_provenance(
+        PROJECT_ROOT,
+        lockfile="uv.lock",
+        dependencies=(
+            "agent-memory",
+            "lotus-ai",
+            "pandas",
+            *(("neo4j", "sentence-transformers") if system_id == "zep-memory" else ()),
+        ),
+    )
+    validate_run_provenance(runtime_provenance, run_mode=run_mode)
     _require_environment(system_id)
     if (
         maintenance_checkpoint_output_dir is not None
@@ -94,9 +117,7 @@ def run_agent_memory_bundle(
             else retrieval_recipe_id
         ),
         condition_id=condition_id,
-        maintenance_rule=(
-            grouped_agg_rule if system_id == "claude-memory" else "zep-view-policy"
-        ),
+        maintenance_rule=grouped_agg_rule,
         thinking_enabled=memory_thinking_enabled,
         consolidation_mode="none",
         framework_cache_mode="disabled",
@@ -113,9 +134,15 @@ def run_agent_memory_bundle(
         driver_factory = ZepMemoryDriverFactory.from_environment(
             base_namespace=base_namespace or _namespace(bundle.benchmark_id, output_dir),
             model_id=memory_provider_model_id,
+            grouped_agg_rule=grouped_agg_rule,
             thinking_enabled=memory_thinking_enabled,
         )
     try:
+        storage_provenance = (
+            driver_factory.runtime_provenance()
+            if isinstance(driver_factory, ZepMemoryDriverFactory)
+            else None
+        )
         BenchmarkRunner(
             system_contract=system_contract,
             contracts=contracts,
@@ -130,6 +157,8 @@ def run_agent_memory_bundle(
                 else None
             ),
             max_new_cases=max_new_cases,
+            runtime_provenance=runtime_provenance,
+            storage_provenance=storage_provenance,
         ).run(bundle)
     finally:
         close = getattr(driver_factory, "close", None)
