@@ -49,6 +49,12 @@ _PILOT_CONDITIONS = {
 def _condition_id(args: argparse.Namespace) -> str:
     if args.condition_id:
         return str(args.condition_id)
+    if args.maintenance_only and args.system in {"mem0-memory", "mem0-enhanced"}:
+        return "AM-Mem0-Maintenance"
+    if args.system == "mem0-memory":
+        return "AM-Mem0-Base"
+    if args.system == "mem0-enhanced":
+        return "AM-Mem0-Enhanced"
     if args.system == "zep-memory":
         suffix = "-maintenance" if args.maintenance_only else ""
         return f"zep-memory-{args.grouped_agg_rule}{suffix}"
@@ -112,7 +118,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     run.add_argument(
         "--sem-topk-method",
         choices=("pairwise-naive", "pairwise-quick", "pairwise-heap", "listwise"),
-        default="pairwise-naive",
+        default=None,
     )
     run.add_argument(
         "--memory-thinking",
@@ -124,20 +130,48 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(raw_args)
     if getattr(args, "question_ids", None) is not None:
         args.question_ids = tuple(args.question_ids)
-    if args.command == "run" and args.system == "zep-memory":
-        explicit_claude_options = [
+    if args.command == "run":
+        invalid_options = [
             option
-            for option in ("--sem-topk-method",)
+            for option in (
+                *(
+                    ("--sem-topk-method",)
+                    if args.system not in {"claude-memory", "mem0-enhanced"}
+                    else ()
+                ),
+                *(
+                    ("--grouped-agg-rule",)
+                    if args.system in {"mem0-memory", "mem0-enhanced"}
+                    else ()
+                ),
+            )
             if any(
                 argument == option or argument.startswith(f"{option}=")
                 for argument in raw_args
             )
         ]
-        if explicit_claude_options:
+        if invalid_options:
+            if args.system == "zep-memory":
+                parser.error(
+                    f"{', '.join(invalid_options)} is only valid with "
+                    "--system claude-memory or --system mem0-enhanced"
+                )
             parser.error(
-                f"{', '.join(explicit_claude_options)} is only valid with "
-                "--system claude-memory"
+                f"{', '.join(invalid_options)} is not valid with "
+                f"--system {args.system}"
             )
+        if args.sem_topk_method is None:
+            args.sem_topk_method = (
+                "pairwise-quick"
+                if args.system == "mem0-enhanced"
+                else "pairwise-naive"
+            )
+    if (
+        args.command == "run"
+        and args.system in {"mem0-memory", "mem0-enhanced"}
+        and args.memory_thinking != "disabled"
+    ):
+        parser.error(f"{args.system} requires --memory-thinking disabled")
     return args
 
 

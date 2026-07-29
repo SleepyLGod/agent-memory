@@ -229,6 +229,28 @@ def test_contract_registry_covers_every_official_source() -> None:
     assert all(contract.task_id == contract_id for contract_id, contract in contracts.items())
 
 
+def test_bundle_carries_portable_contracts_for_native_runners() -> None:
+    source = "eventqa_65536"
+    bundle = normalize_memory_agent_bench(
+        _split_rows(source),
+        sources=[source],
+        chunker=_chunker,
+    )
+
+    task_contracts = bundle.metadata["task_contracts"]
+    scorer_contract = bundle.metadata["scorer_contract"]
+
+    assert set(task_contracts) == set(MEMORY_AGENT_TASKS)
+    assert task_contracts[source]["contract_id"] == (
+        "memory-agent-bench:eventqa_65536"
+    )
+    assert set(scorer_contract["infbench_prompts"]) == {
+        "fluency",
+        "recall",
+        "precision",
+    }
+
+
 def test_contract_answer_prompt_uses_official_task_instruction_and_context() -> None:
     source = "factconsolidation_sh_6k"
     case = normalize_memory_agent_bench(

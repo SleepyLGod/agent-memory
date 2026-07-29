@@ -10,6 +10,8 @@ import re
 
 from .agent_memory_drivers import (
     ClaudeMemoryDriverFactory,
+    Mem0MemoryDriverFactory,
+    Mem0MemoryEnhancedDriverFactory,
     ZepMemoryDriverFactory,
 )
 from .artifacts import BenchmarkArtifactStore
@@ -18,7 +20,12 @@ from .harness import BenchmarkRunner, MemorySystemContract, TaskContract
 from .models import LiteLLMBenchmarkModel
 from .provenance import collect_runtime_provenance, validate_run_provenance
 
-AGENT_MEMORY_SYSTEMS = ("claude-memory", "zep-memory")
+AGENT_MEMORY_SYSTEMS = (
+    "claude-memory",
+    "zep-memory",
+    "mem0-memory",
+    "mem0-enhanced",
+)
 DEFAULT_MEMORY_MODEL_ID = "deepseek-v4-flash"
 DEFAULT_PROVIDER_MODEL_ID = "deepseek/deepseek-v4-flash"
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -31,6 +38,14 @@ _BUILT_IN_CONTRACTS = {
     "zep-memory": (
         "benchmark-event-to-zep-log:v1",
         "zep-memory-entity-rrf-fact-bfs-cross-encoder:v1",
+    ),
+    "mem0-memory": (
+        "benchmark-event-to-mem0-message:v1",
+        "mem0-base-bge-m3-cosine:v1",
+    ),
+    "mem0-enhanced": (
+        "benchmark-event-to-mem0-message:v1",
+        "mem0-enhanced-sem-topk:v1",
     ),
 }
 
@@ -67,7 +82,7 @@ def run_agent_memory_bundle(
     judge_model_id: str = DEFAULT_PROVIDER_MODEL_ID,
     base_namespace: str | None = None,
     grouped_agg_rule: str = "rule-all-group",
-    sem_topk_method: str = "pairwise-naive",
+    sem_topk_method: str | None = None,
     memory_thinking_enabled: bool = True,
     condition_id: str = "",
     maintenance_only: bool = False,
@@ -78,6 +93,10 @@ def run_agent_memory_bundle(
 
     if system_id not in AGENT_MEMORY_SYSTEMS:
         raise ValueError(f"unsupported agent-memory benchmark system {system_id!r}")
+    if sem_topk_method is None:
+        sem_topk_method = (
+            "pairwise-quick" if system_id == "mem0-enhanced" else "pairwise-naive"
+        )
     bundle_run_mode = bundle.metadata.get("run_mode")
     if bundle_run_mode is not None and (
         not isinstance(bundle_run_mode, str) or not bundle_run_mode
@@ -95,7 +114,15 @@ def run_agent_memory_bundle(
             "agent-memory",
             "lotus-ai",
             "pandas",
-            *(("neo4j", "sentence-transformers") if system_id == "zep-memory" else ()),
+            *(
+                ("neo4j", "sentence-transformers")
+                if system_id == "zep-memory"
+                else (
+                    ("qdrant-client", "sentence-transformers")
+                    if system_id in {"mem0-memory", "mem0-enhanced"}
+                    else ()
+                )
+            ),
         ),
     )
     validate_run_provenance(runtime_provenance, run_mode=run_mode)
@@ -106,6 +133,13 @@ def run_agent_memory_bundle(
     ):
         raise ValueError("maintenance checkpoint source and output must be different")
     input_adapter_id, retrieval_recipe_id = _BUILT_IN_CONTRACTS[system_id]
+    if system_id in {"mem0-memory", "mem0-enhanced"}:
+        if grouped_agg_rule != "rule-all-group":
+            raise ValueError(f"{system_id} does not use grouped aggregate rules")
+        if system_id == "mem0-memory" and sem_topk_method != "pairwise-naive":
+            raise ValueError("mem0-memory Base retrieval does not use sem_topk")
+        if memory_thinking_enabled:
+            raise ValueError(f"{system_id} benchmark requires thinking disabled")
     system_contract = MemorySystemContract(
         system_id=system_id,
         memory_model_id=memory_model_id,
@@ -113,11 +147,30 @@ def run_agent_memory_bundle(
         input_adapter_id=input_adapter_id,
         retrieval_recipe_id=(
             f"{retrieval_recipe_id}:{sem_topk_method}"
-            if system_id == "claude-memory"
+            if system_id in {"claude-memory", "mem0-enhanced"}
             else retrieval_recipe_id
         ),
-        condition_id=condition_id,
-        maintenance_rule=grouped_agg_rule,
+        condition_id=condition_id
+        or (
+            "AM-Mem0-Maintenance"
+            if maintenance_only
+            and system_id in {"mem0-memory", "mem0-enhanced"}
+            else "AM-Mem0-Base"
+            if system_id == "mem0-memory"
+            else "AM-Mem0-Enhanced"
+            if system_id == "mem0-enhanced"
+            else ""
+        ),
+        maintenance_policy_id=(
+            "mem0-memory"
+            if system_id in {"mem0-memory", "mem0-enhanced"}
+            else ""
+        ),
+        maintenance_rule=(
+            "mem0-additive-view:v1"
+            if system_id in {"mem0-memory", "mem0-enhanced"}
+            else grouped_agg_rule
+        ),
         thinking_enabled=memory_thinking_enabled,
         consolidation_mode="none",
         framework_cache_mode="disabled",
@@ -130,17 +183,37 @@ def run_agent_memory_bundle(
             sem_topk_method=sem_topk_method,
             thinking_enabled=memory_thinking_enabled,
         )
-    else:
+    elif system_id == "zep-memory":
         driver_factory = ZepMemoryDriverFactory.from_environment(
             base_namespace=base_namespace or _namespace(bundle.benchmark_id, output_dir),
             model_id=memory_provider_model_id,
             grouped_agg_rule=grouped_agg_rule,
             thinking_enabled=memory_thinking_enabled,
         )
+    elif system_id == "mem0-memory":
+        driver_factory = Mem0MemoryDriverFactory(
+            base_namespace=base_namespace or _namespace(bundle.benchmark_id, output_dir),
+            model_id=memory_provider_model_id,
+            thinking_enabled=memory_thinking_enabled,
+        )
+    else:
+        driver_factory = Mem0MemoryEnhancedDriverFactory(
+            base_namespace=base_namespace or _namespace(bundle.benchmark_id, output_dir),
+            model_id=memory_provider_model_id,
+            sem_topk_method=sem_topk_method,
+            thinking_enabled=memory_thinking_enabled,
+        )
     try:
         storage_provenance = (
             driver_factory.runtime_provenance()
-            if isinstance(driver_factory, ZepMemoryDriverFactory)
+            if isinstance(
+                driver_factory,
+                (
+                    ZepMemoryDriverFactory,
+                    Mem0MemoryDriverFactory,
+                    Mem0MemoryEnhancedDriverFactory,
+                ),
+            )
             else None
         )
         BenchmarkRunner(

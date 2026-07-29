@@ -129,7 +129,10 @@ def test_longmemeval_cli_rejects_explicit_claude_options_for_zep(
                 *option_args,
             ]
         )
-    assert "only valid with --system claude-memory" in capsys.readouterr().err
+    assert (
+        "only valid with --system claude-memory or --system mem0-enhanced"
+        in capsys.readouterr().err
+    )
 
 
 @pytest.mark.parametrize("system_id", ("claude-memory", "zep-memory"))
@@ -282,6 +285,24 @@ def test_memory_agent_bench_cli_has_explicit_four_source_smoke(tmp_path) -> None
     assert args.smoke is True
     assert args.sources is None
     assert args.nltk_data_dir.name == "nltk"
+
+
+def test_memory_agent_bench_cli_accepts_explicit_condition_id(tmp_path) -> None:
+    args = memory_agent_bench.parse_args(
+        [
+            "run",
+            "--bundle-dir",
+            str(tmp_path / "bundle"),
+            "--output-dir",
+            str(tmp_path / "output"),
+            "--system",
+            "claude-memory",
+            "--condition-id",
+            "MAB-JM-Q",
+        ]
+    )
+
+    assert args.condition_id == "MAB-JM-Q"
 
 
 @pytest.mark.parametrize("grouped_agg_rule", GROUPED_AGG_RULES)

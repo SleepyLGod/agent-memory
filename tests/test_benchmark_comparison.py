@@ -151,11 +151,12 @@ def test_comparison_writes_question_and_system_rows(tmp_path: Path) -> None:
             "condition_a": "first",
             "condition_b": "second",
             "losses_b": "0",
-            "mean_score_delta_b_minus_a": "0.0",
-            "question_count": "1",
-            "ties": "1",
-            "wins_b": "0",
-        }
+                "mean_score_delta_b_minus_a": "0.0",
+                "question_count": "1",
+                "scorer_id": "exact",
+                "ties": "1",
+                "wins_b": "0",
+            }
     ]
 
 
@@ -206,17 +207,19 @@ def test_comparison_counts_shared_maintenance_once(tmp_path: Path) -> None:
     )
     first = _run(tmp_path / "first", system_id="JM-Q")
     second = _run(tmp_path / "second", system_id="JM-L")
-    for run in (first, second):
+    third = _run(tmp_path / "third", system_id="AM-Mem0-Base")
+    for run in (first, second, third):
         manifest = json.loads((run / "manifest.json").read_text())
         manifest["maintenance_checkpoint_source"] = str(maintenance)
         _write_json(run / "manifest.json", manifest)
 
-    output = compare_benchmark_runs((first, second), tmp_path / "comparison")
+    output = compare_benchmark_runs((first, second, third), tmp_path / "comparison")
     summary = json.loads((output / "summary.json").read_text())
 
     assert summary["metrics"]["JM-Q"]["logical_total_cost_usd"] == 0.35
     assert summary["metrics"]["JM-L"]["logical_total_cost_usd"] == 0.35
-    assert summary["actual_paid_experiment_cost_usd"] == 0.6
+    assert summary["metrics"]["AM-Mem0-Base"]["logical_total_cost_usd"] == 0.35
+    assert summary["actual_paid_experiment_cost_usd"] == 0.85
 
 
 def test_comparison_rejects_missing_runtime_provenance(tmp_path: Path) -> None:
@@ -266,7 +269,7 @@ def test_comparison_rejects_thinking_mismatch(tmp_path: Path) -> None:
 
 
 def test_comparison_rejects_graph_storage_mismatch(tmp_path: Path) -> None:
-    storage = {
+    storage: dict[str, object] = {
         "connector": "neo4j",
         "image": "neo4j:5.26.2",
         "image_digest": "sha256:image",
@@ -282,6 +285,39 @@ def test_comparison_rejects_graph_storage_mismatch(tmp_path: Path) -> None:
         tmp_path / "second",
         system_id="zep-memory",
         storage_provenance={**storage, "driver_version": "6.2.0"},
+    )
+
+    with pytest.raises(ValueError, match="storage_provenance"):
+        compare_benchmark_runs((first, second), tmp_path / "comparison")
+
+
+@pytest.mark.parametrize("second_system_id", ["mem0-memory", "mem0-enhanced"])
+def test_comparison_rejects_mem0_qdrant_or_embedding_mismatch(
+    tmp_path: Path,
+    second_system_id: str,
+) -> None:
+    storage = {
+        "connector": "qdrant",
+        "mode": "embedded-local-single-owner",
+        "driver_version": "1.12.1",
+        "embedding_runtime_version": "3.4.1",
+        "embedding_model": "BAAI/bge-m3",
+        "embedding_revision": "revision",
+        "dimensions": 1024,
+        "device": "cpu",
+        "bm25_enabled": False,
+        "entity_boost_enabled": False,
+        "reranker_enabled": False,
+    }
+    first = _run(
+        tmp_path / "first",
+        system_id="native-mem0",
+        storage_provenance=storage,
+    )
+    second = _run(
+        tmp_path / "second",
+        system_id=second_system_id,
+        storage_provenance={**storage, "embedding_revision": "different"},
     )
 
     with pytest.raises(ValueError, match="storage_provenance"):

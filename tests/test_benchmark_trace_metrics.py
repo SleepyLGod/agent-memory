@@ -56,6 +56,7 @@ def test_normalize_provider_calls_deduplicates_agent_semantic_usage(
     assert rows[0] == {
         "trace_id": "provider-call",
         "logical_call_id": "call-1",
+        "framework_batch_id": "provider-call",
         "case_id": "",
         "event_id": "",
         "session_id": "",
@@ -175,3 +176,44 @@ def test_provider_summary_keeps_unknown_cost_explicit(tmp_path: Path) -> None:
     assert summary["estimated_cost_usd"] is None
     assert summary["phases"]["answering"]["estimated_cost_usd"] == 5.6e-07
     assert summary["phases"]["retrieval"]["estimated_cost_usd"] is None
+
+
+def test_normalize_provider_calls_preserves_batch_identity_and_usage(
+    tmp_path: Path,
+) -> None:
+    events = []
+    for batch_id, size in (("batch-1", 3), ("batch-2", 2), ("batch-3", 1)):
+        for item_index in range(size):
+            events.append(
+                {
+                    "trace_id": f"{batch_id}-{item_index}",
+                    "event_type": "provider_usage",
+                    "operator": "sem_topk",
+                    "operator_call_id": "logical-1",
+                    "provider_batch_id": batch_id,
+                    "provider_item_index": item_index,
+                    "phase": "retrieval",
+                    "model": "deepseek-v4-flash",
+                    "provider_usage_available": True,
+                    "provider_prompt_tokens": 10,
+                    "provider_prompt_cache_hit_tokens": 6,
+                    "provider_prompt_cache_miss_tokens": 4,
+                    "provider_completion_tokens": 2,
+                }
+            )
+
+    rows = normalize_provider_calls(events, output_dir=tmp_path)
+    summary = summarize_provider_calls(rows)
+
+    assert {row["logical_call_id"] for row in rows} == {"logical-1"}
+    assert {row["framework_batch_id"] for row in rows} == {
+        "batch-1",
+        "batch-2",
+        "batch-3",
+    }
+    assert summary["provider_call_count"] == 6
+    assert summary["prompt_tokens"] == 60
+    assert summary["cache_hit_tokens"] == 36
+    assert summary["cache_miss_tokens"] == 24
+    assert summary["completion_tokens"] == 12
+    assert summary["estimated_cost_usd"] == 6.8208e-06

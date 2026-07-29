@@ -113,6 +113,7 @@ def longmemeval_task_contract(
         answer_prompt_digest=LONGMEMEVAL_ANSWER_PROMPT_DIGEST,
         scorer_id=scorer_id,
         scorer_digest=LONGMEMEVAL_JUDGE_PROMPT_DIGEST,
+        memory_system_error_score=0.0,
         judge_plan=_judge_plan,
         judge_reducer=judge_reducer,
     )

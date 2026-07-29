@@ -65,6 +65,7 @@ class MemorySystemContract:
     input_adapter_id: str
     retrieval_recipe_id: str
     condition_id: str = ""
+    maintenance_policy_id: str = ""
     maintenance_rule: str = ""
     thinking_enabled: bool | None = None
     consolidation_mode: str = "none"
@@ -87,6 +88,10 @@ class MemorySystemContract:
             raise TypeError("checkpoint_enabled must be a bool")
         if self.condition_id and not isinstance(self.condition_id, str):
             raise TypeError("condition_id must be a string")
+        if self.maintenance_policy_id and not isinstance(
+            self.maintenance_policy_id, str
+        ):
+            raise TypeError("maintenance_policy_id must be a string")
         if self.thinking_enabled is not None and not isinstance(
             self.thinking_enabled, bool
         ):
@@ -104,7 +109,19 @@ class MemorySystemContract:
     def effective_condition_id(self) -> str:
         """Return the unique experiment identity used in reports."""
 
-        return self.condition_id or self.system_id
+        if self.condition_id:
+            return self.condition_id
+        maintenance = self.maintenance_rule or "none"
+        return (
+            f"{self.system_id}|maintenance={maintenance}"
+            f"|retrieval={self.retrieval_recipe_id}"
+        )
+
+    @property
+    def effective_maintenance_policy_id(self) -> str:
+        """Return the explicit compatibility identity for maintenance state."""
+
+        return self.maintenance_policy_id or self.system_id
 
     @property
     def maintenance_fingerprint(self) -> str:
@@ -112,7 +129,8 @@ class MemorySystemContract:
 
         return _digest(
             {
-                "system_id": self.system_id,
+                # Keep this key for stable fingerprints of existing contracts.
+                "system_id": self.effective_maintenance_policy_id,
                 "memory_model_id": self.memory_model_id,
                 "memory_provider_model_id": self.memory_provider_model_id,
                 "input_adapter_id": self.input_adapter_id,
@@ -215,6 +233,46 @@ class JudgeStep:
 
 
 @dataclass(frozen=True)
+class GradeContract:
+    """One independently recorded scorer applied to a generated answer."""
+
+    scorer_id: str
+    scorer_digest: str
+    deterministic_scorer: Callable[[BenchmarkQuestion, str], GradeResult] | None = None
+    judge_plan: Callable[[BenchmarkQuestion, str], tuple[JudgeStep, ...]] | None = None
+    judge_reducer: Callable[
+        [BenchmarkQuestion, str, tuple[Any, ...]], GradeResult
+    ] | None = None
+    applies_to: Callable[[BenchmarkQuestion], bool] | None = None
+
+    def __post_init__(self) -> None:
+        if not self.scorer_id or not self.scorer_digest:
+            raise ValueError("grade scorer ID and digest must be non-empty")
+        deterministic = self.deterministic_scorer is not None
+        judged = self.judge_plan is not None or self.judge_reducer is not None
+        if deterministic == judged:
+            raise ValueError(
+                "GradeContract requires exactly one deterministic or LLM judge path"
+            )
+        if judged and (self.judge_plan is None or self.judge_reducer is None):
+            raise ValueError("LLM grade contracts require both plan and reducer")
+
+    def applies(self, question: BenchmarkQuestion) -> bool:
+        """Return whether this scorer evaluates the question."""
+
+        return self.applies_to is None or self.applies_to(question)
+
+    @property
+    def fingerprint_payload(self) -> Mapping[str, str]:
+        """Return the stable declared scorer contract."""
+
+        return {
+            "scorer_id": self.scorer_id,
+            "scorer_digest": self.scorer_digest,
+        }
+
+
+@dataclass(frozen=True)
 class TaskContract:
     """Benchmark task behavior independent of any memory system."""
 
@@ -232,6 +290,7 @@ class TaskContract:
     judge_reducer: Callable[
         [BenchmarkQuestion, str, tuple[Any, ...]], GradeResult
     ] | None = None
+    additional_graders: tuple[GradeContract, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.task_id:
@@ -248,6 +307,24 @@ class TaskContract:
             )
         if judged and (self.judge_plan is None or self.judge_reducer is None):
             raise ValueError("LLM judge contracts require both plan and reducer")
+        if any(not isinstance(grader, GradeContract) for grader in self.additional_graders):
+            raise TypeError("additional graders must be GradeContract values")
+        scorer_ids = [grader.scorer_id for grader in self.graders]
+        if len(scorer_ids) != len(set(scorer_ids)):
+            raise ValueError("task scorer IDs must be unique")
+
+    @property
+    def graders(self) -> tuple[GradeContract, ...]:
+        """Return the primary scorer followed by optional secondary scorers."""
+
+        primary = GradeContract(
+            scorer_id=self.scorer_id,
+            scorer_digest=self.scorer_digest,
+            deterministic_scorer=self.deterministic_scorer,
+            judge_plan=self.judge_plan,
+            judge_reducer=self.judge_reducer,
+        )
+        return (primary, *self.additional_graders)
 
     @property
     def fingerprint(self) -> str:
@@ -259,6 +336,10 @@ class TaskContract:
                 "answer_prompt_digest": self.answer_prompt_digest,
                 "scorer_id": self.scorer_id,
                 "scorer_digest": self.scorer_digest,
+                "additional_graders": [
+                    dict(grader.fingerprint_payload)
+                    for grader in self.additional_graders
+                ],
                 "checkpoint_boundary": self.checkpoint_boundary,
                 "memory_system_error_score": self.memory_system_error_score,
             }
@@ -334,6 +415,10 @@ class BenchmarkRunner:
             task_id: {
                 "scorer_id": self.contracts[task_id].scorer_id,
                 "scorer_digest": self.contracts[task_id].scorer_digest,
+                "additional_graders": [
+                    dict(grader.fingerprint_payload)
+                    for grader in self.contracts[task_id].additional_graders
+                ],
             }
             for task_id in sorted(required_task_ids)
         }
@@ -400,6 +485,7 @@ class BenchmarkRunner:
         state_dir = self.artifacts.start_case(case, contract.fingerprint)
         attempt = int(state_dir.name.removeprefix("attempt-"))
         # Drivers receive only an opaque case identity, never questions or gold labels.
+        setup_started = perf_counter()
         try:
             driver = self.driver_factory(
                 case.case_id,
@@ -407,6 +493,18 @@ class BenchmarkRunner:
                 self.artifacts.trace_dir,
             )
         except BaseException as error:
+            setup_latency_ms = round((perf_counter() - setup_started) * 1000, 3)
+            self.artifacts.trace_stage(
+                phase="driver_setup",
+                case_id=case.case_id,
+                payload={
+                    "attempt": attempt,
+                    "status": "error",
+                    "latency_ms": setup_latency_ms,
+                    "error_type": type(error).__name__,
+                    "error": str(error),
+                },
+            )
             self.artifacts.fail_case(
                 case,
                 contract.fingerprint,
@@ -420,6 +518,15 @@ class BenchmarkRunner:
                 },
             )
             raise
+        self.artifacts.trace_stage(
+            phase="driver_setup",
+            case_id=case.case_id,
+            payload={
+                "attempt": attempt,
+                "status": "success",
+                "latency_ms": round((perf_counter() - setup_started) * 1000, 3),
+            },
+        )
         if driver.system_id != self.system_id:
             raise ValueError(
                 f"driver system_id {driver.system_id!r} does not match run "
@@ -451,10 +558,16 @@ class BenchmarkRunner:
             completed_count = 0
             if checkpoint is not None:
                 restore_started = perf_counter()
-                driver.restore_state(
-                    checkpoint.directory / "driver",
-                    checkpoint.completed_events,
-                )
+                with semantic_trace_scope(
+                    phase="checkpoint",
+                    case_id=case.case_id,
+                    attempt=attempt,
+                    operation="restore",
+                ):
+                    driver.restore_state(
+                        checkpoint.directory / "driver",
+                        checkpoint.completed_events,
+                    )
                 completed_count = len(checkpoint.completed_events)
                 self.artifacts.trace_stage(
                     phase="checkpoint",
@@ -678,36 +791,51 @@ class BenchmarkRunner:
             },
         )
 
-        grade_started = perf_counter()
-        if contract.deterministic_scorer is not None:
-            grade = contract.deterministic_scorer(question, answer)
-        else:
-            assert contract.judge_plan is not None
-            assert contract.judge_reducer is not None
-            parsed_steps = tuple(
-                self._complete_and_parse(
-                    case=case,
-                    question=question,
-                    prompt=step.prompt,
-                    phase="grading",
-                    parse=step.parse,
-                    model=self.judge_model,
+        for grader_index, grader_contract in enumerate(contract.graders):
+            if not grader_contract.applies(question):
+                continue
+            grade_started = perf_counter()
+            if grader_contract.deterministic_scorer is not None:
+                grade = grader_contract.deterministic_scorer(question, answer)
+            else:
+                assert grader_contract.judge_plan is not None
+                assert grader_contract.judge_reducer is not None
+                parsed_steps = tuple(
+                    self._complete_and_parse(
+                        case=case,
+                        question=question,
+                        prompt=step.prompt,
+                        phase="grading",
+                        parse=step.parse,
+                        model=self.judge_model,
+                    )
+                    for step in grader_contract.judge_plan(question, answer)
                 )
-                for step in contract.judge_plan(question, answer)
+                grade = grader_contract.judge_reducer(
+                    question,
+                    answer,
+                    parsed_steps,
+                )
+            if grade.scorer_id != grader_contract.scorer_id:
+                raise ValueError(
+                    "grade result scorer_id does not match its declared contract"
+                )
+            self.artifacts.append_case_row(
+                case.case_id,
+                "grades",
+                {
+                    "question_id": question.question_id,
+                    "scorer_id": grade.scorer_id,
+                    "score": grade.score,
+                    "label": grade.label,
+                    "details": grade.details,
+                    "primary": grader_index == 0,
+                    "latency_ms": round(
+                        (perf_counter() - grade_started) * 1000,
+                        3,
+                    ),
+                },
             )
-            grade = contract.judge_reducer(question, answer, parsed_steps)
-        self.artifacts.append_case_row(
-            case.case_id,
-            "grades",
-            {
-                "question_id": question.question_id,
-                "scorer_id": grade.scorer_id,
-                "score": grade.score,
-                "label": grade.label,
-                "details": grade.details,
-                "latency_ms": round((perf_counter() - grade_started) * 1000, 3),
-            },
-        )
 
     def _retrieve_question(
         self,
@@ -810,23 +938,27 @@ class BenchmarkRunner:
                 "latency_ms": None,
             },
         )
-        self.artifacts.append_case_row(
-            case.case_id,
-            "grades",
-            {
-                "question_id": question.question_id,
-                "scorer_id": contract.scorer_id,
-                "score": 0.0,
-                "label": "system_error",
-                "details": {
-                    "grade_source": "benchmark_failure_policy",
-                    "failed_phase": "retrieval",
-                    "error_type": error_type,
-                    "error": error_message,
+        for grader_index, grader in enumerate(contract.graders):
+            if not grader.applies(question):
+                continue
+            self.artifacts.append_case_row(
+                case.case_id,
+                "grades",
+                {
+                    "question_id": question.question_id,
+                    "scorer_id": grader.scorer_id,
+                    "score": 0.0,
+                    "label": "system_error",
+                    "details": {
+                        "grade_source": "benchmark_failure_policy",
+                        "failed_phase": "retrieval",
+                        "error_type": error_type,
+                        "error": error_message,
+                    },
+                    "primary": grader_index == 0,
+                    "latency_ms": None,
                 },
-                "latency_ms": None,
-            },
-        )
+            )
         self.artifacts.trace_stage(
             phase="retrieval",
             case_id=case.case_id,
@@ -899,24 +1031,28 @@ class BenchmarkRunner:
                     "latency_ms": None,
                 },
             )
-            self.artifacts.append_case_row(
-                case.case_id,
-                "grades",
-                {
-                    "question_id": question.question_id,
-                    "scorer_id": contract.scorer_id,
-                    "score": contract.memory_system_error_score,
-                    "label": "system_error",
-                    "details": {
-                        "grade_source": "benchmark_failure_policy",
-                        "failed_phase": phase,
-                        "event_id": event_id,
-                        "error_type": error_type,
-                        "error": error_message,
+            for grader_index, grader in enumerate(contract.graders):
+                if not grader.applies(question):
+                    continue
+                self.artifacts.append_case_row(
+                    case.case_id,
+                    "grades",
+                    {
+                        "question_id": question.question_id,
+                        "scorer_id": grader.scorer_id,
+                        "score": contract.memory_system_error_score,
+                        "label": "system_error",
+                        "details": {
+                            "grade_source": "benchmark_failure_policy",
+                            "failed_phase": phase,
+                            "event_id": event_id,
+                            "error_type": error_type,
+                            "error": error_message,
+                        },
+                        "primary": grader_index == 0,
+                        "latency_ms": None,
                     },
-                    "latency_ms": None,
-                },
-            )
+                )
 
     def _complete_and_parse(
         self,
@@ -993,6 +1129,7 @@ __all__ = [
     "BenchmarkModel",
     "BenchmarkRunner",
     "GradeResult",
+    "GradeContract",
     "JudgeStep",
     "MemorySystemContract",
     "MemorySystemDriver",
