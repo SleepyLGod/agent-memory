@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
+from math import isfinite
 from time import perf_counter
-from typing import Any
+from typing import Any, cast
 
 import pandas as pd
 
@@ -48,12 +49,12 @@ def execute_search(
         mapping=mapping,
         embedding_provider=embedding_provider,
     )
-    # Retrieval methods produce independent candidates; the reranker owns final order.
+    # Methods produce candidates; an optional reranker may replace their order.
     rankings: list[list[dict[str, Any]]] = []
     method_metrics: list[dict[str, Any]] = []
-    candidate_limit = request.limit * 2
     for method in request.methods:
         method_started = perf_counter()
+        candidate_limit = _candidate_limit(method, default=request.limit * 2)
         rows = _execute_method(
             session,
             request=request,
@@ -97,15 +98,20 @@ def execute_search(
             zip(range(1, request.limit + 1), ordered_ids[: request.limit], strict=False)
         )
     ]
-    metrics = {
-        "methods": method_metrics,
-        "bfs_origins": list(request.origin_record_ids),
-        "reranker": {
+    reranker_metrics = (
+        None
+        if request.reranker is None
+        else {
             "kind": request.reranker.kind,
             "input_candidate_ids": list(candidates),
             "candidate_ids": ordered_ids[: request.limit],
             "scores": scores[: request.limit],
-        },
+        }
+    )
+    metrics = {
+        "methods": method_metrics,
+        "bfs_origins": list(request.origin_record_ids),
+        "reranker": reranker_metrics,
         "latency_ms": (perf_counter() - started) * 1000,
     }
     return SearchBatch(
@@ -155,6 +161,7 @@ def _execute_method(
         query, parameters = _cosine_query(
             request,
             mapping=mapping,
+            method=method,
             query_vector=query_vector,
             candidate_limit=candidate_limit,
         )
@@ -171,7 +178,17 @@ def _execute_method(
     result = session.run(query, **parameters)
     data = getattr(result, "data", None)
     rows = data() if callable(data) else [dict(record) for record in result]
-    return [dict(row) for row in rows]
+    return [
+        dict(row)
+        for row in cast(Iterable[Mapping[str, Any]], rows)
+    ]
+
+
+def _candidate_limit(method: SearchMethodSpec, *, default: int) -> int:
+    value = method.params.get("candidate_limit", default)
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError("search candidate_limit must be a positive integer")
+    return value
 
 
 def _fulltext_query(
@@ -219,18 +236,21 @@ def _cosine_query(
     request: SearchRequest,
     *,
     mapping: Neo4jNodeMapping | Neo4jRelationshipMapping,
+    method: SearchMethodSpec,
     query_vector: list[float],
     candidate_limit: int,
 ) -> tuple[str, dict[str, Any]]:
     if mapping.embedding is None:
         raise ValueError("cosine search requires an embedding mapping")
     embedding_property = mapping.embedding.property_name
+    minimum_score = _minimum_score(method, default=0.6)
+    score_operator = ">=" if "min_score" in method.params else ">"
     if isinstance(mapping, Neo4jNodeMapping):
         query = f"""
         MATCH (record:{mapping.label})
         WHERE record.group_id = $namespace AND record.{embedding_property} IS NOT NULL
         WITH record, vector.similarity.cosine(record.{embedding_property}, $query_vector) AS method_score
-        WHERE method_score > $minimum_score
+        WHERE method_score {score_operator} $minimum_score
         RETURN record.uuid AS record_id, properties(record) AS properties, method_score
         ORDER BY method_score DESC
         LIMIT $candidate_limit
@@ -240,7 +260,7 @@ def _cosine_query(
         MATCH ()-[record:{mapping.relationship_type}]->()
         WHERE record.group_id = $namespace AND record.{embedding_property} IS NOT NULL
         WITH record, vector.similarity.cosine(record.{embedding_property}, $query_vector) AS method_score
-        WHERE method_score > $minimum_score
+        WHERE method_score {score_operator} $minimum_score
         RETURN record.uuid AS record_id, properties(record) AS properties, method_score
         ORDER BY method_score DESC
         LIMIT $candidate_limit
@@ -248,9 +268,19 @@ def _cosine_query(
     return query, {
         "namespace": request.namespace,
         "query_vector": query_vector,
-        "minimum_score": 0.6,
+        "minimum_score": minimum_score,
         "candidate_limit": candidate_limit,
     }
+
+
+def _minimum_score(method: SearchMethodSpec, *, default: float) -> float:
+    value = method.params.get("min_score", default)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError("cosine min_score must be a number")
+    normalized = float(value)
+    if not isfinite(normalized) or not -1.0 <= normalized <= 1.0:
+        raise ValueError("cosine min_score must be between -1 and 1")
+    return normalized
 
 
 def _bfs_query(
@@ -301,6 +331,15 @@ def _rerank(
     readable_properties: Mapping[str, str],
     reranker_provider: CrossEncoderProvider | None,
 ) -> tuple[list[str], list[float]]:
+    if request.reranker is None:
+        if len(rankings) != 1:
+            raise ValueError(
+                "Neo4j search without a reranker requires exactly one method"
+            )
+        return (
+            [str(row["record_id"]) for row in rankings[0]],
+            [float(row["method_score"]) for row in rankings[0]],
+        )
     if request.reranker.kind == "rrf":
         return _rrf(
             [[str(row["record_id"]) for row in ranking] for ranking in rankings]

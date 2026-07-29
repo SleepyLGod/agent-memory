@@ -7,6 +7,11 @@ from .connector import (
     StorageTransaction,
 )
 from .deployment import StorageDeployment
+from .embedding import (
+    EmbeddingProvider,
+    EmbeddingSpec,
+    SentenceTransformerEmbeddingProvider,
+)
 from .schema import Schema, SchemaColumn
 from .search import CrossEncoderProvider, SearchBatch, SearchConnector, SearchRequest
 from .statements import InsertStatement, StatementSet
@@ -16,11 +21,14 @@ __all__ = [
     "InsertStatement",
     "ConnectorMapping",
     "CrossEncoderProvider",
+    "EmbeddingProvider",
+    "EmbeddingSpec",
     "Schema",
     "SchemaColumn",
     "SearchBatch",
     "SearchConnector",
     "SearchRequest",
+    "SentenceTransformerEmbeddingProvider",
     "StatementSet",
     "StorageCommit",
     "StorageConflictError",
