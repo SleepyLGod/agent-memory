@@ -6,7 +6,6 @@ from datetime import datetime, timezone
 
 from agent_memory.api import Log, Memory
 from agent_memory.policy.logical import UserQuery
-from agent_memory.policy.retrieval import BM25, CosineSimilarity, RRF
 
 
 WINDOW_SIZE = 40
@@ -120,9 +119,4 @@ class SimpleMemMemory(Memory):
         )
     )
 
-    retrieval_query = facts.search(
-        UserQuery(),
-        methods=[BM25(), CosineSimilarity()],
-        reranker=RRF(),
-        limit=25,
-    )
+    retrieval_query = facts.sem_topk(UserQuery(), 25)

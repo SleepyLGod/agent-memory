@@ -1,9 +1,4 @@
-"""Real LOTUS-backed SimpleMemMemory e2e demo over LOCOMO rows.
-
-Run with a local .env containing DEEPSEEK_API_KEY, or export the key in the
-shell before running this script. The script writes local CSV artifacts under
-.memory-test/ so the maintained memory tables can be inspected manually.
-"""
+"""Real LOTUS-backed SimpleMemMemory e2e demo over LOCOMO rows."""
 
 from __future__ import annotations
 
@@ -53,6 +48,7 @@ DEFAULT_SAMPLE_LIMIT = 1
 DEFAULT_START_ROW = 26
 DEFAULT_ROW_LIMIT = 43
 DEFAULT_QUERY = "Which memories are most useful for future collaboration style?"
+DEFAULT_MODEL = DEFAULT_LOTUS_MODEL
 USAGE_FIELDS = (
     "physical_prompt_tokens",
     "physical_completion_tokens",
@@ -90,8 +86,8 @@ def parse_args() -> argparse.Namespace:
         help="Retrieval query to run after maintaining memory.",
     )
     parser.add_argument(
-        "--model", default=DEFAULT_LOTUS_MODEL,
-        help=f"LiteLLM model passed to LotusAdapter. Defaults to {DEFAULT_LOTUS_MODEL}.",
+        "--model", default=DEFAULT_MODEL,
+        help=f"LiteLLM model passed to LotusAdapter. Defaults to {DEFAULT_MODEL}.",
     )
     parser.add_argument(
         "--print-steps", action="store_true",
@@ -253,7 +249,11 @@ def main() -> None:
 
     adapter = LotusAdapter(
         model=args.model,
-        config=LotusExecutionConfig(semantic_trace_dir=trace_dir),
+        config=LotusExecutionConfig(
+            semantic_trace_dir=trace_dir,
+            structured_max_tokens=16384,
+            lm_model_kwargs={"max_tokens": 16384},
+        ),
     )
     memory = SimpleMemMemory(adapter=adapter)
     step_metrics: list[dict[str, Any]] = []
