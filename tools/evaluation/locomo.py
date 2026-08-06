@@ -72,6 +72,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         choices=("pairwise-naive", "pairwise-quick", "pairwise-heap", "listwise"),
         default=None,
     )
+    run.add_argument("--sem-groupby-pair-batch-size", type=int)
+    run.add_argument("--sem-groupby-pair-batch-retries", type=int, default=0)
     args = parser.parse_args(raw_args)
     if args.command == "run":
         invalid = [
@@ -151,6 +153,8 @@ def main(argv: Sequence[str] | None = None) -> Path:
         base_namespace=args.namespace,
         grouped_agg_rule=args.grouped_agg_rule,
         sem_topk_method=args.sem_topk_method,
+        sem_groupby_pair_batch_size=args.sem_groupby_pair_batch_size,
+        sem_groupby_pair_batch_retries=args.sem_groupby_pair_batch_retries,
         memory_thinking_enabled=False,
         condition_id=args.condition_id or "",
         maintenance_only=args.maintenance_only,

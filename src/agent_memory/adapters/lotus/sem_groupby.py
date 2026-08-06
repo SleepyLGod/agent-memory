@@ -43,6 +43,8 @@ def execute_sem_groupby(
             label_col=str(query.params.get("label_col", "_label")),
             instruction=str(query.params["instruction"]),
             default=context.config.sem_groupby_default,
+            pair_batch_size=context.config.sem_groupby_pair_batch_size,
+            pair_batch_retries=context.config.sem_groupby_pair_batch_retries,
             trace_dir=context.config.trace_dir(),
         )
     if labels:
@@ -60,6 +62,8 @@ def execute_sem_groupby(
         input_cols=input_cols,
         instruction=str(query.params["instruction"]),
         default=context.config.sem_groupby_default,
+        pair_batch_size=context.config.sem_groupby_pair_batch_size,
+        pair_batch_retries=context.config.sem_groupby_pair_batch_retries,
         trace_dir=context.config.trace_dir(),
     )
     result = assign_semantic_group_ids(
@@ -93,6 +97,8 @@ def execute_partitioned_sem_groupby(
     label_col: str,
     instruction: str,
     default: bool,
+    pair_batch_size: int | None,
+    pair_batch_retries: int,
     trace_dir: Any,
 ) -> pd.DataFrame:
     """Assign semantic group ids independently within deterministic partitions."""
@@ -125,6 +131,8 @@ def execute_partitioned_sem_groupby(
                 input_cols=input_cols,
                 instruction=instruction,
                 default=default,
+                pair_batch_size=pair_batch_size,
+                pair_batch_retries=pair_batch_retries,
                 trace_dir=trace_dir,
             )
             result = assign_semantic_group_ids(
@@ -327,6 +335,8 @@ def evaluate_group_matches(
     input_cols: Sequence[str],
     instruction: str,
     default: bool = False,
+    pair_batch_size: int | None = None,
+    pair_batch_retries: int = 0,
     trace_dir: Any = None,
 ) -> list[tuple[int, int]]:
     """Evaluate candidate row pairs with LOTUS sem_filter."""
@@ -338,8 +348,12 @@ def evaluate_group_matches(
     from lotus.sem_ops.sem_filter import sem_filter
     from lotus.templates import task_instructions
 
+    if pair_batch_size is not None and pair_batch_size < 1:
+        raise ValueError("sem_groupby pair_batch_size must be positive")
+    if pair_batch_retries < 0:
+        raise ValueError("sem_groupby pair_batch_retries cannot be negative")
+
     pairs = semantic_pair_candidates(unique_rows, input_cols)
-    docs = task_instructions.df2multimodal_info(pairs, ["left", "right"])
     lowered_instruction = lower_pairwise_grouping_instruction(
         instruction,
         input_cols=input_cols,
@@ -348,26 +362,115 @@ def evaluate_group_matches(
         "{left} and {right} satisfy this semantic grouping condition: "
         f"{lowered_instruction}"
     )
-    output = sem_filter(
-        docs,
-        lotus.settings.lm,
-        user_instruction,
-        default=default,
-        progress_bar_desc="Grouping comparisons",
-    )
+    batch_size = pair_batch_size or len(pairs)
+    parsed_outputs: list[bool] = []
+    raw_outputs: list[Any] = []
+    explanations: list[Any] = []
+    for start in range(0, len(pairs), batch_size):
+        pair_batch = pairs.iloc[start : start + batch_size].reset_index(drop=True)
+        docs = task_instructions.df2multimodal_info(pair_batch, ["left", "right"])
+        output = evaluate_group_match_batch(
+            sem_filter,
+            docs=docs,
+            lm=lotus.settings.lm,
+            instruction=user_instruction,
+            default=default,
+            retries=pair_batch_retries,
+        )
+        batch_outputs = list(output.outputs)
+        if len(batch_outputs) != len(pair_batch):
+            raise ValueError(
+                "sem_groupby pair batch returned an unexpected number of outputs: "
+                f"expected {len(pair_batch)}, got {len(batch_outputs)}"
+            )
+        parsed_outputs.extend(bool(value) for value in batch_outputs)
+        raw_outputs.extend(
+            aligned_batch_values(output, "raw_outputs", len(pair_batch), "")
+        )
+        explanations.extend(
+            aligned_batch_values(output, "explanations", len(pair_batch), "")
+        )
+
     write_groupby_pair_trace(
         trace_dir,
         pairs,
         source_instruction=instruction,
         instruction=user_instruction,
-        output=output,
+        outputs=parsed_outputs,
+        raw_outputs=raw_outputs,
+        explanations=explanations,
         default=default,
     )
     return [
         (int(row["_left_unique_id"]), int(row["_right_unique_id"]))
-        for (_index, row), keep in zip(pairs.iterrows(), output.outputs)
+        for (_index, row), keep in zip(pairs.iterrows(), parsed_outputs)
         if keep
     ]
+
+
+def evaluate_group_match_batch(
+    sem_filter: Callable[..., Any],
+    *,
+    docs: Sequence[Any],
+    lm: Any,
+    instruction: str,
+    default: bool,
+    retries: int,
+) -> Any:
+    """Evaluate one physical pair batch, retrying only transient provider failures."""
+
+    for attempt in range(retries + 1):
+        try:
+            return sem_filter(
+                docs,
+                lm,
+                instruction,
+                default=default,
+                progress_bar_desc="Grouping comparisons",
+            )
+        except Exception as error:
+            if attempt >= retries or not is_retryable_group_match_error(error):
+                raise
+    raise AssertionError("sem_groupby pair batch retry loop did not return or raise")
+
+
+def aligned_batch_values(
+    output: Any,
+    attribute: str,
+    expected: int,
+    fill: Any,
+) -> list[Any]:
+    """Return one optional output value per pair without shifting later batches."""
+
+    values = list(getattr(output, attribute, ()) or ())
+    if len(values) < expected:
+        values.extend(fill for _ in range(expected - len(values)))
+    return values[:expected]
+
+
+def is_retryable_group_match_error(error: Exception) -> bool:
+    """Return whether LOTUS surfaced a transient LiteLLM provider failure."""
+
+    from litellm.exceptions import (
+        APIConnectionError,
+        BadGatewayError,
+        InternalServerError,
+        RateLimitError,
+        ServiceUnavailableError,
+        Timeout,
+    )
+
+    return isinstance(
+        error,
+        (
+            APIConnectionError,
+            BadGatewayError,
+            InternalServerError,
+            RateLimitError,
+            ServiceUnavailableError,
+            Timeout,
+        ),
+    )
 
 
 def lower_pairwise_grouping_instruction(
@@ -402,13 +505,13 @@ def write_groupby_pair_trace(
     *,
     source_instruction: str,
     instruction: str,
-    output: Any,
+    outputs: Sequence[bool],
+    raw_outputs: Sequence[Any],
+    explanations: Sequence[Any],
     default: bool,
 ) -> None:
     """Write one sem_groupby trace row per evaluated pair."""
 
-    raw_outputs = list(getattr(output, "raw_outputs", ()))
-    explanations = list(getattr(output, "explanations", ()))
     rows: list[dict[str, Any]] = []
     for index, (_row_index, pair) in enumerate(pairs.iterrows()):
         rows.append(
@@ -420,7 +523,7 @@ def write_groupby_pair_trace(
                 "right_unique_id": int(pair["_right_unique_id"]),
                 "left": pair["left"],
                 "right": pair["right"],
-                "parsed_output": bool(output.outputs[index]),
+                "parsed_output": bool(outputs[index]),
                 "raw_output": raw_outputs[index] if index < len(raw_outputs) else "",
                 "explanation": explanations[index] if index < len(explanations) else "",
                 "default": default,

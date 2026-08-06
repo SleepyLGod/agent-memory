@@ -83,6 +83,8 @@ def run_agent_memory_bundle(
     base_namespace: str | None = None,
     grouped_agg_rule: str = "rule-all-group",
     sem_topk_method: str | None = None,
+    sem_groupby_pair_batch_size: int | None = None,
+    sem_groupby_pair_batch_retries: int = 0,
     memory_thinking_enabled: bool = True,
     condition_id: str = "",
     maintenance_only: bool = False,
@@ -93,6 +95,10 @@ def run_agent_memory_bundle(
 
     if system_id not in AGENT_MEMORY_SYSTEMS:
         raise ValueError(f"unsupported agent-memory benchmark system {system_id!r}")
+    if sem_groupby_pair_batch_size is not None and sem_groupby_pair_batch_size < 1:
+        raise ValueError("sem_groupby_pair_batch_size must be positive")
+    if sem_groupby_pair_batch_retries < 0:
+        raise ValueError("sem_groupby_pair_batch_retries cannot be negative")
     if sem_topk_method is None:
         sem_topk_method = (
             "pairwise-quick" if system_id == "mem0-enhanced" else "pairwise-naive"
@@ -125,6 +131,10 @@ def run_agent_memory_bundle(
             ),
         ),
     )
+    runtime_provenance["runtime"]["lotus_execution"] = {
+        "sem_groupby_pair_batch_size": sem_groupby_pair_batch_size,
+        "sem_groupby_pair_batch_retries": sem_groupby_pair_batch_retries,
+    }
     validate_run_provenance(runtime_provenance, run_mode=run_mode)
     _require_environment(system_id)
     if (
@@ -181,6 +191,8 @@ def run_agent_memory_bundle(
             model_id=memory_provider_model_id,
             grouped_agg_rule=grouped_agg_rule,
             sem_topk_method=sem_topk_method,
+            sem_groupby_pair_batch_size=sem_groupby_pair_batch_size,
+            sem_groupby_pair_batch_retries=sem_groupby_pair_batch_retries,
             thinking_enabled=memory_thinking_enabled,
         )
     elif system_id == "zep-memory":
@@ -188,12 +200,16 @@ def run_agent_memory_bundle(
             base_namespace=base_namespace or _namespace(bundle.benchmark_id, output_dir),
             model_id=memory_provider_model_id,
             grouped_agg_rule=grouped_agg_rule,
+            sem_groupby_pair_batch_size=sem_groupby_pair_batch_size,
+            sem_groupby_pair_batch_retries=sem_groupby_pair_batch_retries,
             thinking_enabled=memory_thinking_enabled,
         )
     elif system_id == "mem0-memory":
         driver_factory = Mem0MemoryDriverFactory(
             base_namespace=base_namespace or _namespace(bundle.benchmark_id, output_dir),
             model_id=memory_provider_model_id,
+            sem_groupby_pair_batch_size=sem_groupby_pair_batch_size,
+            sem_groupby_pair_batch_retries=sem_groupby_pair_batch_retries,
             thinking_enabled=memory_thinking_enabled,
         )
     else:
@@ -201,6 +217,8 @@ def run_agent_memory_bundle(
             base_namespace=base_namespace or _namespace(bundle.benchmark_id, output_dir),
             model_id=memory_provider_model_id,
             sem_topk_method=sem_topk_method,
+            sem_groupby_pair_batch_size=sem_groupby_pair_batch_size,
+            sem_groupby_pair_batch_retries=sem_groupby_pair_batch_retries,
             thinking_enabled=memory_thinking_enabled,
         )
     try:

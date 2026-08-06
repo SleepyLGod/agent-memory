@@ -382,6 +382,8 @@ class ClaudeMemoryDriverFactory:
         model_id: str = "deepseek/deepseek-v4-flash",
         grouped_agg_rule: str = "rule-all-group",
         sem_topk_method: str = "pairwise-naive",
+        sem_groupby_pair_batch_size: int | None = None,
+        sem_groupby_pair_batch_retries: int = 0,
         thinking_enabled: bool = True,
     ) -> None:
         from agent_memory.adapters.lotus.context import SEM_TOPK_METHODS
@@ -398,6 +400,8 @@ class ClaudeMemoryDriverFactory:
         self.model_id = model_id
         self.grouped_agg_rule = grouped_agg_rule
         self.sem_topk_method = sem_topk_method
+        self.sem_groupby_pair_batch_size = sem_groupby_pair_batch_size
+        self.sem_groupby_pair_batch_retries = sem_groupby_pair_batch_retries
         self.thinking_enabled = thinking_enabled
 
     def __call__(
@@ -428,6 +432,8 @@ class ClaudeMemoryDriverFactory:
                 lm_enable_cache=False,
                 structured_max_tokens=BENCHMARK_STRUCTURED_MAX_TOKENS,
                 sem_topk_method=self.sem_topk_method,
+                sem_groupby_pair_batch_size=self.sem_groupby_pair_batch_size,
+                sem_groupby_pair_batch_retries=self.sem_groupby_pair_batch_retries,
             ),
         )
         memory = am.ClaudeMemory(adapter=adapter)
@@ -448,6 +454,8 @@ class ZepMemoryDriverFactory:
         base_namespace: str,
         model_id: str = "deepseek/deepseek-v4-flash",
         grouped_agg_rule: str = "rule-re-group",
+        sem_groupby_pair_batch_size: int | None = None,
+        sem_groupby_pair_batch_retries: int = 0,
         thinking_enabled: bool = True,
         neo4j_image: str,
         neo4j_image_digest: str,
@@ -464,6 +472,8 @@ class ZepMemoryDriverFactory:
         self.base_namespace = base_namespace
         self.model_id = model_id
         self.grouped_agg_rule = grouped_agg_rule
+        self.sem_groupby_pair_batch_size = sem_groupby_pair_batch_size
+        self.sem_groupby_pair_batch_retries = sem_groupby_pair_batch_retries
         self.thinking_enabled = thinking_enabled
         self.neo4j_image = neo4j_image
         self.neo4j_image_digest = neo4j_image_digest
@@ -477,6 +487,8 @@ class ZepMemoryDriverFactory:
         base_namespace: str,
         model_id: str = "deepseek/deepseek-v4-flash",
         grouped_agg_rule: str = "rule-re-group",
+        sem_groupby_pair_batch_size: int | None = None,
+        sem_groupby_pair_batch_retries: int = 0,
         thinking_enabled: bool = True,
     ) -> ZepMemoryDriverFactory:
         """Create the pinned Graphiti-compatible CPU deployment connector."""
@@ -515,6 +527,8 @@ class ZepMemoryDriverFactory:
             base_namespace=base_namespace,
             model_id=model_id,
             grouped_agg_rule=grouped_agg_rule,
+            sem_groupby_pair_batch_size=sem_groupby_pair_batch_size,
+            sem_groupby_pair_batch_retries=sem_groupby_pair_batch_retries,
             thinking_enabled=thinking_enabled,
             neo4j_image=neo4j_image,
             neo4j_image_digest=neo4j_image_digest,
@@ -573,6 +587,8 @@ class ZepMemoryDriverFactory:
                 },
                 lm_enable_cache=False,
                 structured_max_tokens=BENCHMARK_STRUCTURED_MAX_TOKENS,
+                sem_groupby_pair_batch_size=self.sem_groupby_pair_batch_size,
+                sem_groupby_pair_batch_retries=self.sem_groupby_pair_batch_retries,
             ),
         )
         policy = PolicyDifferentiator(
@@ -612,12 +628,16 @@ class Mem0MemoryDriverFactory:
         *,
         base_namespace: str,
         model_id: str = "deepseek/deepseek-v4-flash",
+        sem_groupby_pair_batch_size: int | None = None,
+        sem_groupby_pair_batch_retries: int = 0,
         thinking_enabled: bool = False,
     ) -> None:
         if not base_namespace:
             raise ValueError("Mem0 benchmark base_namespace must be non-empty")
         self.base_namespace = base_namespace
         self.model_id = model_id
+        self.sem_groupby_pair_batch_size = sem_groupby_pair_batch_size
+        self.sem_groupby_pair_batch_retries = sem_groupby_pair_batch_retries
         self.thinking_enabled = thinking_enabled
         self.sem_topk_method = "pairwise-naive"
 
@@ -698,6 +718,8 @@ class Mem0MemoryDriverFactory:
                     lm_enable_cache=False,
                     structured_max_tokens=BENCHMARK_STRUCTURED_MAX_TOKENS,
                     sem_topk_method=self.sem_topk_method,
+                    sem_groupby_pair_batch_size=self.sem_groupby_pair_batch_size,
+                    sem_groupby_pair_batch_retries=self.sem_groupby_pair_batch_retries,
                 ),
             )
             policy = PolicyDifferentiator().differentiate(
@@ -733,6 +755,8 @@ class Mem0MemoryEnhancedDriverFactory(Mem0MemoryDriverFactory):
         base_namespace: str,
         model_id: str = "deepseek/deepseek-v4-flash",
         sem_topk_method: str = "pairwise-quick",
+        sem_groupby_pair_batch_size: int | None = None,
+        sem_groupby_pair_batch_retries: int = 0,
         thinking_enabled: bool = False,
     ) -> None:
         from agent_memory.adapters.lotus.context import SEM_TOPK_METHODS
@@ -744,6 +768,8 @@ class Mem0MemoryEnhancedDriverFactory(Mem0MemoryDriverFactory):
         super().__init__(
             base_namespace=base_namespace,
             model_id=model_id,
+            sem_groupby_pair_batch_size=sem_groupby_pair_batch_size,
+            sem_groupby_pair_batch_retries=sem_groupby_pair_batch_retries,
             thinking_enabled=thinking_enabled,
         )
         self.sem_topk_method = sem_topk_method

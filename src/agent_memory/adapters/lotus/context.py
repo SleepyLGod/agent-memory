@@ -72,10 +72,23 @@ class LotusExecutionConfig:
     sem_join_progress_bar_desc: str = "Join comparisons"
 
     sem_groupby_default: bool = False
+    sem_groupby_pair_batch_size: int | None = None
+    sem_groupby_pair_batch_retries: int = 0
 
     sem_agg_safe_mode: bool = False
     sem_agg_progress_bar_desc: str = "Aggregating"
     sem_agg_model_kwargs: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        """Validate bounded semantic execution settings."""
+
+        if (
+            self.sem_groupby_pair_batch_size is not None
+            and self.sem_groupby_pair_batch_size < 1
+        ):
+            raise ValueError("sem_groupby_pair_batch_size must be positive")
+        if self.sem_groupby_pair_batch_retries < 0:
+            raise ValueError("sem_groupby_pair_batch_retries cannot be negative")
 
     def trace_dir(self) -> Path | str | None:
         """Return the configured semantic trace directory."""
