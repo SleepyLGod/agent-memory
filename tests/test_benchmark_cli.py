@@ -6,7 +6,31 @@ from types import SimpleNamespace
 import pytest
 
 from agent_memory.planner.rules import GROUPED_AGG_RULES
-from tools.evaluation import longmemeval, memory_agent_bench
+from tools.evaluation import locomo, longmemeval, memory_agent_bench
+
+
+@pytest.mark.parametrize("module", (locomo, longmemeval, memory_agent_bench))
+def test_agent_benchmark_clis_share_sem_groupby_execution_options(
+    module, tmp_path
+) -> None:
+    args = module.parse_args(
+        [
+            "run",
+            "--bundle-dir",
+            str(tmp_path / "bundle"),
+            "--output-dir",
+            str(tmp_path / "output"),
+            "--system",
+            "claude-memory",
+            "--sem-groupby-pair-batch-size",
+            "12",
+            "--sem-groupby-pair-batch-retries",
+            "2",
+        ]
+    )
+
+    assert args.sem_groupby_pair_batch_size == 12
+    assert args.sem_groupby_pair_batch_retries == 2
 
 
 def test_longmemeval_cli_separates_bundle_preparation_from_system_run(tmp_path) -> None:
@@ -258,6 +282,10 @@ def test_longmemeval_zep_run_forwards_existing_runner_contract(
             "ZEP-SMOKE",
             "--memory-thinking",
             "enabled",
+            "--sem-groupby-pair-batch-size",
+            "12",
+            "--sem-groupby-pair-batch-retries",
+            "2",
             "--maintenance-checkpoint-output-dir",
             str(tmp_path / "maintenance"),
         ]
@@ -268,6 +296,8 @@ def test_longmemeval_zep_run_forwards_existing_runner_contract(
     assert captured["base_namespace"] == "longmemeval-zep-smoke"
     assert captured["condition_id"] == "ZEP-SMOKE"
     assert captured["memory_thinking_enabled"] is True
+    assert captured["sem_groupby_pair_batch_size"] == 12
+    assert captured["sem_groupby_pair_batch_retries"] == 2
     assert captured["maintenance_checkpoint_output_dir"] == tmp_path / "maintenance"
 
 

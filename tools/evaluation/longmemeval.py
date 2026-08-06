@@ -120,6 +120,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         choices=("pairwise-naive", "pairwise-quick", "pairwise-heap", "listwise"),
         default=None,
     )
+    run.add_argument("--sem-groupby-pair-batch-size", type=int)
+    run.add_argument("--sem-groupby-pair-batch-retries", type=int, default=0)
     run.add_argument(
         "--memory-thinking",
         choices=("enabled", "disabled"),
@@ -217,6 +219,8 @@ def main(argv: Sequence[str] | None = None) -> Path:
         base_namespace=args.namespace,
         grouped_agg_rule=args.grouped_agg_rule,
         sem_topk_method=args.sem_topk_method,
+        sem_groupby_pair_batch_size=args.sem_groupby_pair_batch_size,
+        sem_groupby_pair_batch_retries=args.sem_groupby_pair_batch_retries,
         memory_thinking_enabled=args.memory_thinking == "enabled",
         condition_id=_condition_id(args),
         maintenance_only=args.maintenance_only,

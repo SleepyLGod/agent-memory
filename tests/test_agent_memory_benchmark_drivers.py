@@ -241,6 +241,8 @@ def test_case_factories_create_isolated_policy_instances(monkeypatch, tmp_path) 
         model_id="model",
         grouped_agg_rule="rule-re-group",
         sem_topk_method="listwise",
+        sem_groupby_pair_batch_size=12,
+        sem_groupby_pair_batch_retries=2,
         thinking_enabled=False,
     )
     claude = claude_factory(
@@ -253,6 +255,8 @@ def test_case_factories_create_isolated_policy_instances(monkeypatch, tmp_path) 
     assert created[-1].adapter.config.lm_num_retries == 2
     assert created[-1].adapter.config.structured_max_tokens == 32_768
     assert created[-1].adapter.config.sem_topk_method == "listwise"
+    assert created[-1].adapter.config.sem_groupby_pair_batch_size == 12
+    assert created[-1].adapter.config.sem_groupby_pair_batch_retries == 2
     assert created[-1].adapter.config.lm_model_kwargs == {
         "extra_body": {"thinking": {"type": "disabled"}}
     }
@@ -264,6 +268,8 @@ def test_case_factories_create_isolated_policy_instances(monkeypatch, tmp_path) 
         base_namespace="benchmark-run",
         model_id="model",
         grouped_agg_rule="prefer-join-map",
+        sem_groupby_pair_batch_size=12,
+        sem_groupby_pair_batch_retries=2,
         thinking_enabled=False,
         neo4j_image="neo4j:5.26.2",
         neo4j_image_digest="sha256:image",
@@ -281,6 +287,8 @@ def test_case_factories_create_isolated_policy_instances(monkeypatch, tmp_path) 
     assert storage.namespace.endswith("-attempt-0002")
     assert created[-1].adapter.config.lm_num_retries == 2
     assert created[-1].adapter.config.structured_max_tokens == 32_768
+    assert created[-1].adapter.config.sem_groupby_pair_batch_size == 12
+    assert created[-1].adapter.config.sem_groupby_pair_batch_retries == 2
     assert created[-1].adapter.config.lm_model_kwargs == {
         "extra_body": {"thinking": {"type": "disabled"}}
     }
@@ -447,6 +455,8 @@ def test_zep_run_configures_existing_factory_and_checkpoint_flow(
         output_dir=output_dir,
         memory_provider_model_id="provider-model",
         grouped_agg_rule="prefer-join-map",
+        sem_groupby_pair_batch_size=12,
+        sem_groupby_pair_batch_retries=2,
         memory_thinking_enabled=False,
         condition_id="ZEP-SMOKE",
         maintenance_checkpoint_output_dir=maintenance_dir,
@@ -460,6 +470,8 @@ def test_zep_run_configures_existing_factory_and_checkpoint_flow(
         "base_namespace": f"longmemeval-v1-cleaned-s-{namespace_digest}",
         "model_id": "provider-model",
         "grouped_agg_rule": "prefer-join-map",
+        "sem_groupby_pair_batch_size": 12,
+        "sem_groupby_pair_batch_retries": 2,
         "thinking_enabled": False,
     }
     system_contract = captured["runner"]["system_contract"]
@@ -467,6 +479,12 @@ def test_zep_run_configures_existing_factory_and_checkpoint_flow(
     assert system_contract.condition_id == "ZEP-SMOKE"
     assert system_contract.maintenance_rule == "prefer-join-map"
     assert system_contract.thinking_enabled is False
+    assert captured["runner"]["runtime_provenance"]["runtime"][
+        "lotus_execution"
+    ] == {
+        "sem_groupby_pair_batch_size": 12,
+        "sem_groupby_pair_batch_retries": 2,
+    }
     assert (
         captured["runner"]["maintenance_checkpoint_source"].output_dir
         == maintenance_dir
