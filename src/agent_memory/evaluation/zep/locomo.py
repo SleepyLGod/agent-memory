@@ -324,7 +324,7 @@ def build_manifest(
             "id": config.model,
             "temperature": GENERATION_TEMPERATURE,
             "max_tokens": GENERATION_MAX_TOKENS,
-            "thinking": {"type": "enabled"},
+            "thinking": {"type": "disabled"},
             "application_cache": "disabled",
         },
         "storage": {
@@ -578,7 +578,7 @@ def create_runtime(
             config=LotusExecutionConfig(
                 semantic_trace_dir=trace_dir,
                 lm_model_kwargs={
-                    "extra_body": {"thinking": {"type": "enabled"}}
+                    "extra_body": {"thinking": {"type": "disabled"}}
                 },
                 lm_enable_cache=False,
             ),

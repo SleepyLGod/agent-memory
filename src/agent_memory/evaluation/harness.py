@@ -12,6 +12,12 @@ from typing import Any, Protocol
 
 from agent_memory.evaluation.artifacts import BenchmarkArtifactStore
 from agent_memory.evaluation.bundle import BenchmarkBundle
+from agent_memory.evaluation.recovery import (
+    ArtifactContractError,
+    AttemptLineage,
+    UnitAttemptExhausted,
+    is_retryable_unit_error,
+)
 from agent_memory.evaluation.types import (
     BenchmarkCase,
     BenchmarkEvent,
@@ -291,10 +297,13 @@ class TaskContract:
         [BenchmarkQuestion, str, tuple[Any, ...]], GradeResult
     ] | None = None
     additional_graders: tuple[GradeContract, ...] = ()
+    answer_parser_id: str = ""
 
     def __post_init__(self) -> None:
         if not self.task_id:
             raise ValueError("task_id must be non-empty")
+        if not isinstance(self.answer_parser_id, str):
+            raise TypeError("answer_parser_id must be a string")
         if self.checkpoint_boundary not in {"session", "event"}:
             raise ValueError("checkpoint_boundary must be 'session' or 'event'")
         if self.memory_system_error_score is not None and not 0 <= self.memory_system_error_score <= 1:
@@ -330,20 +339,21 @@ class TaskContract:
     def fingerprint(self) -> str:
         """Fingerprint the declared prompt/scorer contract, not Python callables."""
 
-        return _digest(
-            {
-                "task_id": self.task_id,
-                "answer_prompt_digest": self.answer_prompt_digest,
-                "scorer_id": self.scorer_id,
-                "scorer_digest": self.scorer_digest,
-                "additional_graders": [
-                    dict(grader.fingerprint_payload)
-                    for grader in self.additional_graders
-                ],
-                "checkpoint_boundary": self.checkpoint_boundary,
-                "memory_system_error_score": self.memory_system_error_score,
-            }
-        )
+        payload: dict[str, Any] = {
+            "task_id": self.task_id,
+            "answer_prompt_digest": self.answer_prompt_digest,
+            "scorer_id": self.scorer_id,
+            "scorer_digest": self.scorer_digest,
+            "additional_graders": [
+                dict(grader.fingerprint_payload)
+                for grader in self.additional_graders
+            ],
+            "checkpoint_boundary": self.checkpoint_boundary,
+            "memory_system_error_score": self.memory_system_error_score,
+        }
+        if self.answer_parser_id:
+            payload["answer_parser_id"] = self.answer_parser_id
+        return _digest(payload)
 
 
 DriverFactory = Callable[[str, Path, Path], MemorySystemDriver]
@@ -395,6 +405,8 @@ class BenchmarkRunner:
         self.storage_provenance = (
             dict(storage_provenance) if storage_provenance is not None else None
         )
+        self._execution_attempt = 0
+        self._unit_attempt = 0
 
     def run(self, bundle: BenchmarkBundle) -> None:
         """Run incomplete cases and rebuild aggregate metrics."""
@@ -410,6 +422,11 @@ class BenchmarkRunner:
         answer_prompt_digests = {
             task_id: self.contracts[task_id].answer_prompt_digest
             for task_id in sorted(required_task_ids)
+        }
+        answer_parser_contracts = {
+            task_id: self.contracts[task_id].answer_parser_id
+            for task_id in sorted(required_task_ids)
+            if self.contracts[task_id].answer_parser_id
         }
         scorer_contracts = {
             task_id: {
@@ -441,6 +458,7 @@ class BenchmarkRunner:
             judge_model_id=self.judge_model.model_id,
             contract_fingerprints=selected_contracts,
             answer_prompt_digests=answer_prompt_digests,
+            answer_parser_contracts=answer_parser_contracts or None,
             scorer_contracts=scorer_contracts,
             runtime_provenance=self.runtime_provenance,
             storage_provenance=self.storage_provenance,
@@ -469,7 +487,14 @@ class BenchmarkRunner:
                 self._run_case(bundle, case, contract)
                 new_cases += 1
             except BaseException as error:
-                self.artifacts.fail_case(case, contract.fingerprint, error)
+                if isinstance(error, UnitAttemptExhausted):
+                    self.artifacts.attention_case(
+                        case,
+                        contract.fingerprint,
+                        error,
+                    )
+                else:
+                    self.artifacts.fail_case(case, contract.fingerprint, error)
                 first_error = error
                 break
         self.artifacts.finalize_metrics()
@@ -484,6 +509,8 @@ class BenchmarkRunner:
     ) -> None:
         state_dir = self.artifacts.start_case(case, contract.fingerprint)
         attempt = int(state_dir.name.removeprefix("attempt-"))
+        self._execution_attempt = attempt
+        self._unit_attempt = 0
         # Drivers receive only an opaque case identity, never questions or gold labels.
         setup_started = perf_counter()
         try:
@@ -535,12 +562,14 @@ class BenchmarkRunner:
         primary_error: BaseException | None = None
         try:
             checkpoint = None
+            checkpoint_is_local = False
             if self.system_contract.checkpoint_enabled:
                 checkpoint = self.artifacts.load_checkpoint(
                     bundle=bundle,
                     case=case,
                     system_contract=self.system_contract,
                 )
+                checkpoint_is_local = checkpoint is not None
             if checkpoint is None and self.maintenance_checkpoint_source is not None:
                 checkpoint = self.maintenance_checkpoint_source.load_checkpoint(
                     bundle=bundle,
@@ -556,6 +585,9 @@ class BenchmarkRunner:
                         "maintenance checkpoint source must contain the full case input"
                     )
             completed_count = 0
+            committed_attempts: list[AttemptLineage] = []
+            pending_attempts: list[AttemptLineage] = []
+            attempt_store = self.artifacts.unit_attempt_store(case.case_id)
             if checkpoint is not None:
                 restore_started = perf_counter()
                 with semantic_trace_scope(
@@ -567,8 +599,11 @@ class BenchmarkRunner:
                     driver.restore_state(
                         checkpoint.directory / "driver",
                         checkpoint.completed_events,
-                    )
+                )
                 completed_count = len(checkpoint.completed_events)
+                committed_attempts.extend(checkpoint.event_attempts)
+                if checkpoint_is_local:
+                    attempt_store.reconcile_many(checkpoint.event_attempts)
                 self.artifacts.trace_stage(
                     phase="checkpoint",
                     case_id=case.case_id,
@@ -576,6 +611,8 @@ class BenchmarkRunner:
                         "operation": "restore",
                         "checkpoint_id": checkpoint.directory.name,
                         "completed_event_count": completed_count,
+                        "execution_attempt": attempt,
+                        "unit_attempt": 0,
                         "latency_ms": round(
                             (perf_counter() - restore_started) * 1000, 3
                         ),
@@ -586,123 +623,252 @@ class BenchmarkRunner:
                 case.events[completed_count:],
                 start=completed_count,
             ):
+                unit_attempt = self.artifacts.begin_unit_attempt(
+                    case=case,
+                    phase="insertion",
+                    unit_id=event.event_id,
+                    execution_attempt=attempt,
+                )
+                self._unit_attempt = unit_attempt
                 started = perf_counter()
+                operation_phase = "insertion"
+                insertion_recorded = False
                 try:
                     with semantic_trace_scope(
                         phase="insertion",
                         case_id=case.case_id,
                         event_id=event.event_id,
+                        session_id=event.session_id,
                         attempt=attempt,
+                        execution_attempt=attempt,
+                        unit_attempt=unit_attempt,
                     ):
                         metrics = driver.add(event)
+                    self.artifacts.trace_stage(
+                        phase="insertion",
+                        case_id=case.case_id,
+                        payload={
+                            "event_id": event.event_id,
+                            "session_id": event.session_id,
+                            "attempt": attempt,
+                            "execution_attempt": attempt,
+                            "unit_attempt": unit_attempt,
+                            "latency_ms": round(
+                                (perf_counter() - started) * 1000,
+                                3,
+                            ),
+                            **dict(metrics),
+                        },
+                    )
+                    insertion_recorded = True
+                    lineage: AttemptLineage = (
+                        "insertion",
+                        event.event_id,
+                        attempt,
+                        unit_attempt,
+                    )
+                    pending_attempts.append(lineage)
+                    next_event = (
+                        case.events[event_index + 1]
+                        if event_index + 1 < len(case.events)
+                        else None
+                    )
+                    session_finished = (
+                        next_event is None
+                        or next_event.session_id != event.session_id
+                    )
+                    if session_finished:
+                        finish_started = perf_counter()
+                        operation_phase = "consolidation"
+                        with semantic_trace_scope(
+                            phase="consolidation",
+                            case_id=case.case_id,
+                            event_id=event.event_id,
+                            session_id=event.session_id,
+                            attempt=attempt,
+                            execution_attempt=attempt,
+                            unit_attempt=unit_attempt,
+                        ):
+                            finish_metrics = driver.finish_session(
+                                event.session_id
+                            )
+                        if finish_metrics:
+                            self.artifacts.trace_stage(
+                                phase="consolidation",
+                                case_id=case.case_id,
+                                payload={
+                                    "event_id": event.event_id,
+                                    "session_id": event.session_id,
+                                    "completed_event_count": event_index + 1,
+                                    "execution_attempt": attempt,
+                                    "unit_attempt": unit_attempt,
+                                    "latency_ms": round(
+                                        (perf_counter() - finish_started) * 1000,
+                                        3,
+                                    ),
+                                    **dict(finish_metrics),
+                                },
+                            )
+                    checkpoint_boundary = (
+                        self.system_contract.checkpoint_enabled
+                        and (
+                            contract.checkpoint_boundary == "event"
+                            or session_finished
+                        )
+                    )
+                    if checkpoint_boundary:
+                        checkpoint_started = perf_counter()
+                        operation_phase = "checkpoint"
+                        checkpoint = self.artifacts.save_checkpoint(
+                            bundle=bundle,
+                            case=case,
+                            system_contract=self.system_contract,
+                            completed_events=case.events[: event_index + 1],
+                            event_attempts=tuple(
+                                committed_attempts + pending_attempts
+                            ),
+                            driver=driver,
+                        )
+                        self.artifacts.trace_stage(
+                            phase="checkpoint",
+                            case_id=case.case_id,
+                            payload={
+                                "operation": "save",
+                                "session_id": event.session_id,
+                                "checkpoint_id": checkpoint.directory.name,
+                                "completed_event_count": event_index + 1,
+                                "execution_attempt": attempt,
+                                "unit_attempt": unit_attempt,
+                                "checkpoint_bytes": sum(
+                                    path.stat().st_size
+                                    for path in checkpoint.directory.rglob("*")
+                                    if path.is_file()
+                                ),
+                                "latency_ms": round(
+                                    (perf_counter() - checkpoint_started) * 1000,
+                                    3,
+                                ),
+                            },
+                        )
+                        attempt_store.reconcile_many(pending_attempts)
+                        committed_attempts.extend(pending_attempts)
+                        pending_attempts.clear()
+                    elif not self.system_contract.checkpoint_enabled:
+                        attempt_store.reconcile_many(pending_attempts)
+                        committed_attempts.extend(pending_attempts)
+                        pending_attempts.clear()
+                except ArtifactContractError:
+                    raise
                 except Exception as error:
+                    retryable = is_retryable_unit_error(error)
+                    if not insertion_recorded:
+                        self.artifacts.trace_stage(
+                            phase="insertion",
+                            case_id=case.case_id,
+                            payload={
+                                "event_id": event.event_id,
+                                "session_id": event.session_id,
+                                "attempt": attempt,
+                                "execution_attempt": attempt,
+                                "unit_attempt": unit_attempt,
+                                "status": "error",
+                                "latency_ms": round(
+                                    (perf_counter() - started) * 1000,
+                                    3,
+                                ),
+                                "error_type": type(error).__name__,
+                                "error": str(error),
+                            },
+                        )
+                    elif operation_phase in {"consolidation", "checkpoint"}:
+                        self.artifacts.trace_stage(
+                            phase=operation_phase,
+                            case_id=case.case_id,
+                            payload={
+                                "event_id": event.event_id,
+                                "session_id": event.session_id,
+                                "operation": (
+                                    "save"
+                                    if operation_phase == "checkpoint"
+                                    else "finish_session"
+                                ),
+                                "execution_attempt": attempt,
+                                "unit_attempt": unit_attempt,
+                                "status": "error",
+                                "latency_ms": None,
+                                "error_type": type(error).__name__,
+                                "error": str(error),
+                            },
+                        )
+                    exhausted = False
+                    if retryable:
+                        exhausted = self.artifacts.finish_unit_attempt(
+                            case=case,
+                            phase="insertion",
+                            unit_id=event.event_id,
+                            execution_attempt=attempt,
+                            unit_attempt=unit_attempt,
+                            status="failed",
+                            error=error,
+                        )
+                        if exhausted and contract.memory_system_error_score is None:
+                            raise UnitAttemptExhausted(
+                                f"insertion:{event.event_id} exhausted "
+                                f"{unit_attempt} attempts"
+                            ) from error
+                        if not exhausted:
+                            raise
                     if contract.memory_system_error_score is None:
                         raise
                     self._record_case_system_error(
                         case=case,
                         contract=contract,
-                        phase="insertion",
+                        phase=operation_phase,
                         error=error,
                         latency_ms=(perf_counter() - started) * 1000,
                         event_id=event.event_id,
                     )
                     self.artifacts.complete_case(case, contract.fingerprint)
                     return
-                self.artifacts.trace_stage(
-                    phase="insertion",
-                    case_id=case.case_id,
-                    payload={
-                        "event_id": event.event_id,
-                        "session_id": event.session_id,
-                        "attempt": attempt,
-                        "latency_ms": round((perf_counter() - started) * 1000, 3),
-                        **dict(metrics),
-                    },
-                )
-                next_event = (
-                    case.events[event_index + 1]
-                    if event_index + 1 < len(case.events)
-                    else None
-                )
-                session_finished = (
-                    next_event is None or next_event.session_id != event.session_id
-                )
-                if session_finished:
-                    finish_started = perf_counter()
-                    try:
-                        finish_metrics = driver.finish_session(event.session_id)
-                    except Exception as error:
-                        if contract.memory_system_error_score is None:
-                            raise
-                        self._record_case_system_error(
-                            case=case,
-                            contract=contract,
-                            phase="consolidation",
-                            error=error,
-                            latency_ms=(perf_counter() - finish_started) * 1000,
-                            event_id=event.event_id,
-                        )
-                        self.artifacts.complete_case(case, contract.fingerprint)
-                        return
-                    if finish_metrics:
-                        self.artifacts.trace_stage(
-                            phase="consolidation",
-                            case_id=case.case_id,
-                            payload={
-                                "session_id": event.session_id,
-                                "completed_event_count": event_index + 1,
-                                "latency_ms": round(
-                                    (perf_counter() - finish_started) * 1000, 3
-                                ),
-                                **dict(finish_metrics),
-                            },
-                        )
-                if self.system_contract.checkpoint_enabled and (
-                    contract.checkpoint_boundary == "event" or session_finished
-                ):
-                    checkpoint_started = perf_counter()
-                    checkpoint = self.artifacts.save_checkpoint(
-                        bundle=bundle,
-                        case=case,
-                        system_contract=self.system_contract,
-                        completed_events=case.events[: event_index + 1],
-                        driver=driver,
-                    )
-                    self.artifacts.trace_stage(
-                        phase="checkpoint",
-                        case_id=case.case_id,
-                        payload={
-                            "operation": "save",
-                            "session_id": event.session_id,
-                            "checkpoint_id": checkpoint.directory.name,
-                            "completed_event_count": event_index + 1,
-                            "checkpoint_bytes": sum(
-                                path.stat().st_size
-                                for path in checkpoint.directory.rglob("*")
-                                if path.is_file()
-                            ),
-                            "latency_ms": round(
-                                (perf_counter() - checkpoint_started) * 1000, 3
-                            ),
-                        },
-                    )
             if self.maintenance_only:
                 self.artifacts.complete_maintenance(case, contract.fingerprint)
                 return
             if contract.memory_system_error_score is not None:
                 prepared_retrievals: list[
-                    tuple[BenchmarkQuestion, str, RetrievalOutput, float]
+                    tuple[BenchmarkQuestion, str, RetrievalOutput, float, AttemptLineage]
                 ] = []
                 for question in case.questions:
+                    unit_attempt = self.artifacts.begin_unit_attempt(
+                        case=case,
+                        phase="question",
+                        unit_id=question.question_id,
+                        execution_attempt=attempt,
+                    )
+                    self._unit_attempt = unit_attempt
                     started = perf_counter()
                     try:
                         prepared_retrievals.append(
                             (
                                 question,
                                 *self._retrieve_question(case, question, contract, driver),
+                                ("question", question.question_id, attempt, unit_attempt),
                             )
                         )
+                    except ArtifactContractError:
+                        raise
                     except Exception as error:
+                        if is_retryable_unit_error(error):
+                            exhausted = self.artifacts.finish_unit_attempt(
+                                case=case,
+                                phase="question",
+                                unit_id=question.question_id,
+                                execution_attempt=attempt,
+                                unit_attempt=unit_attempt,
+                                status="failed",
+                                error=error,
+                            )
+                            if not exhausted:
+                                raise
                         self._record_case_system_error(
                             case=case,
                             contract=contract,
@@ -713,7 +879,13 @@ class BenchmarkRunner:
                         )
                         self.artifacts.complete_case(case, contract.fingerprint)
                         return
-                for question, query_text, retrieval, latency_ms in prepared_retrievals:
+                for (
+                    question,
+                    query_text,
+                    retrieval,
+                    latency_ms,
+                    question_lineage,
+                ) in prepared_retrievals:
                     self._run_question(
                         case,
                         question,
@@ -721,9 +893,73 @@ class BenchmarkRunner:
                         driver,
                         prepared_retrieval=(query_text, retrieval, latency_ms),
                     )
+                    attempt_store.reconcile_success(question_lineage)
             else:
                 for question in case.questions:
-                    self._run_question(case, question, contract, driver)
+                    scorer_ids = [
+                        grader.scorer_id
+                        for grader in contract.graders
+                        if grader.applies(question)
+                    ]
+                    if self.artifacts.question_completed(
+                        case=case,
+                        question=question,
+                        contract_fingerprint=contract.fingerprint,
+                        scorer_ids=scorer_ids,
+                    ):
+                        question_lineage = self.artifacts.question_store(
+                            case.case_id
+                        ).lineage(question.question_id)
+                        if question_lineage is not None:
+                            attempt_store.reconcile_success(question_lineage)
+                        continue
+                    unit_attempt = self.artifacts.begin_unit_attempt(
+                        case=case,
+                        phase="question",
+                        unit_id=question.question_id,
+                        execution_attempt=attempt,
+                    )
+                    self._unit_attempt = unit_attempt
+                    try:
+                        with semantic_trace_scope(
+                            case_id=case.case_id,
+                            question_id=question.question_id,
+                            execution_attempt=attempt,
+                            unit_attempt=unit_attempt,
+                        ):
+                            self._run_question(
+                                case,
+                                question,
+                                contract,
+                                driver,
+                            )
+                    except ArtifactContractError:
+                        raise
+                    except Exception as error:
+                        if is_retryable_unit_error(error):
+                            exhausted = self.artifacts.finish_unit_attempt(
+                                case=case,
+                                phase="question",
+                                unit_id=question.question_id,
+                                execution_attempt=attempt,
+                                unit_attempt=unit_attempt,
+                                status="failed",
+                                error=error,
+                            )
+                            if exhausted:
+                                raise UnitAttemptExhausted(
+                                    f"question:{question.question_id} exhausted "
+                                    f"{unit_attempt} attempts"
+                                ) from error
+                        raise
+                    question_lineage = self.artifacts.question_store(
+                        case.case_id
+                    ).lineage(question.question_id)
+                    if question_lineage is None:
+                        raise ArtifactContractError(
+                            "question completed without atomic result evidence"
+                        )
+                    attempt_store.reconcile_success(question_lineage)
             self.artifacts.complete_case(case, contract.fingerprint)
         except BaseException as error:
             primary_error = error
@@ -751,6 +987,8 @@ class BenchmarkRunner:
                     case, question, contract, driver
                 )
             except Exception as error:
+                if contract.memory_system_error_score is None:
+                    raise
                 self._record_retrieval_system_error(
                     case=case,
                     question=question,
@@ -762,7 +1000,7 @@ class BenchmarkRunner:
                 return
         else:
             query_text, retrieval, retrieval_latency = prepared_retrieval
-        self._record_retrieval_success(
+        retrieval_row = self._record_retrieval_success(
             case=case,
             question=question,
             query_text=query_text,
@@ -781,16 +1019,13 @@ class BenchmarkRunner:
             model=self.answer_model,
         )
         answer_latency = (perf_counter() - answer_started) * 1000
-        self.artifacts.append_case_row(
-            case.case_id,
-            "answers",
-            {
-                "question_id": question.question_id,
-                "answer": answer,
-                "latency_ms": round(answer_latency, 3),
-            },
-        )
+        answer_row = {
+            "question_id": question.question_id,
+            "answer": answer,
+            "latency_ms": round(answer_latency, 3),
+        }
 
+        grade_rows: list[dict[str, Any]] = []
         for grader_index, grader_contract in enumerate(contract.graders):
             if not grader_contract.applies(question):
                 continue
@@ -817,12 +1052,10 @@ class BenchmarkRunner:
                     parsed_steps,
                 )
             if grade.scorer_id != grader_contract.scorer_id:
-                raise ValueError(
+                raise ArtifactContractError(
                     "grade result scorer_id does not match its declared contract"
                 )
-            self.artifacts.append_case_row(
-                case.case_id,
-                "grades",
+            grade_rows.append(
                 {
                     "question_id": question.question_id,
                     "scorer_id": grade.scorer_id,
@@ -836,6 +1069,16 @@ class BenchmarkRunner:
                     ),
                 },
             )
+        self.artifacts.publish_question(
+            case=case,
+            question=question,
+            contract_fingerprint=contract.fingerprint,
+            retrieval=retrieval_row,
+            answer=answer_row,
+            grades=grade_rows,
+            execution_attempt=self._execution_attempt,
+            unit_attempt=self._unit_attempt,
+        )
 
     def _retrieve_question(
         self,
@@ -869,19 +1112,15 @@ class BenchmarkRunner:
         query_text: str,
         retrieval: RetrievalOutput,
         latency_ms: float,
-    ) -> None:
-        self.artifacts.append_case_row(
-            case.case_id,
-            "retrieval",
-            {
-                "question_id": question.question_id,
-                "query": query_text,
-                "context": retrieval.context,
-                "channels": retrieval.channels,
-                "metrics": retrieval.metrics,
-                "latency_ms": round(latency_ms, 3),
-            },
-        )
+    ) -> dict[str, Any]:
+        row = {
+            "question_id": question.question_id,
+            "query": query_text,
+            "context": retrieval.context,
+            "channels": retrieval.channels,
+            "metrics": retrieval.metrics,
+            "latency_ms": round(latency_ms, 3),
+        }
         self.artifacts.trace_stage(
             phase="retrieval",
             case_id=case.case_id,
@@ -893,6 +1132,7 @@ class BenchmarkRunner:
                 },
             },
         )
+        return row
 
     def _record_retrieval_system_error(
         self,
@@ -909,41 +1149,32 @@ class BenchmarkRunner:
         error_type = type(error).__name__
         error_message = str(error)
         rounded_latency = round(latency_ms, 3)
-        self.artifacts.append_case_row(
-            case.case_id,
-            "retrieval",
-            {
-                "question_id": question.question_id,
-                "query": query_text,
+        retrieval_row = {
+            "question_id": question.question_id,
+            "query": query_text,
+            "status": "system_error",
+            "context": "",
+            "channels": {},
+            "metrics": {
                 "status": "system_error",
-                "context": "",
-                "channels": {},
-                "metrics": {
-                    "status": "system_error",
-                    "error_type": error_type,
-                    "error": error_message,
-                },
                 "error_type": error_type,
                 "error": error_message,
-                "latency_ms": rounded_latency,
             },
-        )
-        self.artifacts.append_case_row(
-            case.case_id,
-            "answers",
-            {
-                "question_id": question.question_id,
-                "status": "skipped_due_to_retrieval_error",
-                "answer": "",
-                "latency_ms": None,
-            },
-        )
+            "error_type": error_type,
+            "error": error_message,
+            "latency_ms": rounded_latency,
+        }
+        answer_row = {
+            "question_id": question.question_id,
+            "status": "skipped_due_to_retrieval_error",
+            "answer": "",
+            "latency_ms": None,
+        }
+        grade_rows: list[dict[str, Any]] = []
         for grader_index, grader in enumerate(contract.graders):
             if not grader.applies(question):
                 continue
-            self.artifacts.append_case_row(
-                case.case_id,
-                "grades",
+            grade_rows.append(
                 {
                     "question_id": question.question_id,
                     "scorer_id": grader.scorer_id,
@@ -959,6 +1190,16 @@ class BenchmarkRunner:
                     "latency_ms": None,
                 },
             )
+        self.artifacts.publish_question(
+            case=case,
+            question=question,
+            contract_fingerprint=contract.fingerprint,
+            retrieval=retrieval_row,
+            answer=answer_row,
+            grades=grade_rows,
+            execution_attempt=self._execution_attempt,
+            unit_attempt=self._unit_attempt,
+        )
         self.artifacts.trace_stage(
             phase="retrieval",
             case_id=case.case_id,

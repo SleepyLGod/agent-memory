@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 from random import Random
 from statistics import mean
-from typing import Any
+from typing import Any, Mapping
 
 _CONTRACT_FIELDS = (
     "benchmark_id",
@@ -27,6 +27,7 @@ _CONTRACT_FIELDS = (
     "run_mode",
     "contract_fingerprints",
     "answer_prompt_digests",
+    "answer_parser_contracts",
     "scorer_contracts",
 )
 
@@ -47,6 +48,10 @@ def compare_benchmark_runs(
         set(conditions)
     ):
         raise ValueError("comparison requires unique non-empty condition_id values")
+    system_ids = {
+        condition: str(manifest.get("system_id") or "")
+        for condition, manifest in zip(conditions, manifests, strict=True)
+    }
 
     reference = manifests[0]
     for field in _CONTRACT_FIELDS:
@@ -126,7 +131,7 @@ def compare_benchmark_runs(
     _write_csv(output_dir / "per_question.csv", rows)
     _write_csv(
         output_dir / "paired_deltas.csv",
-        _paired_delta_rows(result_sets, conditions),
+        _paired_delta_rows(result_sets, conditions, system_ids),
     )
     summaries = {
         condition_id: _logical_condition_metrics(run_dir)
@@ -139,9 +144,9 @@ def compare_benchmark_runs(
         for run_dir in run_dirs
     ]
     maintenance_sources = {
-        str(manifest.get("maintenance_checkpoint_source"))
+        str(source[0])
         for manifest in manifests
-        if manifest.get("maintenance_checkpoint_source")
+        if (source := _maintenance_source_contract(manifest)) is not None
     }
     actual_paid_costs.extend(
         _read_object(Path(source) / "metrics" / "summary.json").get(
@@ -225,8 +230,18 @@ def _validate_provenance(run_dir: Path, manifest: dict[str, Any]) -> None:
     run_mode = manifest.get("run_mode")
     if not isinstance(run_mode, str) or not run_mode:
         raise ValueError(f"benchmark run has invalid run_mode: {run_dir}")
-    if not run_mode.startswith("integration-smoke") and source["dirty"]:
-        raise ValueError(f"formal benchmark run used dirty source: {run_dir}")
+    if (
+        not run_mode.startswith("integration-smoke")
+        and not (
+            isinstance(source.get("source_snapshot_sha256"), str)
+            and len(source["source_snapshot_sha256"]) == 64
+            and isinstance(source.get("evidence_sha256"), str)
+            and len(source["evidence_sha256"]) == 64
+        )
+    ):
+        raise ValueError(
+            f"formal benchmark run lacks validated source evidence: {run_dir}"
+        )
     if manifest.get("system_id") in {"native-graphiti", "zep-memory"}:
         storage = manifest.get("storage_provenance")
         if not isinstance(storage, dict):
@@ -271,8 +286,8 @@ def _validate_provenance(run_dir: Path, manifest: dict[str, Any]) -> None:
 def _logical_condition_metrics(run_dir: Path) -> dict[str, Any]:
     summary = _read_object(run_dir / "metrics" / "summary.json")
     manifest = _read_object(run_dir / "manifest.json")
-    source_value = manifest.get("maintenance_checkpoint_source")
-    if not source_value:
+    source = _maintenance_source_contract(manifest)
+    if source is None:
         return {
             **summary,
             "actual_run_cost_usd": summary.get("estimated_cost_usd"),
@@ -282,27 +297,50 @@ def _logical_condition_metrics(run_dir: Path) -> dict[str, Any]:
             "logical_completion_tokens": summary.get("completion_tokens"),
             "logical_insertion_metrics": _phase_metrics(summary, "insertion"),
         }
-    source_summary = _read_object(
-        Path(str(source_value)) / "metrics" / "summary.json"
+    source_path, cost_scope = source
+    source_summary = _read_object(source_path / "metrics" / "summary.json")
+    source_costs = (
+        _phase_metrics(source_summary, "insertion")
+        if cost_scope == "insertion"
+        else source_summary
     )
     return {
         **summary,
         "actual_run_cost_usd": summary.get("estimated_cost_usd"),
-        "shared_maintenance_cost_usd": source_summary.get("estimated_cost_usd"),
+        "shared_maintenance_cost_usd": source_costs.get("estimated_cost_usd"),
         "logical_total_cost_usd": _sum_complete(
             [
                 summary.get("estimated_cost_usd"),
-                source_summary.get("estimated_cost_usd"),
+                source_costs.get("estimated_cost_usd"),
             ]
         ),
         "logical_prompt_tokens": int(summary.get("prompt_tokens") or 0)
-        + int(source_summary.get("prompt_tokens") or 0),
+        + int(source_costs.get("prompt_tokens") or 0),
         "logical_completion_tokens": int(summary.get("completion_tokens") or 0)
-        + int(source_summary.get("completion_tokens") or 0),
+        + int(source_costs.get("completion_tokens") or 0),
         "logical_insertion_metrics": _phase_metrics(
             source_summary, "insertion"
         ),
     }
+
+
+def _maintenance_source_contract(
+    manifest: Mapping[str, Any],
+) -> tuple[Path, str] | None:
+    value = manifest.get("maintenance_checkpoint_source")
+    if not value:
+        return None
+    if isinstance(value, str):
+        return Path(value), "all"
+    if not isinstance(value, Mapping):
+        raise ValueError("maintenance checkpoint source must be a path or object")
+    path = value.get("path")
+    cost_scope = value.get("cost_scope", "all")
+    if not isinstance(path, str) or not path:
+        raise ValueError("maintenance checkpoint source object requires a path")
+    if cost_scope not in {"all", "insertion"}:
+        raise ValueError("maintenance checkpoint source has invalid cost_scope")
+    return Path(path), str(cost_scope)
 
 
 def _sum_complete(values: list[Any]) -> float | None:
@@ -322,6 +360,7 @@ def _phase_metrics(summary: dict[str, Any], phase: str) -> dict[str, Any]:
 def _paired_delta_rows(
     result_sets: list[dict[tuple[str, str, str], dict[str, Any]]],
     conditions: list[str],
+    system_ids: dict[str, str],
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for left_index, right_index in combinations(range(len(conditions)), 2):
@@ -342,7 +381,9 @@ def _paired_delta_rows(
                     "condition_a": left_condition,
                     "condition_b": right_condition,
                     "comparison_type": _comparison_type(
-                        left_condition, right_condition
+                        left_condition,
+                        right_condition,
+                        system_ids,
                     ),
                     "scorer_id": scorer_id,
                     "question_count": len(deltas),
@@ -371,7 +412,11 @@ def _bootstrap_mean_interval(values: list[float]) -> tuple[float | None, float |
     ]
 
 
-def _comparison_type(left: str, right: str) -> str:
+def _comparison_type(
+    left: str,
+    right: str,
+    system_ids: dict[str, str],
+) -> str:
     pair = frozenset((left, right))
     if pair == {"JM-Q", "JM-L"}:
         return "retrieval_within_join_map"
@@ -381,7 +426,11 @@ def _comparison_type(left: str, right: str) -> str:
         return "maintenance_with_pairwise_quick"
     if pair == {"JM-L", "RG-L"}:
         return "maintenance_with_listwise"
-    if "native" in pair:
+    native_count = sum(
+        system_ids[condition].startswith("native-")
+        for condition in pair
+    )
+    if native_count == 1:
         return "native_vs_agent"
     return "other_pair"
 

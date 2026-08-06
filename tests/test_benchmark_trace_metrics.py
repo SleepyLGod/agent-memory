@@ -65,6 +65,8 @@ def test_normalize_provider_calls_deduplicates_agent_semantic_usage(
         "operator": "sem_agg",
         "operation": "",
         "attempt": None,
+        "execution_attempt": None,
+        "unit_attempt": None,
         "batch_size": None,
         "item_index": 0,
         "source": "agent-provider",
@@ -78,6 +80,7 @@ def test_normalize_provider_calls_deduplicates_agent_semantic_usage(
         "reasoning_tokens": 3,
         "total_tokens": 16,
         "usage_available": True,
+        "known_cost_usd": 1.8424e-06,
         "estimated_cost_usd": 1.8424e-06,
     }
 

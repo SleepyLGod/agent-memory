@@ -28,6 +28,7 @@ LOCOMO_OFFICIAL_SCORER_ID = "locomo_official:v1"
 LOCOMO_OFFICIAL_SCORER_DIGEST = sha256(
     b"locomo_answer_score:category-1-5:v1"
 ).hexdigest()
+LOCOMO_ANSWER_PARSER_ID = "locomo-structured-or-raw-text:v1"
 
 
 def _parse_json_object(response: str) -> Mapping[str, Any]:
@@ -42,11 +43,16 @@ def _parse_json_object(response: str) -> Mapping[str, Any]:
 
 
 def _parse_answer(response: str) -> str:
-    parsed = _parse_json_object(response)
-    answer = parsed.get("answer")
-    if not isinstance(answer, str) or not answer.strip():
-        raise ValueError("LOCOMO answer must be a non-empty string")
-    return answer.strip()
+    raw = response.strip()
+    if not raw:
+        raise ValueError("LOCOMO answer must be non-empty")
+    try:
+        answer = _parse_json_object(raw).get("answer")
+    except (json.JSONDecodeError, ValueError):
+        return raw
+    if isinstance(answer, str) and answer.strip():
+        return answer.strip()
+    return raw
 
 
 def _parse_zep_judge(response: str) -> Mapping[str, str]:
@@ -147,7 +153,7 @@ def locomo_task_contract(
         scorer_id=LOCOMO_OFFICIAL_SCORER_ID,
         scorer_digest=LOCOMO_OFFICIAL_SCORER_DIGEST,
         checkpoint_boundary="session",
-        memory_system_error_score=0.0,
+        memory_system_error_score=None,
         deterministic_scorer=_official_score,
         additional_graders=(
             GradeContract(
@@ -158,11 +164,13 @@ def locomo_task_contract(
                 applies_to=lambda question: int(question.category) in {1, 2, 3, 4},
             ),
         ),
+        answer_parser_id=LOCOMO_ANSWER_PARSER_ID,
     )
 
 
 __all__ = [
     "LOCOMO_OFFICIAL_SCORER_DIGEST",
     "LOCOMO_OFFICIAL_SCORER_ID",
+    "LOCOMO_ANSWER_PARSER_ID",
     "locomo_task_contract",
 ]
