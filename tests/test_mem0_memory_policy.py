@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Mapping
 from typing import Any
@@ -18,7 +19,10 @@ from agent_memory.memories.mem0.policy import Mem0Memory
 from agent_memory.memories.mem0.policy_enhanced import Mem0MemoryEnhanced
 from agent_memory.memories.mem0.prompts import (
     MEM0_ADDITIVE_EXTRACTION_INSTRUCTION,
+    MEM0_SEMANTIC_DUPLICATE_INSTRUCTION,
     MEM0_SOURCE_COMMIT,
+    MEM0_SOURCE_DEDUPLICATION_EXCERPT,
+    MEM0_SOURCE_DEDUPLICATION_EXCERPT_SHA256,
     MEM0_SOURCE_PROMPT_PATH,
     MEM0_SOURCE_PROMPT_SHA256,
 )
@@ -33,15 +37,38 @@ from agent_memory.planner import PolicyDifferentiator
 
 
 class _FakeMem0Adapter(LotusAdapter):
-    """Execute relational nodes while replacing only semantic extraction."""
+    """Execute relational nodes with deterministic Mem0 semantic operations."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        outputs_by_content: Mapping[str, list[dict[str, str]]] | None = None,
+        duplicate_pairs: set[tuple[str, str]] | None = None,
+    ) -> None:
         super().__init__()
+        self.outputs_by_content = dict(outputs_by_content or {})
+        self.duplicate_pairs = set(duplicate_pairs or ())
         self.extraction_inputs: list[dict[str, Any]] = []
+        self.duplicate_pair_batches: list[list[tuple[str, str]]] = []
 
     def execute(self, query: QueryExpr, inputs: Mapping[str, Any]) -> Any:
-        """Return deterministic memory rows for sem_flat_map test inputs."""
+        """Return deterministic rows for Mem0 semantic test inputs."""
 
+        if query.op == "sem_filter":
+            source = self.execute(query.inputs[0], inputs)
+            pairs = [
+                (
+                    str(row["memory:earlier"]),
+                    str(row["memory:later"]),
+                )
+                for _, row in source.iterrows()
+            ]
+            self.duplicate_pair_batches.append(pairs)
+            keep = [
+                earlier == later or (earlier, later) in self.duplicate_pairs
+                for earlier, later in pairs
+            ]
+            return source.loc[keep].copy()
         if query.op != "sem_flat_map":
             return super().execute(query, inputs)
 
@@ -58,7 +85,9 @@ class _FakeMem0Adapter(LotusAdapter):
                     "previous_messages": previous_messages,
                 }
             )
-            if content.startswith("skip"):
+            if content in self.outputs_by_content:
+                parsed_outputs.append(self.outputs_by_content[content])
+            elif content.startswith("skip"):
                 parsed_outputs.append([])
             elif content.startswith("duplicate"):
                 parsed_outputs.append(
@@ -83,6 +112,7 @@ class _FakeMem0Adapter(LotusAdapter):
             source,
             parsed_outputs,
             tuple(query.params["output_cols"]),
+            ordinal_col=query.params.get("ordinal_col"),
         )
 
 
@@ -98,11 +128,19 @@ def _message(index: int, *, content: str | None = None) -> dict[str, str]:
     }
 
 
-def test_mem0_policy_has_one_public_view_and_one_private_context_relation() -> None:
+def test_mem0_policy_has_one_public_view_and_named_private_stages() -> None:
     spec = Mem0Memory.spec()
 
     assert tuple(spec.views) == ("memories",)
-    assert tuple(spec.private_relations) == ("_windowed_messages",)
+    assert tuple(spec.private_relations) == (
+        "_windowed_messages",
+        "_extracted_memories",
+        "_earlier_memories",
+        "_later_memories",
+        "_candidate_memory_pairs",
+        "_duplicate_memory_pairs",
+        "_duplicate_memory_keys",
+    )
     assert tuple(spec.retrieval_queries) == ("default",)
     assert am.Mem0Memory is Mem0Memory
 
@@ -149,15 +187,22 @@ def test_mem0_storage_bindings_preserve_cross_policy_plan_identity() -> None:
     assert enhanced.sink_outputs == base.sink_outputs
 
 
-def test_mem0_view_uses_windowed_additive_extraction_and_exact_dedup() -> None:
-    query = Mem0Memory.spec().views["memories"].query
+def test_mem0_view_uses_native_aligned_semantic_first_earlier_dedup() -> None:
+    spec = Mem0Memory.spec()
+    query = spec.views["memories"].query
 
     assert query.op == "drop_duplicates"
     assert query.params["subset"] == ("memory",)
     assert query.inputs[0].op == "select"
     assert query.inputs[0].params["columns"] == ("memory", "attributed_to")
-    extraction = query.inputs[0].inputs[0]
+    anti_join = query.inputs[0].inputs[0]
+    assert anti_join.op == "join"
+    assert anti_join.params["how"] == "left_anti"
+    assert anti_join.params["on"] == ("_row_id", "_memory_ordinal")
+
+    extraction = spec.private_relations["_extracted_memories"]
     assert extraction.op == "sem_flat_map"
+    assert extraction.params["ordinal_col"] == "_memory_ordinal"
     assert extraction.inputs[0].op == "array_agg"
     assert extraction.inputs[0].inputs[0].op == "over"
     assert extraction.inputs[0].inputs[0].params["rows"] == (-10, -1)
@@ -167,7 +212,28 @@ def test_mem0_view_uses_windowed_additive_extraction_and_exact_dedup() -> None:
         "observation_date",
         "previous_messages",
     )
-    assert set(_query_ops(query)).isdisjoint({"search", "sem_groupby", "sem_topk"})
+    candidate_pairs = spec.private_relations["_candidate_memory_pairs"]
+    assert candidate_pairs.op == "join"
+    assert candidate_pairs.params["how"] == "inner"
+    assert candidate_pairs.inputs[0].params["name"] == "earlier"
+    assert candidate_pairs.inputs[1].params["name"] == "later"
+
+    duplicate_pairs = spec.private_relations["_duplicate_memory_pairs"]
+    assert duplicate_pairs.op == "sem_filter"
+    assert (
+        duplicate_pairs.params["instruction"]
+        == MEM0_SEMANTIC_DUPLICATE_INSTRUCTION
+    )
+    duplicate_keys = spec.private_relations["_duplicate_memory_keys"]
+    assert duplicate_keys.op == "drop_duplicates"
+    assert duplicate_keys.inputs[0].op == "select"
+    assert duplicate_keys.inputs[0].params["columns"] == (
+        "_row_id",
+        "_memory_ordinal",
+    )
+    assert set(_query_ops(query)).isdisjoint(
+        {"search", "sem_groupby", "sem_agg", "sem_join", "sem_topk"}
+    )
 
 
 def test_mem0_runtime_supplies_only_the_previous_ten_messages_as_context() -> None:
@@ -209,6 +275,96 @@ def test_mem0_runtime_keeps_zero_or_more_rows_and_deduplicates_by_memory() -> No
     ]
 
 
+def test_mem0_semantic_dedup_keeps_old_and_preserves_related_new_memories() -> None:
+    promotion = "Marcus was promoted to Senior Engineer at Shopify."
+    promotion_paraphrase = "Marcus got the Senior Engineer promotion at Shopify."
+    dog = "User has a dog named Poppy, a golden retriever."
+    vet = (
+        "User's dog Poppy had a vet checkup and is healthy but needs "
+        "to lose weight."
+    )
+    old_preference = "User prefers almond milk lattes."
+    shifted_preference = (
+        "User switched from almond milk to oat milk lattes after developing "
+        "an almond sensitivity."
+    )
+    old_location = "User lives in Paris."
+    new_location = "User now lives in London."
+    outputs = {
+        "promotion": [{"memory": promotion, "attributed_to": "user"}],
+        "promotion paraphrase": [
+            {"memory": promotion_paraphrase, "attributed_to": "assistant"}
+        ],
+        "dog": [{"memory": dog, "attributed_to": "user"}],
+        "vet": [{"memory": vet, "attributed_to": "assistant"}],
+        "old preference": [
+            {"memory": old_preference, "attributed_to": "user"}
+        ],
+        "shifted preference": [
+            {"memory": shifted_preference, "attributed_to": "user"}
+        ],
+        "old location": [{"memory": old_location, "attributed_to": "user"}],
+        "new location": [{"memory": new_location, "attributed_to": "user"}],
+    }
+    adapter = _FakeMem0Adapter(
+        outputs_by_content=outputs,
+        duplicate_pairs={(promotion, promotion_paraphrase)},
+    )
+    memory = Mem0Memory(adapter=adapter)
+
+    for index, content in enumerate(outputs):
+        memory.add(_message(index, content=content))
+
+    assert memory._runtime._state["memories"].to_dict("records") == [
+        {"memory": promotion, "attributed_to": "user"},
+        {"memory": dog, "attributed_to": "user"},
+        {"memory": vet, "attributed_to": "assistant"},
+        {"memory": old_preference, "attributed_to": "user"},
+        {"memory": shifted_preference, "attributed_to": "user"},
+        {"memory": old_location, "attributed_to": "user"},
+        {"memory": new_location, "attributed_to": "user"},
+    ]
+
+
+def test_mem0_incremental_semantic_dedup_only_evaluates_new_pairs() -> None:
+    adapter = _FakeMem0Adapter()
+    memory = Mem0Memory(adapter=adapter)
+
+    for index in range(3):
+        memory.add(_message(index))
+
+    non_empty_batches = [
+        batch for batch in adapter.duplicate_pair_batches if batch
+    ]
+    assert [len(batch) for batch in non_empty_batches] == [1, 2]
+    assert non_empty_batches[0] == [
+        ("Memory from message-0.", "Memory from message-1.")
+    ]
+    assert non_empty_batches[1] == [
+        ("Memory from message-0.", "Memory from message-2."),
+        ("Memory from message-1.", "Memory from message-2."),
+    ]
+
+
+def test_mem0_incremental_result_matches_full_view_recompute() -> None:
+    duplicate_pairs = {
+        ("Memory from message-0.", "Memory from message-2."),
+    }
+    adapter = _FakeMem0Adapter(duplicate_pairs=duplicate_pairs)
+    memory = Mem0Memory(adapter=adapter)
+    for index in range(4):
+        memory.add(_message(index))
+
+    full_view = adapter.execute(
+        Mem0Memory.spec().views["memories"].query,
+        {"log": memory._runtime._state["log"]},
+    )
+
+    assert full_view.to_dict("records") == memory._runtime._state[
+        "memories"
+    ].to_dict("records")
+
+
 def test_mem0_prompt_is_pinned_and_keeps_only_current_message_as_evidence() -> None:
     assert MEM0_SOURCE_COMMIT == "d653b63fac6c8ad0ad84aead0912b366e705d269"
     assert MEM0_SOURCE_PROMPT_PATH.endswith(":ADDITIVE_EXTRACTION_PROMPT")
@@ -228,11 +384,32 @@ def test_mem0_prompt_is_pinned_and_keeps_only_current_message_as_evidence() -> N
     assert "{current_date}" not in MEM0_ADDITIVE_EXTRACTION_INSTRUCTION
 
 
+def test_mem0_semantic_duplicate_prompt_is_pinned_to_native_boundary() -> None:
+    assert hashlib.sha256(
+        MEM0_SOURCE_DEDUPLICATION_EXCERPT.encode()
+    ).hexdigest() == MEM0_SOURCE_DEDUPLICATION_EXCERPT_SHA256
+    assert (
+        "semantically equivalent to an Existing Memory with no meaningful "
+        "new context"
+    ) in MEM0_SOURCE_DEDUPLICATION_EXCERPT
+    assert (
+        "Only skip extraction when the specific fact or event itself is "
+        "already captured"
+    ) in MEM0_SOURCE_DEDUPLICATION_EXCERPT
+    assert "**When in doubt, extract.**" in MEM0_SOURCE_DEDUPLICATION_EXCERPT
+    assert "{memory:earlier}" in MEM0_SEMANTIC_DUPLICATE_INSTRUCTION
+    assert "{memory:later}" in MEM0_SEMANTIC_DUPLICATE_INSTRUCTION
+    assert "Keep this pair only when Native Mem0 would skip" in (
+        MEM0_SEMANTIC_DUPLICATE_INSTRUCTION
+    )
+    assert "Poppy had a vet checkup" in MEM0_SEMANTIC_DUPLICATE_INSTRUCTION
+    assert "Max went on a camping trip" in MEM0_SEMANTIC_DUPLICATE_INSTRUCTION
+
+
 def test_mem0_prompt_formats_only_declared_input_placeholders() -> None:
     from lotus.nl_expression import nle2str
 
-    query = Mem0Memory.spec().views["memories"].query
-    extraction = query.inputs[0].inputs[0]
+    extraction = Mem0Memory.spec().private_relations["_extracted_memories"]
     output_cols = tuple(extraction.params["output_cols"])
     instruction = escape_structured_formatter_placeholders(
         MEM0_ADDITIVE_EXTRACTION_INSTRUCTION,
