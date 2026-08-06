@@ -250,6 +250,8 @@ def _row(
         ),
         "operation": str(event.get("operation") or ""),
         "attempt": _optional_int(event.get("attempt")),
+        "execution_attempt": _optional_int(event.get("execution_attempt")),
+        "unit_attempt": _optional_int(event.get("unit_attempt")),
         "batch_size": _optional_int(
             event.get("provider_batch_size") or event.get("llm_batch_size")
         ),
@@ -267,6 +269,9 @@ def _row(
         "reasoning_tokens": reasoning_tokens,
         "total_tokens": total,
         "usage_available": usage_available,
+        "known_cost_usd": (
+            float(round(cost, 12)) if cost is not None else 0.0
+        ),
         "estimated_cost_usd": (
             float(round(cost, 12)) if cost is not None else None
         ),
@@ -275,6 +280,7 @@ def _row(
 
 def _summarize_rows(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     costs = [row.get("estimated_cost_usd") for row in rows]
+    known_cost = sum(Decimal(str(cost)) for cost in costs if cost is not None)
     return {
         "provider_call_count": len(rows),
         "provider_error_count": sum(row.get("status") == "error" for row in rows),
@@ -282,6 +288,7 @@ def _summarize_rows(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
             bool(row.get("usage_available")) for row in rows
         ),
         "usage_complete": all(bool(row.get("usage_available")) for row in rows),
+        "known_cost_usd": float(round(known_cost, 12)),
         "latency_ms": round(
             sum(float(row.get("latency_ms") or 0) for row in rows), 3
         ),
@@ -292,7 +299,7 @@ def _summarize_rows(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "reasoning_tokens": _complete_token_sum(rows, "reasoning_tokens"),
         "total_tokens": _known_token_sum(rows, "total_tokens"),
         "estimated_cost_usd": (
-            float(round(sum(Decimal(str(cost)) for cost in costs), 12))
+            float(round(known_cost, 12))
             if costs and all(cost is not None for cost in costs)
             else (0.0 if not costs else None)
         ),

@@ -21,6 +21,11 @@ from agent_memory.evaluation.harness import (
     RetrievalOutput,
     TaskContract,
 )
+from agent_memory.evaluation.locomo_contracts import (
+    LOCOMO_ANSWER_PARSER_ID,
+    locomo_task_contract,
+)
+from agent_memory.evaluation.recovery import UnitAttemptStore
 from agent_memory.evaluation.types import BenchmarkCase, BenchmarkEvent, BenchmarkQuestion
 from agent_memory.tracing.semantic import active_trace_scope, write_trace_event
 
@@ -90,6 +95,54 @@ def _system_contract() -> MemorySystemContract:
         retrieval_recipe_id="fake-retrieval:v1",
         checkpoint_enabled=True,
     )
+
+
+@pytest.mark.parametrize(
+    ("response", "expected"),
+    [
+        ('{"answer":"Speyer"}', "Speyer"),
+        ('```json\n{"answer":"Speyer"}\n```', "Speyer"),
+        ("Speyer", "Speyer"),
+        ('{"wrong_field":"schema echo"}', '{"wrong_field":"schema echo"}'),
+    ],
+)
+def test_locomo_answer_parser_accepts_structured_or_raw_text(
+    response: str,
+    expected: str,
+) -> None:
+    contract = locomo_task_contract()
+
+    assert contract.answer_parser(response) == expected
+    assert contract.answer_parser_id == LOCOMO_ANSWER_PARSER_ID
+
+
+def test_locomo_answer_parser_rejects_empty_and_fingerprints_contract() -> None:
+    contract = locomo_task_contract()
+
+    with pytest.raises(ValueError, match="non-empty"):
+        contract.answer_parser(" \n")
+
+    previous = replace(contract, answer_parser_id="")
+    assert contract.answer_prompt_digest == previous.answer_prompt_digest
+    assert contract.fingerprint != previous.fingerprint
+
+
+def test_locomo_schema_echo_is_scored_as_zero_without_special_case() -> None:
+    contract = locomo_task_contract()
+    question = BenchmarkQuestion(
+        question_id="q167",
+        sample_id="case",
+        question="What is not in memory?",
+        gold_answer="No information available",
+        evidence_event_ids=(),
+        category="5",
+    )
+    schema_echo = '{"type":"object","properties":{"answer":{"type":"string"}}}'
+    answer = contract.answer_parser(schema_echo)
+    assert contract.deterministic_scorer is not None
+
+    assert answer == schema_echo
+    assert contract.deterministic_scorer(question, answer).score == 0.0
 
 
 @dataclass
@@ -522,6 +575,67 @@ def test_operation_usage_separates_calls_batches_and_provider_responses(
     assert row["estimated_cost_usd"] == "6.8208e-06"
 
 
+def test_session_metrics_separate_insertion_and_consolidation_provider_usage(
+    tmp_path: Path,
+) -> None:
+    class SessionTracingDriver(_Driver):
+        trace_dir: Path
+
+        def _trace_usage(self, batch_id: str) -> None:
+            write_trace_event(
+                self.trace_dir,
+                operator="memory",
+                event_type="provider_usage",
+                payload={
+                    "provider_batch_id": batch_id,
+                    "provider_usage_available": True,
+                    "provider_prompt_tokens": 10,
+                    "provider_prompt_cache_hit_tokens": 6,
+                    "provider_prompt_cache_miss_tokens": 4,
+                    "provider_completion_tokens": 2,
+                    "model": "deepseek-v4-flash",
+                },
+            )
+
+        def add(self, event: BenchmarkEvent) -> dict[str, int]:
+            self._trace_usage(f"insert-{event.event_id}")
+            return super().add(event)
+
+        def finish_session(self, session_id: str) -> dict[str, str]:
+            self._trace_usage(f"consolidate-{session_id}")
+            return super().finish_session(session_id)
+
+    def factory(case_id: str, state_dir: Path, trace_dir: Path) -> _Driver:
+        del case_id
+        driver = SessionTracingDriver(state_dir)
+        driver.trace_dir = trace_dir
+        return driver
+
+    BenchmarkRunner(
+        system_contract=_system_contract(),
+        contracts={"task-1": _contract()},
+        driver_factory=factory,
+        answer_model=_Model(),
+        judge_model=_Model(),
+        artifacts=BenchmarkArtifactStore(tmp_path),
+    ).run(_bundle())
+
+    with (tmp_path / "metrics" / "per_event.csv").open(
+        newline="", encoding="utf-8"
+    ) as stream:
+        event_rows = list(csv.DictReader(stream))
+    with (tmp_path / "metrics" / "per_session.csv").open(
+        newline="", encoding="utf-8"
+    ) as stream:
+        session_rows = list(csv.DictReader(stream))
+
+    assert [row["provider_call_count"] for row in event_rows] == ["1", "1"]
+    assert len(session_rows) == 1
+    assert session_rows[0]["insertion_provider_call_count"] == "2"
+    assert session_rows[0]["consolidation_provider_call_count"] == "1"
+    assert session_rows[0]["provider_call_count"] == "3"
+
+
 def test_default_condition_id_uses_maintenance_and_retrieval_contract() -> None:
     quick = replace(
         _system_contract(),
@@ -596,7 +710,9 @@ def test_retrieval_system_error_scores_zero_and_completed_case_is_skipped(
     model = _Model()
     runner = BenchmarkRunner(
         system_contract=_system_contract(),
-        contracts={"task-1": _contract()},
+        contracts={
+            "task-1": replace(_contract(), memory_system_error_score=0.0)
+        },
         driver_factory=factory,
         answer_model=model,
         judge_model=model,
@@ -607,7 +723,7 @@ def test_retrieval_system_error_scores_zero_and_completed_case_is_skipped(
 
     assert len(drivers) == 1
     assert drivers[0].closed
-    assert drivers[0].queries == ["query:first?", "query:second?"]
+    assert drivers[0].queries == ["query:first?"]
     assert model.calls == []
 
     case_dir = tmp_path / "cases" / "case-1-ba225b98"
@@ -666,6 +782,51 @@ def test_retrieval_system_error_scores_zero_and_completed_case_is_skipped(
     assert reliability[0]["memory_system_error_question_count"] == "2"
 
 
+def test_retryable_retrieval_error_retries_before_zero_score_policy(
+    tmp_path: Path,
+) -> None:
+    drivers: list[_Driver] = []
+
+    class TimeoutRetrieval(_Driver):
+        def retrieve(self, request):
+            assert self.queries is not None
+            self.queries.append(request.query_text)
+            raise TimeoutError("temporary retrieval timeout")
+
+    def factory(case_id, state_dir, trace_dir):
+        del case_id, trace_dir
+        driver = TimeoutRetrieval(state_dir) if not drivers else _Driver(state_dir)
+        drivers.append(driver)
+        return driver
+
+    model = _Model()
+    runner = BenchmarkRunner(
+        system_contract=_system_contract(),
+        contracts={
+            "task-1": replace(_contract(), memory_system_error_score=0.0)
+        },
+        driver_factory=factory,
+        answer_model=model,
+        judge_model=model,
+        artifacts=BenchmarkArtifactStore(tmp_path),
+    )
+
+    with pytest.raises(TimeoutError, match="temporary retrieval timeout"):
+        runner.run(_bundle())
+    runner.run(_bundle())
+
+    assert len(drivers) == 2
+    assert drivers[1].restored_event_ids == ("event-1", "event-2")
+    grades = [
+        json.loads(line)
+        for line in (
+            tmp_path / "cases" / "case-1-ba225b98" / "grades.jsonl"
+        ).read_text().splitlines()
+    ]
+    assert [row["score"] for row in grades] == [1.0, 1.0]
+    assert all(row["label"] != "system_error" for row in grades)
+
+
 def test_retrieval_system_error_does_not_stop_later_cases(tmp_path: Path) -> None:
     first = replace(_bundle().cases[0], questions=(_bundle().cases[0].questions[0],))
     second = BenchmarkCase(
@@ -695,7 +856,9 @@ def test_retrieval_system_error_does_not_stop_later_cases(tmp_path: Path) -> Non
     model = _Model(["two"])
     runner = BenchmarkRunner(
         system_contract=_system_contract(),
-        contracts={"task-1": _contract()},
+        contracts={
+            "task-1": replace(_contract(), memory_system_error_score=0.0)
+        },
         driver_factory=factory,
         answer_model=model,
         judge_model=model,
@@ -1174,6 +1337,96 @@ def test_session_checkpoint_resumes_without_readding_completed_session(
     assert [row["event_id"] for row in insertion_rows].count("event-1") == 1
     assert [row["event_id"] for row in insertion_rows].count("event-2") == 1
     assert [row["event_id"] for row in insertion_rows].count("event-3") == 2
+
+
+def test_checkpoint_manifest_reconciles_ledger_after_publish_crash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    drivers: list[_Driver] = []
+    original = UnitAttemptStore.reconcile_many
+    crashed = False
+
+    def crash_after_checkpoint(self, lineages):
+        nonlocal crashed
+        values = tuple(lineages)
+        if values and not crashed:
+            crashed = True
+            raise SystemExit("simulated crash after checkpoint publish")
+        return original(self, values)
+
+    monkeypatch.setattr(UnitAttemptStore, "reconcile_many", crash_after_checkpoint)
+    runner = BenchmarkRunner(
+        system_contract=_system_contract(),
+        contracts={"task-1": _contract()},
+        driver_factory=lambda case_id, state_dir, trace_dir: drivers.append(
+            _Driver(state_dir)
+        )
+        or drivers[-1],
+        answer_model=_Model(["one", "two"]),
+        judge_model=_Model(),
+        artifacts=BenchmarkArtifactStore(tmp_path),
+    )
+
+    with pytest.raises(SystemExit, match="checkpoint publish"):
+        runner.run(_bundle())
+
+    monkeypatch.setattr(UnitAttemptStore, "reconcile_many", original)
+    runner.run(_bundle())
+
+    assert drivers[1].restored_event_ids == ("event-1", "event-2")
+    insertion_rows = [
+        json.loads(line)
+        for line in (tmp_path / "trace" / "events.jsonl").read_text().splitlines()
+        if '"event_type": "insertion_result"' in line
+    ]
+    assert [row["event_id"] for row in insertion_rows] == [
+        "event-1",
+        "event-2",
+    ]
+
+
+def test_atomic_question_result_reconciles_without_repeating_question(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    drivers: list[_Driver] = []
+    model = _Model(["one", "two"])
+    original = UnitAttemptStore.reconcile_success
+    crashed = False
+
+    def crash_after_question(self, lineage):
+        nonlocal crashed
+        if lineage[:2] == ("question", "q1") and not crashed:
+            crashed = True
+            raise SystemExit("simulated crash after question publish")
+        return original(self, lineage)
+
+    monkeypatch.setattr(
+        UnitAttemptStore,
+        "reconcile_success",
+        crash_after_question,
+    )
+    runner = BenchmarkRunner(
+        system_contract=_system_contract(),
+        contracts={"task-1": _contract()},
+        driver_factory=lambda case_id, state_dir, trace_dir: drivers.append(
+            _Driver(state_dir)
+        )
+        or drivers[-1],
+        answer_model=model,
+        judge_model=model,
+        artifacts=BenchmarkArtifactStore(tmp_path),
+    )
+
+    with pytest.raises(SystemExit, match="question publish"):
+        runner.run(_bundle())
+
+    monkeypatch.setattr(UnitAttemptStore, "reconcile_success", original)
+    runner.run(_bundle())
+
+    assert drivers[1].queries == ["query:second?"]
+    assert model.calls == [("answer", 1), ("answer", 1)]
 
 
 def test_runner_does_not_checkpoint_a_system_without_checkpoint_support(

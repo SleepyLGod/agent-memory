@@ -27,13 +27,26 @@ def _run(
     root: Path,
     *,
     system_id: str,
+    condition_id: str | None = None,
     judge_model_id: str = "judge",
     score: float = 1.0,
     label: str = "",
     run_mode: str = "integration-smoke",
     dirty: bool = False,
+    frozen_source: bool = False,
     storage_provenance: dict[str, object] | None = None,
 ) -> Path:
+    source_provenance: dict[str, object] = {
+        "commit": f"commit-{system_id}",
+        "dirty": dirty,
+    }
+    if frozen_source:
+        source_provenance.update(
+            {
+                "source_snapshot_sha256": "a" * 64,
+                "evidence_sha256": "b" * 64,
+            }
+        )
     _write_json(
         root / "manifest.json",
         {
@@ -46,7 +59,7 @@ def _run(
             "case_ids": ["case-1"],
             "question_ids": ["q1"],
             "system_id": system_id,
-            "condition_id": system_id,
+            "condition_id": condition_id or system_id,
             "memory_model_id": "memory",
             "thinking_enabled": False,
             "memory_provider_model_id": f"provider-{system_id}",
@@ -59,7 +72,7 @@ def _run(
             "judge_model_id": judge_model_id,
             "judge_thinking_enabled": False,
             "run_mode": run_mode,
-            "source_provenance": {"commit": f"commit-{system_id}", "dirty": dirty},
+            "source_provenance": source_provenance,
             "runtime_provenance": {
                 "language": "python",
                 "language_version": "3.13",
@@ -70,6 +83,7 @@ def _run(
             "storage_provenance": storage_provenance,
             "contract_fingerprints": {"task": "contract"},
             "answer_prompt_digests": {"task": "answer"},
+            "answer_parser_contracts": {"task": "parser"},
             "scorer_contracts": {
                 "task": {"scorer_id": "exact", "scorer_digest": "score"}
             },
@@ -222,6 +236,235 @@ def test_comparison_counts_shared_maintenance_once(tmp_path: Path) -> None:
     assert summary["actual_paid_experiment_cost_usd"] == 0.85
 
 
+def test_comparison_scopes_full_parent_run_to_insertion_state(
+    tmp_path: Path,
+) -> None:
+    storage: dict[str, object] = {
+        "connector": "qdrant",
+        "mode": "embedded-local-single-owner",
+        "driver_version": "1.12.1",
+        "embedding_runtime_version": "3.4.1",
+        "embedding_model": "BAAI/bge-m3",
+        "embedding_revision": "revision",
+        "dimensions": 1024,
+        "device": "cpu",
+        "bm25_enabled": False,
+        "entity_boost_enabled": False,
+        "reranker_enabled": False,
+    }
+    parent = _run(tmp_path / "parent", system_id="native-parent")
+    _write_json(
+        parent / "metrics" / "summary.json",
+        {
+            "estimated_cost_usd": 0.7,
+            "prompt_tokens": 70,
+            "completion_tokens": 7,
+            "phases": {
+                "insertion": {
+                    "estimated_cost_usd": 0.1,
+                    "prompt_tokens": 10,
+                    "completion_tokens": 1,
+                    "provider_call_count": 3,
+                }
+            },
+        },
+    )
+    native = _run(
+        tmp_path / "native",
+        system_id="native-mem0",
+        condition_id="Native-Mem0-Base",
+        storage_provenance=storage,
+    )
+    manifest = json.loads((native / "manifest.json").read_text())
+    manifest["maintenance_checkpoint_source"] = {
+        "path": str(parent),
+        "cost_scope": "insertion",
+    }
+    _write_json(native / "manifest.json", manifest)
+    peer = _run(
+        tmp_path / "peer",
+        system_id="mem0-memory",
+        condition_id="AM-Mem0-Base",
+        storage_provenance=storage,
+    )
+
+    output = compare_benchmark_runs((native, peer), tmp_path / "comparison")
+    summary = json.loads((output / "summary.json").read_text())
+
+    native_metrics = summary["metrics"]["Native-Mem0-Base"]
+    assert native_metrics["shared_maintenance_cost_usd"] == 0.1
+    assert native_metrics["logical_total_cost_usd"] == 0.35
+    assert native_metrics["logical_prompt_tokens"] == 10
+    assert native_metrics["logical_completion_tokens"] == 1
+    assert summary["actual_paid_experiment_cost_usd"] == 1.2
+
+
+def test_comparison_classifies_native_pair_from_system_contract(
+    tmp_path: Path,
+) -> None:
+    storage: dict[str, object] = {
+        "connector": "qdrant",
+        "mode": "embedded-local-single-owner",
+        "driver_version": "1.12.1",
+        "embedding_runtime_version": "3.4.1",
+        "embedding_model": "BAAI/bge-m3",
+        "embedding_revision": "revision",
+        "dimensions": 1024,
+        "device": "cpu",
+        "bm25_enabled": False,
+        "entity_boost_enabled": False,
+        "reranker_enabled": False,
+    }
+    native = _run(
+        tmp_path / "native",
+        system_id="native-mem0",
+        condition_id="Native-Mem0-Base",
+        storage_provenance=storage,
+    )
+    agent = _run(
+        tmp_path / "agent",
+        system_id="mem0-memory",
+        condition_id="AM-Mem0-Base",
+        storage_provenance=storage,
+    )
+
+    output = compare_benchmark_runs((native, agent), tmp_path / "comparison")
+
+    with (output / "paired_deltas.csv").open(
+        newline="", encoding="utf-8"
+    ) as handle:
+        row = next(csv.DictReader(handle))
+    assert row["comparison_type"] == "native_vs_agent"
+
+
+def test_mem0_four_condition_comparison_preserves_cost_boundaries(
+    tmp_path: Path,
+) -> None:
+    storage: dict[str, object] = {
+        "connector": "qdrant",
+        "mode": "embedded-local-single-owner",
+        "driver_version": "1.12.1",
+        "embedding_runtime_version": "3.4.1",
+        "embedding_model": "BAAI/bge-m3",
+        "embedding_revision": "revision",
+        "dimensions": 1024,
+        "device": "cpu",
+        "bm25_enabled": False,
+        "entity_boost_enabled": False,
+        "reranker_enabled": False,
+    }
+    maintenance = tmp_path / "maintenance"
+    _write_json(
+        maintenance / "metrics" / "summary.json",
+        {
+            "estimated_cost_usd": 0.1,
+            "prompt_tokens": 10,
+            "completion_tokens": 1,
+            "phases": {"insertion": {"provider_call_count": 3}},
+        },
+    )
+    native = _run(
+        tmp_path / "native",
+        system_id="native-mem0",
+        condition_id="Native-Mem0-Base",
+        storage_provenance=storage,
+    )
+    base = _run(
+        tmp_path / "base",
+        system_id="mem0-memory",
+        condition_id="AM-Mem0-Base",
+        storage_provenance=storage,
+    )
+    quick = _run(
+        tmp_path / "quick",
+        system_id="mem0-enhanced",
+        condition_id="AM-Mem0-pairwise-quick",
+        storage_provenance=storage,
+    )
+    listwise = _run(
+        tmp_path / "listwise",
+        system_id="mem0-enhanced",
+        condition_id="AM-Mem0-listwise",
+        storage_provenance=storage,
+    )
+    _write_json(
+        native / "metrics" / "summary.json",
+        {
+            "estimated_cost_usd": 0.4,
+            "prompt_tokens": 40,
+            "completion_tokens": 4,
+            "phases": {"insertion": {"provider_call_count": 2}},
+            "actual_provider_usage": {"estimated_cost_usd": 0.4},
+            "final_successful_provider_usage": {"estimated_cost_usd": 0.3},
+            "recovery_overhead_provider_usage": {"estimated_cost_usd": 0.1},
+        },
+    )
+    for run in (base, quick, listwise):
+        manifest = json.loads((run / "manifest.json").read_text())
+        manifest["maintenance_checkpoint_source"] = str(maintenance)
+        _write_json(run / "manifest.json", manifest)
+        _write_json(
+            run / "metrics" / "summary.json",
+            {
+                "estimated_cost_usd": 0.2,
+                "prompt_tokens": 20,
+                "completion_tokens": 2,
+                "phases": {"insertion": {"provider_call_count": 0}},
+                "actual_provider_usage": {"estimated_cost_usd": 0.2},
+                "final_successful_provider_usage": {
+                    "estimated_cost_usd": 0.15
+                },
+                "recovery_overhead_provider_usage": {
+                    "estimated_cost_usd": 0.05
+                },
+            },
+        )
+
+    output = compare_benchmark_runs(
+        (native, base, quick, listwise),
+        tmp_path / "comparison",
+    )
+    summary = json.loads((output / "summary.json").read_text())
+
+    assert summary["actual_paid_experiment_cost_usd"] == 1.1
+    assert summary["metrics"]["Native-Mem0-Base"][
+        "logical_insertion_metrics"
+    ]["provider_call_count"] == 2
+    for condition in (
+        "AM-Mem0-Base",
+        "AM-Mem0-pairwise-quick",
+        "AM-Mem0-listwise",
+    ):
+        metrics = summary["metrics"][condition]
+        assert metrics["logical_total_cost_usd"] == 0.3
+        assert metrics["logical_insertion_metrics"]["provider_call_count"] == 3
+        assert metrics["actual_provider_usage"]["estimated_cost_usd"] == 0.2
+        assert metrics["final_successful_provider_usage"][
+            "estimated_cost_usd"
+        ] == 0.15
+        assert metrics["recovery_overhead_provider_usage"][
+            "estimated_cost_usd"
+        ] == 0.05
+
+
+def test_comparison_keeps_total_cost_unknown_when_usage_is_incomplete(
+    tmp_path: Path,
+) -> None:
+    first = _run(tmp_path / "first", system_id="first")
+    second = _run(tmp_path / "second", system_id="second")
+    _write_json(
+        first / "metrics" / "summary.json",
+        {"estimated_cost_usd": None, "known_cost_usd": 0.1},
+    )
+
+    output = compare_benchmark_runs((first, second), tmp_path / "comparison")
+    summary = json.loads((output / "summary.json").read_text())
+
+    assert summary["actual_paid_experiment_cost_usd"] is None
+    assert summary["metrics"]["first"]["logical_total_cost_usd"] is None
+    assert summary["metrics"]["first"]["known_cost_usd"] == 0.1
+
+
 def test_comparison_rejects_missing_runtime_provenance(tmp_path: Path) -> None:
     first = _run(tmp_path / "first", system_id="first")
     second = _run(tmp_path / "second", system_id="second")
@@ -244,16 +487,23 @@ def test_comparison_rejects_missing_dependency_versions(tmp_path: Path) -> None:
         compare_benchmark_runs((first, second), tmp_path / "comparison")
 
 
-def test_comparison_rejects_dirty_formal_run(tmp_path: Path) -> None:
+def test_comparison_rejects_formal_run_without_source_evidence(
+    tmp_path: Path,
+) -> None:
     first = _run(
         tmp_path / "first",
         system_id="first",
         run_mode="full",
         dirty=True,
     )
-    second = _run(tmp_path / "second", system_id="second", run_mode="full")
+    second = _run(
+        tmp_path / "second",
+        system_id="second",
+        run_mode="full",
+        frozen_source=True,
+    )
 
-    with pytest.raises(ValueError, match="dirty source"):
+    with pytest.raises(ValueError, match="validated source evidence"):
         compare_benchmark_runs((first, second), tmp_path / "comparison")
 
 

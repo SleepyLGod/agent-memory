@@ -13,14 +13,30 @@ from statistics import mean, median
 from typing import TYPE_CHECKING, Any, Iterable, Mapping
 from uuid import uuid4
 
+from agent_memory.evaluation.attempt_metrics import (
+    DurableUnit,
+    classify_attempt_rows,
+)
 from agent_memory.evaluation.bundle import BenchmarkBundle, write_bundle
 from agent_memory.evaluation.pricing import PricingSnapshot
 from agent_memory.evaluation.provenance import collect_runtime_provenance
+from agent_memory.evaluation.question_results import AtomicQuestionStore
+from agent_memory.evaluation.recovery import (
+    ArtifactContractError,
+    AttemptLineage,
+    MAX_UNIT_ATTEMPTS,
+    UnitAttemptExhausted,
+    UnitAttemptStore,
+)
 from agent_memory.evaluation.trace_metrics import (
     normalize_provider_calls,
     summarize_provider_calls,
 )
-from agent_memory.evaluation.types import BenchmarkCase, BenchmarkEvent
+from agent_memory.evaluation.types import (
+    BenchmarkCase,
+    BenchmarkEvent,
+    BenchmarkQuestion,
+)
 from agent_memory.tracing.semantic import (
     semantic_trace_scope,
     write_llm_call_trace,
@@ -37,6 +53,7 @@ class BenchmarkCheckpoint:
 
     directory: Path
     completed_events: tuple[BenchmarkEvent, ...]
+    event_attempts: tuple[AttemptLineage, ...]
 
 
 def _json_safe(value: Any) -> Any:
@@ -77,6 +94,63 @@ def _event_fingerprint(event: BenchmarkEvent) -> str:
         allow_nan=False,
     )
     return sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _checkpoint_durable_units(case_dir: Path, case_id: str) -> set[DurableUnit]:
+    """Read durable event lineages from the atomically published checkpoint."""
+
+    pointer_path = case_dir / "checkpoints" / "current.json"
+    if not pointer_path.is_file():
+        return set()
+    pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+    checkpoint_id = pointer.get("checkpoint_id")
+    if not isinstance(checkpoint_id, str) or not checkpoint_id:
+        raise ArtifactContractError(
+            "checkpoint current pointer is missing checkpoint_id"
+        )
+    manifest_path = (
+        case_dir
+        / "checkpoints"
+        / "snapshots"
+        / checkpoint_id
+        / "manifest.json"
+    )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    attempts = manifest.get("completed_event_attempts")
+    if not isinstance(attempts, list):
+        raise ArtifactContractError(
+            "checkpoint is missing completed event attempt evidence"
+        )
+    durable: set[DurableUnit] = set()
+    for value in attempts:
+        if not isinstance(value, Mapping):
+            raise ArtifactContractError(
+                "checkpoint event attempt must be an object"
+            )
+        event_id = value.get("event_id")
+        execution_attempt = value.get("execution_attempt")
+        unit_attempt = value.get("unit_attempt")
+        if (
+            not isinstance(event_id, str)
+            or not event_id
+            or not isinstance(execution_attempt, int)
+            or execution_attempt < 1
+            or not isinstance(unit_attempt, int)
+            or unit_attempt < 0
+        ):
+            raise ArtifactContractError(
+                "checkpoint event attempt lineage is invalid"
+            )
+        durable.add(
+            (
+                case_id,
+                "insertion",
+                event_id,
+                execution_attempt,
+                unit_attempt,
+            )
+        )
+    return durable
 
 
 def _append_jsonl(path: Path, value: Mapping[str, Any]) -> None:
@@ -173,6 +247,8 @@ def _provider_rollup(rows: list[dict[str, Any]]) -> dict[str, Any]:
             if rows and all(row.get("reasoning_tokens") is not None for row in rows)
             else None
         ),
+        "usage_complete": all(bool(row.get("usage_available")) for row in rows),
+        "known_cost_usd": round(sum(known_costs), 12),
         "estimated_cost_usd": (
             round(sum(known_costs), 12)
             if costs and len(known_costs) == len(costs)
@@ -198,6 +274,7 @@ class BenchmarkArtifactStore:
         contract_fingerprints: Mapping[str, str],
         answer_prompt_digests: Mapping[str, str],
         scorer_contracts: Mapping[str, Mapping[str, Any]],
+        answer_parser_contracts: Mapping[str, str] | None = None,
         runtime_provenance: Mapping[str, Any] | None = None,
         storage_provenance: Mapping[str, Any] | None = None,
         run_mode: str = "full",
@@ -261,6 +338,10 @@ class BenchmarkArtifactStore:
             "run_mode": run_mode,
             "maintenance_checkpoint_source": maintenance_checkpoint_source,
         }
+        if answer_parser_contracts:
+            expected["answer_parser_contracts"] = dict(
+                sorted(answer_parser_contracts.items())
+            )
         manifest_path = self.output_dir / "manifest.json"
         if manifest_path.exists():
             actual = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -306,8 +387,9 @@ class BenchmarkArtifactStore:
         if status_path.exists():
             previous = json.loads(status_path.read_text(encoding="utf-8"))
             attempt = int(previous.get("attempt", 0)) + 1
-        for name in ("retrieval.jsonl", "answers.jsonl", "grades.jsonl"):
-            (case_dir / name).write_text("", encoding="utf-8")
+        AtomicQuestionStore(case_dir).rebuild_jsonl(
+            [question.question_id for question in case.questions]
+        )
         _write_json(
             case_dir / "case.json",
             {
@@ -331,6 +413,125 @@ class BenchmarkArtifactStore:
         state_dir.mkdir(parents=True, exist_ok=True)
         return state_dir
 
+    def begin_unit_attempt(
+        self,
+        *,
+        case: BenchmarkCase,
+        phase: str,
+        unit_id: str,
+        execution_attempt: int,
+    ) -> int:
+        """Start one persisted event or question attempt."""
+
+        return self.unit_attempt_store(case.case_id).begin(
+            phase=phase,
+            unit_id=unit_id,
+            execution_attempt=execution_attempt,
+        )
+
+    def finish_unit_attempt(
+        self,
+        *,
+        case: BenchmarkCase,
+        phase: str,
+        unit_id: str,
+        execution_attempt: int,
+        unit_attempt: int,
+        status: str,
+        error: BaseException | None = None,
+    ) -> bool:
+        """Finish one unit attempt and return whether its budget is exhausted."""
+
+        return self.unit_attempt_store(case.case_id).finish(
+            phase=phase,
+            unit_id=unit_id,
+            execution_attempt=execution_attempt,
+            unit_attempt=unit_attempt,
+            status=status,
+            error=error,
+        )
+
+    def question_completed(
+        self,
+        *,
+        case: BenchmarkCase,
+        question: BenchmarkQuestion,
+        contract_fingerprint: str,
+        scorer_ids: Iterable[str],
+    ) -> bool:
+        """Return whether one atomic question result matches its contract."""
+
+        return self.question_store(case.case_id).completed(
+            question_id=question.question_id,
+            contract_fingerprint=contract_fingerprint,
+            scorer_ids=list(scorer_ids),
+        )
+
+    def publish_question(
+        self,
+        *,
+        case: BenchmarkCase,
+        question: BenchmarkQuestion,
+        contract_fingerprint: str,
+        retrieval: Mapping[str, Any],
+        answer: Mapping[str, Any],
+        grades: Iterable[Mapping[str, Any]],
+        execution_attempt: int,
+        unit_attempt: int,
+    ) -> None:
+        """Atomically publish one complete retrieval, answer, and grade result."""
+
+        grade_rows = [dict(row) for row in grades]
+        store = self.question_store(case.case_id)
+        store.publish(
+            question_id=question.question_id,
+            contract_fingerprint=contract_fingerprint,
+            retrieval=retrieval,
+            answer=answer,
+            grades=grade_rows,
+            execution_attempt=execution_attempt,
+            unit_attempt=unit_attempt,
+        )
+        store.rebuild_jsonl(
+            [item.question_id for item in case.questions]
+        )
+
+    def unit_attempt_store(self, case_id: str) -> UnitAttemptStore:
+        """Return the case-local unit attempt ledger."""
+
+        return UnitAttemptStore(self.case_dir(case_id) / "control")
+
+    def question_store(self, case_id: str) -> AtomicQuestionStore:
+        """Return the case-local atomic question store."""
+
+        return AtomicQuestionStore(self.case_dir(case_id))
+
+    def attention_case(
+        self,
+        case: BenchmarkCase,
+        contract_fingerprint: str,
+        error: UnitAttemptExhausted,
+    ) -> None:
+        """Mark a case stopped after one unit exhausts its attempt budget."""
+
+        status_path = self.case_dir(case.case_id) / "status.json"
+        current = (
+            json.loads(status_path.read_text(encoding="utf-8"))
+            if status_path.exists()
+            else {"attempt": 0}
+        )
+        _write_json(
+            status_path,
+            {
+                **current,
+                "status": "attention_required",
+                "case_id": case.case_id,
+                "contract_fingerprint": contract_fingerprint,
+                "error_type": type(error).__name__,
+                "error": str(error),
+            },
+        )
+
     def save_checkpoint(
         self,
         *,
@@ -338,16 +539,36 @@ class BenchmarkArtifactStore:
         case: BenchmarkCase,
         system_contract: MemorySystemContract,
         completed_events: tuple[BenchmarkEvent, ...],
+        event_attempts: tuple[AttemptLineage, ...],
         driver: MemorySystemDriver,
     ) -> BenchmarkCheckpoint:
         """Publish driver state only after one complete input session succeeds."""
 
         if not completed_events:
-            raise ValueError("checkpoint requires at least one completed event")
+            raise ArtifactContractError(
+                "checkpoint requires at least one completed event"
+            )
         completed_ids = tuple(event.event_id for event in completed_events)
         expected_prefix = tuple(event.event_id for event in case.events[: len(completed_ids)])
         if completed_ids != expected_prefix:
-            raise ValueError("checkpoint events must be a prefix of the case input")
+            raise ArtifactContractError(
+                "checkpoint events must be a prefix of the case input"
+            )
+        if len(event_attempts) != len(completed_events):
+            raise ArtifactContractError(
+                "checkpoint event attempts must match the completed event prefix"
+            )
+        for event, lineage in zip(completed_events, event_attempts, strict=True):
+            phase, unit_id, execution_attempt, unit_attempt = lineage
+            if (
+                phase != "insertion"
+                or unit_id != event.event_id
+                or execution_attempt < 1
+                or unit_attempt < 0
+            ):
+                raise ArtifactContractError(
+                    "checkpoint event attempt does not match its completed event"
+                )
 
         checkpoint_root = self.case_dir(case.case_id) / "checkpoints"
         checkpoint_id = (
@@ -357,7 +578,7 @@ class BenchmarkArtifactStore:
         staging = checkpoint_root / "staging" / f"{checkpoint_id}-{uuid4().hex}"
         driver_metadata = driver.save_state(staging / "driver")
         manifest = {
-            "schema_version": 2,
+            "schema_version": 3,
             "checkpoint_id": checkpoint_id,
             "case_id": case.case_id,
             "bundle_fingerprint": bundle.fingerprint,
@@ -379,6 +600,18 @@ class BenchmarkArtifactStore:
             "completed_event_fingerprints": [
                 _event_fingerprint(event) for event in completed_events
             ],
+            "completed_event_attempts": [
+                {
+                    "event_id": event.event_id,
+                    "execution_attempt": lineage[2],
+                    "unit_attempt": lineage[3],
+                }
+                for event, lineage in zip(
+                    completed_events,
+                    event_attempts,
+                    strict=True,
+                )
+            ],
             "driver_state": dict(driver_metadata),
         }
         _write_json(staging / "manifest.json", manifest)
@@ -387,14 +620,16 @@ class BenchmarkArtifactStore:
         if snapshot.exists():
             existing = json.loads((snapshot / "manifest.json").read_text(encoding="utf-8"))
             if existing != manifest:
-                raise ValueError("checkpoint ID collision contains different state")
+                raise ArtifactContractError(
+                    "checkpoint ID collision contains different state"
+                )
         else:
             os.replace(staging, snapshot)
         _write_json_atomic(
             checkpoint_root / "current.json",
             {"schema_version": 1, "checkpoint_id": checkpoint_id},
         )
-        return BenchmarkCheckpoint(snapshot, completed_events)
+        return BenchmarkCheckpoint(snapshot, completed_events, event_attempts)
 
     def load_checkpoint(
         self,
@@ -412,7 +647,9 @@ class BenchmarkArtifactStore:
         pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
         checkpoint_id = pointer.get("checkpoint_id")
         if not isinstance(checkpoint_id, str) or not checkpoint_id:
-            raise ValueError("checkpoint current pointer is missing checkpoint_id")
+            raise ArtifactContractError(
+                "checkpoint current pointer is missing checkpoint_id"
+            )
         snapshot = checkpoint_root / "snapshots" / checkpoint_id
         manifest = json.loads((snapshot / "manifest.json").read_text(encoding="utf-8"))
         checkpoint_maintenance_policy_id = manifest.get(
@@ -423,7 +660,7 @@ class BenchmarkArtifactStore:
             checkpoint_maintenance_policy_id
             != system_contract.effective_maintenance_policy_id
         ):
-            raise ValueError(
+            raise ArtifactContractError(
                 "checkpoint does not match current run contract: "
                 "maintenance_policy_id"
             )
@@ -443,20 +680,62 @@ class BenchmarkArtifactStore:
             if manifest.get(name) != expected
         ]
         if mismatched:
-            raise ValueError(
+            raise ArtifactContractError(
                 "checkpoint does not match current run contract: "
                 + ", ".join(mismatched)
             )
         event_ids = manifest.get("completed_event_ids")
         fingerprints = manifest.get("completed_event_fingerprints")
-        if not isinstance(event_ids, list) or not isinstance(fingerprints, list):
-            raise ValueError("checkpoint is missing completed event prefix evidence")
+        attempts = manifest.get("completed_event_attempts")
+        if (
+            not isinstance(event_ids, list)
+            or not isinstance(fingerprints, list)
+            or not isinstance(attempts, list)
+        ):
+            raise ArtifactContractError(
+                "checkpoint is missing completed event prefix evidence"
+            )
         completed = case.events[: len(event_ids)]
         if [event.event_id for event in completed] != event_ids or [
             _event_fingerprint(event) for event in completed
         ] != fingerprints:
-            raise ValueError("checkpoint completed event prefix does not match input")
-        return BenchmarkCheckpoint(snapshot, tuple(completed))
+            raise ArtifactContractError(
+                "checkpoint completed event prefix does not match input"
+            )
+        if len(attempts) != len(completed):
+            raise ArtifactContractError(
+                "checkpoint event attempts do not match completed events"
+            )
+        event_attempts: list[AttemptLineage] = []
+        for event, value in zip(completed, attempts, strict=True):
+            if not isinstance(value, Mapping) or value.get("event_id") != event.event_id:
+                raise ArtifactContractError(
+                    "checkpoint event attempt identity does not match input"
+                )
+            execution_attempt = value.get("execution_attempt")
+            unit_attempt = value.get("unit_attempt")
+            if (
+                not isinstance(execution_attempt, int)
+                or execution_attempt < 1
+                or not isinstance(unit_attempt, int)
+                or unit_attempt < 0
+            ):
+                raise ArtifactContractError(
+                    "checkpoint event attempt lineage is invalid"
+                )
+            event_attempts.append(
+                (
+                    "insertion",
+                    event.event_id,
+                    execution_attempt,
+                    unit_attempt,
+                )
+            )
+        return BenchmarkCheckpoint(
+            snapshot,
+            tuple(completed),
+            tuple(event_attempts),
+        )
 
     def complete_case(self, case: BenchmarkCase, contract_fingerprint: str) -> None:
         """Mark one case complete only after all questions were graded."""
@@ -637,14 +916,22 @@ class BenchmarkArtifactStore:
         grade_rows: list[dict[str, Any]] = []
         completed_cases = 0
         failed_cases = 0
+        attention_required_cases = 0
         empty_retrievals = 0
         retrieval_system_errors = 0
         memory_system_error_questions = 0
         memory_system_error_cases: set[str] = set()
+        input_question_rows = _read_jsonl(
+            self.output_dir / "input" / "questions.jsonl"
+        )
         input_questions = {
-            row["question_id"]: row
-            for row in _read_jsonl(self.output_dir / "input" / "questions.jsonl")
+            row["question_id"]: row for row in input_question_rows
         }
+        question_ids_by_case: dict[str, list[str]] = {}
+        for row in input_question_rows:
+            question_ids_by_case.setdefault(str(row["case_id"]), []).append(
+                str(row["question_id"])
+            )
         for case_dir in sorted((self.output_dir / "cases").glob("*")):
             status_path = case_dir / "status.json"
             if not status_path.exists():
@@ -655,6 +942,8 @@ class BenchmarkArtifactStore:
             elif status.get("status") == "failed":
                 failed_cases += 1
                 continue
+            elif status.get("status") == "attention_required":
+                attention_required_cases += 1
             retrievals = {
                 row["question_id"]: row
                 for row in _read_jsonl(case_dir / "retrieval.jsonl")
@@ -706,10 +995,20 @@ class BenchmarkArtifactStore:
                     empty_retrievals += 1
                 normalized_answer = _normalized_text(answer_text)
                 normalized_reference = _normalized_text(reference)
+                completion = self.question_store(
+                    str(status.get("case_id") or "")
+                ).completion_metadata(
+                    question_id
+                )
                 question_rows.append(
                     {
                         "case_id": status.get("case_id"),
                         "question_id": question_id,
+                        "execution_attempt": completion.get(
+                            "execution_attempt",
+                            "",
+                        ),
+                        "unit_attempt": completion.get("unit_attempt", ""),
                         "retrieval_status": retrieval_status,
                         "retrieval_error_type": retrieval.get("error_type", ""),
                         "retrieval_error": retrieval.get("error", ""),
@@ -752,6 +1051,8 @@ class BenchmarkArtifactStore:
                 "phase": row.get("phase", ""),
                 "operation": row.get("operation", ""),
                 "attempt": row.get("attempt", ""),
+                "execution_attempt": row.get("execution_attempt", ""),
+                "unit_attempt": row.get("unit_attempt", ""),
                 "status": row.get("status", ""),
                 "model": row.get("model", ""),
                 "revision": row.get("revision", ""),
@@ -771,20 +1072,20 @@ class BenchmarkArtifactStore:
             for row in trace_rows
             if row.get("event_type") == "embedding_call"
         ]
-        self._write_csv(
-            self.output_dir / "metrics" / "embedding_usage.csv",
-            embedding_rows,
-        )
-        embedding_by_event: dict[tuple[str, str, int], list[dict[str, Any]]] = {}
+        embedding_by_event: dict[
+            tuple[str, str, int, int],
+            list[dict[str, Any]],
+        ] = {}
         embedding_by_question: dict[tuple[str, str], list[dict[str, Any]]] = {}
         for row in embedding_rows:
             case_id = str(row.get("case_id") or "")
             event_id = str(row.get("event_id") or "")
             question_id = str(row.get("question_id") or "")
-            attempt = int(row.get("attempt") or 1)
+            execution_attempt = int(row.get("execution_attempt") or 0)
+            unit_attempt = int(row.get("unit_attempt") or 0)
             if event_id:
                 embedding_by_event.setdefault(
-                    (case_id, event_id, attempt),
+                    (case_id, event_id, execution_attempt, unit_attempt),
                     [],
                 ).append(row)
             if question_id:
@@ -805,7 +1106,6 @@ class BenchmarkArtifactStore:
                 sum(float(call.get("latency_ms") or 0) for call in calls),
                 3,
             )
-        self._write_csv(self.output_dir / "metrics" / "per_question.csv", question_rows)
         self._write_csv(self.output_dir / "metrics" / "per_grade.csv", grade_rows)
         pricing = PricingSnapshot.deepseek_2026_07_17()
         provider_rows = normalize_provider_calls(
@@ -813,15 +1113,122 @@ class BenchmarkArtifactStore:
             output_dir=self.output_dir,
             pricing=pricing,
         )
+        durable_units: set[DurableUnit] = set()
+        authoritative_cases: set[str] = set()
+        for case_dir in sorted((self.output_dir / "cases").glob("*")):
+            status_path = case_dir / "status.json"
+            if not status_path.is_file():
+                continue
+            case_id = str(
+                json.loads(status_path.read_text(encoding="utf-8")).get(
+                    "case_id"
+                )
+                or ""
+            )
+            attempt_store = UnitAttemptStore(case_dir / "control")
+            if attempt_store.state_path.is_file():
+                authoritative_cases.add(case_id)
+            durable_units.update(
+                _checkpoint_durable_units(case_dir, case_id)
+            )
+            question_store = AtomicQuestionStore(case_dir)
+            for question_id in question_ids_by_case.get(case_id, []):
+                lineage = question_store.lineage(question_id)
+                if lineage is None:
+                    continue
+                durable_units.add(
+                    (
+                        case_id,
+                        *lineage,
+                    )
+                )
+        provider_rows = classify_attempt_rows(
+            provider_rows,
+            durable_units=durable_units,
+            authoritative_cases=authoritative_cases,
+        )
+        embedding_rows = classify_attempt_rows(
+            embedding_rows,
+            durable_units=durable_units,
+            authoritative_cases=authoritative_cases,
+        )
+        self._write_csv(
+            self.output_dir / "metrics" / "embedding_usage.csv",
+            embedding_rows,
+        )
+        for question_row in question_rows:
+            question_provider_rows = [
+                row
+                for row in provider_rows
+                if row.get("case_id") == question_row.get("case_id")
+                and row.get("question_id") == question_row.get("question_id")
+            ]
+            for phase in ("retrieval", "answering", "grading"):
+                phase_rows = [
+                    row
+                    for row in question_provider_rows
+                    if row.get("phase") == phase
+                ]
+                actual = summarize_provider_calls(phase_rows)
+                final = summarize_provider_calls(
+                    [row for row in phase_rows if row.get("successful_path")]
+                )
+                recovery = summarize_provider_calls(
+                    [row for row in phase_rows if not row.get("successful_path")]
+                )
+                question_row[f"{phase}_provider_call_count"] = actual[
+                    "provider_call_count"
+                ]
+                question_row[f"{phase}_provider_latency_ms"] = actual[
+                    "latency_ms"
+                ]
+                question_row[f"{phase}_prompt_tokens"] = actual[
+                    "prompt_tokens"
+                ]
+                question_row[f"{phase}_cache_hit_tokens"] = actual[
+                    "cache_hit_tokens"
+                ]
+                question_row[f"{phase}_cache_miss_tokens"] = actual[
+                    "cache_miss_tokens"
+                ]
+                question_row[f"{phase}_completion_tokens"] = actual[
+                    "completion_tokens"
+                ]
+                question_row[f"{phase}_known_cost_usd"] = actual[
+                    "known_cost_usd"
+                ]
+                question_row[f"{phase}_estimated_cost_usd"] = actual[
+                    "estimated_cost_usd"
+                ]
+                question_row[f"{phase}_usage_complete"] = actual[
+                    "usage_complete"
+                ]
+                question_row[f"{phase}_final_known_cost_usd"] = final[
+                    "known_cost_usd"
+                ]
+                question_row[f"{phase}_final_estimated_cost_usd"] = final[
+                    "estimated_cost_usd"
+                ]
+                question_row[f"{phase}_recovery_known_cost_usd"] = recovery[
+                    "known_cost_usd"
+                ]
+        self._write_csv(
+            self.output_dir / "metrics" / "per_question.csv",
+            question_rows,
+        )
         self._write_csv(
             self.output_dir / "metrics" / "provider_usage.csv", provider_rows
         )
-        provider_by_event: dict[tuple[str, str, int], list[dict[str, Any]]] = {}
+        provider_by_event: dict[
+            tuple[str, str, int, int],
+            list[dict[str, Any]],
+        ] = {}
         for row in provider_rows:
             key = (
                 str(row.get("case_id") or ""),
                 str(row.get("event_id") or ""),
-                int(row.get("attempt") or 1),
+                int(row.get("execution_attempt") or 0),
+                int(row.get("unit_attempt") or 0),
             )
             provider_by_event.setdefault(key, []).append(row)
 
@@ -838,11 +1245,35 @@ class BenchmarkArtifactStore:
             occurrence = event_occurrences.get(occurrence_key, 0) + 1
             event_occurrences[occurrence_key] = occurrence
             attempt = int(event.get("attempt") or 1)
-            calls = provider_by_event.get((case_id, event_id, attempt), [])
-            embedding_calls = embedding_by_event.get(
-                (case_id, event_id, attempt),
+            execution_attempt = int(event.get("execution_attempt") or attempt)
+            unit_attempt = int(event.get("unit_attempt") or 0)
+            final_path = (
+                case_id not in authoritative_cases
+                or (
+                    case_id,
+                    "insertion",
+                    event_id,
+                    execution_attempt,
+                    unit_attempt,
+                )
+                in durable_units
+            )
+            calls = provider_by_event.get(
+                (case_id, event_id, execution_attempt, unit_attempt),
                 [],
             )
+            calls = [
+                call for call in calls if call.get("phase") == "insertion"
+            ]
+            embedding_calls = embedding_by_event.get(
+                (case_id, event_id, execution_attempt, unit_attempt),
+                [],
+            )
+            embedding_calls = [
+                call
+                for call in embedding_calls
+                if call.get("phase") == "insertion"
+            ]
             shape = {
                 key: int(value)
                 for key, value in event.items()
@@ -866,6 +1297,9 @@ class BenchmarkArtifactStore:
                     "session_id": event.get("session_id", ""),
                     "occurrence": occurrence,
                     "attempt": attempt,
+                    "execution_attempt": execution_attempt,
+                    "unit_attempt": unit_attempt,
+                    "successful_path": final_path,
                     "replayed": occurrence > 1,
                     "wall_latency_ms": event.get("latency_ms", ""),
                     "status": event.get("status", "success"),
@@ -902,59 +1336,154 @@ class BenchmarkArtifactStore:
         consolidation_rows = []
         for (case_id, session_id), rows in sorted(events_by_session.items()):
             consolidation = consolidation_by_session.get((case_id, session_id), {})
-            session_costs = [
-                float(row["estimated_cost_usd"])
-                for row in rows
-                if row.get("estimated_cost_usd") is not None
+            final_rows = [row for row in rows if row.get("successful_path")]
+            recovery_rows = [
+                row for row in rows if not row.get("successful_path")
             ]
-            session_reasoning = [
-                int(row["reasoning_tokens"])
-                for row in rows
-                if row.get("reasoning_tokens") is not None
+            session_provider_rows = [
+                row
+                for row in provider_rows
+                if row.get("case_id") == case_id
+                and row.get("session_id") == session_id
+                and row.get("phase") in {"insertion", "consolidation"}
+            ]
+            insertion_provider_rows = [
+                row
+                for row in session_provider_rows
+                if row.get("phase") == "insertion"
+            ]
+            consolidation_provider_rows = [
+                row
+                for row in session_provider_rows
+                if row.get("phase") == "consolidation"
+            ]
+            session_usage = summarize_provider_calls(session_provider_rows)
+            final_session_usage = summarize_provider_calls(
+                [
+                    row
+                    for row in session_provider_rows
+                    if row.get("successful_path")
+                ]
+            )
+            recovery_session_usage = summarize_provider_calls(
+                [
+                    row
+                    for row in session_provider_rows
+                    if not row.get("successful_path")
+                ]
+            )
+            insertion_usage = summarize_provider_calls(
+                insertion_provider_rows
+            )
+            consolidation_usage = summarize_provider_calls(
+                consolidation_provider_rows
+            )
+            final_consolidation_usage = summarize_provider_calls(
+                [
+                    row
+                    for row in consolidation_provider_rows
+                    if row.get("successful_path")
+                ]
+            )
+            recovery_consolidation_usage = summarize_provider_calls(
+                [
+                    row
+                    for row in consolidation_provider_rows
+                    if not row.get("successful_path")
+                ]
+            )
+            session_checkpoint_events = [
+                row
+                for row in trace_rows
+                if row.get("event_type") == "checkpoint_result"
+                and row.get("session_id") == session_id
             ]
             consolidation_rows.append(
                 {
                     "case_id": case_id,
                     "session_id": session_id,
-                    "event_count": len(rows),
+                    "event_count": len(final_rows),
+                    "attempt_event_count": len(rows),
                     "insertion_wall_latency_ms": round(
                         sum(float(row.get("wall_latency_ms") or 0) for row in rows),
+                        3,
+                    ),
+                    "final_insertion_wall_latency_ms": round(
+                        sum(
+                            float(row.get("wall_latency_ms") or 0)
+                            for row in final_rows
+                        ),
+                        3,
+                    ),
+                    "recovery_insertion_wall_latency_ms": round(
+                        sum(
+                            float(row.get("wall_latency_ms") or 0)
+                            for row in recovery_rows
+                        ),
                         3,
                     ),
                     "consolidation_wall_latency_ms": consolidation.get(
                         "latency_ms", 0
                     ),
-                    "provider_call_count": sum(
-                        int(row.get("provider_call_count") or 0) for row in rows
-                    ),
-                    "provider_latency_sum_ms": round(
+                    "checkpoint_wall_latency_ms": round(
                         sum(
-                            float(row.get("provider_latency_sum_ms") or 0)
-                            for row in rows
+                            float(row.get("latency_ms") or 0)
+                            for row in session_checkpoint_events
                         ),
                         3,
                     ),
-                    "prompt_tokens": sum(
-                        int(row.get("prompt_tokens") or 0) for row in rows
+                    "insertion_provider_call_count": insertion_usage[
+                        "provider_call_count"
+                    ],
+                    "insertion_provider_latency_ms": insertion_usage[
+                        "latency_ms"
+                    ],
+                    "consolidation_provider_call_count": consolidation_usage[
+                        "provider_call_count"
+                    ],
+                    "consolidation_provider_latency_ms": consolidation_usage[
+                        "latency_ms"
+                    ],
+                    "provider_call_count": session_usage[
+                        "provider_call_count"
+                    ],
+                    "provider_latency_sum_ms": session_usage["latency_ms"],
+                    "prompt_tokens": session_usage["prompt_tokens"],
+                    "cache_hit_tokens": session_usage["cache_hit_tokens"],
+                    "cache_miss_tokens": session_usage["cache_miss_tokens"],
+                    "completion_tokens": session_usage["completion_tokens"],
+                    "reasoning_tokens": session_usage["reasoning_tokens"],
+                    "estimated_cost_usd": session_usage[
+                        "estimated_cost_usd"
+                    ],
+                    "known_cost_usd": session_usage["known_cost_usd"],
+                    "usage_complete": session_usage["usage_complete"],
+                    "final_known_cost_usd": final_session_usage[
+                        "known_cost_usd"
+                    ],
+                    "final_estimated_cost_usd": final_session_usage[
+                        "estimated_cost_usd"
+                    ],
+                    "recovery_known_cost_usd": recovery_session_usage[
+                        "known_cost_usd"
+                    ],
+                    "recovery_estimated_cost_usd": recovery_session_usage[
+                        "estimated_cost_usd"
+                    ],
+                    "consolidation_known_cost_usd": consolidation_usage[
+                        "known_cost_usd"
+                    ],
+                    "consolidation_estimated_cost_usd": consolidation_usage[
+                        "estimated_cost_usd"
+                    ],
+                    "consolidation_usage_complete": consolidation_usage[
+                        "usage_complete"
+                    ],
+                    "final_consolidation_known_cost_usd": (
+                        final_consolidation_usage["known_cost_usd"]
                     ),
-                    "cache_hit_tokens": sum(
-                        int(row.get("cache_hit_tokens") or 0) for row in rows
-                    ),
-                    "cache_miss_tokens": sum(
-                        int(row.get("cache_miss_tokens") or 0) for row in rows
-                    ),
-                    "completion_tokens": sum(
-                        int(row.get("completion_tokens") or 0) for row in rows
-                    ),
-                    "reasoning_tokens": (
-                        sum(session_reasoning)
-                        if len(session_reasoning) == len(rows)
-                        else None
-                    ),
-                    "estimated_cost_usd": (
-                        round(sum(session_costs), 12)
-                        if len(session_costs) == len(rows)
-                        else None
+                    "recovery_consolidation_known_cost_usd": (
+                        recovery_consolidation_usage["known_cost_usd"]
                     ),
                 }
             )
@@ -968,9 +1497,14 @@ class BenchmarkArtifactStore:
                 "operation": row.get("operation", ""),
                 "session_id": row.get("session_id", ""),
                 "checkpoint_id": row.get("checkpoint_id", ""),
+                "execution_attempt": row.get("execution_attempt", ""),
+                "unit_attempt": row.get("unit_attempt", ""),
                 "completed_event_count": row.get("completed_event_count", ""),
                 "checkpoint_bytes": row.get("checkpoint_bytes", ""),
                 "wall_latency_ms": row.get("latency_ms", ""),
+                "status": row.get("status", "success"),
+                "error_type": row.get("error_type", ""),
+                "error": row.get("error", ""),
             }
             for row in trace_rows
             if row.get("event_type") == "checkpoint_result"
@@ -1047,6 +1581,16 @@ class BenchmarkArtifactStore:
                 float(row["score"])
             )
         provider_summary = summarize_provider_calls(provider_rows)
+        final_provider_rows = [
+            row for row in provider_rows if row.get("successful_path")
+        ]
+        recovery_provider_rows = [
+            row for row in provider_rows if not row.get("successful_path")
+        ]
+        final_provider_summary = summarize_provider_calls(final_provider_rows)
+        recovery_provider_summary = summarize_provider_calls(
+            recovery_provider_rows
+        )
         insertion_latencies = [
             float(row["wall_latency_ms"])
             for row in per_event_rows
@@ -1143,7 +1687,15 @@ class BenchmarkArtifactStore:
             case_provider = [
                 row for row in provider_rows if row.get("case_id") == case_id
             ]
+            case_final_provider = [
+                row for row in case_provider if row.get("successful_path")
+            ]
+            case_recovery_provider = [
+                row for row in case_provider if not row.get("successful_path")
+            ]
             case_provider_rollup = _provider_rollup(case_provider)
+            case_final_rollup = _provider_rollup(case_final_provider)
+            case_recovery_rollup = _provider_rollup(case_recovery_provider)
             case_cost = case_provider_rollup["estimated_cost_usd"]
             case_scores = [
                 float(row["primary_score"])
@@ -1203,6 +1755,24 @@ class BenchmarkArtifactStore:
                         3,
                     ),
                     **case_provider_rollup,
+                    "actual_known_cost_usd": case_provider_rollup[
+                        "known_cost_usd"
+                    ],
+                    "actual_estimated_cost_usd": case_provider_rollup[
+                        "estimated_cost_usd"
+                    ],
+                    "final_known_cost_usd": case_final_rollup[
+                        "known_cost_usd"
+                    ],
+                    "final_estimated_cost_usd": case_final_rollup[
+                        "estimated_cost_usd"
+                    ],
+                    "recovery_known_cost_usd": case_recovery_rollup[
+                        "known_cost_usd"
+                    ],
+                    "recovery_estimated_cost_usd": case_recovery_rollup[
+                        "estimated_cost_usd"
+                    ],
                     "cost_per_question_usd": (
                         float(case_cost) / len(case_questions)
                         if isinstance(case_cost, int | float)
@@ -1217,6 +1787,7 @@ class BenchmarkArtifactStore:
             "condition_id": manifest.get("condition_id"),
             "completed_cases": completed_cases,
             "failed_cases": failed_cases,
+            "attention_required_cases": attention_required_cases,
             "question_count": len(question_rows),
             "mean_score": sum(scores) / len(scores) if scores else None,
             "scores_by_scorer": {
@@ -1256,6 +1827,41 @@ class BenchmarkArtifactStore:
             "embedding_wall_latency": _latency_stats(embedding_latencies),
             "embedding_phases": embedding_phases,
             "pricing": pricing.to_dict(),
+            "actual_provider_usage": provider_summary,
+            "final_successful_provider_usage": final_provider_summary,
+            "recovery_overhead_provider_usage": recovery_provider_summary,
+            "final_successful_provider_usage_by_phase": {
+                phase: summarize_provider_calls(
+                    [
+                        row
+                        for row in final_provider_rows
+                        if row.get("phase") == phase
+                    ]
+                )
+                for phase in (
+                    "insertion",
+                    "consolidation",
+                    "retrieval",
+                    "answering",
+                    "grading",
+                )
+            },
+            "recovery_overhead_provider_usage_by_phase": {
+                phase: summarize_provider_calls(
+                    [
+                        row
+                        for row in recovery_provider_rows
+                        if row.get("phase") == phase
+                    ]
+                )
+                for phase in (
+                    "insertion",
+                    "consolidation",
+                    "retrieval",
+                    "answering",
+                    "grading",
+                )
+            },
             **provider_summary,
         }
         _write_json(
@@ -1269,6 +1875,7 @@ class BenchmarkArtifactStore:
                     "condition_id": manifest.get("condition_id"),
                     "completed_cases": completed_cases,
                     "failed_cases": failed_cases,
+                    "attention_required_cases": attention_required_cases,
                     "question_count": len(question_rows),
                     "mean_score": summary["mean_score"],
                     "retrieval_system_error_count": retrieval_system_errors,
@@ -1297,6 +1904,20 @@ class BenchmarkArtifactStore:
                     "completion_tokens": provider_summary["completion_tokens"],
                     "reasoning_tokens": provider_summary["reasoning_tokens"],
                     "estimated_cost_usd": provider_summary["estimated_cost_usd"],
+                    "known_cost_usd": provider_summary["known_cost_usd"],
+                    "usage_complete": provider_summary["usage_complete"],
+                    "final_estimated_cost_usd": final_provider_summary[
+                        "estimated_cost_usd"
+                    ],
+                    "final_known_cost_usd": final_provider_summary[
+                        "known_cost_usd"
+                    ],
+                    "recovery_estimated_cost_usd": recovery_provider_summary[
+                        "estimated_cost_usd"
+                    ],
+                    "recovery_known_cost_usd": recovery_provider_summary[
+                        "known_cost_usd"
+                    ],
                     "driver_setup_mean_latency_ms": _latency_stats(
                         driver_setup_latencies
                     )["mean_ms"],
@@ -1351,6 +1972,7 @@ class BenchmarkArtifactStore:
                     "condition_id": manifest.get("condition_id"),
                     "completed_cases": completed_cases,
                     "failed_cases": failed_cases,
+                    "attention_required_cases": attention_required_cases,
                     "restore_count": sum(
                         row.get("operation") == "restore" for row in checkpoint_rows
                     ),
@@ -1373,6 +1995,15 @@ class BenchmarkArtifactStore:
                     "replay_event_count": sum(
                         bool(row.get("replayed")) for row in per_event_rows
                     ),
+                    "unit_attempt_failure_count": sum(
+                        UnitAttemptStore(
+                            case_dir / "control"
+                        ).retryable_failure_count()
+                        for case_dir in (self.output_dir / "cases").glob("*")
+                    ),
+                    "recovery_provider_call_count": recovery_provider_summary[
+                        "provider_call_count"
+                    ],
                 }
             ],
         )
@@ -1388,4 +2019,9 @@ class BenchmarkArtifactStore:
             writer.writerows(rows)
 
 
-__all__ = ["BenchmarkArtifactStore"]
+__all__ = [
+    "ArtifactContractError",
+    "BenchmarkArtifactStore",
+    "MAX_UNIT_ATTEMPTS",
+    "UnitAttemptExhausted",
+]
