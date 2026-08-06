@@ -83,6 +83,17 @@ def test_official_chunking_preserves_sentence_boundaries() -> None:
     assert chunks == ("One two. Three four.", "Five six.")
 
 
+def test_official_chunking_does_not_emit_empty_oversized_first_chunk() -> None:
+    chunks = chunk_text_into_sentences(
+        "One two three.",
+        chunk_size=2,
+        sentence_tokenizer=lambda _: ["One two three."],
+        token_encoder=_WordEncoder(),
+    )
+
+    assert chunks == ("One two three.",)
+
+
 def test_mab_contract_uses_event_checkpoints_and_scores_memory_errors_zero() -> None:
     contracts = memory_agent_bench_task_contracts()
 

@@ -184,7 +184,8 @@ def chunk_text_into_sentences(
             token_encoder.encode(sentence, allowed_special={"<|endoftext|>"})
         )
         if current_tokens + sentence_tokens > chunk_size:
-            chunks.append(" ".join(current))
+            if current:
+                chunks.append(" ".join(current))
             current = [sentence]
             current_tokens = sentence_tokens
         else:

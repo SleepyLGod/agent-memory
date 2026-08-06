@@ -174,6 +174,19 @@ def test_comparison_writes_question_and_system_rows(tmp_path: Path) -> None:
     ]
 
 
+def test_comparison_rejects_matching_partial_result_prefixes(tmp_path: Path) -> None:
+    first = _run(tmp_path / "first", system_id="first")
+    second = _run(tmp_path / "second", system_id="second")
+    for run_dir in (first, second):
+        manifest_path = run_dir / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["question_ids"] = ["q1", "q2"]
+        _write_json(manifest_path, manifest)
+
+    with pytest.raises(ValueError, match="question set is incomplete"):
+        compare_benchmark_runs((first, second), tmp_path / "comparison")
+
+
 def test_comparison_includes_retrieval_system_error_as_zero(tmp_path: Path) -> None:
     failed = _run(
         tmp_path / "failed",
