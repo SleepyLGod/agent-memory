@@ -91,6 +91,7 @@ class _Mem0ExtractionAdapter(LotusAdapter):
             source,
             outputs,
             tuple(query.params["output_cols"]),
+            ordinal_col=query.params.get("ordinal_col"),
         )
 
 
@@ -302,6 +303,31 @@ def test_mem0_enhanced_storage_checkpoint_restores_into_base_vector_retrieval(
     assert [row["memory"] for row in _records(result)] == ["alpha"]
     assert len(base._runtime._state["log"]) == 1
     base_connector.close()
+
+
+def test_semantic_dedup_policy_rejects_legacy_maintenance_checkpoint(
+    tmp_path: Path,
+) -> None:
+    source, source_connector = _stored_mem0(
+        tmp_path / "source",
+        Mem0MemoryEnhanced,
+    )
+    source.add(
+        {
+            "role": "user",
+            "content": "alpha",
+            "observation_date": "2026-07-28T10:00:00",
+        }
+    )
+    snapshot = dict(source._runtime.snapshot_state())
+    snapshot["plan_fingerprint"] = "legacy-exact-only-mem0-plan"
+    source_connector.close()
+
+    target, target_connector = _stored_mem0(tmp_path / "target", Mem0Memory)
+    with pytest.raises(ValueError, match="fingerprint"):
+        target._runtime.restore_state(snapshot)
+
+    target_connector.close()
 
 
 def test_unstored_mem0_enhanced_checkpoint_cannot_restore_into_stored_base(

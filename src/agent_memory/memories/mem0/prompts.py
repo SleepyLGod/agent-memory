@@ -9,6 +9,61 @@ MEM0_SOURCE_PROMPT_SHA256 = (
     "ad19187a37813ef77ee156e714c0650e6ec749e0264bdc07d499bc9b24115155"
 )
 
+# Verbatim duplicate-boundary rules from ADDITIVE_EXTRACTION_PROMPT at the
+# pinned commit. The semantic filter below only adapts the pairwise input and
+# boolean row-filter contract.
+MEM0_SOURCE_DEDUPLICATION_EXCERPT = r"""
+Use these ONLY for deduplication and linking — do NOT extract new memories from Existing Memories. Your extractions must come exclusively from New Messages. If new information in New Messages is semantically equivalent to an Existing Memory with no meaningful new context, skip it.
+
+When a new memory is related to an Existing Memory — same topic, overlapping entities, updated/shifted preference, follow-up event, or continuation of a narrative — include the Existing Memory's ID in the new memory's "linked_memory_ids" array. Your ADD output IDs remain sequential ("0", "1", ...) but linked_memory_ids uses the UUIDs from this list.
+
+IMPORTANT: An existing memory about an entity (e.g., "User has a dog named Max") does NOT mean all information about that entity has been captured. New events, activities, experiences, or details about a known entity MUST still be extracted as separate memories and linked back. Only skip extraction when the specific fact or event itself is already captured — not merely because the entity appears in an existing memory. "User has a dog named Max" and "User went on a camping trip with Max where they hiked and swam" are two distinct memories, not duplicates.
+
+**When in doubt, extract.** A slightly redundant memory is far less costly than a missing one. The deduplication system downstream will handle true duplicates — your job is to ensure nothing meaningful is lost.
+""".strip()
+MEM0_SOURCE_DEDUPLICATION_EXCERPT_SHA256 = (
+    "b52403fae22c0c37e50a94a5874d5cecd37156b400205e4b7b56aae8b070fb49"
+)
+
+MEM0_SEMANTIC_DUPLICATE_INSTRUCTION = rf"""
+# Native Mem0 duplicate boundary
+
+{MEM0_SOURCE_DEDUPLICATION_EXCERPT}
+
+# Pairwise operator adaptation
+
+Existing Memory: {{memory:earlier}}
+New Memory: {{memory:later}}
+
+Keep this pair only when Native Mem0 would skip the New Memory because it
+captures the same specific fact or event as the Existing Memory and adds no
+meaningful new context.
+
+Related memories are not duplicates merely because they concern the same
+person, entity, or topic. A new event, activity, experience, detail,
+updated or shifted preference, follow-up, continuation, or contradiction must
+not be kept by this filter. When uncertain, do not keep the pair so that the
+New Memory remains in the memory view.
+
+Examples adapted from the pinned Native Mem0 prompt:
+
+1. Existing Memory: Marcus was promoted to Senior Engineer at Shopify around
+   August 12, 2025
+   New Memory: Marcus was promoted to Senior Engineer at Shopify around
+   August 12, 2025
+   Keep the pair: yes
+
+2. Existing Memory: User has a dog named Poppy, a golden retriever
+   New Memory: User's dog Poppy had a vet checkup around March 14, 2025, is
+   healthy but needs to lose weight
+   Keep the pair: no
+
+3. Existing Memory: John has a dog named Max
+   New Memory: John and his dog Max went on a camping trip in the summer of
+   2023 where they hiked, swam, and found it a peaceful experience
+   Keep the pair: no
+""".strip()
+
 # Task criteria below are adapted directly from ADDITIVE_EXTRACTION_PROMPT at
 # MEM0_SOURCE_COMMIT. Input binding and output framing are intentionally changed:
 # one log row is the only new evidence, previous_messages is context only, and
@@ -319,7 +374,10 @@ contain memory and attributed_to. attributed_to must be either `user` or
 
 __all__ = [
     "MEM0_ADDITIVE_EXTRACTION_INSTRUCTION",
+    "MEM0_SEMANTIC_DUPLICATE_INSTRUCTION",
     "MEM0_SOURCE_COMMIT",
+    "MEM0_SOURCE_DEDUPLICATION_EXCERPT",
+    "MEM0_SOURCE_DEDUPLICATION_EXCERPT_SHA256",
     "MEM0_SOURCE_PROMPT_PATH",
     "MEM0_SOURCE_PROMPT_SHA256",
 ]

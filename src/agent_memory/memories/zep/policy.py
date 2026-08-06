@@ -16,32 +16,122 @@ from agent_memory.policy.retrieval import (
 )
 
 
-_EPISODE_WINDOW_LEN = 3
+# Match Graphiti's extraction context depth for sequential episode ingestion.
+_EPISODE_WINDOW_LEN = 10
 
 
 # Adapted from Graphiti graphiti_core/prompts/extract_nodes.py::extract_message.
 _ENTITY_EXTRACT_INSTRUCTION = """
+You are an entity extraction specialist for conversational messages. Never
+extract abstract concepts, feelings, or generic words.
+
 Extract entity nodes explicitly mentioned in the CURRENT MESSAGE {content}.
-Return one row per distinct entity with {name}. Use {previous_episodes} only to
-resolve references; never extract an entity that appears only in previous
-messages.
+Return one row per distinct entity with {name}. Use PREVIOUS MESSAGES
+{previous_episodes} only to resolve references; never extract an entity that
+appears only in previous messages.
 
-Always extract the speaker, the text before the first colon, as the first
-entity. If the speaker appears again, return it only once. Resolve pronouns to
-explicit names, but never return a pronoun as an entity name.
+The only entity type is Entity: a specific, identifiable entity that does not
+fit a more specialized type. It must still be a concrete, meaningful thing that
+is specific enough to be uniquely identifiable. GOOD: a named entity not
+covered by another type. BAD: luck, ideas, tomorrow, things, them, everybody, a
+sense of wonder, or great times. When in doubt, do not extract the entity.
 
-Never extract abstract concepts or feelings; dates or times; relationships or
-actions; sentence fragments; generic media, events, institutions, common nouns,
-or bare objects. Bare kinship, associate, and pet terms must be qualified with
-their possessor, for example "Nisha's dad" rather than "dad". Extract named
-entities and concrete things only when the standalone name is specific enough
-to distinguish it later. Preserve the most specific form in the message, such
-as "road cycling", "wool coat", or "Gamecube", rather than a generic head
-noun. When in doubt, do not extract.
+NEVER extract any of the following:
+- Pronouns such as you, me, I, he, she, they, we, us, it, them, him, her,
+  this, that, or those. Resolve references to explicit names instead.
+- Abstract concepts or feelings such as joy, balance, growth, resilience,
+  happiness, passion, or motivation.
+- Generic common nouns or bare object words such as day, life, people, work,
+  stuff, things, food, time, way, tickets, supplies, clothes, keys, or gear.
+- Generic media or content nouns unless uniquely identified in the name itself,
+  such as photo, pic, picture, image, video, post, or story.
+- Generic event or activity nouns unless uniquely identified in the name
+  itself, such as event, game, meeting, class, workshop, or competition.
+- Broad institutional nouns unless explicitly named or uniquely qualified,
+  such as government, school, company, team, or office.
+- Ambiguous bare nouns whose meaning depends on sentence context rather than
+  the entity name itself.
+- Sentence fragments or clauses such as "what you really care about" or
+  "results of that effort".
+- Adjectives or descriptive fragments such as "amazing", "something
+  different", or "new hair color".
+- Duplicate references to the same real-world entity. Return each entity at
+  most once per message, even when it appears as both speaker and body text.
+- Bare relational or kinship terms such as dad, mom, mother, father, sister,
+  brother, husband, wife, spouse, son, daughter, uncle, aunt, cousin, grandma,
+  grandpa, friend, boss, teacher, neighbor, or roommate, and bare animal or pet
+  terms such as dog, cat, pet, puppy, or kitten. Qualify them with the possessor
+  when the message supports it, for example "Nisha's dad" or "Jordan's dog".
+- Bare generic objects that cannot be meaningfully qualified with a possessor,
+  brand, or distinguishing detail, such as "supplies" in "I picked up some
+  supplies".
 
-Example: from "Jordan: We moved to Denver. My spouse joined Lockheed Martin",
-extract Jordan, Denver, and Lockheed Martin. Do not extract spouse, moved, or a
-date.
+Rules:
+1. Always extract the speaker, the text before the first colon, as the first
+   entity. If the speaker appears again, return it only once.
+2. Extract named entities and specific concrete things only when their names
+   can identify them later. Ask whether the entity could have its own database
+   entry or is distinguishable from other things of the same category in this
+   conversation.
+3. Extract brand-named items such as Gamecube, Ford Mustang, or Moen faucet;
+   qualified items such as wool coat, red and purple lighting, cracked
+   windshield, or dog leash; and objects with a concrete color, material, size,
+   model, owner, or use. Do not extract bare heads such as car, coat, game,
+   lighting, or windshield.
+4. When a named person refers to a relative, pet, or associate with a bare
+   term, qualify it using the possessor when possible. Do not return the bare
+   term alone.
+5. Do not extract relationships, actions, dates, times, or other temporal
+   information.
+6. Use the most specific form in the message: "road cycling" rather than
+   "cycling", "wool coat" rather than "coat", and "dog leash" rather than
+   "leash" when context establishes the object type.
+7. Use explicit, unambiguous names and full names when available.
+   When in doubt, do not extract.
+
+<EXAMPLE>
+Message: "Jordan: We just moved to Denver last month. My spouse started a new
+role at Lockheed Martin and I enrolled in a ceramics workshop at the Belmont
+Arts Center."
+Good extractions: Jordan, Denver, Lockheed Martin, Belmont Arts Center, and
+ceramics.
+Do not extract: spouse, new role, last month, or we.
+</EXAMPLE>
+
+<EXAMPLE>
+Message: "Nisha: My dad is visiting next week. He loves walking his dogs in
+Riverside Park."
+Good extractions: Nisha, Nisha's dad, and Riverside Park.
+Do not extract: dad, dogs, or next week.
+</EXAMPLE>
+
+<EXAMPLE>
+Message: "Mary: I forgot Trigger's leash so I couldn't take him on a dog walk.
+After that I went road cycling in my new wool coat."
+Good extractions: Mary, Trigger, dog leash, road cycling, and wool coat.
+Do not extract: leash, cycling, coat, or dog walk.
+</EXAMPLE>
+
+<EXAMPLE>
+Message: "Nate: My gaming room has red and purple lighting and I mostly play on
+a Gamecube. Last week the windshield on my Mustang got cracked."
+Good extractions: Nate, gaming room, red and purple lighting, Gamecube,
+Mustang, and cracked windshield.
+Do not extract: lighting, windshield, or week.
+</EXAMPLE>
+
+<EXAMPLE>
+Message: "Alex: I shared a pic from the game after the event."
+Good extraction: Alex.
+Do not extract: pic, game, or event.
+</EXAMPLE>
+
+<EXAMPLE>
+Message: "Jordan: We won by a tight score. Scoring that last basket felt
+incredible."
+Good extraction: Jordan.
+Do not extract: basket.
+</EXAMPLE>
 """.strip()
 
 
@@ -74,31 +164,64 @@ recurrence, causality, or intent from a single weak observation.
 
 # Adapted from Graphiti graphiti_core/prompts/extract_edges.py::edge.
 _FACT_EXTRACT_INSTRUCTION = """
-Extract every factual relationship stated in the current episode {content}
-between the resolved {entities}. Each listed entity has an integer
+You are an expert fact extractor that extracts factual relationship triples
+with relevant date information.
+
+Extract every factual relationship stated in the CURRENT MESSAGE {content}
+between the resolved ENTITIES {entities}. Each listed entity has an integer
 entity_ordinal. Return one row per relationship with {source_entity_ordinal},
 {target_entity_ordinal}, {relation_type}, {fact}, {valid_at}, and {invalid_at}.
 
-Use {previous_episodes} only to resolve references and maintain continuity. Use
-{reference_time} to resolve relative temporal expressions. Use ISO 8601
-timestamps when temporal bounds can be resolved; otherwise return JSON null.
-Both entity ordinals must identify distinct entities in the provided list. An
-ordinal outside that list makes the fact invalid.
+Use PREVIOUS MESSAGES {previous_episodes} only to disambiguate references or
+support continuity. Use REFERENCE TIME {reference_time} to resolve temporal
+expressions in the current message.
 
-Extract only facts clearly stated or unambiguously implied by the current
-message. Use previous episodes only for reference disambiguation and continuity.
-Prefer entity names over pronouns in {fact}. Do not emit semantically redundant
-facts, but treat a later claim with additional concrete detail as a new fact,
-not a duplicate. Preserve every proper noun, brand, model, quantity, count,
-color, material, physical description, location, and named activity; paraphrase
-without generalizing away those details.
+Only extract facts that:
+- involve two distinct entities from the provided ENTITIES list;
+- are clearly stated or unambiguously implied in the CURRENT MESSAGE; and
+- can be represented as an edge between those entities.
 
-Derive {relation_type} from the relationship predicate in
-SCREAMING_SNAKE_CASE. For ongoing present-tense facts, set {valid_at} to the
-episode {reference_time}. Resolve relative time against {reference_time}; set
-{invalid_at} only when a change or termination is expressed. Use ISO 8601 when
-resolvable, assume midnight for date-only values and January 1 for year-only
-values, and return JSON null rather than hallucinating a temporal bound.
+Extraction rules:
+1. {source_entity_ordinal} and {target_entity_ordinal} must be integer ordinals
+   from the provided ENTITIES list. An out-of-range ordinal makes the fact
+   invalid.
+2. The source and target must identify two distinct entities.
+   Never emit a self-loop.
+3. Prefer facts involving two explicit entities. When a sentence gives a
+   specific concrete detail about one entity, such as a brand, item, physical
+   description, quantity, location, or named activity, do not drop it. Use a
+   second entity from the list to anchor a proper relationship when one exists.
+   Skip it only when no second entity can anchor the detail.
+   BAD: "Alice feels happy" is a vague single-entity state.
+   GOOD: "Alice feels happy about Bob's promotion" relates Alice to Bob's
+   promotion.
+   GOOD: "Nate plays games on a Gamecube" relates Nate to Gamecube when
+   Gamecube is in ENTITIES.
+   GOOD: "Alice congratulated Bob" and "Alice lives in Paris" each relate two
+   explicit entities.
+4. Prefer entity names over pronouns in {fact}. Do not emit semantically
+   redundant facts. A later claim with additional concrete detail is a new fact,
+   not a duplicate.
+   NOT A DUPLICATE: "user plays video games" and "user plays games on a
+   Gamecube" differ in specificity.
+   DUPLICATE: "user plays games on a Gamecube" and "user plays Gamecube games"
+   express the same specific fact.
+5. Preserve every supported proper noun, brand, product, model, quantity,
+   count, color, material, physical description, item, named location, and
+   named activity. Paraphrase the sentence structure without generalizing any
+   concrete detail.
+   Never generalize Gamecube to gaming console, Ford Mustang to car, wool coat
+   to coat, red and purple lighting to lighting, cracked windshield to car
+   damage, or three screenplays to several screenplays.
+6. Derive {relation_type} from the relationship predicate in
+   SCREAMING_SNAKE_CASE, for example WORKS_AT, LIVES_IN, or IS_FRIENDS_WITH.
+7. Use ISO 8601 with a Z suffix for temporal bounds. Resolve relative
+   expressions against {reference_time}. For an ongoing present-tense fact, set
+   {valid_at} to {reference_time}. Set {invalid_at} only when a change or
+   termination is expressed. Assume midnight for a date-only value and January
+   1 at midnight for a year-only value. Return JSON null when a temporal bound
+   is not explicitly stated or resolvable.
+   Never infer dates from unrelated events.
 """.strip()
 
 
