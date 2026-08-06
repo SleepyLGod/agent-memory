@@ -258,7 +258,7 @@ def test_longmemeval_zep_run_forwards_existing_runner_contract(
 ) -> None:
     output_dir = tmp_path / "output"
     captured = {}
-    bundle = SimpleNamespace(benchmark_id="longmemeval-v1-cleaned-s")
+    bundle = SimpleNamespace(benchmark_id="longmemeval-v1-cleaned-s", cases=())
     monkeypatch.setattr(longmemeval, "read_bundle", lambda path: bundle)
     monkeypatch.setattr(
         longmemeval,
@@ -396,7 +396,9 @@ def test_longmemeval_maintenance_run_does_not_export_hypotheses(
     monkeypatch.setattr(
         longmemeval,
         "read_bundle",
-        lambda path: SimpleNamespace(benchmark_id="longmemeval-v1-cleaned-s"),
+        lambda path: SimpleNamespace(
+            benchmark_id="longmemeval-v1-cleaned-s", cases=()
+        ),
     )
     monkeypatch.setattr(
         longmemeval,
@@ -417,6 +419,41 @@ def test_longmemeval_maintenance_run_does_not_export_hypotheses(
             "--output-dir",
             str(output_dir),
             "--maintenance-only",
+        ]
+    )
+
+    assert result == output_dir
+
+
+def test_longmemeval_partial_run_does_not_export_hypotheses(
+    tmp_path, monkeypatch
+) -> None:
+    output_dir = tmp_path / "partial"
+    bundle = SimpleNamespace(
+        benchmark_id="longmemeval-v1-cleaned-s",
+        cases=(SimpleNamespace(case_id="case-1"),),
+    )
+    monkeypatch.setattr(longmemeval, "read_bundle", lambda path: bundle)
+    monkeypatch.setattr(
+        longmemeval,
+        "run_agent_memory_bundle",
+        lambda **kwargs: output_dir,
+    )
+    monkeypatch.setattr(
+        longmemeval,
+        "write_official_hypotheses",
+        lambda *args: pytest.fail("partial run must not export hypotheses"),
+    )
+
+    result = longmemeval.main(
+        [
+            "run",
+            "--bundle-dir",
+            str(tmp_path / "bundle"),
+            "--output-dir",
+            str(output_dir),
+            "--max-new-cases",
+            "1",
         ]
     )
 

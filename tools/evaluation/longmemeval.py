@@ -10,6 +10,7 @@ from typing import Sequence
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
+from agent_memory.evaluation.artifacts import BenchmarkArtifactStore  # noqa: E402
 from agent_memory.evaluation.bundle import read_bundle, write_bundle  # noqa: E402
 from agent_memory.evaluation.longmemeval import (  # noqa: E402
     LONGMEMEVAL_CLAUDE_PILOT_30_IDS,
@@ -203,13 +204,10 @@ def main(argv: Sequence[str] | None = None) -> Path:
     bundle = read_bundle(args.bundle_dir)
     if bundle.benchmark_id != "longmemeval-v1-cleaned-s":
         raise ValueError("bundle is not the pinned LongMemEval v1 dataset")
+    contract = longmemeval_task_contract(judge_model_id=args.judge_model)
     output = run_agent_memory_bundle(
         bundle=bundle,
-        contracts={
-            "longmemeval-v1": longmemeval_task_contract(
-                judge_model_id=args.judge_model
-            )
-        },
+        contracts={"longmemeval-v1": contract},
         system_id=args.system,
         output_dir=args.output_dir,
         memory_model_id=args.memory_model_id,
@@ -228,7 +226,11 @@ def main(argv: Sequence[str] | None = None) -> Path:
         max_new_cases=args.max_new_cases,
     )
     if not args.maintenance_only:
-        write_official_hypotheses(bundle, output)
+        store = BenchmarkArtifactStore(output)
+        if all(
+            store.completed(case, contract.fingerprint) for case in bundle.cases
+        ):
+            write_official_hypotheses(bundle, output)
     return output
 
 

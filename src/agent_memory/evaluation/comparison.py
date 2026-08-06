@@ -118,6 +118,17 @@ def compare_benchmark_runs(
         _read_run_results(path, condition_id)
         for path, condition_id in zip(run_dirs, conditions, strict=True)
     ]
+    for run_dir, manifest, results in zip(
+        run_dirs, manifests, result_sets, strict=True
+    ):
+        declared_cases = set(manifest["case_ids"])
+        actual_cases = {case_id for case_id, _, _ in results}
+        if actual_cases != declared_cases:
+            raise ValueError(f"benchmark run case set is incomplete: {run_dir}")
+        declared_questions = set(manifest["question_ids"])
+        actual_questions = {question_id for _, question_id, _ in results}
+        if actual_questions != declared_questions:
+            raise ValueError(f"benchmark run question set is incomplete: {run_dir}")
     expected_questions = set(result_sets[0])
     for run_dir, results in zip(run_dirs[1:], result_sets[1:], strict=True):
         if set(results) != expected_questions:
