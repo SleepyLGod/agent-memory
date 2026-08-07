@@ -21,7 +21,6 @@ from agent_memory.adapters.lotus.sem_agg import (
     execute_native_sem_agg_group,
     execute_structured_sem_agg_group,
 )
-from agent_memory.adapters.lotus.sem_groupby import GROUP_ID_COLUMN
 from agent_memory.policy.expressions import (
     ArrayCatExpr,
     BooleanExpr,
@@ -231,7 +230,12 @@ def execute_drop_duplicates(
     """Execute exact duplicate-row removal."""
 
     source = execute(query.inputs[0], inputs)
-    return source.drop_duplicates(ignore_index=True)
+    subset = query.params.get("subset")
+    return source.drop_duplicates(
+        subset=list(subset) if subset is not None else None,
+        keep="first",
+        ignore_index=True,
+    )
 
 
 def execute_array_agg(

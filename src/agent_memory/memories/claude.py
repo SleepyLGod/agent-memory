@@ -131,12 +131,12 @@ Focus on:
 Output one canonical memory row with {name}, {description}, {type}, and {body}.
 """.strip()
 
-_CATALOG_INSTRUCTION = """
-Produce one MEMORY.md catalog index row per topic, filling {catalog_title} and {hook}.
+_CATALOG_HOOK_INSTRUCTION = """
+Write one short plain-text relevance hook for the canonical topic {name}, using its
+description {description}, type {type}, and body {body}.
 
-MEMORY.md is an index, not a memory — each entry should be one line, under ~150 characters: `- [Title](file.md) — one-line hook`. It has no frontmatter. Never write memory content directly into MEMORY.md.
-
-Keep {hook} short and useful for relevance selection. Do not generate filesystem paths; markdown storage will derive paths from the topic identity later.
+Return only the hook text, under 150 characters. Do not return JSON, a title, a
+filesystem path, a list, or multiple catalog entries.
 """.strip()
 
 
@@ -203,15 +203,15 @@ class ClaudeMemory(Memory):
         .select(["name", "description", "type", "body"])
     )
 
+    # One canonical topic produces exactly one catalog entry.
     catalog = (
         topics.sem_map(
             input_cols=["name", "description", "type", "body"],
-            output_cols={
-                "catalog_title": "Title shown in the memory catalog.",
-                "hook": "One-line relevance hook.",
-            },
-            instruction=_CATALOG_INSTRUCTION,
-        ).select(["catalog_title", "name", "hook"])
+            output_cols={"hook": "One-line relevance hook."},
+            instruction=_CATALOG_HOOK_INSTRUCTION,
+        )
+        .assign(catalog_title=topics.col("name"))
+        .select(["catalog_title", "name", "hook"])
     )
 
     retrieval_query = (

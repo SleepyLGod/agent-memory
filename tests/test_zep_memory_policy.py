@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import agent_memory as am
+import pytest
 from agent_memory.policy.aggregates import (
     ArrayAggregateSpec,
     MinAggregateSpec,
@@ -10,7 +11,11 @@ from agent_memory.policy.aggregates import (
 )
 from agent_memory.policy.logical import QueryExpr
 from agent_memory.memories import ZepMemory, ZepMemoryExtended
-from agent_memory.planner import PolicyDifferentiator, RetrievalPlan
+from agent_memory.planner import (
+    DifferentialRules,
+    PolicyDifferentiator,
+    RetrievalPlan,
+)
 from agent_memory.policy.retrieval import RetrievalQuery
 from agent_memory.policy.schema import output_columns
 from agent_memory.memories.zep.storage import GRAPHITI_NEO4J_STATEMENTS
@@ -81,6 +86,66 @@ def test_zep_extended_policy_adds_communities_without_changing_core_queries() ->
     assert extended.retrieval_queries == baseline.retrieval_queries
 
 
+def test_zep_entity_extraction_prompt_preserves_graphiti_rules_and_examples() -> None:
+    baseline = ZepMemory.spec().private_relations["_extracted_entities"]
+    extended = ZepMemoryExtended.spec().private_relations["_extracted_entities"]
+    baseline_extraction = next(
+        node for node in _walk(baseline) if node.op == "sem_flat_map"
+    )
+    extended_extraction = next(
+        node for node in _walk(extended) if node.op == "sem_flat_map"
+    )
+    instruction = baseline_extraction.params["instruction"]
+    normalized_instruction = " ".join(instruction.split())
+
+    assert instruction == extended_extraction.params["instruction"]
+    assert instruction.count("<EXAMPLE>") == 6
+    for expected in (
+        "The only entity type is Entity",
+        "a sense of wonder",
+        "Generic media or content nouns",
+        "Generic event or activity nouns",
+        "Bare relational or kinship terms",
+        "mother, father, sister",
+        "Jordan's dog",
+        "Belmont Arts Center",
+        "Nisha's dad",
+        "dog leash",
+        "red and purple lighting",
+        "Gamecube",
+        "Do not extract: pic, game, or event",
+        "Do not extract: basket",
+    ):
+        assert expected in normalized_instruction
+
+
+def test_zep_fact_extraction_prompt_preserves_graphiti_fact_contract() -> None:
+    baseline = ZepMemory.spec().private_relations["_extracted_facts"]
+    extended = ZepMemoryExtended.spec().private_relations["_extracted_facts"]
+    baseline_extraction = next(
+        node for node in _walk(baseline) if node.op == "sem_flat_map"
+    )
+    extended_extraction = next(
+        node for node in _walk(extended) if node.op == "sem_flat_map"
+    )
+    instruction = baseline_extraction.params["instruction"]
+
+    assert instruction == extended_extraction.params["instruction"]
+    for expected in (
+        "two distinct entities",
+        "Never emit a self-loop",
+        'BAD: "Alice feels happy"',
+        'GOOD: "Nate plays games on a Gamecube"',
+        "NOT A DUPLICATE",
+        "DUPLICATE",
+        "Never generalize Gamecube to gaming console",
+        "three screenplays to several screenplays",
+        "SCREAMING_SNAKE_CASE",
+        "Never infer dates from unrelated events",
+    ):
+        assert expected in instruction
+
+
 def test_zep_retrieval_is_one_two_channel_storage_backed_dag() -> None:
     spec = ZepMemory.spec()
     retrieval = spec.retrieval_queries["default"]
@@ -127,6 +192,49 @@ def test_zep_retrieval_is_one_two_channel_storage_backed_dag() -> None:
         spec,
         statements=GRAPHITI_NEO4J_STATEMENTS,
     ).fingerprint
+
+
+def test_prefer_join_map_selects_rules_by_grouping_capability() -> None:
+    policy = PolicyDifferentiator(
+        rules=DifferentialRules(grouped_agg_rule="prefer-join-map")
+    ).differentiate(
+        ZepMemory.spec(),
+        statements=GRAPHITI_NEO4J_STATEMENTS,
+    )
+    grouped_nodes = [
+        node
+        for node in policy.nodes.values()
+        if node.execution_kind == "semantic_state"
+        and node.query.op == "agg"
+        and node.query.inputs[0].op == "sem_groupby"
+    ]
+    unpartitioned = next(
+        node
+        for node in grouped_nodes
+        if not node.query.inputs[0].params.get("partition_by")
+    )
+    partitioned = next(
+        node
+        for node in grouped_nodes
+        if node.query.inputs[0].params.get("partition_by")
+    )
+
+    assert policy.grouped_agg_rule == "prefer-join-map"
+    assert unpartitioned.maintenance_query is not None
+    assert "sem_join" in _ops(unpartitioned.maintenance_query)
+    assert partitioned.maintenance_query is not None
+    assert "sem_join" not in _ops(partitioned.maintenance_query)
+    assert "concat" in _ops(partitioned.maintenance_query)
+
+
+def test_strict_join_map_still_rejects_partitioned_zep_facts() -> None:
+    with pytest.raises(NotImplementedError, match="partition_by.*rule-join-map"):
+        PolicyDifferentiator(
+            rules=DifferentialRules(grouped_agg_rule="rule-join-map")
+        ).differentiate(
+            ZepMemory.spec(),
+            statements=GRAPHITI_NEO4J_STATEMENTS,
+        )
 
 
 def test_zep_episodes_view_uses_select_not_map() -> None:

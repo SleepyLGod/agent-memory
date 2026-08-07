@@ -1,7 +1,13 @@
 """Semantic memory framework experiments for agent developers."""
 
 from .api import Memory, Message
-from .memories import ClaudeMemory, ZepMemory, ZepMemoryExtended
+from .memories import (
+    ClaudeMemory,
+    Mem0Memory,
+    Mem0MemoryEnhanced,
+    ZepMemory,
+    ZepMemoryExtended,
+)
 from .planner.differential_policy import DifferentiatedPolicy
 from .policy import (
     BFS,
@@ -30,6 +36,8 @@ __all__ = [
     "CosineSimilarity",
     "CrossEncoder",
     "Log",
+    "Mem0Memory",
+    "Mem0MemoryEnhanced",
     "Memory",
     "Message",
     "RRF",

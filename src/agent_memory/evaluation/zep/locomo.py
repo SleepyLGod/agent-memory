@@ -105,6 +105,7 @@ class ZepLocomoRunConfig:
     question_numbers: tuple[int, ...] | None = None
     include_adversarial: bool = True
     model: str = DEFAULT_MODEL
+    grouped_agg_rule: str = "rule-re-group"
     namespace: str | None = None
 
 
@@ -317,12 +318,13 @@ def build_manifest(
         "question_limit": config.question_limit,
         "question_numbers": list(config.question_numbers or ()),
         "include_adversarial": config.include_adversarial,
+        "grouped_agg_rule": config.grouped_agg_rule,
         "namespace": namespace,
         "model": {
             "id": config.model,
             "temperature": GENERATION_TEMPERATURE,
             "max_tokens": GENERATION_MAX_TOKENS,
-            "thinking": {"type": "enabled"},
+            "thinking": {"type": "disabled"},
             "application_cache": "disabled",
         },
         "storage": {
@@ -532,6 +534,7 @@ def create_runtime(
     *,
     namespace: str,
     model: str,
+    grouped_agg_rule: str,
     trace_dir: Path,
 ) -> tuple[Any, Any, Any]:
     """Create the real Graphiti-compatible storage, adapter, and ZepMemory."""
@@ -545,6 +548,8 @@ def create_runtime(
         GRAPHITI_NEO4J_STATEMENTS,
     )
     from agent_memory.storage import StorageDeployment
+    from agent_memory.planner import DifferentialRules, PolicyDifferentiator
+    from agent_memory.runtime import MemoryRuntime
     from agent_memory.storage.neo4j import (
         Neo4jConnector,
         SentenceTransformerCrossEncoderProvider,
@@ -573,12 +578,23 @@ def create_runtime(
             config=LotusExecutionConfig(
                 semantic_trace_dir=trace_dir,
                 lm_model_kwargs={
-                    "extra_body": {"thinking": {"type": "enabled"}}
+                    "extra_body": {"thinking": {"type": "disabled"}}
                 },
                 lm_enable_cache=False,
             ),
         )
-        memory = am.ZepMemory(adapter=adapter, storage=storage)
+        policy = PolicyDifferentiator(
+            rules=DifferentialRules(grouped_agg_rule=grouped_agg_rule)
+        ).differentiate(
+            am.ZepMemory.spec(),
+            statements=storage.statements,
+        )
+        memory = am.ZepMemory(adapter=adapter)
+        memory._runtime = MemoryRuntime(
+            policy,
+            adapter=adapter,
+            storage=storage,
+        )
     except Exception:
         connector.close()
         raise
@@ -594,11 +610,17 @@ def checkpoint_round_trip(
     """Restore one checkpoint and prove retrieval identity/order is unchanged."""
 
     import agent_memory as am
+    from agent_memory.runtime import MemoryRuntime
 
     before = _query_without_semantic_usage(memory, question.question)
     snapshot = memory._runtime.snapshot_state()
     state = pickle.dumps(snapshot)
-    restored = am.ZepMemory(adapter=adapter, storage=storage)
+    restored = am.ZepMemory(adapter=adapter)
+    restored._runtime = MemoryRuntime(
+        memory._runtime.policy,
+        adapter=adapter,
+        storage=storage,
+    )
     restored._runtime.restore_state(pickle.loads(state))
     for name in ("episodes", "entities", "facts"):
         pd.testing.assert_frame_equal(
@@ -678,6 +700,7 @@ def run_zep_locomo(config: ZepLocomoRunConfig) -> Path:
         storage, memory, adapter = create_runtime(
             namespace=namespace,
             model=config.model,
+            grouped_agg_rule=config.grouped_agg_rule,
             trace_dir=store.trace_dir,
         )
         phase = "insertion"

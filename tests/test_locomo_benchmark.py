@@ -944,12 +944,10 @@ def test_load_checkpoint_rejects_mismatched_arguments(tmp_path: Path) -> None:
         )
 
 
-def test_grouped_agg_rule_choices_include_join_map() -> None:
-    assert claude_memory_locomo_module.GROUPED_AGG_RULES == (
-        "compressed",
-        "changed-aware",
-        "join-map",
-    )
+def test_grouped_agg_rule_choices_match_the_planner() -> None:
+    from agent_memory.planner.rules import GROUPED_AGG_RULES
+
+    assert claude_memory_locomo_module.GROUPED_AGG_RULES == GROUPED_AGG_RULES
 
 
 def test_sem_topk_method_choices_use_canonical_names() -> None:

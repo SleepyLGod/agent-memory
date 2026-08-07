@@ -462,7 +462,6 @@ class StructuredLMExecutor:
 
         import lotus
         from lotus.templates import task_instructions
-        from lotus.types import LMOutput
         from lotus.utils import show_safe_mode
 
         if lotus.settings.lm is None:

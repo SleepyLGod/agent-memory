@@ -481,7 +481,6 @@ def build_trace_diagnosis(
                         "parse_retry_attempts": event.get("parse_retry_attempts", 0),
                         "parse_error": event.get("parse_error", ""),
                         "failure_artifact": event.get("failure_artifact", ""),
-                        "trace_id": event.get("trace_id", ""),
                         "phase": event.get("phase", ""),
                         "add_index": event.get("step_index", event.get("add_index", "")),
                     }
@@ -510,7 +509,6 @@ def build_trace_diagnosis(
                     "default": event.get("default", ""),
                     "default_false": empty_raw_output and parsed_output == "False",
                     "instruction_preview": text_preview(event.get("instruction", ""), limit=260),
-                    "trace_id": event.get("trace_id", ""),
                     "phase": event.get("phase", ""),
                     "add_index": event.get("step_index", event.get("add_index", "")),
                 }

@@ -219,6 +219,18 @@ def test_policy_fingerprint_includes_the_selected_rule() -> None:
     assert join_map.grouped_agg_rule == "rule-join-map"
 
 
+def test_claude_policy_prefer_join_map_matches_strict_join_map_plan() -> None:
+    strict = planner.PolicyDifferentiator(
+        rules=DifferentialRules(grouped_agg_rule="rule-join-map")
+    ).differentiate(am.ClaudeMemory.spec())
+    preferred = planner.PolicyDifferentiator(
+        rules=DifferentialRules(grouped_agg_rule="prefer-join-map")
+    ).differentiate(am.ClaudeMemory.spec())
+
+    assert preferred.grouped_agg_rule == "prefer-join-map"
+    assert preferred.fingerprint == strict.fingerprint
+
+
 def test_policy_compiler_rejects_process_window_external_relation_capture() -> None:
     source_log = am.Log({"message": "Message body."})
     external = source_log.select(["message"])
@@ -763,9 +775,7 @@ class _ClaudeStubAdapter(LotusAdapter):
         if query.op == "sem_map":
             source = self.execute(query.inputs[0], inputs).copy()
             for column in query.params["output_cols"]:
-                if column.name == "catalog_title":
-                    source[column.name] = source["name"]
-                elif column.name == "hook":
+                if column.name == "hook":
                     source[column.name] = source["description"]
                 else:
                     source[column.name] = column.name
@@ -788,6 +798,19 @@ def test_claude_runtime_propagates_topic_replacement_without_stale_catalog() -> 
         "Keep architecture notes concise.",
     }
     assert catalog.loc[0, "name"] == "documentation_preference"
+    assert catalog.loc[0, "catalog_title"] == catalog.loc[0, "name"]
+    assert isinstance(catalog.loc[0, "hook"], str)
+
+    snapshot = memory._runtime.snapshot_state()
+    assert snapshot["schema_version"] == 2
+    restored = am.ClaudeMemory(adapter=_ClaudeStubAdapter())
+    restored._runtime.restore_state(snapshot)
+    restored.add({"message": "Prefer direct wording."})
+
+    restored_topics = restored._runtime._state["topics"]
+    restored_catalog = restored._runtime._state["catalog"]
+    assert len(restored_catalog) == len(restored_topics) == 1
+    assert restored_catalog.loc[0, "catalog_title"] == restored_catalog.loc[0, "name"]
 
 
 class _ZepStubAdapter(LotusAdapter):

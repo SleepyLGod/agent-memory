@@ -4,11 +4,25 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from hashlib import sha256
 import json
 from pathlib import Path
 from typing import Any
+from urllib.request import urlopen
 
-from agent_memory.evaluation.types import BenchmarkEvent, BenchmarkQuestion
+from agent_memory.evaluation.bundle import BenchmarkBundle
+from agent_memory.evaluation.types import (
+    BenchmarkCase,
+    BenchmarkEvent,
+    BenchmarkQuestion,
+)
+
+LOCOMO_COMMIT = "3eb6f2c585f5e1699204e3c3bdf7adc5c28cb376"
+LOCOMO_SHA256 = "79fa87e90f04081343b8c8debecb80a9a6842b76a7aa537dc9fdf651ea698ff4"
+LOCOMO_URL = (
+    "https://raw.githubusercontent.com/snap-research/locomo/"
+    f"{LOCOMO_COMMIT}/data/locomo10.json"
+)
 
 
 @dataclass(frozen=True)
@@ -32,6 +46,109 @@ def load_locomo_sample(dataset_path: Path, *, sample_index: int = 0) -> LocomoBe
     if not isinstance(sample, Mapping):
         raise TypeError(f"LOCOMO sample {sample_index} must be a JSON object")
     return normalize_locomo_sample(sample, sample_index=sample_index)
+
+
+def ensure_locomo_dataset(path: Path) -> Path:
+    """Download and verify the pinned LOCOMO dataset."""
+
+    if path.exists():
+        actual = sha256(path.read_bytes()).hexdigest()
+        if actual != LOCOMO_SHA256:
+            raise ValueError(
+                f"LOCOMO SHA-256 mismatch: expected {LOCOMO_SHA256}, got {actual}"
+            )
+        return path
+    with urlopen(LOCOMO_URL, timeout=60) as response:
+        content = response.read()
+    actual = sha256(content).hexdigest()
+    if actual != LOCOMO_SHA256:
+        raise ValueError(
+            f"LOCOMO SHA-256 mismatch: expected {LOCOMO_SHA256}, got {actual}"
+        )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(content)
+    return path
+
+
+def locomo_bundle(
+    dataset_path: Path,
+    *,
+    sample_index: int = 0,
+    start_row: int = 1,
+    row_limit: int | None = None,
+    question_numbers: Sequence[int] | None = None,
+    include_adversarial: bool = True,
+    run_mode: str | None = None,
+) -> BenchmarkBundle:
+    """Build one pinned, evidence-complete LOCOMO case bundle."""
+
+    ensure_locomo_dataset(dataset_path)
+    sample = load_locomo_sample(dataset_path, sample_index=sample_index)
+    if start_row < 1:
+        raise ValueError("start_row must be one-based and at least 1")
+    if row_limit is not None and row_limit < 1:
+        raise ValueError("row_limit must be positive")
+    start = start_row - 1
+    events = tuple(
+        sample.events[start:]
+        if row_limit is None
+        else sample.events[start : start + row_limit]
+    )
+    if not events or (row_limit is not None and len(events) != row_limit):
+        raise ValueError("LOCOMO event selection is incomplete")
+
+    normalized_numbers = tuple(question_numbers or ())
+    if any(number < 1 for number in normalized_numbers):
+        raise ValueError("question numbers must be positive")
+    if len(normalized_numbers) != len(set(normalized_numbers)):
+        raise ValueError("question numbers must be unique")
+    by_number = {
+        int(question.metadata.get("question_number", 0)): question
+        for question in sample.questions
+        if include_adversarial or int(question.category) != 5
+    }
+    if normalized_numbers:
+        missing = [number for number in normalized_numbers if number not in by_number]
+        if missing:
+            raise ValueError(f"LOCOMO questions are unavailable: {missing}")
+        questions = tuple(by_number[number] for number in normalized_numbers)
+    else:
+        questions = tuple(by_number[number] for number in sorted(by_number))
+
+    event_ids = {event.event_id for event in events}
+    for question in questions:
+        missing_evidence = set(question.evidence_event_ids) - event_ids
+        if missing_evidence:
+            number = question.metadata.get("question_number")
+            raise ValueError(
+                f"LOCOMO question {number} requires un-ingested evidence: "
+                + ", ".join(sorted(missing_evidence))
+            )
+    if not questions:
+        raise ValueError("LOCOMO selection contains no questions")
+
+    return BenchmarkBundle(
+        benchmark_id="locomo",
+        dataset_revision=LOCOMO_COMMIT,
+        dataset_sha256=LOCOMO_SHA256,
+        cases=(
+            BenchmarkCase(
+                case_id=sample.sample_id,
+                task_id="locomo",
+                events=events,
+                questions=questions,
+                metadata={
+                    "sample_index": sample_index,
+                    "start_row": start_row,
+                    "row_limit": row_limit,
+                },
+            ),
+        ),
+        metadata={
+            "source": "snap-research/locomo",
+            **({"run_mode": run_mode} if run_mode is not None else {}),
+        },
+    )
 
 
 def normalize_locomo_sample(
@@ -199,7 +316,7 @@ def _questions(
         question = str(row.get("question") or "").strip()
         if not question:
             continue
-        evidence = row.get("evidence") or ()
+        evidence: object = row.get("evidence") or ()
         if isinstance(evidence, Sequence) and not isinstance(evidence, (str, bytes, bytearray)):
             evidence_ids = tuple(
                 evidence_id

@@ -166,6 +166,17 @@ deduped = rows.drop_duplicates()
 
 This is exact row equality, not semantic equality.
 
+Use `subset` when row identity is defined by selected columns while other
+columns carry payload or provenance:
+
+```python
+deduped = rows.drop_duplicates(subset=["memory"])
+```
+
+The first row for each exact subset value is retained. `subset` accepts one
+column name or a non-empty sequence of unique column names. It does not perform
+semantic matching.
+
 ### `union`
 
 Relational `UNION`: append rows, then remove exact duplicates.
@@ -1043,7 +1054,29 @@ The search result logically preserves readable source columns and adds:
 
 - `record_id`: opaque stable identity supplied by the physical backend;
 - `rank`: final one-based result rank;
-- `score`: final reranker score.
+- `score`: final search score, either from the single method or the configured
+  reranker.
+
+A single search method may omit reranking. Candidate depth and a method-level
+score gate are explicit on cosine search:
+
+```python
+retrieval_query = am.RetrievalQuery(
+    memories=memories.search(
+        am.UserQuery(),
+        methods=[
+            am.CosineSimilarity(candidate_limit=80, min_score=0.1),
+        ],
+        reranker=None,
+        limit=20,
+    )
+)
+```
+
+`candidate_limit` is the physical cosine candidate pool and `min_score` filters
+raw cosine scores before the final limit. A search with multiple methods must
+declare a reranker or fusion rule; otherwise its ordering is undefined and the
+query is rejected.
 
 `RetrievalQuery` is the single retrieval root and contains ordered named
 channels. A relation handle such as `_retrieved_entities` is a shared node in

@@ -246,13 +246,9 @@ def generate_answer(
 ) -> AnswerRecord:
     """Generate one answer from one already-computed retrieval result."""
 
-    messages = _structured_messages(
-        system_prompt=ANSWER_SYSTEM_PROMPT,
-        user_prompt=ANSWER_USER_PROMPT_TEMPLATE.format(
-            context=format_retrieval_context(retrieval),
-            question=question.question,
-        ),
-        response_schema=ANSWER_RESPONSE_SCHEMA,
+    messages = build_locomo_answer_messages(
+        question,
+        format_retrieval_context(retrieval),
     )
     started = perf_counter()
     response = _generate_json(
@@ -272,6 +268,22 @@ def generate_answer(
     )
 
 
+def build_locomo_answer_messages(
+    question: BenchmarkQuestion,
+    context: str,
+) -> list[dict[str, str]]:
+    """Build the shared LOCOMO answer prompt for any retrieval backend."""
+
+    return _structured_messages(
+        system_prompt=ANSWER_SYSTEM_PROMPT,
+        user_prompt=ANSWER_USER_PROMPT_TEMPLATE.format(
+            context=context,
+            question=question.question,
+        ),
+        response_schema=ANSWER_RESPONSE_SCHEMA,
+    )
+
+
 def generate_zep_judge(question: BenchmarkQuestion, answer: str) -> Any:
     """Grade one category 1-4 answer with the corrected published Zep rubric."""
 
@@ -279,15 +291,7 @@ def generate_zep_judge(question: BenchmarkQuestion, answer: str) -> Any:
 
     if int(question.category) not in {1, 2, 3, 4}:
         raise ValueError("Zep judge only evaluates LOCOMO categories 1-4")
-    messages = _structured_messages(
-        system_prompt=ZEP_JUDGE_SYSTEM_PROMPT,
-        user_prompt=ZEP_JUDGE_USER_PROMPT_TEMPLATE.format(
-            question=question.question,
-            gold_answer=question.gold_answer,
-            generated_answer=answer,
-        ),
-        response_schema=ZEP_JUDGE_RESPONSE_SCHEMA,
-    )
+    messages = build_locomo_zep_judge_messages(question, answer)
     started = perf_counter()
     response = _generate_json(
         messages,
@@ -307,6 +311,23 @@ def generate_zep_judge(question: BenchmarkQuestion, answer: str) -> Any:
         is_correct=label == "CORRECT",
         reasoning=reasoning.strip(),
         latency_ms=round((perf_counter() - started) * 1000, 3),
+    )
+
+
+def build_locomo_zep_judge_messages(
+    question: BenchmarkQuestion,
+    answer: str,
+) -> list[dict[str, str]]:
+    """Build the corrected published Zep judge prompt."""
+
+    return _structured_messages(
+        system_prompt=ZEP_JUDGE_SYSTEM_PROMPT,
+        user_prompt=ZEP_JUDGE_USER_PROMPT_TEMPLATE.format(
+            question=question.question,
+            gold_answer=question.gold_answer,
+            generated_answer=answer,
+        ),
+        response_schema=ZEP_JUDGE_RESPONSE_SCHEMA,
     )
 
 
@@ -425,14 +446,18 @@ def _record_ids(result: RetrievalResult, channel: str) -> tuple[str, ...]:
 
 __all__ = [
     "ANSWER_PROMPT_DIGEST",
+    "ANSWER_RESPONSE_SCHEMA",
     "ANSWER_SYSTEM_PROMPT",
     "ANSWER_USER_PROMPT_TEMPLATE",
     "GENERATION_MAX_TOKENS",
     "GENERATION_TEMPERATURE",
     "ZEP_JUDGE_PROMPT_DIGEST",
+    "ZEP_JUDGE_RESPONSE_SCHEMA",
     "ZEP_JUDGE_SYSTEM_PROMPT",
     "ZEP_JUDGE_USER_PROMPT_TEMPLATE",
     "AnswerRecord",
+    "build_locomo_answer_messages",
+    "build_locomo_zep_judge_messages",
     "format_retrieval_context",
     "generate_answer",
     "generate_zep_judge",

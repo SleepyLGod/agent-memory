@@ -1,12 +1,13 @@
 """Typed Neo4j storage mappings and runtime connector."""
 
+from agent_memory.storage.embedding import EmbeddingSpec
+
 from .connector import (
     Neo4jConnector,
     SentenceTransformerCrossEncoderProvider,
     SentenceTransformerEmbeddingProvider,
 )
 from .mapping import (
-    EmbeddingSpec,
     Neo4jIdentity,
     Neo4jNestedProperty,
     Neo4jNodeMapping,

@@ -7,8 +7,6 @@ import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any
-
 from agent_memory.policy.aggregates import SemanticAggregateSpec
 from agent_memory.policy.logical import MemorySpec, MemoryView, QueryExpr
 from agent_memory.policy.retrieval import RetrievalQuery

@@ -13,8 +13,6 @@ import os
 import re
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
-
 import pandas as pd
 import pytest
 from dotenv import load_dotenv

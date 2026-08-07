@@ -120,6 +120,35 @@ def _normalize_group_keys(keys: str | Sequence[str]) -> tuple[str, ...]:
     return normalized
 
 
+def _normalize_drop_duplicates_subset(
+    subset: str | Sequence[str],
+) -> tuple[str, ...]:
+    """Normalize columns that define exact duplicate identity."""
+
+    if isinstance(subset, str):
+        normalized = (subset,)
+    elif isinstance(subset, Sequence) and not isinstance(subset, (str, bytes)):
+        normalized = tuple(str(column) for column in subset)
+    else:
+        raise TypeError(
+            "drop_duplicates subset must be a column name or sequence of "
+            "column names"
+        )
+    if not normalized:
+        raise ValueError("drop_duplicates subset cannot be empty")
+    if any(not column for column in normalized):
+        raise ValueError("drop_duplicates subset column names cannot be empty")
+    duplicates = sorted(
+        {column for column in normalized if normalized.count(column) > 1}
+    )
+    if duplicates:
+        raise ValueError(
+            "drop_duplicates subset column names must be unique: "
+            f"{duplicates}"
+        )
+    return normalized
+
+
 def _normalize_partition_by(partition_by: str | Sequence[str] | None) -> tuple[str, ...] | None:
     """Normalize optional sem_groupby deterministic partition columns."""
 
@@ -203,7 +232,7 @@ class Relation(RelationHandle):
         query: UserQuery,
         *,
         methods: Sequence[Any],
-        reranker: Any,
+        reranker: Any | None,
         limit: int,
     ) -> "SearchRelation":
         """Build one storage-backed ranked search relation."""
@@ -340,10 +369,22 @@ class Relation(RelationHandle):
             )
         )
 
-    def drop_duplicates(self) -> "Relation":
-        """Remove exact duplicate rows."""
+    def drop_duplicates(
+        self,
+        *,
+        subset: str | Sequence[str] | None = None,
+    ) -> "Relation":
+        """Remove duplicate rows, optionally comparing only selected columns."""
 
-        return self._derive("drop_duplicates")
+        if subset is None:
+            return self._derive("drop_duplicates")
+        normalized = _normalize_drop_duplicates_subset(subset)
+        missing = sorted(set(normalized).difference(output_columns(self.expr)))
+        if missing:
+            raise ValueError(
+                f"drop_duplicates subset columns not found: {missing}"
+            )
+        return self._derive("drop_duplicates", subset=normalized)
 
     def array_agg(self, *, columns: Sequence[str], output_col: str) -> "Relation":
         """Aggregate relation rows into one JSON array-of-records column."""
