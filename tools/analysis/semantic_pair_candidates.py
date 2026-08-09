@@ -117,7 +117,7 @@ class CandidateStrategy:
         if self.top_k is not None:
             parts.append(f"top-k:{self.top_k}")
         if self.threshold is not None:
-            parts.append(f"threshold:{self.threshold:g}")
+            parts.append(f"threshold:{self.threshold!r}")
         return "+".join(parts)
 
 

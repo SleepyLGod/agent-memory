@@ -1169,6 +1169,16 @@ def test_candidate_threshold_must_be_numeric(threshold: object) -> None:
         CandidateStrategy(threshold=cast(float, threshold))
 
 
+def test_distinct_thresholds_have_distinct_strategy_ids() -> None:
+    first = CandidateStrategy(threshold=0.12345671)
+    second = CandidateStrategy(threshold=0.12345672)
+
+    assert first.strategy_id == "threshold:0.12345671"
+    assert second.strategy_id == "threshold:0.12345672"
+    assert first.strategy_id != second.strategy_id
+    assert CandidateStrategy(threshold=0.5).strategy_id == "threshold:0.5"
+
+
 def test_embedding_batch_size_changes_only_physical_encode_batch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
