@@ -82,4 +82,6 @@ include = [
     "tools/evaluation/longmemeval.py",
     "tools/evaluation/locomo.py",
     "tools/evaluation/memory_agent_bench.py",
+    "tools/analysis/semantic_pair_candidates.py",
+    "tests/test_semantic_pair_candidates.py",
 ]
