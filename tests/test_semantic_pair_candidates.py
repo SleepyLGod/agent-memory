@@ -7,7 +7,7 @@ from pathlib import Path
 import sys
 import tarfile
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -142,6 +142,43 @@ def _write_attempt_ledger(
     _write_jsonl(root / "checkpoint/control-events.jsonl", rows)
 
 
+def _write_current_attempt_state(
+    root: Path,
+    *,
+    case_id: str,
+    event_id: str,
+    execution_attempt: int,
+    unit_attempt: int,
+    status: str = "success",
+) -> None:
+    case_dir = root / "cases/case-artifact"
+    case_dir.mkdir(parents=True, exist_ok=True)
+    (case_dir / "case.json").write_text(
+        json.dumps({"case_id": case_id}) + "\n", encoding="utf-8"
+    )
+    control_dir = case_dir / "control"
+    control_dir.mkdir(parents=True, exist_ok=True)
+    (control_dir / "unit-attempts.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "units": {
+                    f"insertion:{event_id}": {
+                        "phase": "insertion",
+                        "unit_id": event_id,
+                        "execution_attempt": execution_attempt,
+                        "unit_attempt": unit_attempt,
+                        "retryable_failure_count": unit_attempt - 1,
+                        "last_status": status,
+                    }
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
 def _write_legacy_recovery(
     root: Path,
     *,
@@ -242,6 +279,38 @@ def _write_sem_filter_run(root: Path) -> None:
     )
     _write_csv(root / "trace/snapshots/output.csv", [duplicate], columns)
     _write_jsonl(root / "trace/events.jsonl", [_sem_filter_event()])
+
+
+def _write_sem_filter_attempt_run(root: Path, *, with_ledger: bool) -> None:
+    _write_sem_filter_run(root)
+    base = _sem_filter_event()
+    _write_jsonl(
+        root / "trace/events.jsonl",
+        [
+            {
+                **base,
+                "trace_id": "failed-filter",
+                "operator_call_id": "failed-filter-call",
+                "execution_attempt": 1,
+                "unit_attempt": 1,
+            },
+            {
+                **base,
+                "trace_id": "successful-filter",
+                "operator_call_id": "successful-filter-call",
+                "execution_attempt": 2,
+                "unit_attempt": 2,
+            },
+        ],
+    )
+    if with_ledger:
+        _write_current_attempt_state(
+            root,
+            case_id="case-1",
+            event_id="event-2",
+            execution_attempt=2,
+            unit_attempt=2,
+        )
 
 
 def _manual_group(direction: str) -> PairGroup:
@@ -497,6 +566,79 @@ def test_tar_and_directory_sem_filter_reports_match(tmp_path: Path) -> None:
     assert not list(tmp_path.rglob("pairs.jsonl"))
 
 
+def test_current_attempt_ledger_excludes_failed_retry_for_directory_and_tar(
+    tmp_path: Path,
+) -> None:
+    run = tmp_path / "source/archived/run"
+    _write_sem_filter_attempt_run(run, with_ledger=True)
+    archive = tmp_path / "runs.tar"
+    with tarfile.open(archive, "w") as handle:
+        handle.add(run, arcname="archived/run")
+
+    directory_report = analyze_sources([DirectorySource(run)])
+    tar_report = analyze_sources([TarSource(archive, "archived/run")])
+
+    expected = {
+        "group_count": 1,
+        "pair_count": 3,
+        "positive_pair_count": 1,
+    }
+    assert directory_report["baseline"] == expected
+    assert tar_report["baseline"] == expected
+    for report in (directory_report, tar_report):
+        source = report["sources"][0]
+        assert source["scanned_group_count"] == 2
+        assert source["excluded_failed_attempt_group_count"] == 1
+        assert source["attempt_ledger_sha256"]
+
+
+def test_successful_current_attempt_ledger_preserves_core_report(
+    tmp_path: Path,
+) -> None:
+    run = tmp_path / "run"
+    _write_sem_filter_run(run)
+    event = {
+        **_sem_filter_event(),
+        "execution_attempt": 1,
+        "unit_attempt": 1,
+    }
+    _write_jsonl(run / "trace/events.jsonl", [event])
+
+    without_ledger = analyze_sources([DirectorySource(run)])
+    _write_current_attempt_state(
+        run,
+        case_id="case-1",
+        event_id="event-2",
+        execution_attempt=1,
+        unit_attempt=1,
+    )
+    with_ledger = analyze_sources([DirectorySource(run)])
+
+    assert with_ledger["baseline"] == without_ledger["baseline"]
+    assert with_ledger["by_operator"] == without_ledger["by_operator"]
+    assert with_ledger["strategies"] == without_ledger["strategies"]
+    assert with_ledger["sources"][0]["attempt_ledger_sha256"]
+
+
+@pytest.mark.parametrize("source_kind", ["directory", "tar"])
+def test_multiple_attempts_without_provenance_are_rejected(
+    tmp_path: Path, source_kind: str
+) -> None:
+    run = tmp_path / "source/archived/run"
+    _write_sem_filter_attempt_run(run, with_ledger=False)
+    source: DirectorySource | TarSource
+    if source_kind == "directory":
+        source = DirectorySource(run)
+    else:
+        archive = tmp_path / "runs.tar"
+        with tarfile.open(archive, "w") as handle:
+            handle.add(run, arcname="archived/run")
+        source = TarSource(archive, "archived/run")
+
+    with pytest.raises(PairTraceError, match="authoritative recovery metadata"):
+        analyze_sources([source])
+
+
 def test_tar_sem_groupby_requires_directory_source(tmp_path: Path) -> None:
     source_root = tmp_path / "source"
     run = source_root / "archived/run"
@@ -583,6 +725,68 @@ def test_conflicting_groupby_label_is_rejected(tmp_path: Path) -> None:
     (run / "trace/outputs/second.json").write_text("false\n", encoding="utf-8")
 
     with pytest.raises(PairTraceError, match="conflicting baseline labels"):
+        analyze_sources([DirectorySource(run)])
+
+
+def test_conflicting_sem_join_label_names_the_operator(tmp_path: Path) -> None:
+    run = tmp_path / "run"
+    first = _sem_join_event(
+        call_id="call",
+        trace_id="first",
+        left_id=0,
+        right_id=1,
+        left="A",
+        right="B",
+        parsed_path="trace/outputs/first.json",
+    )
+    second = {
+        **first,
+        "trace_id": "second",
+        "parsed_output_path": "trace/outputs/second.json",
+    }
+    _write_jsonl(run / "trace/events.jsonl", [first, second])
+    (run / "trace/outputs").mkdir(parents=True)
+    (run / "trace/outputs/first.json").write_text("true\n", encoding="utf-8")
+    (run / "trace/outputs/second.json").write_text("false\n", encoding="utf-8")
+
+    with pytest.raises(PairTraceError, match="sem_join pair"):
+        analyze_sources([DirectorySource(run)], phase="add")
+
+
+def test_corrupt_pair_output_has_artifact_context(tmp_path: Path) -> None:
+    run = tmp_path / "run"
+    _write_groupby_run(run, call_id="call", labels=[True, False, False])
+    (run / "trace/outputs/pair-0.json").write_bytes(b"\xff")
+
+    with pytest.raises(PairTraceError, match="pair-0.json"):
+        analyze_sources([DirectorySource(run)])
+
+
+def test_unreadable_pair_output_has_artifact_context(tmp_path: Path) -> None:
+    run = tmp_path / "run"
+    event = _groupby_event(
+        call_id="call",
+        trace_id="pair",
+        left_id=0,
+        right_id=1,
+        left="A",
+        right="B",
+        parsed_path="trace/outputs",
+    )
+    _write_jsonl(run / "trace/events.jsonl", [event])
+    (run / "trace/outputs").mkdir(parents=True)
+
+    with pytest.raises(PairTraceError, match="cannot read artifact"):
+        analyze_sources([DirectorySource(run)])
+
+
+def test_malformed_sem_filter_row_count_is_rejected(tmp_path: Path) -> None:
+    run = tmp_path / "run"
+    _write_sem_filter_run(run)
+    event = {**_sem_filter_event(), "input_rows": None}
+    _write_jsonl(run / "trace/events.jsonl", [event])
+
+    with pytest.raises(PairTraceError, match="sem_filter input_rows"):
         analyze_sources([DirectorySource(run)])
 
 
@@ -957,6 +1161,12 @@ def test_scorer_and_strategy_must_be_configured_together() -> None:
         analyze_sources([source], strategies=[CandidateStrategy(top_k=1)])
     with pytest.raises(ValueError, match="requires at least one"):
         analyze_sources([source], scorer=FakeScorer({}))
+
+
+@pytest.mark.parametrize("threshold", [True, "0.5"])
+def test_candidate_threshold_must_be_numeric(threshold: object) -> None:
+    with pytest.raises(ValueError, match="finite number"):
+        CandidateStrategy(threshold=cast(float, threshold))
 
 
 def test_embedding_batch_size_changes_only_physical_encode_batch(

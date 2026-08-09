@@ -78,6 +78,15 @@ class LegacyRecovery:
 
 
 @dataclass(frozen=True)
+class CurrentAttemptLedger:
+    """Successful insertion lineages from case-local harness state."""
+
+    case_ids: frozenset[str]
+    successful_lineages: frozenset[tuple[str, str, str, int, int]]
+    digest: str
+
+
+@dataclass(frozen=True)
 class CandidateStrategy:
     """A threshold, top-k, or combined candidate strategy."""
 
@@ -93,8 +102,12 @@ class CandidateStrategy:
             or self.top_k < 1
         ):
             raise ValueError("candidate top_k must be a positive integer")
-        if self.threshold is not None and not math.isfinite(self.threshold):
-            raise ValueError("candidate threshold must be finite")
+        if self.threshold is not None and (
+            not isinstance(self.threshold, (int, float))
+            or isinstance(self.threshold, bool)
+            or not math.isfinite(float(self.threshold))
+        ):
+            raise ValueError("candidate threshold must be a finite number")
 
     @property
     def strategy_id(self) -> str:
@@ -189,6 +202,9 @@ class DirectorySource:
     ) -> Iterator[PairGroup]:
         """Use one ordered reader pool for the complete directory source."""
 
+        current_attempts = self._read_current_attempt_ledger()
+        if current_attempts is not None:
+            self.stats.attempt_ledger_sha256 = current_attempts.digest
         control_ledger_exists = (
             self.root / "checkpoint/control-events.jsonl"
         ).is_file()
@@ -208,6 +224,7 @@ class DirectorySource:
         pending_trace_indices: list[int] = []
         closed_call_ids: set[str] = set()
         group_evidence_digests: dict[str, str] = {}
+        unproven_attempts: dict[tuple[str, str, str], tuple[int, int]] = {}
 
         def is_new_group(group: PairGroup) -> bool:
             evidence_digest = _group_evidence_digest(group)
@@ -226,28 +243,23 @@ class DirectorySource:
         def group_status(
             events: Sequence[Mapping[str, Any]], trace_indices: Sequence[int]
         ) -> str | None:
-            if legacy_recovery is not None:
-                statuses = {
-                    (
-                        "legacy-failed"
-                        if _is_excluded_trace_index(index, legacy_recovery.ranges)
-                        else "legacy-completed"
-                    )
-                    for index in trace_indices
-                }
-                if len(statuses) != 1:
+            statuses = {
+                _event_attempt_status(
+                    event,
+                    trace_index=trace_index,
+                    current_attempts=current_attempts,
+                    attempt_intervals=attempt_intervals,
+                    legacy_recovery=legacy_recovery,
+                    unproven_attempts=unproven_attempts,
+                )
+                for event, trace_index in zip(events, trace_indices, strict=True)
+            }
+            if len(statuses) != 1:
+                if legacy_recovery is not None:
                     raise PairTraceError(
                         "semantic group crosses legacy recovery ranges"
                     )
-                return statuses.pop()
-            statuses = {
-                self._attempt_status(event, attempt_intervals)
-                for event in events
-            }
-            if len(statuses) != 1:
-                raise PairTraceError(
-                    "semantic group crosses recorded attempt intervals"
-                )
+                raise PairTraceError("semantic group crosses recorded attempt provenance")
             return statuses.pop()
 
         def flush_group() -> PairGroup | None:
@@ -344,6 +356,27 @@ class DirectorySource:
                 "legacy recovery trace_event_count exceeds events.jsonl length"
             )
 
+    def _read_current_attempt_ledger(self) -> CurrentAttemptLedger | None:
+        cases_root = self.root / "cases"
+        if not cases_root.is_dir():
+            return None
+        artifacts: list[tuple[str, bytes, bytes]] = []
+        for state_path in sorted(cases_root.glob("*/control/unit-attempts.json")):
+            case_dir = state_path.parent.parent
+            relative_case_dir = case_dir.relative_to(self.root).as_posix()
+            artifacts.append(
+                (
+                    relative_case_dir,
+                    self._read_bytes(
+                        (case_dir / "case.json").relative_to(self.root).as_posix()
+                    ),
+                    self._read_bytes(state_path.relative_to(self.root).as_posix()),
+                )
+            )
+        if not artifacts:
+            return None
+        return _parse_current_attempt_ledger(artifacts, source=self.description)
+
     def _read_attempt_intervals(self) -> dict[str, tuple[AttemptInterval, ...]]:
         ledger_path = self.root / "checkpoint/control-events.jsonl"
         if not ledger_path.is_file():
@@ -423,7 +456,8 @@ class DirectorySource:
                     raise PairTraceError(
                         f"event attempt intervals overlap: {event_id}"
                     )
-        self.stats.attempt_ledger_sha256 = digest.hexdigest()
+        if not self.stats.attempt_ledger_sha256:
+            self.stats.attempt_ledger_sha256 = digest.hexdigest()
         return {
             event_id: tuple(values) for event_id, values in intervals.items()
         }
@@ -476,31 +510,6 @@ class DirectorySource:
         self.stats.legacy_recovery_sha256 = hashlib.sha256(raw_value).hexdigest()
         return LegacyRecovery(tuple(ranges), trace_event_count)
 
-    def _attempt_status(
-        self,
-        event: Mapping[str, Any],
-        intervals: Mapping[str, Sequence[AttemptInterval]],
-    ) -> str | None:
-        event_id = str(event.get("event_id") or "")
-        candidates = intervals.get(event_id)
-        if candidates is None:
-            return None
-        timestamp = _parse_timestamp(
-            event.get("timestamp"),
-            source=f"trace event {event.get('trace_id') or event_id}",
-        )
-        matches = [
-            interval
-            for interval in candidates
-            if interval.start <= timestamp <= interval.end
-        ]
-        if len(matches) != 1:
-            raise PairTraceError(
-                "semantic pair trace is outside recorded attempt intervals: "
-                f"{event_id} at {event.get('timestamp')}"
-            )
-        return matches[0].status
-
     def _read_bytes(self, relative_path: str) -> bytes:
         target = (self.root / _safe_relative_path(relative_path)).resolve()
         if not target.is_relative_to(self.root):
@@ -509,6 +518,8 @@ class DirectorySource:
             return target.read_bytes()
         except FileNotFoundError as error:
             raise PairTraceError(f"missing artifact: {target}") from error
+        except OSError as error:
+            raise PairTraceError(f"cannot read artifact: {target}") from error
 
     def contains_output(self, output: Path) -> bool:
         """Protect the complete run directory from analyzer writes."""
@@ -540,16 +551,28 @@ class TarSource:
         events: list[dict[str, Any]] = []
         events_digest = hashlib.sha256()
         found_events = False
+        attempt_artifacts: dict[str, dict[str, bytes]] = defaultdict(dict)
         with self._open_stream() as archive:
             for member in archive:
-                if member.name != events_name:
+                artifact_key = self._attempt_artifact_key(member.name)
+                if member.name != events_name and artifact_key is None:
                     continue
-                if found_events or not member.isfile():
-                    raise PairTraceError(f"invalid tar events member: {events_name}")
-                found_events = True
+                if not member.isfile():
+                    raise PairTraceError(f"tar member is not a file: {member.name}")
                 handle = archive.extractfile(member)
                 if handle is None:
-                    raise PairTraceError(f"cannot read tar member: {events_name}")
+                    raise PairTraceError(f"cannot read tar member: {member.name}")
+                if artifact_key is not None:
+                    case_root, kind = artifact_key
+                    if kind in attempt_artifacts[case_root]:
+                        raise PairTraceError(
+                            f"duplicate tar attempt artifact: {member.name}"
+                        )
+                    attempt_artifacts[case_root][kind] = handle.read()
+                    continue
+                if found_events:
+                    raise PairTraceError(f"invalid tar events member: {events_name}")
+                found_events = True
                 for line_number, raw_line in enumerate(handle, 1):
                     events_digest.update(raw_line)
                     self.stats.event_count += 1
@@ -566,10 +589,30 @@ class TarSource:
                         )
                     if kind == "sem_filter":
                         events.append(event)
-                break
         if not found_events:
             raise PairTraceError(f"missing tar member: {events_name}")
         self.stats.events_sha256 = events_digest.hexdigest()
+
+        current_attempts = self._parse_attempt_artifacts(attempt_artifacts)
+        if current_attempts is not None:
+            self.stats.attempt_ledger_sha256 = current_attempts.digest
+        unproven_attempts: dict[tuple[str, str, str], tuple[int, int]] = {}
+        selected_events: list[dict[str, Any]] = []
+        for trace_index, event in enumerate(events):
+            self.stats.scanned_group_count += 1
+            status = _event_attempt_status(
+                event,
+                trace_index=trace_index,
+                current_attempts=current_attempts,
+                attempt_intervals={},
+                legacy_recovery=None,
+                unproven_attempts=unproven_attempts,
+            )
+            if status == "failed":
+                self.stats.excluded_failed_attempt_group_count += 1
+                continue
+            selected_events.append(event)
+        events = selected_events
 
         references: dict[str, list[tuple[int, str]]] = defaultdict(list)
         for index, event in enumerate(events):
@@ -612,7 +655,6 @@ class TarSource:
                     stable_group_ids.add(group.group_id)
                     completed.add(index)
                     del snapshots[index]
-                    self.stats.scanned_group_count += 1
                     yield group
 
         missing = sorted(set(range(len(events))) - completed)
@@ -622,6 +664,39 @@ class TarSource:
                 "missing tar snapshot for semantic group: "
                 f"{event.get('operator_call_id') or event.get('trace_id') or missing[0]}"
             )
+
+    def _attempt_artifact_key(self, member_name: str) -> tuple[str, str] | None:
+        prefix = f"{self.member_root}/"
+        if not member_name.startswith(prefix):
+            return None
+        parts = PurePosixPath(member_name.removeprefix(prefix)).parts
+        if len(parts) == 3 and parts[0] == "cases" and parts[2] == "case.json":
+            return "/".join(parts[:2]), "case"
+        if (
+            len(parts) == 4
+            and parts[0] == "cases"
+            and parts[2:] == ("control", "unit-attempts.json")
+        ):
+            return "/".join(parts[:2]), "state"
+        return None
+
+    def _parse_attempt_artifacts(
+        self, artifacts: Mapping[str, Mapping[str, bytes]]
+    ) -> CurrentAttemptLedger | None:
+        rows: list[tuple[str, bytes, bytes]] = []
+        for case_root, values in sorted(artifacts.items()):
+            state = values.get("state")
+            if state is None:
+                continue
+            case = values.get("case")
+            if case is None:
+                raise PairTraceError(
+                    f"missing tar case artifact for attempt state: {case_root}"
+                )
+            rows.append((case_root, case, state))
+        if not rows:
+            return None
+        return _parse_current_attempt_ledger(rows, source=self.description)
 
     def _member_name(self, relative_path: str) -> str:
         return f"{self.member_root}/{_safe_relative_path(relative_path).as_posix()}"
@@ -1054,7 +1129,12 @@ def _pair_decision_group(
                 raise PairTraceError(
                     "one physical pair-decision call contains mixed logical groups"
                 )
-            parsed = json.loads(raw_output)
+            try:
+                parsed = json.loads(raw_output)
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise PairTraceError(
+                    f"invalid semantic pair parsed output: {parsed_path}"
+                ) from error
             if not isinstance(parsed, bool):
                 raise PairTraceError(
                     f"semantic pair parsed output must be boolean: {parsed_path}"
@@ -1066,7 +1146,9 @@ def _pair_decision_group(
             pair_key = (left_id, right_id, left, right)
             prior_label = labels_by_pair.get(pair_key)
             if prior_label is not None and prior_label != parsed:
-                raise PairTraceError("sem_groupby pair has conflicting baseline labels")
+                raise PairTraceError(
+                    f"{operator} pair has conflicting baseline labels"
+                )
             labels_by_pair[pair_key] = parsed
             drafts.append(
                 (
@@ -1109,9 +1191,13 @@ def _sem_filter_group_from_bytes(
 ) -> PairGroup:
     input_rows = _parse_csv(input_value, source="input_snapshot_path")
     output_rows = _parse_csv(output_value, source="output_snapshot_path")
-    if int(event.get("input_rows", len(input_rows))) != len(input_rows):
+    if _optional_nonnegative_integer(
+        event, "input_rows", default=len(input_rows)
+    ) != len(input_rows):
         raise PairTraceError("sem_filter input row count does not match snapshot")
-    if int(event.get("output_rows", len(output_rows))) != len(output_rows):
+    if _optional_nonnegative_integer(
+        event, "output_rows", default=len(output_rows)
+    ) != len(output_rows):
         raise PairTraceError("sem_filter output row count does not match snapshot")
     paired_bases = _paired_placeholder_bases(event, input_rows)
     output_counts = Counter(_row_signature(row) for row in output_rows)
@@ -1318,6 +1404,153 @@ def _event_case_id(event: Mapping[str, Any]) -> str:
     return str(event.get("case_id") or event.get("sample_id") or "")
 
 
+def _parse_current_attempt_ledger(
+    artifacts: Sequence[tuple[str, bytes, bytes]], *, source: str
+) -> CurrentAttemptLedger:
+    case_ids: set[str] = set()
+    successful: set[tuple[str, str, str, int, int]] = set()
+    digest = hashlib.sha256()
+    for case_root, case_raw, state_raw in sorted(artifacts):
+        digest.update(case_root.encode("utf-8"))
+        digest.update(b"\x00case\x00")
+        digest.update(case_raw)
+        digest.update(b"\x00state\x00")
+        digest.update(state_raw)
+        case_value = _parse_json_object_bytes(
+            case_raw, source=f"{source}:{case_root}/case.json"
+        )
+        state_value = _parse_json_object_bytes(
+            state_raw,
+            source=f"{source}:{case_root}/control/unit-attempts.json",
+        )
+        case_id = _required_string(case_value, "case_id")
+        if case_id in case_ids:
+            raise PairTraceError(f"duplicate case attempt state: {case_id}")
+        case_ids.add(case_id)
+        units = state_value.get("units")
+        if not isinstance(units, dict):
+            raise PairTraceError(
+                f"unit attempt state must contain an object of units: {case_id}"
+            )
+        for unit in units.values():
+            if not isinstance(unit, dict):
+                raise PairTraceError(f"unit attempt entry must be an object: {case_id}")
+            phase = _required_string(unit, "phase")
+            unit_id = _required_string(unit, "unit_id")
+            execution_attempt = _required_positive_integer(
+                unit.get("execution_attempt"), name="execution_attempt"
+            )
+            unit_attempt = _required_positive_integer(
+                unit.get("unit_attempt"), name="unit_attempt"
+            )
+            status = unit.get("last_status")
+            if status not in {"running", "failed", "success"}:
+                raise PairTraceError(
+                    f"invalid unit attempt status for {case_id}:{phase}:{unit_id}"
+                )
+            if status == "success":
+                successful.add(
+                    (
+                        case_id,
+                        phase,
+                        unit_id,
+                        execution_attempt,
+                        unit_attempt,
+                    )
+                )
+    return CurrentAttemptLedger(
+        case_ids=frozenset(case_ids),
+        successful_lineages=frozenset(successful),
+        digest=digest.hexdigest(),
+    )
+
+
+def _event_attempt_status(
+    event: Mapping[str, Any],
+    *,
+    trace_index: int,
+    current_attempts: CurrentAttemptLedger | None,
+    attempt_intervals: Mapping[str, Sequence[AttemptInterval]],
+    legacy_recovery: LegacyRecovery | None,
+    unproven_attempts: dict[tuple[str, str, str], tuple[int, int]],
+) -> str | None:
+    case_id = _event_case_id(event)
+    if current_attempts is not None and case_id in current_attempts.case_ids:
+        lineage = _trace_attempt_lineage(event, required=True)
+        assert lineage is not None
+        return (
+            "completed"
+            if lineage in current_attempts.successful_lineages
+            else "failed"
+        )
+
+    event_id = str(event.get("event_id") or "")
+    candidates = attempt_intervals.get(event_id)
+    if candidates is not None:
+        timestamp = _parse_timestamp(
+            event.get("timestamp"),
+            source=f"trace event {event.get('trace_id') or event_id}",
+        )
+        matches = [
+            interval
+            for interval in candidates
+            if interval.start <= timestamp <= interval.end
+        ]
+        if len(matches) != 1:
+            raise PairTraceError(
+                "semantic pair trace is outside recorded attempt intervals: "
+                f"{event_id} at {event.get('timestamp')}"
+            )
+        return matches[0].status
+
+    if legacy_recovery is not None:
+        return (
+            "legacy-failed"
+            if _is_excluded_trace_index(trace_index, legacy_recovery.ranges)
+            else "legacy-completed"
+        )
+
+    lineage = _trace_attempt_lineage(event, required=False)
+    if lineage is None:
+        return None
+    key = lineage[:3]
+    attempt = lineage[3:]
+    prior = unproven_attempts.setdefault(key, attempt)
+    if prior != attempt:
+        raise PairTraceError(
+            "multiple attempt lineages require authoritative recovery metadata: "
+            f"{case_id}:{event_id}"
+        )
+    return None
+
+
+def _trace_attempt_lineage(
+    event: Mapping[str, Any], *, required: bool
+) -> tuple[str, str, str, int, int] | None:
+    execution_attempt = event.get("execution_attempt")
+    unit_attempt = event.get("unit_attempt")
+    if execution_attempt is None and unit_attempt is None:
+        if required:
+            raise PairTraceError(
+                "trace event is missing execution_attempt and unit_attempt"
+            )
+        return None
+    case_id = _event_case_id(event)
+    phase = str(event.get("phase") or "")
+    event_id = str(event.get("event_id") or "")
+    if not case_id or not phase or not event_id:
+        raise PairTraceError("trace attempt lineage is missing case, phase, or event ID")
+    return (
+        case_id,
+        phase,
+        event_id,
+        _required_positive_integer(
+            execution_attempt, name="trace execution_attempt"
+        ),
+        _required_positive_integer(unit_attempt, name="trace unit_attempt"),
+    )
+
+
 def _is_excluded_trace_index(
     trace_index: int, ranges: Sequence[tuple[int, int]]
 ) -> bool:
@@ -1326,6 +1559,16 @@ def _is_excluded_trace_index(
 
 def _row_signature(row: Mapping[str, str]) -> tuple[tuple[str, str], ...]:
     return tuple(sorted((str(key), str(value)) for key, value in row.items()))
+
+
+def _parse_json_object_bytes(value: bytes, *, source: str) -> dict[str, Any]:
+    try:
+        parsed = json.loads(value)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise PairTraceError(f"invalid JSON object: {source}") from error
+    if not isinstance(parsed, dict):
+        raise PairTraceError(f"JSON value must be an object: {source}")
+    return parsed
 
 
 def _parse_json_line(
@@ -1376,6 +1619,20 @@ def _required_nonnegative_integer(value: object, *, name: str) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or value < 0:
         raise PairTraceError(f"{name} must be a non-negative integer")
     return value
+
+
+def _required_positive_integer(value: object, *, name: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        raise PairTraceError(f"{name} must be a positive integer")
+    return value
+
+
+def _optional_nonnegative_integer(
+    row: Mapping[str, Any], key: str, *, default: int
+) -> int:
+    if key not in row:
+        return default
+    return _required_nonnegative_integer(row[key], name=f"sem_filter {key}")
 
 
 def _safe_relative_path(value: str) -> PurePosixPath:
