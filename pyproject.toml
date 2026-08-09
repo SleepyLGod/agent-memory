@@ -6,10 +6,10 @@ readme = "README.md"
 authors = [
     { name = "Von", email = "haodong.lu.me@gmail.com" }
 ]
-requires-python = ">=3.13"
+requires-python = ">=3.12"
 dependencies = [
     "dspy>=3.2.0",
-    "lotus-ai>=1.1.4",
+    "lotus-ai==1.1.4",
     "nltk>=3.9.1",
     "pandas>=2.3.3",
     "python-dotenv>=1.2.2",
@@ -46,10 +46,10 @@ dev = [
 ]
 
 [tool.ruff]
-target-version = "py313"
+target-version = "py312"
 
 [tool.pyright]
-pythonVersion = "3.13"
+pythonVersion = "3.12"
 include = [
     "src/agent_memory/evaluation/agent_memory_drivers.py",
     "src/agent_memory/evaluation/artifacts.py",
