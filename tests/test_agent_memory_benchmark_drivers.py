@@ -8,11 +8,20 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
+from agent_memory.adapters.lotus.pair_execution import (
+    PAIR_LEFT_ID_COLUMN,
+    PAIR_LEFT_TEXT_COLUMN,
+    PAIR_RIGHT_ID_COLUMN,
+    PAIR_RIGHT_TEXT_COLUMN,
+    SemanticPairExecutionProfile,
+)
 from agent_memory.evaluation.agent_memory_drivers import (
     ClaudeMemoryDriverFactory,
     ClaudeMemoryDriver,
+    SEMANTIC_PAIR_BGE_M3,
     ZepMemoryDriverFactory,
     ZepMemoryDriver,
+    build_operator_semantic_pair_profiles,
     event_to_zep_log_row,
 )
 from agent_memory.evaluation.bundle import BenchmarkBundle
@@ -65,6 +74,23 @@ def _event() -> BenchmarkEvent:
         text="I moved to Paris.",
         session_id="session-1",
         timestamp="2025-01-02T03:04:00",
+    )
+
+
+def _search_filter_profile(
+    *, device: str = "cpu"
+) -> SemanticPairExecutionProfile:
+    return SemanticPairExecutionProfile(
+        mode="search-filter",
+        direction="left-to-right",
+        left_id_columns=(PAIR_LEFT_ID_COLUMN,),
+        right_id_columns=(PAIR_RIGHT_ID_COLUMN,),
+        left_text_columns=(PAIR_LEFT_TEXT_COLUMN,),
+        right_text_columns=(PAIR_RIGHT_TEXT_COLUMN,),
+        embedding=SEMANTIC_PAIR_BGE_M3,
+        embedding_device=device,
+        top_k=20,
+        min_similarity=0.5,
     )
 
 
@@ -200,9 +226,10 @@ def test_case_factories_create_isolated_policy_instances(monkeypatch, tmp_path) 
             return "fake-spec"
 
     class FakeAdapter:
-        def __init__(self, *, model, config) -> None:
+        def __init__(self, *, model, config, pair_embedding_provider=None) -> None:
             self.model = model
             self.config = config
+            self.pair_embedding_provider = pair_embedding_provider
 
     class FakeConnector:
         def __init__(self) -> None:
@@ -270,6 +297,7 @@ def test_case_factories_create_isolated_policy_instances(monkeypatch, tmp_path) 
         grouped_agg_rule="prefer-join-map",
         sem_groupby_pair_batch_size=12,
         sem_groupby_pair_batch_retries=2,
+        semantic_pair_profiles={"query": _search_filter_profile()},
         thinking_enabled=False,
         neo4j_image="neo4j:5.26.2",
         neo4j_image_digest="sha256:image",
@@ -299,6 +327,12 @@ def test_case_factories_create_isolated_policy_instances(monkeypatch, tmp_path) 
     )
     assert isinstance(connector.embedding_provider, TracingEmbeddingProvider)
     assert connector.embedding_provider._provider is original_embedding_provider
+    assert created[-1].adapter.pair_embedding_provider is (
+        connector.embedding_provider
+    )
+    assert created[-1].adapter.config.semantic_pair_profiles == {
+        "query": _search_filter_profile()
+    }
 
     first_tracing_provider = connector.embedding_provider
     zep_factory(
@@ -311,6 +345,69 @@ def test_case_factories_create_isolated_policy_instances(monkeypatch, tmp_path) 
     assert connector.embedding_provider._provider is original_embedding_provider
     zep_factory.close()
     assert connector.closed == 1
+
+
+def test_claude_factory_creates_traced_pair_provider_only_for_profile(
+    monkeypatch, tmp_path
+) -> None:
+    import agent_memory.storage as storage_module
+
+    captured = {}
+
+    class FakeEmbeddingProvider:
+        def __init__(
+            self,
+            spec: EmbeddingSpec,
+            *,
+            device: str,
+            dependency_extra: str,
+        ) -> None:
+            captured.update(
+                spec=spec,
+                device=device,
+                dependency_extra=dependency_extra,
+            )
+            self.device = device
+
+        def embed(
+            self,
+            spec: EmbeddingSpec,
+            texts: list[str],
+        ) -> list[list[float]]:
+            del spec
+            return [[1.0, 0.0] for _ in texts]
+
+    monkeypatch.setattr(
+        storage_module,
+        "SentenceTransformerEmbeddingProvider",
+        FakeEmbeddingProvider,
+    )
+    profiles = {"query": _search_filter_profile(device="cuda")}
+    driver = ClaudeMemoryDriverFactory(
+        grouped_agg_rule="rule-join-map",
+        semantic_pair_profiles=profiles,
+        thinking_enabled=False,
+    )(
+        "case-1",
+        tmp_path / "attempt-0001",
+        tmp_path / "trace",
+    )
+
+    adapter = driver._memory._runtime._engine.adapter
+    assert captured == {
+        "spec": SEMANTIC_PAIR_BGE_M3,
+        "device": "cuda",
+        "dependency_extra": "zep or mem0",
+    }
+    assert isinstance(adapter.pair_embedding_provider, TracingEmbeddingProvider)
+    assert adapter.config.semantic_pair_profiles == profiles
+
+    oracle = ClaudeMemoryDriverFactory(thinking_enabled=False)(
+        "case-2",
+        tmp_path / "attempt-0002",
+        tmp_path / "trace-2",
+    )
+    assert oracle._memory._runtime._engine.adapter.pair_embedding_provider is None
 
 
 def test_embedding_trace_decorator_records_success_and_error(tmp_path: Path) -> None:
@@ -388,7 +485,38 @@ def test_zep_factory_reports_physical_storage_provenance(monkeypatch) -> None:
         "image_digest": "sha256:image",
         "server_version": "5.26.2",
         "driver_version": "6.1.0",
+        "embedding_device": "cpu",
+        "embedding_runtime_version": "6.1.0",
     }
+
+
+def test_zep_search_filter_rejects_missing_or_mismatched_provider() -> None:
+    class Connector:
+        def __init__(self) -> None:
+            self.embedding_provider: object | None = None
+
+    with pytest.raises(ValueError, match="requires an embedding provider"):
+        ZepMemoryDriverFactory(
+            connector=Connector(),
+            base_namespace="benchmark-run",
+            semantic_pair_profiles={"query": _search_filter_profile()},
+            neo4j_image="neo4j:5.26.2",
+            neo4j_image_digest="sha256:image",
+        )
+
+    connector = Connector()
+    connector.embedding_provider = type("Provider", (), {"device": "cpu"})()
+    with pytest.raises(ValueError, match="devices do not match"):
+        ZepMemoryDriverFactory(
+            connector=connector,
+            base_namespace="benchmark-run",
+            semantic_pair_profiles={
+                "query": _search_filter_profile(device="cuda")
+            },
+            embedding_device="cuda",
+            neo4j_image="neo4j:5.26.2",
+            neo4j_image_digest="sha256:image",
+        )
 
 
 def test_zep_run_configures_existing_factory_and_checkpoint_flow(
@@ -472,6 +600,8 @@ def test_zep_run_configures_existing_factory_and_checkpoint_flow(
         "grouped_agg_rule": "prefer-join-map",
         "sem_groupby_pair_batch_size": 12,
         "sem_groupby_pair_batch_retries": 2,
+        "semantic_pair_profiles": {},
+        "embedding_device": "cpu",
         "thinking_enabled": False,
     }
     system_contract = captured["runner"]["system_contract"]
@@ -547,9 +677,158 @@ def test_zep_run_closes_factory_when_storage_provenance_fails(
     assert captured["closed"] is True
 
 
-@pytest.mark.parametrize("system_id", ("claude-memory", "zep-memory"))
-def test_search_filter_rejects_unsupported_system_before_external_setup(
-    system_id, monkeypatch, tmp_path
+def test_operator_profiles_target_claude_join_and_zep_groupby() -> None:
+    import agent_memory as am
+    from agent_memory.memories.zep.storage import GRAPHITI_NEO4J_STATEMENTS
+    from agent_memory.planner import DifferentialRules, PolicyDifferentiator
+
+    claude = PolicyDifferentiator(
+        rules=DifferentialRules(grouped_agg_rule="rule-join-map")
+    ).differentiate(am.ClaudeMemory.spec())
+    claude_profiles = build_operator_semantic_pair_profiles(
+        claude,
+        mode="search-filter",
+        operators=("sem_join",),
+        embedding=SEMANTIC_PAIR_BGE_M3,
+        embedding_device="cuda",
+        top_k=20,
+        min_similarity=0.5,
+    )
+    assert len(claude_profiles) == 1
+    assert {profile.direction for profile in claude_profiles.values()} == {
+        "left-to-right"
+    }
+
+    zep = PolicyDifferentiator(
+        rules=DifferentialRules(grouped_agg_rule="rule-re-group")
+    ).differentiate(
+        am.ZepMemory.spec(),
+        statements=GRAPHITI_NEO4J_STATEMENTS,
+    )
+    zep_profiles = build_operator_semantic_pair_profiles(
+        zep,
+        mode="search-filter",
+        operators=("sem_groupby",),
+        embedding=SEMANTIC_PAIR_BGE_M3,
+        embedding_device="cuda",
+        top_k=None,
+        min_similarity=0.5,
+    )
+    assert len(zep_profiles) == 6
+    assert {profile.direction for profile in zep_profiles.values()} == {"symmetric"}
+
+
+@pytest.mark.parametrize(
+    ("system_id", "grouped_agg_rule", "top_k", "expected_count"),
+    (
+        ("claude-memory", "rule-join-map", 20, 1),
+        ("zep-memory", "rule-re-group", None, 6),
+    ),
+)
+def test_run_wires_search_filter_profiles_before_external_execution(
+    system_id,
+    grouped_agg_rule,
+    top_k,
+    expected_count,
+    monkeypatch,
+    tmp_path,
+) -> None:
+    import agent_memory.evaluation.run as run_module
+
+    captured = {}
+
+    class FakeFactory:
+        def __init__(self, **kwargs) -> None:
+            captured["factory"] = kwargs
+
+        @classmethod
+        def from_environment(cls, **kwargs):
+            return cls(**kwargs)
+
+        def runtime_provenance(self):
+            return {
+                "connector": "neo4j",
+                "image": "neo4j:5.26.2",
+                "image_digest": "sha256:image",
+                "server_version": "5.26.2",
+                "driver_version": "6.1.0",
+                "embedding_device": "cuda",
+                "embedding_runtime_version": "3.4.1",
+            }
+
+        def close(self) -> None:
+            captured["closed"] = True
+
+    class FakeRunner:
+        def __init__(self, **kwargs) -> None:
+            captured["runner"] = kwargs
+
+        def run(self, bundle) -> None:
+            captured["bundle"] = bundle
+
+    monkeypatch.setattr(run_module, "_require_environment", lambda _system: None)
+    monkeypatch.setattr(
+        run_module,
+        "collect_runtime_provenance",
+        lambda *args, **kwargs: {"source": {}, "runtime": {}},
+    )
+    monkeypatch.setattr(
+        run_module,
+        "validate_run_provenance",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(run_module, "BenchmarkRunner", FakeRunner)
+    if system_id == "claude-memory":
+        monkeypatch.setattr(run_module, "ClaudeMemoryDriverFactory", FakeFactory)
+    else:
+        monkeypatch.setattr(run_module, "ZepMemoryDriverFactory", FakeFactory)
+    bundle = BenchmarkBundle(
+        "locomo",
+        "revision",
+        "sha256",
+        (
+            BenchmarkCase(
+                case_id="case-1",
+                task_id="locomo",
+                events=(_event(),),
+                questions=(BenchmarkQuestion("q1", "case-1", "?", "answer", ()),),
+            ),
+        ),
+        {"run_mode": "integration-smoke"},
+    )
+
+    run_agent_memory_bundle(
+        bundle=bundle,
+        contracts={},
+        system_id=system_id,
+        output_dir=tmp_path / "output",
+        grouped_agg_rule=grouped_agg_rule,
+        semantic_pair_profile="search-filter",
+        semantic_pair_top_k=top_k,
+        semantic_pair_min_similarity=0.5,
+        embedding_device="cuda",
+        memory_thinking_enabled=False,
+    )
+
+    profiles = captured["factory"]["semantic_pair_profiles"]
+    assert len(profiles) == expected_count
+    assert {profile.embedding_device for profile in profiles.values()} == {"cuda"}
+    if system_id == "zep-memory":
+        assert captured["factory"]["embedding_device"] == "cuda"
+        assert captured["closed"] is True
+    contract = captured["runner"]["system_contract"]
+    assert contract.maintenance_execution_id.startswith(
+        "semantic-pair-search-filter:"
+    )
+    execution = captured["runner"]["runtime_provenance"]["runtime"][
+        "lotus_execution"
+    ]
+    assert len(execution["semantic_pair_query_profiles"]) == expected_count
+    assert execution["embedding_device"] == "cuda"
+
+
+def test_claude_search_filter_rejects_rule_without_join_before_external_setup(
+    monkeypatch, tmp_path
 ) -> None:
     import agent_memory.evaluation.run as run_module
 
@@ -579,23 +858,19 @@ def test_search_filter_rejects_unsupported_system_before_external_setup(
         {"run_mode": "integration-smoke"},
     )
 
-    with pytest.raises(
-        ValueError,
-        match="search-filter is currently supported only for Mem0",
-    ):
+    with pytest.raises(ValueError, match="no eligible sem_join queries"):
         run_agent_memory_bundle(
             bundle=bundle,
             contracts={},
-            system_id=system_id,
+            system_id="claude-memory",
             output_dir=tmp_path / "output",
             semantic_pair_profile="search-filter",
             semantic_pair_min_similarity=0.6,
         )
 
 
-@pytest.mark.parametrize("system_id", ("claude-memory", "zep-memory"))
-def test_cuda_embedding_rejects_unsupported_system_before_external_setup(
-    system_id, monkeypatch, tmp_path
+def test_claude_oracle_rejects_cuda_before_external_setup(
+    monkeypatch, tmp_path
 ) -> None:
     import agent_memory.evaluation.run as run_module
 
@@ -621,11 +896,11 @@ def test_cuda_embedding_rejects_unsupported_system_before_external_setup(
         {"run_mode": "integration-smoke"},
     )
 
-    with pytest.raises(ValueError, match="supported only for Mem0"):
+    with pytest.raises(ValueError, match="require.*search-filter"):
         run_agent_memory_bundle(
             bundle=bundle,
             contracts={},
-            system_id=system_id,
+            system_id="claude-memory",
             output_dir=tmp_path / "output",
             embedding_device="cuda",
         )

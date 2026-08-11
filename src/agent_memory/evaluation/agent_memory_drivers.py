@@ -14,6 +14,10 @@ from typing import Any
 import pandas as pd
 
 from agent_memory.adapters.lotus.pair_execution import (
+    PAIR_LEFT_ID_COLUMN,
+    PAIR_LEFT_TEXT_COLUMN,
+    PAIR_RIGHT_ID_COLUMN,
+    PAIR_RIGHT_TEXT_COLUMN,
     SEMANTIC_PAIR_EXECUTION_MODES,
     SemanticPairExecutionProfile,
 )
@@ -28,6 +32,98 @@ from agent_memory.storage import EmbeddingSpec
 
 BENCHMARK_STRUCTURED_MAX_TOKENS = 32_768
 BENCHMARK_LM_NUM_RETRIES = 2
+SEMANTIC_PAIR_BGE_M3 = EmbeddingSpec(
+    source_column="semantic_pair_text",
+    property_name="semantic_pair_embedding",
+    model="BAAI/bge-m3",
+    revision="5617a9f61b028005a4858fdac845db406aefb181",
+    dimensions=1024,
+    normalize=True,
+)
+
+
+def build_operator_semantic_pair_profiles(
+    policy: Any,
+    *,
+    mode: str,
+    operators: tuple[str, ...],
+    embedding: EmbeddingSpec,
+    embedding_device: str = "cpu",
+    top_k: int | None,
+    min_similarity: float | None,
+) -> dict[str, SemanticPairExecutionProfile]:
+    """Bind one physical profile to eligible pair-shaped operator queries."""
+
+    if mode not in SEMANTIC_PAIR_EXECUTION_MODES:
+        raise ValueError(
+            "semantic pair profile must be one of: "
+            + ", ".join(SEMANTIC_PAIR_EXECUTION_MODES)
+        )
+    if mode == "oracle-only":
+        if top_k is not None or min_similarity is not None:
+            raise ValueError("oracle-only does not accept semantic pair bounds")
+        return {}
+    supported = {"sem_join", "sem_groupby"}
+    unknown = sorted(set(operators) - supported)
+    if unknown:
+        raise ValueError(f"unsupported semantic pair operators: {unknown}")
+
+    from agent_memory.tracing.semantic import query_digest
+
+    profiles: dict[str, SemanticPairExecutionProfile] = {}
+    pending = [node.query for node in policy.nodes.values()]
+    pending.extend(
+        node.maintenance_query
+        for node in policy.nodes.values()
+        if node.maintenance_query is not None
+    )
+    visited: set[int] = set()
+    while pending:
+        query = pending.pop()
+        if id(query) in visited:
+            continue
+        visited.add(id(query))
+        pending.extend(query.inputs)
+        if query.op not in operators:
+            continue
+        if query.op == "sem_groupby" and query.params.get("labels"):
+            continue
+        direction = "left-to-right" if query.op == "sem_join" else "symmetric"
+        profiles[query_digest(query)] = SemanticPairExecutionProfile(
+            mode="search-filter",
+            direction=direction,
+            left_id_columns=(PAIR_LEFT_ID_COLUMN,),
+            right_id_columns=(PAIR_RIGHT_ID_COLUMN,),
+            left_text_columns=(PAIR_LEFT_TEXT_COLUMN,),
+            right_text_columns=(PAIR_RIGHT_TEXT_COLUMN,),
+            embedding=embedding,
+            embedding_device=embedding_device,
+            top_k=top_k,
+            min_similarity=min_similarity,
+        )
+    if not profiles:
+        raise ValueError(
+            "search-filter found no eligible " + ", ".join(operators) + " queries"
+        )
+    return profiles
+
+
+def _semantic_pair_embedding_contract(
+    profiles: dict[str, SemanticPairExecutionProfile],
+) -> tuple[EmbeddingSpec, str] | None:
+    """Return the one embedding contract shared by configured pair profiles."""
+
+    if not profiles:
+        return None
+    embeddings = {profile.embedding for profile in profiles.values()}
+    devices = {profile.embedding_device for profile in profiles.values()}
+    if None in embeddings or len(embeddings) != 1 or len(devices) != 1:
+        raise ValueError(
+            "semantic pair profiles must share one embedding and device"
+        )
+    embedding = next(iter(embeddings))
+    assert embedding is not None
+    return embedding, next(iter(devices))
 
 
 def build_mem0_semantic_pair_profiles(
@@ -439,6 +535,7 @@ class ClaudeMemoryDriverFactory:
         sem_topk_method: str = "pairwise-naive",
         sem_groupby_pair_batch_size: int | None = None,
         sem_groupby_pair_batch_retries: int = 0,
+        semantic_pair_profiles: dict[str, SemanticPairExecutionProfile] | None = None,
         thinking_enabled: bool = True,
     ) -> None:
         from agent_memory.adapters.lotus.context import SEM_TOPK_METHODS
@@ -457,6 +554,8 @@ class ClaudeMemoryDriverFactory:
         self.sem_topk_method = sem_topk_method
         self.sem_groupby_pair_batch_size = sem_groupby_pair_batch_size
         self.sem_groupby_pair_batch_retries = sem_groupby_pair_batch_retries
+        self.semantic_pair_profiles = dict(semantic_pair_profiles or {})
+        _semantic_pair_embedding_contract(self.semantic_pair_profiles)
         self.thinking_enabled = thinking_enabled
 
     def __call__(
@@ -471,6 +570,22 @@ class ClaudeMemoryDriverFactory:
         from agent_memory.adapters.lotus.context import LotusExecutionConfig
         from agent_memory.planner import DifferentialRules, PolicyDifferentiator
         from agent_memory.runtime import MemoryRuntime
+        from agent_memory.storage import SentenceTransformerEmbeddingProvider
+
+        pair_embedding_provider = None
+        embedding_contract = _semantic_pair_embedding_contract(
+            self.semantic_pair_profiles
+        )
+        if embedding_contract is not None:
+            embedding, device = embedding_contract
+            pair_embedding_provider = TracingEmbeddingProvider(
+                SentenceTransformerEmbeddingProvider(
+                    embedding,
+                    device=device,
+                    dependency_extra="zep or mem0",
+                ),
+                trace_dir=trace_dir,
+            )
 
         adapter = LotusAdapter(
             model=self.model_id,
@@ -489,7 +604,9 @@ class ClaudeMemoryDriverFactory:
                 sem_topk_method=self.sem_topk_method,
                 sem_groupby_pair_batch_size=self.sem_groupby_pair_batch_size,
                 sem_groupby_pair_batch_retries=self.sem_groupby_pair_batch_retries,
+                semantic_pair_profiles=self.semantic_pair_profiles,
             ),
+            pair_embedding_provider=pair_embedding_provider,
         )
         memory = am.ClaudeMemory(adapter=adapter)
         policy = PolicyDifferentiator(
@@ -511,6 +628,8 @@ class ZepMemoryDriverFactory:
         grouped_agg_rule: str = "rule-re-group",
         sem_groupby_pair_batch_size: int | None = None,
         sem_groupby_pair_batch_retries: int = 0,
+        semantic_pair_profiles: dict[str, SemanticPairExecutionProfile] | None = None,
+        embedding_device: str = "cpu",
         thinking_enabled: bool = True,
         neo4j_image: str,
         neo4j_image_digest: str,
@@ -529,10 +648,28 @@ class ZepMemoryDriverFactory:
         self.grouped_agg_rule = grouped_agg_rule
         self.sem_groupby_pair_batch_size = sem_groupby_pair_batch_size
         self.sem_groupby_pair_batch_retries = sem_groupby_pair_batch_retries
+        self.semantic_pair_profiles = dict(semantic_pair_profiles or {})
+        embedding_contract = _semantic_pair_embedding_contract(
+            self.semantic_pair_profiles
+        )
+        if embedding_device not in {"cpu", "cuda"}:
+            raise ValueError("Zep embedding_device must be 'cpu' or 'cuda'")
+        if embedding_contract is not None and embedding_contract[1] != embedding_device:
+            raise ValueError(
+                "Zep semantic pair profile and embedding devices do not match"
+            )
+        self._embedding_provider = getattr(connector, "embedding_provider", None)
+        if embedding_contract is not None and self._embedding_provider is None:
+            raise ValueError("Zep search-filter requires an embedding provider")
+        provider_device = getattr(self._embedding_provider, "device", None)
+        if provider_device is not None and provider_device != embedding_device:
+            raise ValueError(
+                "Zep connector and configured embedding devices do not match"
+            )
+        self.embedding_device = embedding_device
         self.thinking_enabled = thinking_enabled
         self.neo4j_image = neo4j_image
         self.neo4j_image_digest = neo4j_image_digest
-        self._embedding_provider = getattr(connector, "embedding_provider", None)
         self._closed = False
 
     @classmethod
@@ -544,9 +681,11 @@ class ZepMemoryDriverFactory:
         grouped_agg_rule: str = "rule-re-group",
         sem_groupby_pair_batch_size: int | None = None,
         sem_groupby_pair_batch_retries: int = 0,
+        semantic_pair_profiles: dict[str, SemanticPairExecutionProfile] | None = None,
+        embedding_device: str = "cpu",
         thinking_enabled: bool = True,
     ) -> ZepMemoryDriverFactory:
-        """Create the pinned Graphiti-compatible CPU deployment connector."""
+        """Create the pinned Graphiti-compatible deployment connector."""
 
         neo4j_image = os.getenv("AGENT_MEMORY_NEO4J_IMAGE")
         neo4j_image_digest = os.getenv("AGENT_MEMORY_NEO4J_IMAGE_DIGEST")
@@ -573,7 +712,10 @@ class ZepMemoryDriverFactory:
                 os.environ["AGENT_MEMORY_NEO4J_PASSWORD"],
             ),
             database=os.getenv("AGENT_MEMORY_NEO4J_DATABASE", "neo4j"),
-            embedding_provider=SentenceTransformerEmbeddingProvider(GRAPHITI_BGE_M3),
+            embedding_provider=SentenceTransformerEmbeddingProvider(
+                GRAPHITI_BGE_M3,
+                device=embedding_device,
+            ),
             reranker_provider=SentenceTransformerCrossEncoderProvider(),
             schema=GRAPHITI_NEO4J_SCHEMA,
         )
@@ -584,6 +726,8 @@ class ZepMemoryDriverFactory:
             grouped_agg_rule=grouped_agg_rule,
             sem_groupby_pair_batch_size=sem_groupby_pair_batch_size,
             sem_groupby_pair_batch_retries=sem_groupby_pair_batch_retries,
+            semantic_pair_profiles=semantic_pair_profiles,
+            embedding_device=embedding_device,
             thinking_enabled=thinking_enabled,
             neo4j_image=neo4j_image,
             neo4j_image_digest=neo4j_image_digest,
@@ -598,6 +742,8 @@ class ZepMemoryDriverFactory:
             "image_digest": self.neo4j_image_digest,
             "server_version": self.connector.server_version(),
             "driver_version": version("neo4j"),
+            "embedding_device": self.embedding_device,
+            "embedding_runtime_version": version("sentence-transformers"),
         }
 
     def __call__(
@@ -618,11 +764,13 @@ class ZepMemoryDriverFactory:
 
         case_digest = sha256(case_id.encode("utf-8")).hexdigest()[:16]
         namespace = f"{self.base_namespace}-{case_digest}-{state_dir.name}"
+        traced_embedding_provider = None
         if self._embedding_provider is not None:
-            self.connector.embedding_provider = TracingEmbeddingProvider(
+            traced_embedding_provider = TracingEmbeddingProvider(
                 self._embedding_provider,
                 trace_dir=trace_dir,
             )
+            self.connector.embedding_provider = traced_embedding_provider
         storage = StorageDeployment(
             connector=self.connector,
             statements=GRAPHITI_NEO4J_STATEMENTS,
@@ -644,6 +792,10 @@ class ZepMemoryDriverFactory:
                 structured_max_tokens=BENCHMARK_STRUCTURED_MAX_TOKENS,
                 sem_groupby_pair_batch_size=self.sem_groupby_pair_batch_size,
                 sem_groupby_pair_batch_retries=self.sem_groupby_pair_batch_retries,
+                semantic_pair_profiles=self.semantic_pair_profiles,
+            ),
+            pair_embedding_provider=(
+                traced_embedding_provider if self.semantic_pair_profiles else None
             ),
         )
         policy = PolicyDifferentiator(
@@ -855,9 +1007,11 @@ __all__ = [
     "Mem0MemoryDriverFactory",
     "Mem0MemoryEnhancedDriver",
     "Mem0MemoryEnhancedDriverFactory",
+    "SEMANTIC_PAIR_BGE_M3",
     "ZepMemoryDriver",
     "ZepMemoryDriverFactory",
     "build_mem0_semantic_pair_profiles",
+    "build_operator_semantic_pair_profiles",
     "event_to_mem0_log_row",
     "event_to_zep_log_row",
 ]
