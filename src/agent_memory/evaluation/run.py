@@ -95,6 +95,7 @@ def run_agent_memory_bundle(
     semantic_pair_profile: str = "oracle-only",
     semantic_pair_top_k: int | None = None,
     semantic_pair_min_similarity: float | None = None,
+    embedding_device: str = "cpu",
     memory_thinking_enabled: bool = True,
     condition_id: str = "",
     maintenance_only: bool = False,
@@ -114,6 +115,10 @@ def run_agent_memory_bundle(
             "semantic_pair_profile must be one of: "
             + ", ".join(SEMANTIC_PAIR_PROFILES)
         )
+    if embedding_device not in {"cpu", "cuda"}:
+        raise ValueError("embedding_device must be 'cpu' or 'cuda'")
+    if system_id not in {"mem0-memory", "mem0-enhanced"} and embedding_device != "cpu":
+        raise ValueError("non-CPU embedding devices are currently supported only for Mem0")
     if semantic_pair_top_k is not None and (
         isinstance(semantic_pair_top_k, bool) or semantic_pair_top_k < 1
     ):
@@ -151,6 +156,7 @@ def run_agent_memory_bundle(
             memory_type,
             mode=semantic_pair_profile,
             embedding=MEM0_BGE_M3,
+            embedding_device=embedding_device,
             top_k=semantic_pair_top_k,
             min_similarity=semantic_pair_min_similarity,
         )
@@ -160,6 +166,9 @@ def run_agent_memory_bundle(
     maintenance_execution_id = (
         f"semantic-pair-search-filter:{semantic_pair_execution_fingerprint}"
         if semantic_pair_execution_fingerprint
+        else f"embedding-device:{embedding_device}"
+        if system_id in {"mem0-memory", "mem0-enhanced"}
+        and embedding_device != "cpu"
         else ""
     )
     bundle_run_mode = bundle.metadata.get("run_mode")
@@ -183,7 +192,7 @@ def run_agent_memory_bundle(
                 ("neo4j", "sentence-transformers")
                 if system_id == "zep-memory"
                 else (
-                    ("qdrant-client", "sentence-transformers")
+                    ("qdrant-client", "sentence-transformers", "torch")
                     if system_id in {"mem0-memory", "mem0-enhanced"}
                     else ()
                 )
@@ -196,6 +205,7 @@ def run_agent_memory_bundle(
         "semantic_pair_profile": semantic_pair_profile,
         "semantic_pair_top_k": semantic_pair_top_k,
         "semantic_pair_min_similarity": semantic_pair_min_similarity,
+        "embedding_device": embedding_device,
         "semantic_pair_execution_fingerprint": (
             semantic_pair_execution_fingerprint or None
         ),
@@ -281,6 +291,7 @@ def run_agent_memory_bundle(
             sem_groupby_pair_batch_size=sem_groupby_pair_batch_size,
             sem_groupby_pair_batch_retries=sem_groupby_pair_batch_retries,
             semantic_pair_profiles=semantic_pair_profiles,
+            embedding_device=embedding_device,
             thinking_enabled=memory_thinking_enabled,
         )
     else:
@@ -291,6 +302,7 @@ def run_agent_memory_bundle(
             sem_groupby_pair_batch_size=sem_groupby_pair_batch_size,
             sem_groupby_pair_batch_retries=sem_groupby_pair_batch_retries,
             semantic_pair_profiles=semantic_pair_profiles,
+            embedding_device=embedding_device,
             thinking_enabled=memory_thinking_enabled,
         )
     try:

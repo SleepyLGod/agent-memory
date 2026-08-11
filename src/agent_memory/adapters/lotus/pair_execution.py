@@ -29,6 +29,7 @@ class SemanticPairExecutionProfile:
     left_text_columns: tuple[str, ...]
     right_text_columns: tuple[str, ...]
     embedding: EmbeddingSpec | None = None
+    embedding_device: str = "cpu"
     top_k: int | None = None
     min_similarity: float | None = None
 
@@ -55,6 +56,8 @@ class SemanticPairExecutionProfile:
                 raise ValueError(f"semantic pair {name} must be non-empty strings")
             if len(set(columns)) != len(columns):
                 raise ValueError(f"semantic pair {name} must be unique")
+        if not isinstance(self.embedding_device, str) or not self.embedding_device:
+            raise ValueError("semantic pair embedding_device must be non-empty")
         if self.top_k is not None and (
             not isinstance(self.top_k, int)
             or isinstance(self.top_k, bool)
@@ -86,6 +89,7 @@ class SemanticPairExecutionProfile:
             "left_text_columns": list(self.left_text_columns),
             "right_text_columns": list(self.right_text_columns),
             "embedding": None if self.embedding is None else self.embedding.to_dict(),
+            "embedding_device": self.embedding_device,
             "top_k": self.top_k,
             "min_similarity": self.min_similarity,
         }
@@ -125,6 +129,11 @@ def select_semantic_pair_candidates(
 
     if profile.mode != "search-filter" or profile.embedding is None:
         raise ValueError("candidate selection requires a search-filter profile")
+    provider_device = getattr(embedding_provider, "device", None)
+    if provider_device is not None and provider_device != profile.embedding_device:
+        raise ValueError(
+            "semantic pair profile and embedding provider devices do not match"
+        )
     _require_columns(source, profile)
     if source.empty:
         return PairCandidateSelection(

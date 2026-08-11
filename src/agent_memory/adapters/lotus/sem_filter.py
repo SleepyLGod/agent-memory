@@ -114,6 +114,7 @@ def write_search_filter_trace(
             "min_similarity": profile.min_similarity,
             "embedding_model": embedding.model,
             "embedding_revision": embedding.revision,
+            "embedding_device": profile.embedding_device,
             "total_pair_count": selection.total_pair_count,
             "candidate_pair_count": selection.candidate_pair_count,
             "pair_reduction": selection.pair_reduction,

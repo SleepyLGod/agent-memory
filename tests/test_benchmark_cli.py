@@ -52,12 +52,15 @@ def test_agent_benchmark_clis_share_semantic_pair_execution_options(
             "10",
             "--semantic-pair-min-similarity",
             "0.6",
+            "--embedding-device",
+            "cuda",
         ]
     )
 
     assert args.semantic_pair_profile == "search-filter"
     assert args.semantic_pair_top_k == 10
     assert args.semantic_pair_min_similarity == pytest.approx(0.6)
+    assert args.embedding_device == "cuda"
 
 
 def test_longmemeval_cli_separates_bundle_preparation_from_system_run(tmp_path) -> None:

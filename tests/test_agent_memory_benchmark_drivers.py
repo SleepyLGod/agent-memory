@@ -487,6 +487,7 @@ def test_zep_run_configures_existing_factory_and_checkpoint_flow(
         "semantic_pair_profile": "oracle-only",
         "semantic_pair_top_k": None,
         "semantic_pair_min_similarity": None,
+        "embedding_device": "cpu",
         "semantic_pair_execution_fingerprint": None,
         "semantic_pair_query_profiles": {},
     }
@@ -589,6 +590,44 @@ def test_search_filter_rejects_unsupported_system_before_external_setup(
             output_dir=tmp_path / "output",
             semantic_pair_profile="search-filter",
             semantic_pair_min_similarity=0.6,
+        )
+
+
+@pytest.mark.parametrize("system_id", ("claude-memory", "zep-memory"))
+def test_cuda_embedding_rejects_unsupported_system_before_external_setup(
+    system_id, monkeypatch, tmp_path
+) -> None:
+    import agent_memory.evaluation.run as run_module
+
+    monkeypatch.setattr(
+        run_module,
+        "collect_runtime_provenance",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("provenance must not run before device validation")
+        ),
+    )
+    bundle = BenchmarkBundle(
+        "longmemeval-v1-cleaned-s",
+        "revision",
+        "sha256",
+        (
+            BenchmarkCase(
+                case_id="case-1",
+                task_id="longmemeval-v1",
+                events=(_event(),),
+                questions=(BenchmarkQuestion("q1", "case-1", "?", "answer", ()),),
+            ),
+        ),
+        {"run_mode": "integration-smoke"},
+    )
+
+    with pytest.raises(ValueError, match="supported only for Mem0"):
+        run_agent_memory_bundle(
+            bundle=bundle,
+            contracts={},
+            system_id=system_id,
+            output_dir=tmp_path / "output",
+            embedding_device="cuda",
         )
 
 

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 
 import pandas as pd
@@ -200,6 +200,19 @@ def test_threshold_selects_pairs_and_embeds_unique_endpoint_texts() -> None:
     ]
 
 
+def test_embedding_device_changes_profile_identity_and_must_match_provider() -> None:
+    cpu = _profile(min_similarity=0.6)
+    cuda = replace(cpu, embedding_device="cuda")
+
+    assert cpu.fingerprint != cuda.fingerprint
+    provider = FakeEmbeddingProvider({})
+    provider.device = "cpu"
+    with pytest.raises(ValueError, match="devices do not match"):
+        select_semantic_pair_candidates(
+            _pairs(),
+            profile=cuda,
+            embedding_provider=provider,
+        )
 @pytest.mark.parametrize(
     ("direction", "expected"),
     [
@@ -419,6 +432,7 @@ def test_sem_filter_search_filter_sends_only_candidates_to_oracle(tmp_path) -> N
     assert candidate["total_pair_count"] == 2
     assert candidate["candidate_pair_count"] == 1
     assert candidate["min_similarity"] == pytest.approx(0.75)
+    assert candidate["embedding_device"] == "cpu"
     assert "vectors" not in candidate
     assert "pairs" not in candidate
 

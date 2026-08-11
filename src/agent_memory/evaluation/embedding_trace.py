@@ -18,6 +18,12 @@ class TracingEmbeddingProvider:
     def __init__(self, provider: EmbeddingProvider, *, trace_dir: Path) -> None:
         self._provider = provider
         self._trace_dir = trace_dir
+        device = getattr(provider, "device", "cpu")
+        if not isinstance(device, str) or not device:
+            raise ValueError("traced embedding device must be a non-empty string")
+        self.device = device
+        self.torch_version = getattr(provider, "torch_version", None)
+        self.torch_cuda_version = getattr(provider, "torch_cuda_version", None)
 
     def embed(
         self,
@@ -53,7 +59,9 @@ class TracingEmbeddingProvider:
             "batch_size": len(texts),
             "dimensions": spec.dimensions,
             "normalize": spec.normalize,
-            "device": "cpu",
+            "device": self.device,
+            "torch_version": self.torch_version,
+            "torch_cuda_version": self.torch_cuda_version,
             "input_path": str(input_path.relative_to(self._trace_dir.parent)),
         }
         try:

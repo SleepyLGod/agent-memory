@@ -131,6 +131,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     run.add_argument("--semantic-pair-top-k", type=int)
     run.add_argument("--semantic-pair-min-similarity", type=float)
+    run.add_argument("--embedding-device", choices=("cpu", "cuda"), default="cpu")
     run.add_argument(
         "--memory-thinking",
         choices=("enabled", "disabled"),
@@ -230,6 +231,7 @@ def main(argv: Sequence[str] | None = None) -> Path:
         semantic_pair_profile=args.semantic_pair_profile,
         semantic_pair_top_k=args.semantic_pair_top_k,
         semantic_pair_min_similarity=args.semantic_pair_min_similarity,
+        embedding_device=args.embedding_device,
         memory_thinking_enabled=args.memory_thinking == "enabled",
         condition_id=_condition_id(args),
         maintenance_only=args.maintenance_only,
