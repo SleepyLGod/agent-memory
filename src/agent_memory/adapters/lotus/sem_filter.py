@@ -11,11 +11,11 @@ import pandas as pd
 from agent_memory.adapters.lotus.context import LotusExecutionConfig, LotusExecutionContext
 from agent_memory.adapters.lotus.pair_execution import (
     PairCandidateSelection,
-    SemanticPairExecutionProfile,
     select_semantic_pair_candidates,
+    write_search_filter_trace,
 )
 from agent_memory.tracing.semantic import write_compact_operator_trace
-from agent_memory.tracing.semantic import query_digest, write_trace_event
+from agent_memory.tracing.semantic import query_digest
 from agent_memory.adapters.lotus.structured import examples_dataframe, normalize_strategy
 from agent_memory.policy.logical import QueryExpr
 
@@ -49,6 +49,7 @@ def execute_sem_filter(
         oracle_source = source.iloc[list(selection.selected_positions)].copy()
         write_search_filter_trace(
             context.config.trace_dir(),
+            operator="sem_filter",
             query_digest_value=digest,
             profile=profile,
             selection=selection,
@@ -88,39 +89,6 @@ def execute_sem_filter(
         },
     )
     return result
-
-
-def write_search_filter_trace(
-    trace_dir: Any,
-    *,
-    query_digest_value: str,
-    profile: SemanticPairExecutionProfile,
-    selection: PairCandidateSelection,
-) -> None:
-    """Record candidate generation without persisting pairs or vectors."""
-
-    embedding = profile.embedding
-    assert embedding is not None
-    write_trace_event(
-        trace_dir,
-        operator="sem_filter",
-        event_type="candidate_generation",
-        payload={
-            "query_digest": query_digest_value,
-            "profile": profile.mode,
-            "profile_fingerprint": profile.fingerprint,
-            "direction": profile.direction,
-            "top_k": profile.top_k,
-            "min_similarity": profile.min_similarity,
-            "embedding_model": embedding.model,
-            "embedding_revision": embedding.revision,
-            "embedding_device": profile.embedding_device,
-            "total_pair_count": selection.total_pair_count,
-            "candidate_pair_count": selection.candidate_pair_count,
-            "pair_reduction": selection.pair_reduction,
-            "embedding_latency_ms": round(selection.embedding_latency_ms, 3),
-        },
-    )
 
 
 def bind_qualified_filter_columns(

@@ -8,6 +8,15 @@ from typing import Any
 import pandas as pd
 
 from agent_memory.adapters.lotus.context import LotusExecutionConfig, LotusExecutionContext
+from agent_memory.adapters.lotus.pair_execution import (
+    PAIR_LEFT_ID_COLUMN,
+    PAIR_LEFT_TEXT_COLUMN,
+    PAIR_RIGHT_ID_COLUMN,
+    PAIR_RIGHT_TEXT_COLUMN,
+    SemanticPairExecutionProfile,
+    select_semantic_pair_candidates,
+    write_search_filter_trace,
+)
 from agent_memory.tracing.semantic import (
     query_digest,
     write_pair_trace,
@@ -15,6 +24,7 @@ from agent_memory.tracing.semantic import (
 )
 from agent_memory.adapters.lotus.structured import examples_dataframe, normalize_strategy
 from agent_memory.policy.logical import QueryExpr
+from agent_memory.storage.embedding import EmbeddingProvider
 
 
 def execute_sem_join(
@@ -28,6 +38,15 @@ def execute_sem_join(
     context.configure()
     left = execute(query.inputs[0], inputs)
     right = execute(query.inputs[1], inputs)
+    digest = query_digest(query)
+    profile = context.config.semantic_pair_profiles.get(digest)
+    if profile is not None and profile.mode == "search-filter":
+        if context.config.sem_join_cascade_args is not None:
+            raise ValueError(
+                "sem_join search-filter cannot be combined with LOTUS cascade"
+            )
+        if context.pair_embedding_provider is None:
+            raise ValueError("search-filter requires a pair embedding provider")
     if left.empty or right.empty:
         result = assemble_join_frame(
             left,
@@ -46,7 +65,18 @@ def execute_sem_join(
             },
         )
         return result
-    join_results = evaluate_semantic_join(query, left, right, context.config)
+    if profile is not None and profile.mode == "search-filter":
+        assert context.pair_embedding_provider is not None
+        join_results = evaluate_search_filtered_semantic_join(
+            query,
+            left,
+            right,
+            context.config,
+            profile=profile,
+            embedding_provider=context.pair_embedding_provider,
+        )
+    else:
+        join_results = evaluate_semantic_join(query, left, right, context.config)
     result = assemble_join_frame(
         left,
         right,
@@ -61,6 +91,14 @@ def execute_sem_join(
         result=result,
         payload={
             "skipped_pairwise": False,
+            **(
+                {
+                    "semantic_pair_profile": profile.mode,
+                    "semantic_pair_profile_fingerprint": profile.fingerprint,
+                }
+                if profile is not None and profile.mode == "search-filter"
+                else {}
+            ),
         },
     )
     return result
@@ -169,6 +207,171 @@ def evaluate_semantic_join(
         default=config.sem_join_default,
     )
     return list(output.join_results)
+
+
+def evaluate_search_filtered_semantic_join(
+    query: QueryExpr,
+    left: pd.DataFrame,
+    right: pd.DataFrame,
+    config: LotusExecutionConfig,
+    *,
+    profile: SemanticPairExecutionProfile,
+    embedding_provider: EmbeddingProvider,
+) -> list[tuple[Any, Any, str | None]]:
+    """Verify a sparse semantic-join candidate set with LOTUS sem_filter."""
+
+    import lotus
+    from lotus.sem_ops.sem_filter import sem_filter
+    from lotus.templates import task_instructions
+
+    left_series, right_series, left_label, right_label, instruction = join_series(
+        left,
+        right,
+        str(query.params["instruction"]),
+    )
+    pairs = semantic_join_pair_candidates(left_series, right_series)
+    selection = select_semantic_pair_candidates(
+        pairs,
+        profile=profile,
+        embedding_provider=embedding_provider,
+    )
+    write_search_filter_trace(
+        config.trace_dir(),
+        operator="sem_join",
+        query_digest_value=query_digest(query),
+        profile=profile,
+        selection=selection,
+    )
+    candidates = pairs.iloc[list(selection.selected_positions)].reset_index(drop=True)
+    if candidates.empty:
+        return []
+
+    oracle_frame = pd.DataFrame(
+        {
+            left_label: candidates[PAIR_LEFT_TEXT_COLUMN],
+            right_label: candidates[PAIR_RIGHT_TEXT_COLUMN],
+        }
+    )
+    docs = task_instructions.df2multimodal_info(
+        oracle_frame,
+        [left_label, right_label],
+    )
+    output = sem_filter(
+        docs,
+        lotus.settings.lm,
+        instruction,
+        examples_multimodal_data=examples_multimodal_data(
+            config.sem_join_examples,
+            left_label=left_label,
+            right_label=right_label,
+        ),
+        examples_answers=example_answers(config.sem_join_examples),
+        cot_reasoning=example_reasoning(config.sem_join_examples),
+        default=config.sem_join_default,
+        strategy=normalize_strategy(config.sem_join_strategy),
+        safe_mode=config.sem_join_safe_mode,
+        progress_bar_desc=config.sem_join_progress_bar_desc,
+    )
+    outputs = list(output.outputs)
+    if len(outputs) != len(candidates):
+        raise ValueError(
+            "sem_join candidate verification returned an unexpected number of "
+            f"outputs: expected {len(candidates)}, got {len(outputs)}"
+        )
+    raw_outputs = aligned_join_values(output, "raw_outputs", len(candidates), "")
+    explanations = aligned_join_values(
+        output,
+        "explanations",
+        len(candidates),
+        None,
+    )
+    write_selected_join_pair_trace(
+        config.trace_dir(),
+        candidates,
+        instruction=instruction,
+        outputs=outputs,
+        raw_outputs=raw_outputs,
+        explanations=explanations,
+        default=config.sem_join_default,
+    )
+    return [
+        (
+            row[PAIR_LEFT_ID_COLUMN],
+            row[PAIR_RIGHT_ID_COLUMN],
+            explanations[index],
+        )
+        for index, (_row_index, row) in enumerate(candidates.iterrows())
+        if bool(outputs[index])
+    ]
+
+
+def semantic_join_pair_candidates(
+    left: pd.Series,
+    right: pd.Series,
+) -> pd.DataFrame:
+    """Return the semantic join cross product in a canonical pair schema."""
+
+    return pd.DataFrame(
+        [
+            {
+                PAIR_LEFT_ID_COLUMN: left_id,
+                PAIR_RIGHT_ID_COLUMN: right_id,
+                PAIR_LEFT_TEXT_COLUMN: left_value,
+                PAIR_RIGHT_TEXT_COLUMN: right_value,
+            }
+            for left_id, left_value in left.items()
+            for right_id, right_value in right.items()
+        ]
+    )
+
+
+def aligned_join_values(
+    output: Any,
+    attribute: str,
+    expected: int,
+    fill: Any,
+) -> list[Any]:
+    """Return one optional LOTUS output value per selected join pair."""
+
+    values = list(getattr(output, attribute, ()) or ())
+    if len(values) < expected:
+        values.extend(fill for _ in range(expected - len(values)))
+    return values[:expected]
+
+
+def write_selected_join_pair_trace(
+    trace_dir: Any,
+    pairs: pd.DataFrame,
+    *,
+    instruction: str,
+    outputs: Sequence[bool],
+    raw_outputs: Sequence[Any],
+    explanations: Sequence[Any],
+    default: bool,
+) -> None:
+    """Write one sem_join trace row per oracle-verified candidate pair."""
+
+    rows = [
+        {
+            "operator": "sem_join",
+            "instruction": instruction,
+            "left_id": pair[PAIR_LEFT_ID_COLUMN],
+            "right_id": pair[PAIR_RIGHT_ID_COLUMN],
+            "left": pair[PAIR_LEFT_TEXT_COLUMN],
+            "right": pair[PAIR_RIGHT_TEXT_COLUMN],
+            "parsed_output": bool(outputs[index]),
+            "raw_output": raw_outputs[index],
+            "explanation": explanations[index],
+            "default": default,
+        }
+        for index, (_row_index, pair) in enumerate(pairs.iterrows())
+    ]
+    write_pair_trace(
+        trace_dir,
+        operator="sem_join",
+        rows=rows,
+        snapshots={"pairs": pairs},
+    )
 
 
 def write_join_pair_trace(
