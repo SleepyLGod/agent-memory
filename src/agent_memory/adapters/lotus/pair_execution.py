@@ -13,9 +13,14 @@ from time import perf_counter
 import pandas as pd
 
 from agent_memory.storage.embedding import EmbeddingProvider, EmbeddingSpec
+from agent_memory.tracing.semantic import write_trace_event
 
 SEMANTIC_PAIR_EXECUTION_MODES = ("oracle-only", "search-filter")
 SEMANTIC_PAIR_DIRECTIONS = ("symmetric", "left-to-right", "right-to-left")
+PAIR_LEFT_ID_COLUMN = "_left_pair_id"
+PAIR_RIGHT_ID_COLUMN = "_right_pair_id"
+PAIR_LEFT_TEXT_COLUMN = "text:left"
+PAIR_RIGHT_TEXT_COLUMN = "text:right"
 
 
 @dataclass(frozen=True)
@@ -218,6 +223,41 @@ def semantic_pair_profiles_fingerprint(
     return sha256(encoded).hexdigest()
 
 
+def write_search_filter_trace(
+    trace_dir: object,
+    *,
+    operator: str,
+    query_digest_value: str,
+    profile: SemanticPairExecutionProfile,
+    selection: PairCandidateSelection,
+) -> None:
+    """Record candidate generation without persisting pairs or vectors."""
+
+    embedding = profile.embedding
+    if embedding is None:
+        raise ValueError("search-filter trace requires an embedding")
+    write_trace_event(
+        trace_dir,
+        operator=operator,
+        event_type="candidate_generation",
+        payload={
+            "query_digest": query_digest_value,
+            "profile": profile.mode,
+            "profile_fingerprint": profile.fingerprint,
+            "direction": profile.direction,
+            "top_k": profile.top_k,
+            "min_similarity": profile.min_similarity,
+            "embedding_model": embedding.model,
+            "embedding_revision": embedding.revision,
+            "embedding_device": profile.embedding_device,
+            "total_pair_count": selection.total_pair_count,
+            "candidate_pair_count": selection.candidate_pair_count,
+            "pair_reduction": selection.pair_reduction,
+            "embedding_latency_ms": round(selection.embedding_latency_ms, 3),
+        },
+    )
+
+
 def _require_columns(
     source: pd.DataFrame,
     profile: SemanticPairExecutionProfile,
@@ -341,9 +381,14 @@ def _endpoint_pair_id(left_id: str, right_id: str) -> str:
 
 __all__ = [
     "PairCandidateSelection",
+    "PAIR_LEFT_ID_COLUMN",
+    "PAIR_LEFT_TEXT_COLUMN",
+    "PAIR_RIGHT_ID_COLUMN",
+    "PAIR_RIGHT_TEXT_COLUMN",
     "SEMANTIC_PAIR_DIRECTIONS",
     "SEMANTIC_PAIR_EXECUTION_MODES",
     "SemanticPairExecutionProfile",
     "select_semantic_pair_candidates",
     "semantic_pair_profiles_fingerprint",
+    "write_search_filter_trace",
 ]

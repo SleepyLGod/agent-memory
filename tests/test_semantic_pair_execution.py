@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import json
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -11,13 +12,19 @@ import pytest
 import agent_memory as am
 from agent_memory.adapters.lotus import LotusAdapter
 from agent_memory.adapters.lotus.pair_execution import (
+    PAIR_LEFT_ID_COLUMN,
+    PAIR_LEFT_TEXT_COLUMN,
+    PAIR_RIGHT_ID_COLUMN,
+    PAIR_RIGHT_TEXT_COLUMN,
     SemanticPairExecutionProfile,
     select_semantic_pair_candidates,
 )
 from agent_memory.evaluation.harness import MemorySystemContract
 from agent_memory.adapters.lotus.context import LotusExecutionConfig
 from agent_memory.adapters.lotus.sem_filter import execute_sem_filter
-from agent_memory.policy.logical import QueryExpr
+from agent_memory.adapters.lotus.sem_groupby import execute_sem_groupby
+from agent_memory.adapters.lotus.sem_join import execute_sem_join
+from agent_memory.policy.logical import ColumnSpec, QueryExpr
 from agent_memory.planner import PolicyDifferentiator
 from agent_memory.runtime import MemoryRuntime
 from agent_memory.storage import EmbeddingSpec
@@ -165,6 +172,23 @@ def _filter_profile(min_similarity: float) -> SemanticPairExecutionProfile:
         right_id_columns=("_row_id:later", "_memory_ordinal:later"),
         left_text_columns=("memory:earlier",),
         right_text_columns=("memory:later",),
+        embedding=PAIR_EMBEDDING,
+        min_similarity=min_similarity,
+    )
+
+
+def _operator_pair_profile(
+    *,
+    direction: str,
+    min_similarity: float,
+) -> SemanticPairExecutionProfile:
+    return SemanticPairExecutionProfile(
+        mode="search-filter",
+        direction=direction,
+        left_id_columns=(PAIR_LEFT_ID_COLUMN,),
+        right_id_columns=(PAIR_RIGHT_ID_COLUMN,),
+        left_text_columns=(PAIR_LEFT_TEXT_COLUMN,),
+        right_text_columns=(PAIR_RIGHT_TEXT_COLUMN,),
         embedding=PAIR_EMBEDDING,
         min_similarity=min_similarity,
     )
@@ -511,6 +535,417 @@ def test_sem_filter_zero_candidates_skips_oracle() -> None:
     assert result.empty
     assert list(result.columns) == list(source.columns)
     assert FakeFilterFrame.oracle_batches == []
+
+
+def test_sem_join_search_filter_verifies_only_candidates_and_preserves_outer_join(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import lotus.sem_ops.sem_filter as sem_filter_module
+
+    oracle_batch_sizes: list[int] = []
+    oracle_contract: dict[str, object] = {}
+
+    class Output:
+        outputs = [True]
+        raw_outputs = ["True"]
+        explanations = ["same topic"]
+
+    def sem_filter(docs: list[object], *args: object, **kwargs: object) -> Output:
+        oracle_batch_sizes.append(len(docs))
+        oracle_contract["instruction"] = args[1]
+        oracle_contract["default"] = kwargs["default"]
+        oracle_contract["progress_bar_desc"] = kwargs["progress_bar_desc"]
+        return Output()
+
+    monkeypatch.setattr(sem_filter_module, "sem_filter", sem_filter)
+    left = pd.DataFrame(
+        {"topic": ["alpha project", "tea preference"]},
+        index=[10, 20],
+    )
+    right = pd.DataFrame(
+        {"topic": ["alpha initiative", "coffee preference"]},
+        index=[100, 200],
+    )
+    query = QueryExpr(
+        op="sem_join",
+        inputs=(
+            QueryExpr(op="materialized_view", params={"name": "left"}),
+            QueryExpr(op="materialized_view", params={"name": "right"}),
+        ),
+        params={
+            "instruction": "{topic:left} and {topic:right} describe the same topic.",
+            "how": "outer",
+        },
+    )
+    provider = FakeEmbeddingProvider(
+        {
+            "text: alpha project": [1.0, 0.0],
+            "text: tea preference": [0.0, 1.0],
+            "text: alpha initiative": [0.9, 0.435889894],
+            "text: coffee preference": [-1.0, 0.0],
+        }
+    )
+    context = FakeContext(
+        LotusExecutionConfig(
+            semantic_trace_dir=tmp_path,
+            semantic_pair_profiles={
+                query_digest(query): _operator_pair_profile(
+                    direction="left-to-right",
+                    min_similarity=0.8,
+                )
+            },
+        ),
+        provider,
+    )
+
+    result = execute_sem_join(
+        query,
+        {"left": left, "right": right},
+        lambda expression, inputs: inputs[str(expression.params["name"])],
+        context,
+    )
+
+    assert oracle_batch_sizes == [1]
+    assert oracle_contract == {
+        "instruction": (
+            "{topic:left} and {topic:right} describe the same topic."
+        ),
+        "default": False,
+        "progress_bar_desc": "Join comparisons",
+    }
+    assert result.loc[0].to_dict() == {
+        "topic:left": "alpha project",
+        "topic:right": "alpha initiative",
+    }
+    assert result.loc[1, "topic:left"] == "tea preference"
+    assert pd.isna(result.loc[1, "topic:right"])
+    assert pd.isna(result.loc[2, "topic:left"])
+    assert result.loc[2, "topic:right"] == "coffee preference"
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "events.jsonl").read_text().splitlines()
+    ]
+    candidate = next(
+        event for event in events if event["event_type"] == "candidate_generation"
+    )
+    assert candidate["operator"] == "sem_join"
+    assert candidate["total_pair_count"] == 4
+    assert candidate["candidate_pair_count"] == 1
+    assert "vectors" not in candidate
+    assert "pairs" not in candidate
+
+
+def test_sem_groupby_search_filter_verifies_only_candidate_edges(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import lotus.sem_ops.sem_filter as sem_filter_module
+
+    oracle_batch_sizes: list[int] = []
+
+    class Output:
+        outputs = [True]
+        raw_outputs = ["True"]
+        explanations = ["same topic"]
+
+    def sem_filter(docs: list[object], *args: object, **kwargs: object) -> Output:
+        del args, kwargs
+        oracle_batch_sizes.append(len(docs))
+        return Output()
+
+    monkeypatch.setattr(sem_filter_module, "sem_filter", sem_filter)
+    source = pd.DataFrame(
+        {"topic": ["alpha project", "alpha initiative", "tea preference"]}
+    )
+    query = QueryExpr(
+        op="sem_groupby",
+        inputs=(QueryExpr(op="materialized_view", params={"name": "rows"}),),
+        params={
+            "input_cols": ("topic",),
+            "instruction": "Group rows that describe the same topic: {topic}.",
+        },
+    )
+    provider = FakeEmbeddingProvider(
+        {
+            "text: topic: alpha project": [1.0, 0.0],
+            "text: topic: alpha initiative": [0.9, 0.435889894],
+            "text: topic: tea preference": [0.0, 1.0],
+        }
+    )
+    context = FakeContext(
+        LotusExecutionConfig(
+            semantic_trace_dir=tmp_path,
+            semantic_pair_profiles={
+                query_digest(query): _operator_pair_profile(
+                    direction="symmetric",
+                    min_similarity=0.8,
+                )
+            },
+        ),
+        provider,
+    )
+
+    result = execute_sem_groupby(
+        query,
+        {"rows": source},
+        lambda expression, inputs: inputs[str(expression.params["name"])],
+        context,
+    )
+
+    assert oracle_batch_sizes == [1]
+    assert list(result["_agent_memory_group_id"]) == [0, 0, 1]
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "events.jsonl").read_text().splitlines()
+    ]
+    candidate = next(
+        event for event in events if event["event_type"] == "candidate_generation"
+    )
+    assert candidate["operator"] == "sem_groupby"
+    assert candidate["total_pair_count"] == 3
+    assert candidate["candidate_pair_count"] == 1
+    assert "vectors" not in candidate
+    assert "pairs" not in candidate
+
+
+def test_sem_join_search_filter_zero_candidates_skips_oracle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import lotus.sem_ops.sem_filter as sem_filter_module
+
+    def sem_filter(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise AssertionError("zero candidates must not call the oracle")
+
+    monkeypatch.setattr(sem_filter_module, "sem_filter", sem_filter)
+    left = pd.DataFrame({"topic": ["alpha"]}, index=[10])
+    right = pd.DataFrame({"topic": ["coffee"]}, index=[100])
+    query = QueryExpr(
+        op="sem_join",
+        inputs=(
+            QueryExpr(op="materialized_view", params={"name": "left"}),
+            QueryExpr(op="materialized_view", params={"name": "right"}),
+        ),
+        params={
+            "instruction": "{topic:left} and {topic:right} are the same topic.",
+            "how": "inner",
+        },
+    )
+    provider = FakeEmbeddingProvider(
+        {
+            "text: alpha": [1.0, 0.0],
+            "text: coffee": [-1.0, 0.0],
+        }
+    )
+    context = FakeContext(
+        LotusExecutionConfig(
+            semantic_pair_profiles={
+                query_digest(query): _operator_pair_profile(
+                    direction="left-to-right",
+                    min_similarity=0.8,
+                )
+            }
+        ),
+        provider,
+    )
+
+    result = execute_sem_join(
+        query,
+        {"left": left, "right": right},
+        lambda expression, inputs: inputs[str(expression.params["name"])],
+        context,
+    )
+
+    assert result.empty
+    assert list(result.columns) == ["topic:left", "topic:right"]
+
+
+def test_sem_join_search_filter_rejects_lotus_cascade() -> None:
+    query = QueryExpr(
+        op="sem_join",
+        inputs=(
+            QueryExpr(op="materialized_view", params={"name": "left"}),
+            QueryExpr(op="materialized_view", params={"name": "right"}),
+        ),
+        params={"instruction": "Rows match.", "how": "inner"},
+    )
+    context = FakeContext(
+        LotusExecutionConfig(
+            sem_join_cascade_args={"sampling_percentage": 0.1},
+            semantic_pair_profiles={
+                query_digest(query): _operator_pair_profile(
+                    direction="left-to-right",
+                    min_similarity=0.8,
+                )
+            },
+        ),
+        FakeEmbeddingProvider({}),
+    )
+
+    with pytest.raises(ValueError, match="cannot be combined with LOTUS cascade"):
+        execute_sem_join(
+            query,
+            {
+                "left": pd.DataFrame({"topic": ["alpha"]}),
+                "right": pd.DataFrame({"topic": ["alpha"]}),
+            },
+            lambda expression, inputs: inputs[str(expression.params["name"])],
+            context,
+        )
+
+
+def test_sem_groupby_search_filter_zero_candidates_skips_oracle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import lotus.sem_ops.sem_filter as sem_filter_module
+
+    def sem_filter(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise AssertionError("zero candidates must not call the oracle")
+
+    monkeypatch.setattr(sem_filter_module, "sem_filter", sem_filter)
+    source = pd.DataFrame({"topic": ["alpha", "coffee"]})
+    query = QueryExpr(
+        op="sem_groupby",
+        inputs=(QueryExpr(op="materialized_view", params={"name": "rows"}),),
+        params={
+            "input_cols": ("topic",),
+            "instruction": "Group the same {topic}.",
+        },
+    )
+    provider = FakeEmbeddingProvider(
+        {
+            "text: topic: alpha": [1.0, 0.0],
+            "text: topic: coffee": [-1.0, 0.0],
+        }
+    )
+    context = FakeContext(
+        LotusExecutionConfig(
+            semantic_pair_profiles={
+                query_digest(query): _operator_pair_profile(
+                    direction="symmetric",
+                    min_similarity=0.8,
+                )
+            }
+        ),
+        provider,
+    )
+
+    result = execute_sem_groupby(
+        query,
+        {"rows": source},
+        lambda expression, inputs: inputs[str(expression.params["name"])],
+        context,
+    )
+
+    assert list(result["_agent_memory_group_id"]) == [0, 1]
+
+
+def test_partitioned_sem_groupby_search_filter_stays_within_each_partition(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import lotus.sem_ops.sem_filter as sem_filter_module
+
+    oracle_batch_sizes: list[int] = []
+
+    class Output:
+        outputs = [True]
+        raw_outputs = ["True"]
+        explanations = ["same topic"]
+
+    def sem_filter(docs: list[object], *args: object, **kwargs: object) -> Output:
+        del args, kwargs
+        oracle_batch_sizes.append(len(docs))
+        return Output()
+
+    monkeypatch.setattr(sem_filter_module, "sem_filter", sem_filter)
+    source = pd.DataFrame(
+        {
+            "scope": ["a", "a", "b", "b"],
+            "topic": ["alpha", "alpha project", "tea", "tea preference"],
+        }
+    )
+    query = QueryExpr(
+        op="sem_groupby",
+        inputs=(QueryExpr(op="materialized_view", params={"name": "rows"}),),
+        params={
+            "input_cols": ("topic",),
+            "partition_by": ("scope",),
+            "instruction": "Group the same {topic} within each scope.",
+        },
+    )
+    provider = FakeEmbeddingProvider(
+        {
+            "text: topic: alpha": [1.0, 0.0],
+            "text: topic: alpha project": [1.0, 0.0],
+            "text: topic: tea": [0.0, 1.0],
+            "text: topic: tea preference": [0.0, 1.0],
+        }
+    )
+    context = FakeContext(
+        LotusExecutionConfig(
+            semantic_trace_dir=tmp_path,
+            semantic_pair_profiles={
+                query_digest(query): _operator_pair_profile(
+                    direction="symmetric",
+                    min_similarity=0.8,
+                )
+            },
+        ),
+        provider,
+    )
+
+    result = execute_sem_groupby(
+        query,
+        {"rows": source},
+        lambda expression, inputs: inputs[str(expression.params["name"])],
+        context,
+    )
+
+    assert oracle_batch_sizes == [1, 1]
+    assert list(result["_agent_memory_group_id"]) == [0, 0, 1, 1]
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "events.jsonl").read_text().splitlines()
+    ]
+    candidate_events = [
+        event for event in events if event["event_type"] == "candidate_generation"
+    ]
+    assert len(candidate_events) == 2
+    assert [event["total_pair_count"] for event in candidate_events] == [1, 1]
+
+
+def test_declared_label_sem_groupby_rejects_pair_profile() -> None:
+    query = QueryExpr(
+        op="sem_groupby",
+        inputs=(QueryExpr(op="materialized_view", params={"name": "rows"}),),
+        params={
+            "input_cols": ("topic",),
+            "instruction": "Assign a label.",
+            "labels": (ColumnSpec("work", "Work topics."),),
+        },
+    )
+    context = FakeContext(
+        LotusExecutionConfig(
+            semantic_pair_profiles={
+                query_digest(query): _operator_pair_profile(
+                    direction="symmetric",
+                    min_similarity=0.8,
+                )
+            }
+        ),
+        FakeEmbeddingProvider({}),
+    )
+
+    with pytest.raises(ValueError, match="only to open-ended pairwise sem_groupby"):
+        execute_sem_groupby(
+            query,
+            {"rows": pd.DataFrame({"topic": ["alpha"]})},
+            lambda expression, inputs: inputs[str(expression.params["name"])],
+            context,
+        )
 
 
 def test_runtime_snapshot_rejects_a_different_pair_execution_profile() -> None:

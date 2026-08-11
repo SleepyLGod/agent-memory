@@ -9,10 +9,24 @@ from typing import Any
 import pandas as pd
 
 from agent_memory.adapters.lotus.context import LotusExecutionContext
+from agent_memory.adapters.lotus.pair_execution import (
+    PAIR_LEFT_ID_COLUMN,
+    PAIR_LEFT_TEXT_COLUMN,
+    PAIR_RIGHT_ID_COLUMN,
+    PAIR_RIGHT_TEXT_COLUMN,
+    SemanticPairExecutionProfile,
+    select_semantic_pair_candidates,
+    write_search_filter_trace,
+)
 from agent_memory.adapters.lotus.sem_join import row_text_series
 from agent_memory.adapters.lotus.structured import StructuredLMExecutor
 from agent_memory.policy.logical import ColumnSpec, QueryExpr
-from agent_memory.tracing.semantic import write_compact_operator_trace, write_pair_trace
+from agent_memory.storage.embedding import EmbeddingProvider
+from agent_memory.tracing.semantic import (
+    query_digest,
+    write_compact_operator_trace,
+    write_pair_trace,
+)
 
 GROUP_ID_COLUMN = "_agent_memory_group_id"
 PAIRWISE_PLACEHOLDER_PATTERN = re.compile(
@@ -34,6 +48,17 @@ def execute_sem_groupby(
     partition_by = tuple(str(column) for column in query.params.get("partition_by", ()))
     validate_partition_by(source, partition_by)
     labels = tuple(query.params.get("labels") or ())
+    digest = query_digest(query)
+    profile = context.config.semantic_pair_profiles.get(digest)
+    if labels and profile is not None:
+        raise ValueError(
+            "semantic pair profiles apply only to open-ended pairwise sem_groupby"
+        )
+    if profile is not None and profile.mode == "search-filter":
+        if profile.direction != "symmetric":
+            raise ValueError("pairwise sem_groupby search-filter must be symmetric")
+        if context.pair_embedding_provider is None:
+            raise ValueError("search-filter requires a pair embedding provider")
     if partition_by:
         return execute_partitioned_sem_groupby(
             source,
@@ -46,6 +71,9 @@ def execute_sem_groupby(
             pair_batch_size=context.config.sem_groupby_pair_batch_size,
             pair_batch_retries=context.config.sem_groupby_pair_batch_retries,
             trace_dir=context.config.trace_dir(),
+            query_digest_value=digest,
+            profile=profile,
+            embedding_provider=context.pair_embedding_provider,
         )
     if labels:
         return assign_declared_labels(
@@ -65,6 +93,9 @@ def execute_sem_groupby(
         pair_batch_size=context.config.sem_groupby_pair_batch_size,
         pair_batch_retries=context.config.sem_groupby_pair_batch_retries,
         trace_dir=context.config.trace_dir(),
+        query_digest_value=digest,
+        profile=profile,
+        embedding_provider=context.pair_embedding_provider,
     )
     result = assign_semantic_group_ids(
         source,
@@ -100,6 +131,9 @@ def execute_partitioned_sem_groupby(
     pair_batch_size: int | None,
     pair_batch_retries: int,
     trace_dir: Any,
+    query_digest_value: str,
+    profile: SemanticPairExecutionProfile | None,
+    embedding_provider: EmbeddingProvider | None,
 ) -> pd.DataFrame:
     """Assign semantic group ids independently within deterministic partitions."""
 
@@ -134,6 +168,9 @@ def execute_partitioned_sem_groupby(
                 pair_batch_size=pair_batch_size,
                 pair_batch_retries=pair_batch_retries,
                 trace_dir=trace_dir,
+                query_digest_value=query_digest_value,
+                profile=profile,
+                embedding_provider=embedding_provider,
             )
             result = assign_semantic_group_ids(
                 partition,
@@ -338,6 +375,9 @@ def evaluate_group_matches(
     pair_batch_size: int | None = None,
     pair_batch_retries: int = 0,
     trace_dir: Any = None,
+    query_digest_value: str = "",
+    profile: SemanticPairExecutionProfile | None = None,
+    embedding_provider: EmbeddingProvider | None = None,
 ) -> list[tuple[int, int]]:
     """Evaluate candidate row pairs with LOTUS sem_filter."""
 
@@ -354,6 +394,26 @@ def evaluate_group_matches(
         raise ValueError("sem_groupby pair_batch_retries cannot be negative")
 
     pairs = semantic_pair_candidates(unique_rows, input_cols)
+    if profile is not None and profile.mode == "search-filter":
+        if profile.direction != "symmetric":
+            raise ValueError("pairwise sem_groupby search-filter must be symmetric")
+        if embedding_provider is None:
+            raise ValueError("search-filter requires a pair embedding provider")
+        selection = select_semantic_pair_candidates(
+            groupby_pair_candidate_projection(pairs),
+            profile=profile,
+            embedding_provider=embedding_provider,
+        )
+        write_search_filter_trace(
+            trace_dir,
+            operator="sem_groupby",
+            query_digest_value=query_digest_value,
+            profile=profile,
+            selection=selection,
+        )
+        pairs = pairs.iloc[list(selection.selected_positions)].reset_index(drop=True)
+        if pairs.empty:
+            return []
     lowered_instruction = lower_pairwise_grouping_instruction(
         instruction,
         input_cols=input_cols,
@@ -406,6 +466,19 @@ def evaluate_group_matches(
         for (_index, row), keep in zip(pairs.iterrows(), parsed_outputs)
         if keep
     ]
+
+
+def groupby_pair_candidate_projection(pairs: pd.DataFrame) -> pd.DataFrame:
+    """Project grouping pairs into the adapter's canonical candidate schema."""
+
+    return pd.DataFrame(
+        {
+            PAIR_LEFT_ID_COLUMN: pairs["_left_unique_id"],
+            PAIR_RIGHT_ID_COLUMN: pairs["_right_unique_id"],
+            PAIR_LEFT_TEXT_COLUMN: pairs["left"],
+            PAIR_RIGHT_TEXT_COLUMN: pairs["right"],
+        }
+    )
 
 
 def evaluate_group_match_batch(
