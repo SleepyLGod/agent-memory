@@ -19,7 +19,6 @@ import pandas as pd
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 path.insert(0, str(PROJECT_ROOT / "src"))
 
-import agent_memory as am  # noqa: E402
 from agent_memory.datasets.locomo import (  # noqa: E402
     DEFAULT_LOCOMO_URL,
     ensure_locomo_dataset,
@@ -36,7 +35,6 @@ from agent_memory.tracing.semantic import (  # noqa: E402
     semantic_trace_scope,
 )
 from agent_memory.memories.simplemem import (  # noqa: E402
-    SIMPLEMEM_EXTRACTION_PROMPT,
     SimpleMemMemory,
     SimpleMemMemoryEnhanced,
     WINDOW_SIZE,
