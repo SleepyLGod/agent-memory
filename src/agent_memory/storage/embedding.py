@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from importlib import import_module
 from typing import Protocol
 
 
@@ -60,7 +61,7 @@ class EmbeddingProvider(Protocol):
 
 
 class SentenceTransformerEmbeddingProvider:
-    """CPU sentence-transformers provider for one pinned embedding spec."""
+    """Sentence-transformers provider for one pinned embedding spec."""
 
     def __init__(
         self,
@@ -71,8 +72,8 @@ class SentenceTransformerEmbeddingProvider:
     ) -> None:
         if not isinstance(spec, EmbeddingSpec):
             raise TypeError("embedding provider spec must be EmbeddingSpec")
-        if device != "cpu":
-            raise ValueError("storage embeddings are fixed to CPU")
+        if not isinstance(device, str) or not device:
+            raise ValueError("embedding device must be a non-empty string")
         if not isinstance(dependency_extra, str) or not dependency_extra:
             raise ValueError("embedding dependency extra must be a non-empty string")
         try:
@@ -84,6 +85,9 @@ class SentenceTransformerEmbeddingProvider:
             ) from exc
         self.spec = spec
         self.device = device
+        torch = import_module("torch")
+        self.torch_version = getattr(torch, "__version__", None)
+        self.torch_cuda_version = getattr(getattr(torch, "version", None), "cuda", None)
         self._model = SentenceTransformer(
             spec.model,
             revision=spec.revision,

@@ -62,6 +62,7 @@ def test_mem0_search_filter_targets_the_shared_duplicate_query() -> None:
     assert profile.left_text_columns == ("memory:earlier",)
     assert profile.right_text_columns == ("memory:later",)
     assert profile.min_similarity == pytest.approx(0.6)
+    assert profile.embedding_device == "cpu"
     policy = PolicyDifferentiator().differentiate(
         am.Mem0Memory.spec(),
         statements=MEM0_QDRANT_STATEMENTS,
@@ -97,8 +98,9 @@ def test_mem0_factory_reuses_one_traced_embedding_provider(
     import agent_memory.storage.qdrant as qdrant_module
 
     class FakeEmbeddingProvider:
-        def __init__(self, spec, *, dependency_extra: str) -> None:
+        def __init__(self, spec, *, device: str, dependency_extra: str) -> None:
             self.spec = spec
+            self.device = device
             self.dependency_extra = dependency_extra
 
         def embed(self, spec, texts):
@@ -127,12 +129,14 @@ def test_mem0_factory_reuses_one_traced_embedding_provider(
         am.Mem0Memory,
         mode="search-filter",
         embedding=MEM0_BGE_M3,
+        embedding_device="cuda",
         top_k=None,
         min_similarity=0.6,
     )
     factory = Mem0MemoryDriverFactory(
         base_namespace="test-mem0",
         semantic_pair_profiles=profiles,
+        embedding_device="cuda",
     )
 
     driver = factory("case-1", tmp_path / "state", tmp_path / "trace")
@@ -142,6 +146,7 @@ def test_mem0_factory_reuses_one_traced_embedding_provider(
         runtime._engine.adapter.pair_embedding_provider
     )
     assert runtime._engine.adapter.config.semantic_pair_profiles == profiles
+    assert runtime.storage.connector.embedding_provider.device == "cuda"
     driver.close()
 
 
@@ -406,6 +411,10 @@ def test_benchmark_embedding_trace_records_inputs_without_vectors(
     tmp_path: Path,
 ) -> None:
     class Provider:
+        device = "cuda"
+        torch_version = "2.7.0+cu118"
+        torch_cuda_version = "11.8"
+
         def embed(
             self,
             spec: EmbeddingSpec,
@@ -433,6 +442,9 @@ def test_benchmark_embedding_trace_records_inputs_without_vectors(
     assert event["batch_size"] == 2
     assert event["dimensions"] == 2
     assert event["result_dimensions"] == 2
+    assert event["device"] == "cuda"
+    assert event["torch_version"] == "2.7.0+cu118"
+    assert event["torch_cuda_version"] == "11.8"
     input_payload = json.loads((tmp_path / event["input_path"]).read_text())
     assert input_payload == {
         "embedding": spec.to_dict(),
@@ -625,6 +637,7 @@ def test_mem0_search_filter_runner_records_physical_contract(
         memory_thinking_enabled=False,
         semantic_pair_profile="search-filter",
         semantic_pair_min_similarity=0.6,
+        embedding_device="cuda",
     )
 
     factory = captured["factory"]
@@ -632,6 +645,9 @@ def test_mem0_search_filter_runner_records_physical_contract(
     profiles = factory["semantic_pair_profiles"]
     assert isinstance(profiles, dict)
     assert len(profiles) == 1
+    profile = next(iter(profiles.values()))
+    assert profile.embedding_device == "cuda"
+    assert factory["embedding_device"] == "cuda"
     runner = captured["runner"]
     assert isinstance(runner, dict)
     contract = runner["system_contract"]
@@ -643,4 +659,23 @@ def test_mem0_search_filter_runner_records_physical_contract(
     execution = runner["runtime_provenance"]["runtime"]["lotus_execution"]
     assert execution["semantic_pair_profile"] == "search-filter"
     assert execution["semantic_pair_min_similarity"] == pytest.approx(0.6)
+    assert execution["embedding_device"] == "cuda"
     assert execution["semantic_pair_execution_fingerprint"]
+
+    run_agent_memory_bundle(
+        bundle=bundle,
+        contracts={},
+        system_id="mem0-memory",
+        output_dir=tmp_path / "oracle-gpu",
+        memory_thinking_enabled=False,
+        embedding_device="cuda",
+    )
+
+    oracle_runner = captured["runner"]
+    assert isinstance(oracle_runner, dict)
+    oracle_contract = oracle_runner["system_contract"]
+    assert isinstance(oracle_contract, MemorySystemContract)
+    assert oracle_contract.maintenance_execution_id == "embedding-device:cuda"
+    assert "execution=embedding-device:cuda" in (
+        oracle_contract.effective_condition_id
+    )

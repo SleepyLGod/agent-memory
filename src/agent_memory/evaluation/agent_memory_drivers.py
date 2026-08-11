@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from hashlib import sha256
+from importlib import import_module
 from importlib.metadata import version
 import json
 import os
@@ -34,6 +35,7 @@ def build_mem0_semantic_pair_profiles(
     *,
     mode: str,
     embedding: EmbeddingSpec,
+    embedding_device: str = "cpu",
     top_k: int | None,
     min_similarity: float | None,
 ) -> dict[str, SemanticPairExecutionProfile]:
@@ -70,6 +72,7 @@ def build_mem0_semantic_pair_profiles(
             left_text_columns=("memory:earlier",),
             right_text_columns=("memory:later",),
             embedding=embedding,
+            embedding_device=embedding_device,
             top_k=top_k,
             min_similarity=min_similarity,
         )
@@ -683,6 +686,7 @@ class Mem0MemoryDriverFactory:
         sem_groupby_pair_batch_size: int | None = None,
         sem_groupby_pair_batch_retries: int = 0,
         semantic_pair_profiles: dict[str, SemanticPairExecutionProfile] | None = None,
+        embedding_device: str = "cpu",
         thinking_enabled: bool = False,
     ) -> None:
         if not base_namespace:
@@ -692,6 +696,9 @@ class Mem0MemoryDriverFactory:
         self.sem_groupby_pair_batch_size = sem_groupby_pair_batch_size
         self.sem_groupby_pair_batch_retries = sem_groupby_pair_batch_retries
         self.semantic_pair_profiles = dict(semantic_pair_profiles or {})
+        if embedding_device not in {"cpu", "cuda"}:
+            raise ValueError("Mem0 embedding_device must be 'cpu' or 'cuda'")
+        self.embedding_device = embedding_device
         self.thinking_enabled = thinking_enabled
         self.sem_topk_method = "pairwise-naive"
 
@@ -699,6 +706,8 @@ class Mem0MemoryDriverFactory:
         """Return the physical Mem0 Base storage profile."""
 
         from agent_memory.memories.mem0.storage import MEM0_BGE_M3
+        torch = import_module("torch")
+        torch_version = getattr(torch, "version", None)
 
         return {
             "connector": "qdrant",
@@ -708,7 +717,9 @@ class Mem0MemoryDriverFactory:
             "embedding_model": MEM0_BGE_M3.model,
             "embedding_revision": MEM0_BGE_M3.revision,
             "dimensions": MEM0_BGE_M3.dimensions,
-            "device": "cpu",
+            "device": self.embedding_device,
+            "torch_version": version("torch"),
+            "torch_cuda_version": getattr(torch_version, "cuda", None),
             "bm25_enabled": False,
             "entity_boost_enabled": False,
             "reranker_enabled": False,
@@ -738,6 +749,7 @@ class Mem0MemoryDriverFactory:
         embedding_provider = TracingEmbeddingProvider(
             SentenceTransformerEmbeddingProvider(
                 MEM0_BGE_M3,
+                device=self.embedding_device,
                 dependency_extra="mem0",
             ),
             trace_dir=trace_dir,
@@ -815,6 +827,7 @@ class Mem0MemoryEnhancedDriverFactory(Mem0MemoryDriverFactory):
         sem_groupby_pair_batch_size: int | None = None,
         sem_groupby_pair_batch_retries: int = 0,
         semantic_pair_profiles: dict[str, SemanticPairExecutionProfile] | None = None,
+        embedding_device: str = "cpu",
         thinking_enabled: bool = False,
     ) -> None:
         from agent_memory.adapters.lotus.context import SEM_TOPK_METHODS
@@ -829,6 +842,7 @@ class Mem0MemoryEnhancedDriverFactory(Mem0MemoryDriverFactory):
             sem_groupby_pair_batch_size=sem_groupby_pair_batch_size,
             sem_groupby_pair_batch_retries=sem_groupby_pair_batch_retries,
             semantic_pair_profiles=semantic_pair_profiles,
+            embedding_device=embedding_device,
             thinking_enabled=thinking_enabled,
         )
         self.sem_topk_method = sem_topk_method

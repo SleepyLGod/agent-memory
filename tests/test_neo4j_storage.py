@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import sys
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
@@ -113,6 +115,32 @@ def test_embedding_provider_reuses_model_for_different_mapping_columns() -> None
         [1.0, 2.0]
     ]
     assert model.calls == [(["Alice lives in Paris"], True)]
+
+
+def test_embedding_provider_passes_configured_cuda_device(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeSentenceTransformer:
+        def __init__(self, model: str, *, revision: str, device: str) -> None:
+            captured.update(model=model, revision=revision, device=device)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "sentence_transformers",
+        SimpleNamespace(SentenceTransformer=FakeSentenceTransformer),
+    )
+
+    provider = SentenceTransformerEmbeddingProvider(_embedding(), device="cuda")
+
+    assert provider.device == "cuda"
+    assert provider.torch_version
+    assert captured == {
+        "model": "BAAI/bge-m3",
+        "revision": "revision-a",
+        "device": "cuda",
+    }
 
 
 @pytest.mark.parametrize(

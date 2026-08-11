@@ -82,6 +82,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     run.add_argument("--semantic-pair-top-k", type=int)
     run.add_argument("--semantic-pair-min-similarity", type=float)
+    run.add_argument("--embedding-device", choices=("cpu", "cuda"), default="cpu")
     args = parser.parse_args(raw_args)
     if args.command == "run":
         invalid = [
@@ -166,6 +167,7 @@ def main(argv: Sequence[str] | None = None) -> Path:
         semantic_pair_profile=args.semantic_pair_profile,
         semantic_pair_top_k=args.semantic_pair_top_k,
         semantic_pair_min_similarity=args.semantic_pair_min_similarity,
+        embedding_device=args.embedding_device,
         memory_thinking_enabled=False,
         condition_id=args.condition_id or "",
         maintenance_only=args.maintenance_only,
