@@ -33,6 +33,33 @@ def test_agent_benchmark_clis_share_sem_groupby_execution_options(
     assert args.sem_groupby_pair_batch_retries == 2
 
 
+@pytest.mark.parametrize("module", (locomo, longmemeval, memory_agent_bench))
+def test_agent_benchmark_clis_share_semantic_pair_execution_options(
+    module, tmp_path
+) -> None:
+    args = module.parse_args(
+        [
+            "run",
+            "--bundle-dir",
+            str(tmp_path / "bundle"),
+            "--output-dir",
+            str(tmp_path / "output"),
+            "--system",
+            "mem0-memory",
+            "--semantic-pair-profile",
+            "search-filter",
+            "--semantic-pair-top-k",
+            "10",
+            "--semantic-pair-min-similarity",
+            "0.6",
+        ]
+    )
+
+    assert args.semantic_pair_profile == "search-filter"
+    assert args.semantic_pair_top_k == 10
+    assert args.semantic_pair_min_similarity == pytest.approx(0.6)
+
+
 def test_longmemeval_cli_separates_bundle_preparation_from_system_run(tmp_path) -> None:
     prepared = longmemeval.parse_args(
         [

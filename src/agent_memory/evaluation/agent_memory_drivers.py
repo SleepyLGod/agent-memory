@@ -12,16 +12,68 @@ from typing import Any
 
 import pandas as pd
 
+from agent_memory.adapters.lotus.pair_execution import (
+    SEMANTIC_PAIR_EXECUTION_MODES,
+    SemanticPairExecutionProfile,
+)
 from agent_memory.evaluation.claude_memory.bindings import event_to_claude_log_row
 from agent_memory.evaluation.embedding_trace import TracingEmbeddingProvider
 from agent_memory.evaluation.harness import RetrievalOutput
 from agent_memory.evaluation.types import BenchmarkEvent, RetrievalRequest
 from agent_memory.evaluation.zep.answering import format_retrieval_context
 from agent_memory.policy.retrieval import RetrievalResult
+from agent_memory.storage import EmbeddingSpec
 
 
 BENCHMARK_STRUCTURED_MAX_TOKENS = 32_768
 BENCHMARK_LM_NUM_RETRIES = 2
+
+
+def build_mem0_semantic_pair_profiles(
+    memory_type: type[Any],
+    *,
+    mode: str,
+    embedding: EmbeddingSpec,
+    top_k: int | None,
+    min_similarity: float | None,
+) -> dict[str, SemanticPairExecutionProfile]:
+    """Bind a physical profile to Mem0's unique pair-shaped semantic filter."""
+
+    if mode not in SEMANTIC_PAIR_EXECUTION_MODES:
+        raise ValueError(
+            "semantic pair profile must be one of: "
+            + ", ".join(SEMANTIC_PAIR_EXECUTION_MODES)
+        )
+    if mode == "oracle-only":
+        if top_k is not None or min_similarity is not None:
+            raise ValueError("oracle-only does not accept semantic pair bounds")
+        return {}
+
+    from agent_memory.planner import PolicyDifferentiator
+    from agent_memory.tracing.semantic import query_digest
+
+    policy = PolicyDifferentiator().differentiate(memory_type.spec())
+    filters = {
+        query_digest(node.query): node.query
+        for node in policy.nodes.values()
+        if node.query.op == "sem_filter"
+    }
+    if len(filters) != 1:
+        raise ValueError("Mem0 search-filter requires exactly one semantic filter")
+    digest = next(iter(filters))
+    return {
+        digest: SemanticPairExecutionProfile(
+            mode="search-filter",
+            direction="right-to-left",
+            left_id_columns=("_row_id:earlier", "_memory_ordinal:earlier"),
+            right_id_columns=("_row_id:later", "_memory_ordinal:later"),
+            left_text_columns=("memory:earlier",),
+            right_text_columns=("memory:later",),
+            embedding=embedding,
+            top_k=top_k,
+            min_similarity=min_similarity,
+        )
+    }
 
 
 def _view_counts(memory: Any) -> dict[str, int]:
@@ -630,6 +682,7 @@ class Mem0MemoryDriverFactory:
         model_id: str = "deepseek/deepseek-v4-flash",
         sem_groupby_pair_batch_size: int | None = None,
         sem_groupby_pair_batch_retries: int = 0,
+        semantic_pair_profiles: dict[str, SemanticPairExecutionProfile] | None = None,
         thinking_enabled: bool = False,
     ) -> None:
         if not base_namespace:
@@ -638,6 +691,7 @@ class Mem0MemoryDriverFactory:
         self.model_id = model_id
         self.sem_groupby_pair_batch_size = sem_groupby_pair_batch_size
         self.sem_groupby_pair_batch_retries = sem_groupby_pair_batch_retries
+        self.semantic_pair_profiles = dict(semantic_pair_profiles or {})
         self.thinking_enabled = thinking_enabled
         self.sem_topk_method = "pairwise-naive"
 
@@ -681,15 +735,16 @@ class Mem0MemoryDriverFactory:
 
         case_digest = sha256(case_id.encode("utf-8")).hexdigest()[:16]
         namespace = f"{self.base_namespace}-{case_digest}"
+        embedding_provider = TracingEmbeddingProvider(
+            SentenceTransformerEmbeddingProvider(
+                MEM0_BGE_M3,
+                dependency_extra="mem0",
+            ),
+            trace_dir=trace_dir,
+        )
         connector = QdrantConnector(
             path=state_dir / "qdrant",
-            embedding_provider=TracingEmbeddingProvider(
-                SentenceTransformerEmbeddingProvider(
-                    MEM0_BGE_M3,
-                    dependency_extra="mem0",
-                ),
-                trace_dir=trace_dir,
-            ),
+            embedding_provider=embedding_provider,
         )
         try:
             memory_type = getattr(am, self.policy_name)
@@ -720,7 +775,9 @@ class Mem0MemoryDriverFactory:
                     sem_topk_method=self.sem_topk_method,
                     sem_groupby_pair_batch_size=self.sem_groupby_pair_batch_size,
                     sem_groupby_pair_batch_retries=self.sem_groupby_pair_batch_retries,
+                    semantic_pair_profiles=self.semantic_pair_profiles,
                 ),
+                pair_embedding_provider=embedding_provider,
             )
             policy = PolicyDifferentiator().differentiate(
                 memory_type.spec(),
@@ -757,6 +814,7 @@ class Mem0MemoryEnhancedDriverFactory(Mem0MemoryDriverFactory):
         sem_topk_method: str = "pairwise-quick",
         sem_groupby_pair_batch_size: int | None = None,
         sem_groupby_pair_batch_retries: int = 0,
+        semantic_pair_profiles: dict[str, SemanticPairExecutionProfile] | None = None,
         thinking_enabled: bool = False,
     ) -> None:
         from agent_memory.adapters.lotus.context import SEM_TOPK_METHODS
@@ -770,6 +828,7 @@ class Mem0MemoryEnhancedDriverFactory(Mem0MemoryDriverFactory):
             model_id=model_id,
             sem_groupby_pair_batch_size=sem_groupby_pair_batch_size,
             sem_groupby_pair_batch_retries=sem_groupby_pair_batch_retries,
+            semantic_pair_profiles=semantic_pair_profiles,
             thinking_enabled=thinking_enabled,
         )
         self.sem_topk_method = sem_topk_method
@@ -784,6 +843,7 @@ __all__ = [
     "Mem0MemoryEnhancedDriverFactory",
     "ZepMemoryDriver",
     "ZepMemoryDriverFactory",
+    "build_mem0_semantic_pair_profiles",
     "event_to_mem0_log_row",
     "event_to_zep_log_row",
 ]

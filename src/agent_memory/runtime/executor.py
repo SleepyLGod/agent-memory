@@ -223,6 +223,7 @@ class PolicyExecutor:
     def snapshot_state(self) -> dict[str, Any]:
         """Return all state required to resume this exact compiled plan."""
 
+        adapter_execution_fingerprint = _adapter_execution_fingerprint(self.adapter)
         snapshot = {
             "schema_version": 2,
             "plan_fingerprint": self.policy.fingerprint,
@@ -235,6 +236,10 @@ class PolicyExecutor:
             "window_next_start": dict(self._window_next_start),
             "next_occurrence": self._next_occurrence,
         }
+        if adapter_execution_fingerprint:
+            snapshot["adapter_execution_fingerprint"] = (
+                adapter_execution_fingerprint
+            )
         if self.storage is not None:
             commit = self._require_storage_commit()
             if commit.is_initial:
@@ -275,6 +280,19 @@ class PolicyExecutor:
             raise ValueError("PolicyExecutor requires snapshot schema_version 2")
         if snapshot.get("plan_fingerprint") != self.policy.fingerprint:
             raise ValueError("Runtime snapshot plan fingerprint does not match this policy")
+        snapshot_adapter_fingerprint = snapshot.get(
+            "adapter_execution_fingerprint", ""
+        )
+        if not isinstance(snapshot_adapter_fingerprint, str):
+            raise ValueError(
+                "Runtime snapshot adapter execution fingerprint must be a string"
+            )
+        if snapshot_adapter_fingerprint != _adapter_execution_fingerprint(
+            self.adapter
+        ):
+            raise ValueError(
+                "Runtime snapshot adapter execution fingerprint does not match"
+            )
 
         state = _require_mapping(snapshot, "state")
         node_state = _require_mapping(snapshot, "node_state")
@@ -945,4 +963,13 @@ def _require_mapping(snapshot: Mapping[str, Any], name: str) -> Mapping[Any, Any
 def _require_nested_mapping(value: Any, name: str) -> Mapping[Any, Any]:
     if not isinstance(value, Mapping):
         raise ValueError(f"Runtime snapshot {name} must be a mapping")
+    return value
+
+
+def _adapter_execution_fingerprint(adapter: Any) -> str:
+    """Return an optional adapter-owned maintenance execution identity."""
+
+    value = getattr(adapter, "maintenance_execution_fingerprint", "")
+    if not isinstance(value, str):
+        raise TypeError("Adapter maintenance execution fingerprint must be a string")
     return value

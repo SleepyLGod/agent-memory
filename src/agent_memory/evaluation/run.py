@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from hashlib import sha256
+import math
 import os
 from pathlib import Path
 import re
@@ -13,6 +14,11 @@ from .agent_memory_drivers import (
     Mem0MemoryDriverFactory,
     Mem0MemoryEnhancedDriverFactory,
     ZepMemoryDriverFactory,
+    build_mem0_semantic_pair_profiles,
+)
+from agent_memory.adapters.lotus.pair_execution import (
+    SEMANTIC_PAIR_EXECUTION_MODES,
+    semantic_pair_profiles_fingerprint,
 )
 from .artifacts import BenchmarkArtifactStore
 from .bundle import BenchmarkBundle
@@ -26,6 +32,7 @@ AGENT_MEMORY_SYSTEMS = (
     "mem0-memory",
     "mem0-enhanced",
 )
+SEMANTIC_PAIR_PROFILES = SEMANTIC_PAIR_EXECUTION_MODES
 DEFAULT_MEMORY_MODEL_ID = "deepseek-v4-flash"
 DEFAULT_PROVIDER_MODEL_ID = "deepseek/deepseek-v4-flash"
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -85,6 +92,9 @@ def run_agent_memory_bundle(
     sem_topk_method: str | None = None,
     sem_groupby_pair_batch_size: int | None = None,
     sem_groupby_pair_batch_retries: int = 0,
+    semantic_pair_profile: str = "oracle-only",
+    semantic_pair_top_k: int | None = None,
+    semantic_pair_min_similarity: float | None = None,
     memory_thinking_enabled: bool = True,
     condition_id: str = "",
     maintenance_only: bool = False,
@@ -99,10 +109,59 @@ def run_agent_memory_bundle(
         raise ValueError("sem_groupby_pair_batch_size must be positive")
     if sem_groupby_pair_batch_retries < 0:
         raise ValueError("sem_groupby_pair_batch_retries cannot be negative")
+    if semantic_pair_profile not in SEMANTIC_PAIR_PROFILES:
+        raise ValueError(
+            "semantic_pair_profile must be one of: "
+            + ", ".join(SEMANTIC_PAIR_PROFILES)
+        )
+    if semantic_pair_top_k is not None and (
+        isinstance(semantic_pair_top_k, bool) or semantic_pair_top_k < 1
+    ):
+        raise ValueError("semantic_pair_top_k must be a positive integer")
+    if semantic_pair_min_similarity is not None and (
+        isinstance(semantic_pair_min_similarity, bool)
+        or not isinstance(semantic_pair_min_similarity, (int, float))
+        or not math.isfinite(float(semantic_pair_min_similarity))
+    ):
+        raise ValueError("semantic_pair_min_similarity must be finite")
+    if semantic_pair_profile == "oracle-only" and (
+        semantic_pair_top_k is not None or semantic_pair_min_similarity is not None
+    ):
+        raise ValueError("oracle-only does not accept semantic pair bounds")
+    if semantic_pair_profile == "search-filter":
+        if system_id not in {"mem0-memory", "mem0-enhanced"}:
+            raise ValueError(
+                "search-filter is currently supported only for Mem0 systems"
+            )
+        if semantic_pair_top_k is None and semantic_pair_min_similarity is None:
+            raise ValueError("search-filter requires top_k or min_similarity")
     if sem_topk_method is None:
         sem_topk_method = (
             "pairwise-quick" if system_id == "mem0-enhanced" else "pairwise-naive"
         )
+    semantic_pair_profiles = {}
+    if system_id in {"mem0-memory", "mem0-enhanced"}:
+        import agent_memory as am
+        from agent_memory.memories.mem0.storage import MEM0_BGE_M3
+
+        memory_type = (
+            am.Mem0Memory if system_id == "mem0-memory" else am.Mem0MemoryEnhanced
+        )
+        semantic_pair_profiles = build_mem0_semantic_pair_profiles(
+            memory_type,
+            mode=semantic_pair_profile,
+            embedding=MEM0_BGE_M3,
+            top_k=semantic_pair_top_k,
+            min_similarity=semantic_pair_min_similarity,
+        )
+    semantic_pair_execution_fingerprint = semantic_pair_profiles_fingerprint(
+        semantic_pair_profiles
+    )
+    maintenance_execution_id = (
+        f"semantic-pair-search-filter:{semantic_pair_execution_fingerprint}"
+        if semantic_pair_execution_fingerprint
+        else ""
+    )
     bundle_run_mode = bundle.metadata.get("run_mode")
     if bundle_run_mode is not None and (
         not isinstance(bundle_run_mode, str) or not bundle_run_mode
@@ -134,6 +193,16 @@ def run_agent_memory_bundle(
     runtime_provenance["runtime"]["lotus_execution"] = {
         "sem_groupby_pair_batch_size": sem_groupby_pair_batch_size,
         "sem_groupby_pair_batch_retries": sem_groupby_pair_batch_retries,
+        "semantic_pair_profile": semantic_pair_profile,
+        "semantic_pair_top_k": semantic_pair_top_k,
+        "semantic_pair_min_similarity": semantic_pair_min_similarity,
+        "semantic_pair_execution_fingerprint": (
+            semantic_pair_execution_fingerprint or None
+        ),
+        "semantic_pair_query_profiles": {
+            digest: profile.to_dict()
+            for digest, profile in sorted(semantic_pair_profiles.items())
+        },
     }
     validate_run_provenance(runtime_provenance, run_mode=run_mode)
     _require_environment(system_id)
@@ -181,6 +250,7 @@ def run_agent_memory_bundle(
             if system_id in {"mem0-memory", "mem0-enhanced"}
             else grouped_agg_rule
         ),
+        maintenance_execution_id=maintenance_execution_id,
         thinking_enabled=memory_thinking_enabled,
         consolidation_mode="none",
         framework_cache_mode="disabled",
@@ -210,6 +280,7 @@ def run_agent_memory_bundle(
             model_id=memory_provider_model_id,
             sem_groupby_pair_batch_size=sem_groupby_pair_batch_size,
             sem_groupby_pair_batch_retries=sem_groupby_pair_batch_retries,
+            semantic_pair_profiles=semantic_pair_profiles,
             thinking_enabled=memory_thinking_enabled,
         )
     else:
@@ -219,6 +290,7 @@ def run_agent_memory_bundle(
             sem_topk_method=sem_topk_method,
             sem_groupby_pair_batch_size=sem_groupby_pair_batch_size,
             sem_groupby_pair_batch_retries=sem_groupby_pair_batch_retries,
+            semantic_pair_profiles=semantic_pair_profiles,
             thinking_enabled=memory_thinking_enabled,
         )
     try:
@@ -260,5 +332,6 @@ def run_agent_memory_bundle(
 
 __all__ = [
     "AGENT_MEMORY_SYSTEMS",
+    "SEMANTIC_PAIR_PROFILES",
     "run_agent_memory_bundle",
 ]

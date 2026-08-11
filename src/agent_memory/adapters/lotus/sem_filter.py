@@ -9,7 +9,13 @@ from typing import Any
 import pandas as pd
 
 from agent_memory.adapters.lotus.context import LotusExecutionConfig, LotusExecutionContext
+from agent_memory.adapters.lotus.pair_execution import (
+    PairCandidateSelection,
+    SemanticPairExecutionProfile,
+    select_semantic_pair_candidates,
+)
 from agent_memory.tracing.semantic import write_compact_operator_trace
+from agent_memory.tracing.semantic import query_digest, write_trace_event
 from agent_memory.adapters.lotus.structured import examples_dataframe, normalize_strategy
 from agent_memory.policy.logical import QueryExpr
 
@@ -28,13 +34,36 @@ def execute_sem_filter(
 
     context.configure()
     source = execute(query.inputs[0], inputs)
+    digest = query_digest(query)
+    profile = context.config.semantic_pair_profiles.get(digest)
+    selection: PairCandidateSelection | None = None
+    oracle_source = source
+    if profile is not None and profile.mode == "search-filter":
+        if context.pair_embedding_provider is None:
+            raise ValueError("search-filter requires a pair embedding provider")
+        selection = select_semantic_pair_candidates(
+            source,
+            profile=profile,
+            embedding_provider=context.pair_embedding_provider,
+        )
+        oracle_source = source.iloc[list(selection.selected_positions)].copy()
+        write_search_filter_trace(
+            context.config.trace_dir(),
+            query_digest_value=digest,
+            profile=profile,
+            selection=selection,
+        )
     lotus_source, instruction, restore_columns = bind_qualified_filter_columns(
-        source,
+        oracle_source,
         str(query.params["instruction"]),
     )
-    result = lotus_source.sem_filter(
-        instruction,
-        **native_sem_filter_kwargs(context.config),
+    result = (
+        lotus_source.copy()
+        if selection is not None and lotus_source.empty
+        else lotus_source.sem_filter(
+            instruction,
+            **native_sem_filter_kwargs(context.config),
+        )
     )
     if restore_columns:
         result = result.rename(columns=restore_columns)
@@ -47,9 +76,50 @@ def execute_sem_filter(
         payload={
             "instruction": str(query.params["instruction"]),
             "lowered_instruction": instruction,
+            "semantic_pair_profile": (
+                "oracle-only" if profile is None else profile.mode
+            ),
+            "semantic_pair_profile_fingerprint": (
+                None if profile is None else profile.fingerprint
+            ),
+            "candidate_pair_count": (
+                None if selection is None else selection.candidate_pair_count
+            ),
         },
     )
     return result
+
+
+def write_search_filter_trace(
+    trace_dir: Any,
+    *,
+    query_digest_value: str,
+    profile: SemanticPairExecutionProfile,
+    selection: PairCandidateSelection,
+) -> None:
+    """Record candidate generation without persisting pairs or vectors."""
+
+    embedding = profile.embedding
+    assert embedding is not None
+    write_trace_event(
+        trace_dir,
+        operator="sem_filter",
+        event_type="candidate_generation",
+        payload={
+            "query_digest": query_digest_value,
+            "profile": profile.mode,
+            "profile_fingerprint": profile.fingerprint,
+            "direction": profile.direction,
+            "top_k": profile.top_k,
+            "min_similarity": profile.min_similarity,
+            "embedding_model": embedding.model,
+            "embedding_revision": embedding.revision,
+            "total_pair_count": selection.total_pair_count,
+            "candidate_pair_count": selection.candidate_pair_count,
+            "pair_reduction": selection.pair_reduction,
+            "embedding_latency_ms": round(selection.embedding_latency_ms, 3),
+        },
+    )
 
 
 def bind_qualified_filter_columns(

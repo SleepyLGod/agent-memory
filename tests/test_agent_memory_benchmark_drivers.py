@@ -484,6 +484,11 @@ def test_zep_run_configures_existing_factory_and_checkpoint_flow(
     ] == {
         "sem_groupby_pair_batch_size": 12,
         "sem_groupby_pair_batch_retries": 2,
+        "semantic_pair_profile": "oracle-only",
+        "semantic_pair_top_k": None,
+        "semantic_pair_min_similarity": None,
+        "semantic_pair_execution_fingerprint": None,
+        "semantic_pair_query_profiles": {},
     }
     assert (
         captured["runner"]["maintenance_checkpoint_source"].output_dir
@@ -539,6 +544,52 @@ def test_zep_run_closes_factory_when_storage_provenance_fails(
         )
 
     assert captured["closed"] is True
+
+
+@pytest.mark.parametrize("system_id", ("claude-memory", "zep-memory"))
+def test_search_filter_rejects_unsupported_system_before_external_setup(
+    system_id, monkeypatch, tmp_path
+) -> None:
+    import agent_memory.evaluation.run as run_module
+
+    def unexpected_provenance(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("provenance must not run before profile validation")
+
+    monkeypatch.setattr(
+        run_module,
+        "collect_runtime_provenance",
+        unexpected_provenance,
+    )
+    bundle = BenchmarkBundle(
+        "longmemeval-v1-cleaned-s",
+        "revision",
+        "sha256",
+        (
+            BenchmarkCase(
+                case_id="case-1",
+                task_id="longmemeval-v1",
+                events=(_event(),),
+                questions=(
+                    BenchmarkQuestion("q1", "case-1", "?", "answer", ()),
+                ),
+            ),
+        ),
+        {"run_mode": "integration-smoke"},
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="search-filter is currently supported only for Mem0",
+    ):
+        run_agent_memory_bundle(
+            bundle=bundle,
+            contracts={},
+            system_id=system_id,
+            output_dir=tmp_path / "output",
+            semantic_pair_profile="search-filter",
+            semantic_pair_min_similarity=0.6,
+        )
 
 
 def test_strict_zep_join_map_fails_before_storage_side_effects(tmp_path) -> None:
