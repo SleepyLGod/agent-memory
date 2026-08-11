@@ -13,8 +13,10 @@ from .agent_memory_drivers import (
     ClaudeMemoryDriverFactory,
     Mem0MemoryDriverFactory,
     Mem0MemoryEnhancedDriverFactory,
+    SEMANTIC_PAIR_BGE_M3,
     ZepMemoryDriverFactory,
     build_mem0_semantic_pair_profiles,
+    build_operator_semantic_pair_profiles,
 )
 from agent_memory.adapters.lotus.pair_execution import (
     SEMANTIC_PAIR_EXECUTION_MODES,
@@ -117,8 +119,14 @@ def run_agent_memory_bundle(
         )
     if embedding_device not in {"cpu", "cuda"}:
         raise ValueError("embedding_device must be 'cpu' or 'cuda'")
-    if system_id not in {"mem0-memory", "mem0-enhanced"} and embedding_device != "cpu":
-        raise ValueError("non-CPU embedding devices are currently supported only for Mem0")
+    if (
+        system_id == "claude-memory"
+        and semantic_pair_profile == "oracle-only"
+        and embedding_device != "cpu"
+    ):
+        raise ValueError(
+            "Claude non-CPU embeddings require the search-filter profile"
+        )
     if semantic_pair_top_k is not None and (
         isinstance(semantic_pair_top_k, bool) or semantic_pair_top_k < 1
     ):
@@ -134,10 +142,6 @@ def run_agent_memory_bundle(
     ):
         raise ValueError("oracle-only does not accept semantic pair bounds")
     if semantic_pair_profile == "search-filter":
-        if system_id not in {"mem0-memory", "mem0-enhanced"}:
-            raise ValueError(
-                "search-filter is currently supported only for Mem0 systems"
-            )
         if semantic_pair_top_k is None and semantic_pair_min_similarity is None:
             raise ValueError("search-filter requires top_k or min_similarity")
     if sem_topk_method is None:
@@ -145,7 +149,46 @@ def run_agent_memory_bundle(
             "pairwise-quick" if system_id == "mem0-enhanced" else "pairwise-naive"
         )
     semantic_pair_profiles = {}
-    if system_id in {"mem0-memory", "mem0-enhanced"}:
+    if semantic_pair_profile == "search-filter" and system_id == "claude-memory":
+        import agent_memory as am
+        from agent_memory.planner import DifferentialRules, PolicyDifferentiator
+
+        policy = PolicyDifferentiator(
+            rules=DifferentialRules(grouped_agg_rule=grouped_agg_rule)
+        ).differentiate(am.ClaudeMemory.spec())
+        semantic_pair_profiles = build_operator_semantic_pair_profiles(
+            policy,
+            mode=semantic_pair_profile,
+            operators=("sem_join",),
+            embedding=SEMANTIC_PAIR_BGE_M3,
+            embedding_device=embedding_device,
+            top_k=semantic_pair_top_k,
+            min_similarity=semantic_pair_min_similarity,
+        )
+    elif semantic_pair_profile == "search-filter" and system_id == "zep-memory":
+        import agent_memory as am
+        from agent_memory.memories.zep.storage import (
+            GRAPHITI_BGE_M3,
+            GRAPHITI_NEO4J_STATEMENTS,
+        )
+        from agent_memory.planner import DifferentialRules, PolicyDifferentiator
+
+        policy = PolicyDifferentiator(
+            rules=DifferentialRules(grouped_agg_rule=grouped_agg_rule)
+        ).differentiate(
+            am.ZepMemory.spec(),
+            statements=GRAPHITI_NEO4J_STATEMENTS,
+        )
+        semantic_pair_profiles = build_operator_semantic_pair_profiles(
+            policy,
+            mode=semantic_pair_profile,
+            operators=("sem_groupby",),
+            embedding=GRAPHITI_BGE_M3,
+            embedding_device=embedding_device,
+            top_k=semantic_pair_top_k,
+            min_similarity=semantic_pair_min_similarity,
+        )
+    elif system_id in {"mem0-memory", "mem0-enhanced"}:
         import agent_memory as am
         from agent_memory.memories.mem0.storage import MEM0_BGE_M3
 
@@ -167,7 +210,7 @@ def run_agent_memory_bundle(
         f"semantic-pair-search-filter:{semantic_pair_execution_fingerprint}"
         if semantic_pair_execution_fingerprint
         else f"embedding-device:{embedding_device}"
-        if system_id in {"mem0-memory", "mem0-enhanced"}
+        if system_id in {"zep-memory", "mem0-memory", "mem0-enhanced"}
         and embedding_device != "cpu"
         else ""
     )
@@ -189,12 +232,16 @@ def run_agent_memory_bundle(
             "lotus-ai",
             "pandas",
             *(
-                ("neo4j", "sentence-transformers")
+                ("neo4j", "sentence-transformers", "torch")
                 if system_id == "zep-memory"
                 else (
                     ("qdrant-client", "sentence-transformers", "torch")
                     if system_id in {"mem0-memory", "mem0-enhanced"}
-                    else ()
+                    else (
+                        ("sentence-transformers", "torch")
+                        if semantic_pair_profiles
+                        else ()
+                    )
                 )
             ),
         ),
@@ -273,6 +320,7 @@ def run_agent_memory_bundle(
             sem_topk_method=sem_topk_method,
             sem_groupby_pair_batch_size=sem_groupby_pair_batch_size,
             sem_groupby_pair_batch_retries=sem_groupby_pair_batch_retries,
+            semantic_pair_profiles=semantic_pair_profiles,
             thinking_enabled=memory_thinking_enabled,
         )
     elif system_id == "zep-memory":
@@ -282,6 +330,8 @@ def run_agent_memory_bundle(
             grouped_agg_rule=grouped_agg_rule,
             sem_groupby_pair_batch_size=sem_groupby_pair_batch_size,
             sem_groupby_pair_batch_retries=sem_groupby_pair_batch_retries,
+            semantic_pair_profiles=semantic_pair_profiles,
+            embedding_device=embedding_device,
             thinking_enabled=memory_thinking_enabled,
         )
     elif system_id == "mem0-memory":
