@@ -29,6 +29,10 @@ mem0 = [
     "qdrant-client==1.12.1",
     "sentence-transformers==3.4.1",
 ]
+simplemem = [
+    "neo4j==6.1.0",
+    "sentence-transformers==3.4.1",
+]
 
 [build-system]
 requires = ["uv_build>=0.8.11,<0.9.0"]

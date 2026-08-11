@@ -36,10 +36,26 @@ from agent_memory.tracing.semantic import (  # noqa: E402
     semantic_trace_scope,
 )
 from agent_memory.memories.simplemem import (  # noqa: E402
-    SimpleMemMemory,
     SIMPLEMEM_EXTRACTION_PROMPT,
+    SimpleMemMemory,
+    SimpleMemMemoryEnhanced,
     WINDOW_SIZE,
     WINDOW_SLIDE,
+)
+from agent_memory.memories.simplemem.storage import (  # noqa: E402
+    SIMPLEMEM_BGE_M3,
+    SIMPLEMEM_ENHANCED_NEO4J_STATEMENTS,
+    SIMPLEMEM_NEO4J_SCHEMA,
+    SIMPLEMEM_NEO4J_STATEMENTS,
+)
+from agent_memory.policy.retrieval import RetrievalResult  # noqa: E402
+from agent_memory.storage import (  # noqa: E402
+    SentenceTransformerEmbeddingProvider,
+    StorageDeployment,
+)
+from agent_memory.storage.neo4j import (  # noqa: E402
+    Neo4jConnector,
+    SentenceTransformerCrossEncoderProvider,
 )
 
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / ".memory-test" / "simplemem-e2e" / "latest"
@@ -88,6 +104,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model", default=DEFAULT_MODEL,
         help=f"LiteLLM model passed to LotusAdapter. Defaults to {DEFAULT_MODEL}.",
+    )
+    parser.add_argument(
+        "--policy", choices=("base", "enhanced"), default="base",
+        help="SimpleMem policy variant: base (semantic-only) or enhanced (hybrid).",
+    )
+    parser.add_argument(
+        "--namespace",
+        default=None,
+        help="Fresh Neo4j namespace; generated automatically when omitted.",
     )
     parser.add_argument(
         "--print-steps", action="store_true",
@@ -194,6 +219,15 @@ def require_environment() -> None:
             "DEEPSEEK_API_KEY is required for SimpleMemMemory e2e. "
             "Set it in .env or export it in the shell."
         )
+    missing = [
+        name
+        for name in ("AGENT_MEMORY_NEO4J_URI", "AGENT_MEMORY_NEO4J_PASSWORD")
+        if not os.getenv(name)
+    ]
+    if missing:
+        raise SystemExit(
+            "Neo4j retrieval requires environment variables: " + ", ".join(missing)
+        )
 
 
 def simplemem_log_row(row: dict[str, Any]) -> dict[str, Any]:
@@ -238,12 +272,15 @@ def main() -> None:
         row_limit=args.row_limit,
         sample_limit=args.sample_limit,
     )
+    namespace = args.namespace or f"simplemem-e2e-{os.getpid()}"
     print("SimpleMemMemory real e2e demo")
     print(f"LOCOMO cache: {dataset_path}")
     print(f"start_row: {args.start_row}")
     print(f"rows: {len(rows)}")
     print(f"model: {args.model}")
+    print(f"policy: {args.policy}")
     print(f"output_dir: {output_dir}")
+    print(f"neo4j_namespace: {namespace}")
     print(f"window size/slide: {WINDOW_SIZE}/{WINDOW_SLIDE}")
     write_csv("locomo_rows", pd.DataFrame(rows), input_dir)
 
@@ -255,7 +292,35 @@ def main() -> None:
             lm_model_kwargs={"max_tokens": 16384},
         ),
     )
-    memory = SimpleMemMemory(adapter=adapter)
+    connector = Neo4jConnector(
+        uri=os.environ["AGENT_MEMORY_NEO4J_URI"],
+        auth=(
+            os.getenv("AGENT_MEMORY_NEO4J_USER", "neo4j"),
+            os.environ["AGENT_MEMORY_NEO4J_PASSWORD"],
+        ),
+        database=os.getenv("AGENT_MEMORY_NEO4J_DATABASE", "neo4j"),
+        embedding_provider=SentenceTransformerEmbeddingProvider(
+            SIMPLEMEM_BGE_M3,
+            device="cpu",
+            dependency_extra="zep",
+        ),
+        reranker_provider=SentenceTransformerCrossEncoderProvider(),
+        schema=SIMPLEMEM_NEO4J_SCHEMA,
+    )
+    statements = (
+        SIMPLEMEM_ENHANCED_NEO4J_STATEMENTS
+        if args.policy == "enhanced"
+        else SIMPLEMEM_NEO4J_STATEMENTS
+    )
+    storage = StorageDeployment(
+        connector=connector,
+        statements=statements,
+        namespace=namespace,
+    )
+    memory_cls = (
+        SimpleMemMemoryEnhanced if args.policy == "enhanced" else SimpleMemMemory
+    )
+    memory = memory_cls(adapter=adapter, storage=storage)
     step_metrics: list[dict[str, Any]] = []
     for index, row in enumerate(rows, start=1):
         print(f"add[{index}]: {row.get('speaker', '')}: {row.get('content', '')[:100]}")
@@ -278,7 +343,11 @@ def main() -> None:
         phase="differential_query",
         action=lambda: memory.query(args.query),
     )
-    query_metric["query_result_rows"] = len(result)
+    if isinstance(result, RetrievalResult):
+        query_frame = result.channels["facts"]
+    else:
+        query_frame = result
+    query_metric["query_result_rows"] = len(query_frame)
     phase_metrics = [query_metric]
 
     log_state = memory._runtime._state.get("log", [])
@@ -286,13 +355,13 @@ def main() -> None:
 
     print_frame("log", log_state)
     print_frame("facts", facts)
-    print_frame("query result", result)
+    print_frame("query result", query_frame)
 
     written = {
         "input/locomo_rows": input_dir / "locomo_rows.csv",
         "differential/log": write_csv("log", log_state, differential_dir),
         "differential/facts": write_csv("facts", facts, differential_dir),
-        "differential/query_result": write_csv("query_result", result, differential_dir),
+        "differential/query_result": write_csv("query_result", query_frame, differential_dir),
     }
 
     steps_frame = pd.DataFrame(step_metrics)
@@ -315,6 +384,8 @@ def main() -> None:
 
     if trace_dir is not None:
         append_trace_metrics(trace_dir, [*step_metrics, *phase_metrics])
+
+    connector.close()
 
     print("\nwrote CSV artifacts:")
     for name, path_value in written.items():

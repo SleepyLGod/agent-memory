@@ -5,6 +5,8 @@ from .memories import (
     ClaudeMemory,
     Mem0Memory,
     Mem0MemoryEnhanced,
+    SimpleMemMemory,
+    SimpleMemMemoryEnhanced,
     ZepMemory,
     ZepMemoryExtended,
 )
@@ -43,6 +45,8 @@ __all__ = [
     "RRF",
     "RetrievalQuery",
     "RetrievalResult",
+    "SimpleMemMemory",
+    "SimpleMemMemoryEnhanced",
     "UserQuery",
     "ZepMemory",
     "ZepMemoryExtended",

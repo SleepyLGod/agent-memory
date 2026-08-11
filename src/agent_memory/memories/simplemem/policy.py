@@ -2,26 +2,13 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
-
 from agent_memory.api import Log, Memory
 from agent_memory.policy.logical import UserQuery
+from agent_memory.policy.retrieval import CosineSimilarity, RetrievalQuery
 
 
 WINDOW_SIZE = 40
-WINDOW_SLIDE = 38 
-
-def _derive_observation_date(created_at: str | float | int) -> str:
-    if isinstance(created_at, (int, float)):
-        dt = datetime.fromtimestamp(created_at, tz=timezone.utc)
-    else:
-        dt = datetime.fromisoformat(str(created_at))
-    return dt.strftime("%Y-%m-%d")
-
-
-def _now_date() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
+WINDOW_SLIDE = 38
 
 SIMPLEMEM_EXTRACTION_PROMPT = r"""
 You are a professional information extraction assistant, skilled at extracting structured, unambiguous information from conversations. You must output valid JSON format.
@@ -45,6 +32,24 @@ Dialogue windows may partially overlap with the previous window. Facts that rela
    - persons: All person names mentioned
    - entities: Companies, products, organizations, etc.
    - topic: The topic of this information
+
+[Output Format]
+Return a JSON object with a "rows" array, each element is a memory entry:
+
+{{
+  "rows": [
+    {{
+      "lossless_restatement": "Complete unambiguous restatement (must include all subjects, objects, time, location, etc.)",
+      "keywords": "keyword1, keyword2, ...",
+      "timestamp": "YYYY-MM-DDTHH:MM:SS or null",
+      "location": "location name or null",
+      "persons": "name1, name2, ...",
+      "entities": "entity1, entity2, ...",
+      "topic": "topic phrase"
+    }},
+    ...
+  ]
+}}
 
 [Example]
 Dialogues:
@@ -74,7 +79,7 @@ Output:
   ]
 }}
 
-Now process the above dialogues.
+Now process the above dialogues. Return ONLY the JSON object, no other explanations.
 """.strip()
 
 
@@ -115,8 +120,30 @@ class SimpleMemMemory(Memory):
                 "lossless_restatement", "keywords", "timestamp",
                 "location", "persons", "entities", "topic",
             ])
-            .drop_duplicates()
         )
+        .drop_duplicates(subset=["lossless_restatement"])
     )
 
-    retrieval_query = facts.sem_topk(UserQuery(), 25)
+    retrieval_query = RetrievalQuery(
+        facts=facts.search(
+            UserQuery(),
+            methods=[
+                CosineSimilarity(candidate_limit=80, min_score=0.1),
+            ],
+            reranker=None,
+            limit=25,
+        ).select(
+            [
+                "record_id",
+                "lossless_restatement",
+                "keywords",
+                "timestamp",
+                "location",
+                "persons",
+                "entities",
+                "topic",
+                "rank",
+                "score",
+            ]
+        )
+    )
