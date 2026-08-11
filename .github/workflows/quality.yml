@@ -16,8 +16,23 @@ jobs:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
-          python-version: "3.13"
+          python-version: "3.12"
           enable-cache: true
       - run: uv sync --frozen --dev --extra benchmarks
       - run: uv run ruff check src tests tools examples
       - run: uv run pyright
+
+  runtime-tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+      - run: uv sync --frozen --dev --extra benchmarks --extra zep --extra mem0
+      - run: PYTHON_DOTENV_DISABLED=1 uv run python -m pytest -q -p no:cacheprovider
