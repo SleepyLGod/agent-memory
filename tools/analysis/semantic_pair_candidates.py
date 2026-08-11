@@ -1338,10 +1338,22 @@ def _select_candidates(
     selected: set[int] = set()
     for indices in buckets.values():
         indices.sort(
-            key=lambda index: (-float(scores[index]), group.pairs[index].pair_id)
+            key=lambda index: (
+                -float(scores[index]),
+                _endpoint_pair_id(
+                    group.pairs[index].left_id,
+                    group.pairs[index].right_id,
+                ),
+            )
         )
         selected.update(indices[: strategy.top_k])
     return selected
+
+
+def _endpoint_pair_id(left_id: str, right_id: str) -> str:
+    """Return the physical executor's row-order-independent pair identity."""
+
+    return json.dumps([left_id, right_id], ensure_ascii=False, separators=(",", ":"))
 
 
 def _is_pairwise_sem_filter_event(event: Mapping[str, Any]) -> bool:

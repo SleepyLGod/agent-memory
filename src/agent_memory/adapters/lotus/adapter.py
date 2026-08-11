@@ -8,6 +8,9 @@ from typing import Any
 from uuid import uuid4
 
 from agent_memory.adapters.lotus.context import LotusExecutionConfig, LotusExecutionContext
+from agent_memory.adapters.lotus.pair_execution import (
+    semantic_pair_profiles_fingerprint,
+)
 from agent_memory.adapters.lotus.relational import (
     execute_agg,
     execute_alias,
@@ -47,6 +50,7 @@ from agent_memory.adapters.lotus.window import (
     execute_window_source,
 )
 from agent_memory.policy.logical import QueryExpr
+from agent_memory.storage.embedding import EmbeddingProvider
 
 DEFAULT_LOTUS_MODEL = "deepseek/deepseek-v4-pro"
 
@@ -57,12 +61,25 @@ class LotusAdapter:
 
     model: str = DEFAULT_LOTUS_MODEL
     config: LotusExecutionConfig = field(default_factory=LotusExecutionConfig)
+    pair_embedding_provider: EmbeddingProvider | None = None
     _context: LotusExecutionContext = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         """Initialize shared LOTUS execution context."""
 
-        self._context = LotusExecutionContext(model=self.model, config=self.config)
+        self._context = LotusExecutionContext(
+            model=self.model,
+            config=self.config,
+            pair_embedding_provider=self.pair_embedding_provider,
+        )
+
+    @property
+    def maintenance_execution_fingerprint(self) -> str:
+        """Identify physical settings that can change maintained state."""
+
+        return semantic_pair_profiles_fingerprint(
+            self.config.semantic_pair_profiles
+        )
 
     def execute(self, query: QueryExpr, inputs: Mapping[str, Any]) -> Any:
         """Execute a logical query expression through LOTUS."""

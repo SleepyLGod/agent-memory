@@ -11,7 +11,9 @@ import pytest
 
 from agent_memory.evaluation.agent_memory_drivers import (
     Mem0MemoryDriver,
+    Mem0MemoryDriverFactory,
     Mem0MemoryEnhancedDriver,
+    build_mem0_semantic_pair_profiles,
     event_to_mem0_log_row,
 )
 from agent_memory.evaluation.bundle import BenchmarkBundle
@@ -26,8 +28,121 @@ from agent_memory.evaluation.types import (
 )
 from agent_memory.policy.retrieval import RetrievalResult
 from agent_memory.storage.embedding import EmbeddingSpec
+from agent_memory.memories.mem0.storage import MEM0_BGE_M3
 from agent_memory.tracing.semantic import semantic_trace_scope
 from tools.evaluation import locomo, longmemeval, memory_agent_bench
+
+
+def test_mem0_search_filter_targets_the_shared_duplicate_query() -> None:
+    import agent_memory as am
+    from agent_memory.memories.mem0.storage import MEM0_QDRANT_STATEMENTS
+    from agent_memory.planner import PolicyDifferentiator
+    from agent_memory.tracing.semantic import query_digest
+
+    base = build_mem0_semantic_pair_profiles(
+        am.Mem0Memory,
+        mode="search-filter",
+        embedding=MEM0_BGE_M3,
+        top_k=None,
+        min_similarity=0.6,
+    )
+    enhanced = build_mem0_semantic_pair_profiles(
+        am.Mem0MemoryEnhanced,
+        mode="search-filter",
+        embedding=MEM0_BGE_M3,
+        top_k=None,
+        min_similarity=0.6,
+    )
+
+    assert base == enhanced
+    assert len(base) == 1
+    profile = next(iter(base.values()))
+    assert profile.mode == "search-filter"
+    assert profile.direction == "right-to-left"
+    assert profile.left_text_columns == ("memory:earlier",)
+    assert profile.right_text_columns == ("memory:later",)
+    assert profile.min_similarity == pytest.approx(0.6)
+    policy = PolicyDifferentiator().differentiate(
+        am.Mem0Memory.spec(),
+        statements=MEM0_QDRANT_STATEMENTS,
+    )
+    executed_filter_digests = {
+        query_digest(node.query)
+        for node in policy.nodes.values()
+        if node.query.op == "sem_filter"
+    }
+    assert set(base) == executed_filter_digests
+
+
+def test_oracle_only_mem0_has_no_physical_pair_override() -> None:
+    import agent_memory as am
+
+    assert (
+        build_mem0_semantic_pair_profiles(
+            am.Mem0Memory,
+            mode="oracle-only",
+            embedding=MEM0_BGE_M3,
+            top_k=None,
+            min_similarity=None,
+        )
+        == {}
+    )
+
+
+def test_mem0_factory_reuses_one_traced_embedding_provider(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import agent_memory as am
+    import agent_memory.storage.qdrant as qdrant_module
+
+    class FakeEmbeddingProvider:
+        def __init__(self, spec, *, dependency_extra: str) -> None:
+            self.spec = spec
+            self.dependency_extra = dependency_extra
+
+        def embed(self, spec, texts):
+            del spec, texts
+            raise AssertionError("factory construction must not embed")
+
+    class FakeConnector:
+        def __init__(self, *, path: Path, embedding_provider) -> None:
+            self.path = path
+            self.embedding_provider = embedding_provider
+            self.closed = False
+
+        def prepare(self, statements) -> None:
+            self.statements = statements
+
+        def close(self) -> None:
+            self.closed = True
+
+    monkeypatch.setattr(
+        qdrant_module,
+        "SentenceTransformerEmbeddingProvider",
+        FakeEmbeddingProvider,
+    )
+    monkeypatch.setattr(qdrant_module, "QdrantConnector", FakeConnector)
+    profiles = build_mem0_semantic_pair_profiles(
+        am.Mem0Memory,
+        mode="search-filter",
+        embedding=MEM0_BGE_M3,
+        top_k=None,
+        min_similarity=0.6,
+    )
+    factory = Mem0MemoryDriverFactory(
+        base_namespace="test-mem0",
+        semantic_pair_profiles=profiles,
+    )
+
+    driver = factory("case-1", tmp_path / "state", tmp_path / "trace")
+
+    runtime = driver._memory._runtime
+    assert runtime.storage.connector.embedding_provider is (
+        runtime._engine.adapter.pair_embedding_provider
+    )
+    assert runtime._engine.adapter.config.semantic_pair_profiles == profiles
+    driver.close()
 
 
 def test_mem0_event_mapping_preserves_roles_names_dates_and_captions() -> None:
@@ -443,3 +558,89 @@ def test_mem0_enhanced_runner_uses_shared_maintenance_and_quick_retrieval(
     )
     assert system_contract.maintenance_rule == "mem0-additive-view:v1"
     assert captured["closed"] is True
+
+
+def test_mem0_search_filter_runner_records_physical_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import agent_memory.evaluation.run as run_module
+
+    captured: dict[str, object] = {}
+
+    class FakeFactory:
+        def __init__(self, **kwargs: object) -> None:
+            captured["factory"] = kwargs
+
+        def runtime_provenance(self) -> dict[str, object]:
+            return {"connector": "qdrant"}
+
+        def close(self) -> None:
+            pass
+
+    class FakeRunner:
+        def __init__(self, **kwargs: object) -> None:
+            captured["runner"] = kwargs
+
+        def run(self, bundle: BenchmarkBundle) -> None:
+            del bundle
+
+    monkeypatch.setattr(run_module, "_require_environment", lambda system_id: None)
+    monkeypatch.setattr(
+        run_module,
+        "collect_runtime_provenance",
+        lambda *args, **kwargs: {"source": {}, "runtime": {}},
+    )
+    monkeypatch.setattr(run_module, "validate_run_provenance", lambda *args, **kwargs: None)
+    monkeypatch.setattr(run_module, "Mem0MemoryDriverFactory", FakeFactory)
+    monkeypatch.setattr(run_module, "BenchmarkRunner", FakeRunner)
+    event = BenchmarkEvent(
+        sample_id="case-1",
+        event_id="event-1",
+        speaker="user",
+        text="I visited Speyer.",
+    )
+    bundle = BenchmarkBundle(
+        "locomo",
+        "revision",
+        "sha256",
+        (
+            BenchmarkCase(
+                case_id="case-1",
+                task_id="locomo",
+                events=(event,),
+                questions=(
+                    BenchmarkQuestion("q1", "case-1", "Where?", "Speyer", ()),
+                ),
+            ),
+        ),
+        {"run_mode": "integration-smoke"},
+    )
+
+    run_agent_memory_bundle(
+        bundle=bundle,
+        contracts={},
+        system_id="mem0-memory",
+        output_dir=tmp_path / "output",
+        memory_thinking_enabled=False,
+        semantic_pair_profile="search-filter",
+        semantic_pair_min_similarity=0.6,
+    )
+
+    factory = captured["factory"]
+    assert isinstance(factory, dict)
+    profiles = factory["semantic_pair_profiles"]
+    assert isinstance(profiles, dict)
+    assert len(profiles) == 1
+    runner = captured["runner"]
+    assert isinstance(runner, dict)
+    contract = runner["system_contract"]
+    assert isinstance(contract, MemorySystemContract)
+    assert contract.maintenance_execution_id.startswith(
+        "semantic-pair-search-filter:"
+    )
+    assert "execution=semantic-pair-search-filter:" in contract.effective_condition_id
+    execution = runner["runtime_provenance"]["runtime"]["lotus_execution"]
+    assert execution["semantic_pair_profile"] == "search-filter"
+    assert execution["semantic_pair_min_similarity"] == pytest.approx(0.6)
+    assert execution["semantic_pair_execution_fingerprint"]

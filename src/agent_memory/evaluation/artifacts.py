@@ -312,6 +312,7 @@ class BenchmarkArtifactStore:
                 system_contract.effective_maintenance_policy_id
             ),
             "maintenance_rule": system_contract.maintenance_rule,
+            "maintenance_execution_id": system_contract.maintenance_execution_id,
             "maintenance_fingerprint": system_contract.maintenance_fingerprint,
             "thinking_enabled": system_contract.thinking_enabled,
             "consolidation_mode": system_contract.consolidation_mode,
@@ -591,6 +592,7 @@ class BenchmarkArtifactStore:
             "memory_provider_model_id": system_contract.memory_provider_model_id,
             "input_adapter_id": system_contract.input_adapter_id,
             "maintenance_rule": system_contract.maintenance_rule,
+            "maintenance_execution_id": system_contract.maintenance_execution_id,
             "maintenance_fingerprint": system_contract.maintenance_fingerprint,
             "thinking_enabled": system_contract.thinking_enabled,
             "consolidation_mode": system_contract.consolidation_mode,

@@ -73,6 +73,7 @@ class MemorySystemContract:
     condition_id: str = ""
     maintenance_policy_id: str = ""
     maintenance_rule: str = ""
+    maintenance_execution_id: str = ""
     thinking_enabled: bool | None = None
     consolidation_mode: str = "none"
     parser_mode: str = ""
@@ -104,6 +105,7 @@ class MemorySystemContract:
             raise TypeError("thinking_enabled must be a bool or None")
         for field_name in (
             "maintenance_rule",
+            "maintenance_execution_id",
             "consolidation_mode",
             "parser_mode",
             "framework_cache_mode",
@@ -116,12 +118,16 @@ class MemorySystemContract:
         """Return the unique experiment identity used in reports."""
 
         if self.condition_id:
-            return self.condition_id
-        maintenance = self.maintenance_rule or "none"
-        return (
-            f"{self.system_id}|maintenance={maintenance}"
-            f"|retrieval={self.retrieval_recipe_id}"
-        )
+            identity = self.condition_id
+        else:
+            maintenance = self.maintenance_rule or "none"
+            identity = (
+                f"{self.system_id}|maintenance={maintenance}"
+                f"|retrieval={self.retrieval_recipe_id}"
+            )
+        if self.maintenance_execution_id:
+            return f"{identity}|execution={self.maintenance_execution_id}"
+        return identity
 
     @property
     def effective_maintenance_policy_id(self) -> str:
@@ -133,19 +139,20 @@ class MemorySystemContract:
     def maintenance_fingerprint(self) -> str:
         """Fingerprint only settings that can affect materialized memory state."""
 
-        return _digest(
-            {
-                # Keep this key for stable fingerprints of existing contracts.
-                "system_id": self.effective_maintenance_policy_id,
-                "memory_model_id": self.memory_model_id,
-                "memory_provider_model_id": self.memory_provider_model_id,
-                "input_adapter_id": self.input_adapter_id,
-                "maintenance_rule": self.maintenance_rule,
-                "thinking_enabled": self.thinking_enabled,
-                "consolidation_mode": self.consolidation_mode,
-                "framework_cache_mode": self.framework_cache_mode,
-            }
-        )
+        contract = {
+            # Keep this key for stable fingerprints of existing contracts.
+            "system_id": self.effective_maintenance_policy_id,
+            "memory_model_id": self.memory_model_id,
+            "memory_provider_model_id": self.memory_provider_model_id,
+            "input_adapter_id": self.input_adapter_id,
+            "maintenance_rule": self.maintenance_rule,
+            "thinking_enabled": self.thinking_enabled,
+            "consolidation_mode": self.consolidation_mode,
+            "framework_cache_mode": self.framework_cache_mode,
+        }
+        if self.maintenance_execution_id:
+            contract["maintenance_execution_id"] = self.maintenance_execution_id
+        return _digest(contract)
 
     @property
     def input_adapter_digest(self) -> str:

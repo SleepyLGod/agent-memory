@@ -7,8 +7,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from agent_memory.adapters.lotus.pair_execution import (
+    SemanticPairExecutionProfile,
+)
 from agent_memory.adapters.lotus.provider_usage_lm import provider_usage_tracing_lm_class
 from agent_memory.adapters.lotus.traced_lm import TracedLM
+from agent_memory.storage.embedding import EmbeddingProvider
 
 DEFAULT_STRUCTURED_MAX_TOKENS = 8192
 DEFAULT_STRUCTURED_PARSE_RETRIES = 3
@@ -40,6 +44,9 @@ class LotusExecutionConfig:
     structured_max_tokens: int = DEFAULT_STRUCTURED_MAX_TOKENS
     structured_parse_retries: int = DEFAULT_STRUCTURED_PARSE_RETRIES
     semantic_trace_dir: Path | str | None = None
+    semantic_pair_profiles: Mapping[str, SemanticPairExecutionProfile] = field(
+        default_factory=dict
+    )
 
     sem_filter_examples: Sequence[Mapping[str, Any]] | None = None
     sem_filter_helper_examples: Sequence[Mapping[str, Any]] | None = None
@@ -89,6 +96,14 @@ class LotusExecutionConfig:
             raise ValueError("sem_groupby_pair_batch_size must be positive")
         if self.sem_groupby_pair_batch_retries < 0:
             raise ValueError("sem_groupby_pair_batch_retries cannot be negative")
+        for query_digest, profile in self.semantic_pair_profiles.items():
+            if not isinstance(query_digest, str) or not query_digest:
+                raise ValueError("semantic pair profile keys must be query digests")
+            if not isinstance(profile, SemanticPairExecutionProfile):
+                raise TypeError(
+                    "semantic pair profile values must be "
+                    "SemanticPairExecutionProfile"
+                )
 
     def trace_dir(self) -> Path | str | None:
         """Return the configured semantic trace directory."""
@@ -102,6 +117,7 @@ class LotusExecutionContext:
 
     model: str
     config: LotusExecutionConfig = field(default_factory=LotusExecutionConfig)
+    pair_embedding_provider: EmbeddingProvider | None = None
     _configured: bool = field(default=False, init=False, repr=False)
 
     def configure(self) -> None:

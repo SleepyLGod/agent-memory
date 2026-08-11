@@ -20,6 +20,7 @@ from agent_memory.evaluation.locomo_contracts import locomo_task_contract  # noq
 from agent_memory.evaluation.run import (  # noqa: E402
     AGENT_MEMORY_SYSTEMS,
     DEFAULT_PROVIDER_MODEL_ID,
+    SEMANTIC_PAIR_PROFILES,
     run_agent_memory_bundle,
 )
 from agent_memory.planner import GROUPED_AGG_RULES  # noqa: E402
@@ -74,6 +75,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     run.add_argument("--sem-groupby-pair-batch-size", type=int)
     run.add_argument("--sem-groupby-pair-batch-retries", type=int, default=0)
+    run.add_argument(
+        "--semantic-pair-profile",
+        choices=SEMANTIC_PAIR_PROFILES,
+        default="oracle-only",
+    )
+    run.add_argument("--semantic-pair-top-k", type=int)
+    run.add_argument("--semantic-pair-min-similarity", type=float)
     args = parser.parse_args(raw_args)
     if args.command == "run":
         invalid = [
@@ -155,6 +163,9 @@ def main(argv: Sequence[str] | None = None) -> Path:
         sem_topk_method=args.sem_topk_method,
         sem_groupby_pair_batch_size=args.sem_groupby_pair_batch_size,
         sem_groupby_pair_batch_retries=args.sem_groupby_pair_batch_retries,
+        semantic_pair_profile=args.semantic_pair_profile,
+        semantic_pair_top_k=args.semantic_pair_top_k,
+        semantic_pair_min_similarity=args.semantic_pair_min_similarity,
         memory_thinking_enabled=False,
         condition_id=args.condition_id or "",
         maintenance_only=args.maintenance_only,
