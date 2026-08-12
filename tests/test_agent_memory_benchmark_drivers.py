@@ -677,7 +677,8 @@ def test_zep_run_closes_factory_when_storage_provenance_fails(
     assert captured["closed"] is True
 
 
-def test_operator_profiles_target_claude_join_and_zep_groupby() -> None:
+@pytest.mark.parametrize("mode", ("search-filter", "proxy-only"))
+def test_operator_profiles_target_claude_join_and_zep_groupby(mode: str) -> None:
     import agent_memory as am
     from agent_memory.memories.zep.storage import GRAPHITI_NEO4J_STATEMENTS
     from agent_memory.planner import DifferentialRules, PolicyDifferentiator
@@ -687,7 +688,7 @@ def test_operator_profiles_target_claude_join_and_zep_groupby() -> None:
     ).differentiate(am.ClaudeMemory.spec())
     claude_profiles = build_operator_semantic_pair_profiles(
         claude,
-        mode="search-filter",
+        mode=mode,
         operators=("sem_join",),
         embedding=SEMANTIC_PAIR_BGE_M3,
         embedding_device="cuda",
@@ -698,6 +699,7 @@ def test_operator_profiles_target_claude_join_and_zep_groupby() -> None:
     assert {profile.direction for profile in claude_profiles.values()} == {
         "left-to-right"
     }
+    assert {profile.mode for profile in claude_profiles.values()} == {mode}
 
     zep = PolicyDifferentiator(
         rules=DifferentialRules(grouped_agg_rule="rule-re-group")
@@ -707,7 +709,7 @@ def test_operator_profiles_target_claude_join_and_zep_groupby() -> None:
     )
     zep_profiles = build_operator_semantic_pair_profiles(
         zep,
-        mode="search-filter",
+        mode=mode,
         operators=("sem_groupby",),
         embedding=SEMANTIC_PAIR_BGE_M3,
         embedding_device="cuda",
@@ -716,6 +718,7 @@ def test_operator_profiles_target_claude_join_and_zep_groupby() -> None:
     )
     assert len(zep_profiles) == 6
     assert {profile.direction for profile in zep_profiles.values()} == {"symmetric"}
+    assert {profile.mode for profile in zep_profiles.values()} == {mode}
 
 
 @pytest.mark.parametrize(
@@ -903,6 +906,44 @@ def test_claude_oracle_rejects_cuda_before_external_setup(
             system_id="claude-memory",
             output_dir=tmp_path / "output",
             embedding_device="cuda",
+        )
+
+
+def test_proxy_only_requires_threshold_before_external_setup(
+    monkeypatch, tmp_path
+) -> None:
+    import agent_memory.evaluation.run as run_module
+
+    monkeypatch.setattr(
+        run_module,
+        "collect_runtime_provenance",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("provenance must not run before profile validation")
+        ),
+    )
+    bundle = BenchmarkBundle(
+        "longmemeval-v1-cleaned-s",
+        "revision",
+        "sha256",
+        (
+            BenchmarkCase(
+                case_id="case-1",
+                task_id="longmemeval-v1",
+                events=(_event(),),
+                questions=(BenchmarkQuestion("q1", "case-1", "?", "answer", ()),),
+            ),
+        ),
+        {"run_mode": "integration-smoke"},
+    )
+
+    with pytest.raises(ValueError, match="proxy-only requires min_similarity"):
+        run_agent_memory_bundle(
+            bundle=bundle,
+            contracts={},
+            system_id="claude-memory",
+            output_dir=tmp_path / "output",
+            semantic_pair_profile="proxy-only",
+            semantic_pair_top_k=10,
         )
 
 

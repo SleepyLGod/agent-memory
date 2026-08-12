@@ -90,7 +90,7 @@ def build_operator_semantic_pair_profiles(
             continue
         direction = "left-to-right" if query.op == "sem_join" else "symmetric"
         profiles[query_digest(query)] = SemanticPairExecutionProfile(
-            mode="search-filter",
+            mode=mode,
             direction=direction,
             left_id_columns=(PAIR_LEFT_ID_COLUMN,),
             right_id_columns=(PAIR_RIGHT_ID_COLUMN,),
@@ -103,7 +103,7 @@ def build_operator_semantic_pair_profiles(
         )
     if not profiles:
         raise ValueError(
-            "search-filter found no eligible " + ", ".join(operators) + " queries"
+            f"{mode} found no eligible " + ", ".join(operators) + " queries"
         )
     return profiles
 
@@ -157,11 +157,13 @@ def build_mem0_semantic_pair_profiles(
         if node.query.op == "sem_filter"
     }
     if len(filters) != 1:
-        raise ValueError("Mem0 search-filter requires exactly one semantic filter")
+        raise ValueError(
+            f"Mem0 {mode} requires exactly one semantic filter"
+        )
     digest = next(iter(filters))
     return {
         digest: SemanticPairExecutionProfile(
-            mode="search-filter",
+            mode=mode,
             direction="right-to-left",
             left_id_columns=("_row_id:earlier", "_memory_ordinal:earlier"),
             right_id_columns=("_row_id:later", "_memory_ordinal:later"),

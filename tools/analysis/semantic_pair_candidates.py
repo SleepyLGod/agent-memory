@@ -806,8 +806,14 @@ class SentenceTransformerCosineScorer:
 class _StrategyCounts:
     selected_pair_count: int = 0
     selected_positive_pair_count: int = 0
+    false_positive_pair_count: int = 0
+    false_negative_pair_count: int = 0
+    true_negative_pair_count: int = 0
     positive_group_count: int = 0
     groups_losing_positive_count: int = 0
+    connected_component_comparison_count: int = 0
+    connected_component_match_count: int = 0
+    connected_component_mismatch_count: int = 0
     counterexamples: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -861,11 +867,27 @@ class AnalysisAccumulator:
             )
             selected = _select_candidates(group, scores or (), strategy)
             selected_positive = positive_indices & selected
+            false_positives = selected - positive_indices
+            false_negatives = positive_indices - selected
+            true_negatives = (
+                set(range(len(group.pairs))) - selected - positive_indices
+            )
             counts.selected_pair_count += len(selected)
             counts.selected_positive_pair_count += len(selected_positive)
+            counts.false_positive_pair_count += len(false_positives)
+            counts.false_negative_pair_count += len(false_negatives)
+            counts.true_negative_pair_count += len(true_negatives)
+            if group.operator == "sem_groupby":
+                counts.connected_component_comparison_count += 1
+                if _connected_components(group, selected) == _connected_components(
+                    group, positive_indices
+                ):
+                    counts.connected_component_match_count += 1
+                else:
+                    counts.connected_component_mismatch_count += 1
             if positive_indices:
                 counts.positive_group_count += 1
-            missed = positive_indices - selected
+            missed = false_negatives
             if missed:
                 counts.groups_losing_positive_count += 1
                 if bucket is self._buckets["__all__"]:
@@ -906,6 +928,30 @@ class AnalysisAccumulator:
     def _bucket_report(bucket: _Bucket) -> dict[str, Any]:
         strategies: list[dict[str, Any]] = []
         for strategy_id, counts in sorted(bucket.strategies.items()):
+            proxy_precision = (
+                _ratio(
+                    counts.selected_positive_pair_count,
+                    counts.selected_pair_count,
+                )
+                if counts.selected_pair_count
+                else None
+            )
+            proxy_recall = (
+                _ratio(
+                    counts.selected_positive_pair_count,
+                    bucket.positive_pair_count,
+                )
+                if bucket.positive_pair_count
+                else None
+            )
+            proxy_f1 = (
+                0.0
+                if proxy_precision == 0.0 or proxy_recall == 0.0
+                else 2 * proxy_precision * proxy_recall
+                / (proxy_precision + proxy_recall)
+                if proxy_precision is not None and proxy_recall is not None
+                else None
+            )
             strategies.append(
                 {
                     "strategy": strategy_id,
@@ -916,6 +962,10 @@ class AnalysisAccumulator:
                         else 0.0
                     ),
                     "selected_positive_pair_count": counts.selected_positive_pair_count,
+                    "true_positive_pair_count": counts.selected_positive_pair_count,
+                    "false_positive_pair_count": counts.false_positive_pair_count,
+                    "false_negative_pair_count": counts.false_negative_pair_count,
+                    "true_negative_pair_count": counts.true_negative_pair_count,
                     "positive_pair_recall": (
                         _ratio(
                             counts.selected_positive_pair_count,
@@ -924,8 +974,20 @@ class AnalysisAccumulator:
                         if bucket.positive_pair_count
                         else None
                     ),
+                    "proxy_precision": proxy_precision,
+                    "proxy_recall": proxy_recall,
+                    "proxy_f1": proxy_f1,
                     "positive_group_count": counts.positive_group_count,
                     "groups_losing_positive_count": counts.groups_losing_positive_count,
+                    "connected_component_comparison_count": (
+                        counts.connected_component_comparison_count
+                    ),
+                    "connected_component_match_count": (
+                        counts.connected_component_match_count
+                    ),
+                    "connected_component_mismatch_count": (
+                        counts.connected_component_mismatch_count
+                    ),
                     "counterexamples": counts.counterexamples,
                 }
             )
@@ -937,6 +999,40 @@ class AnalysisAccumulator:
             },
             "strategies": strategies,
         }
+
+
+def _connected_components(
+    group: PairGroup,
+    edge_indices: set[int],
+) -> frozenset[frozenset[str]]:
+    """Return the undirected endpoint partition induced by selected edges."""
+
+    parent: dict[str, str] = {}
+
+    def find(node: str) -> str:
+        parent.setdefault(node, node)
+        while parent[node] != node:
+            parent[node] = parent[parent[node]]
+            node = parent[node]
+        return node
+
+    def union(left: str, right: str) -> None:
+        left_root = find(left)
+        right_root = find(right)
+        if left_root != right_root:
+            parent[right_root] = left_root
+
+    for pair in group.pairs:
+        find(pair.left_id)
+        find(pair.right_id)
+    for index in edge_indices:
+        pair = group.pairs[index]
+        union(pair.left_id, pair.right_id)
+
+    components: dict[str, set[str]] = defaultdict(set)
+    for node in parent:
+        components[find(node)].add(node)
+    return frozenset(frozenset(component) for component in components.values())
 
 
 def analyze_sources(

@@ -111,12 +111,13 @@ def _pairs() -> pd.DataFrame:
 
 def _profile(
     *,
+    mode: str = "search-filter",
     direction: str = "right-to-left",
     top_k: int | None = None,
     min_similarity: float | None = None,
 ) -> SemanticPairExecutionProfile:
     return SemanticPairExecutionProfile(
-        mode="search-filter",
+        mode=mode,
         direction=direction,
         left_id_columns=("left_id",),
         right_id_columns=("right_id",),
@@ -164,9 +165,13 @@ def _filter_source() -> FakeFilterFrame:
     )
 
 
-def _filter_profile(min_similarity: float) -> SemanticPairExecutionProfile:
+def _filter_profile(
+    min_similarity: float,
+    *,
+    mode: str = "search-filter",
+) -> SemanticPairExecutionProfile:
     return SemanticPairExecutionProfile(
-        mode="search-filter",
+        mode=mode,
         direction="right-to-left",
         left_id_columns=("_row_id:earlier", "_memory_ordinal:earlier"),
         right_id_columns=("_row_id:later", "_memory_ordinal:later"),
@@ -179,11 +184,12 @@ def _filter_profile(min_similarity: float) -> SemanticPairExecutionProfile:
 
 def _operator_pair_profile(
     *,
+    mode: str = "search-filter",
     direction: str,
     min_similarity: float,
 ) -> SemanticPairExecutionProfile:
     return SemanticPairExecutionProfile(
-        mode="search-filter",
+        mode=mode,
         direction=direction,
         left_id_columns=(PAIR_LEFT_ID_COLUMN,),
         right_id_columns=(PAIR_RIGHT_ID_COLUMN,),
@@ -402,6 +408,11 @@ def test_profile_requires_a_search_filter_candidate_bound() -> None:
         _profile()
 
 
+def test_proxy_only_requires_min_similarity() -> None:
+    with pytest.raises(ValueError, match="proxy-only requires min_similarity"):
+        _profile(mode="proxy-only", top_k=1)
+
+
 def test_embedding_provider_errors_are_not_hidden() -> None:
     class FailingProvider:
         def embed(
@@ -418,6 +429,13 @@ def test_embedding_provider_errors_are_not_hidden() -> None:
             profile=_profile(min_similarity=0.6),
             embedding_provider=FailingProvider(),
         )
+
+
+def test_proxy_only_has_a_distinct_physical_fingerprint() -> None:
+    search_filter = _profile(min_similarity=0.6)
+    proxy_only = replace(search_filter, mode="proxy-only")
+
+    assert search_filter.fingerprint != proxy_only.fingerprint
 
 
 def test_sem_filter_search_filter_sends_only_candidates_to_oracle(tmp_path) -> None:
@@ -535,6 +553,65 @@ def test_sem_filter_zero_candidates_skips_oracle() -> None:
     assert result.empty
     assert list(result.columns) == list(source.columns)
     assert FakeFilterFrame.oracle_batches == []
+
+
+def test_sem_filter_proxy_only_returns_selected_rows_without_oracle(
+    tmp_path: Path,
+) -> None:
+    query = _filter_query()
+    source = _filter_source()
+    provider = FakeEmbeddingProvider(
+        {
+            "memory: old alpha": [1.0, 0.0],
+            "memory: old beta": [0.0, 1.0],
+            "memory: new alpha": [0.8, 0.6],
+        }
+    )
+    profile = _filter_profile(0.75, mode="proxy-only")
+    config = LotusExecutionConfig(
+        semantic_trace_dir=tmp_path,
+        semantic_pair_profiles={query_digest(query): profile},
+    )
+    FakeFilterFrame.oracle_batches = []
+
+    result = execute_sem_filter(
+        query,
+        {},
+        lambda _query, _inputs: source,
+        FakeContext(config, provider),
+    )
+
+    assert list(result["memory:earlier"]) == ["old alpha"]
+    assert FakeFilterFrame.oracle_batches == []
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "events.jsonl").read_text().splitlines()
+    ]
+    candidate = next(
+        event for event in events if event["event_type"] == "candidate_generation"
+    )
+    assert candidate["profile"] == "proxy-only"
+    assert candidate["candidate_pair_count"] == 1
+
+
+def test_sem_filter_proxy_only_rejects_lotus_cascade() -> None:
+    query = _filter_query()
+    config = LotusExecutionConfig(
+        sem_filter_cascade_args={"sampling_percentage": 0.1},
+        semantic_pair_profiles={
+            query_digest(query): _filter_profile(0.75, mode="proxy-only")
+        },
+    )
+
+    with pytest.raises(ValueError, match="cannot be combined with LOTUS cascade"):
+        execute_sem_filter(
+            query,
+            {},
+            lambda _query, _inputs: (_ for _ in ()).throw(
+                AssertionError("input execution must not run before validation")
+            ),
+            FakeContext(config, FakeEmbeddingProvider({})),
+        )
 
 
 def test_sem_join_search_filter_verifies_only_candidates_and_preserves_outer_join(
@@ -709,6 +786,118 @@ def test_sem_groupby_search_filter_verifies_only_candidate_edges(
     assert "pairs" not in candidate
 
 
+def test_sem_join_proxy_only_assembles_selected_pairs_without_oracle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import lotus.sem_ops.sem_filter as sem_filter_module
+
+    def sem_filter(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise AssertionError("proxy-only must not call the oracle")
+
+    monkeypatch.setattr(sem_filter_module, "sem_filter", sem_filter)
+    left = pd.DataFrame({"topic": ["alpha", "tea"]}, index=[10, 20])
+    right = pd.DataFrame({"topic": ["alpha project", "coffee"]}, index=[100, 200])
+    query = QueryExpr(
+        op="sem_join",
+        inputs=(
+            QueryExpr(op="materialized_view", params={"name": "left"}),
+            QueryExpr(op="materialized_view", params={"name": "right"}),
+        ),
+        params={
+            "instruction": "{topic:left} and {topic:right} are the same topic.",
+            "how": "outer",
+        },
+    )
+    provider = FakeEmbeddingProvider(
+        {
+            "text: alpha": [1.0, 0.0],
+            "text: tea": [0.0, 1.0],
+            "text: alpha project": [0.9, 0.435889894],
+            "text: coffee": [-1.0, 0.0],
+        }
+    )
+    context = FakeContext(
+        LotusExecutionConfig(
+            semantic_pair_profiles={
+                query_digest(query): _operator_pair_profile(
+                    mode="proxy-only",
+                    direction="left-to-right",
+                    min_similarity=0.8,
+                )
+            }
+        ),
+        provider,
+    )
+
+    result = execute_sem_join(
+        query,
+        {"left": left, "right": right},
+        lambda expression, inputs: inputs[str(expression.params["name"])],
+        context,
+    )
+
+    assert result.loc[0].to_dict() == {
+        "topic:left": "alpha",
+        "topic:right": "alpha project",
+    }
+    assert result.loc[1, "topic:left"] == "tea"
+    assert pd.isna(result.loc[1, "topic:right"])
+    assert pd.isna(result.loc[2, "topic:left"])
+    assert result.loc[2, "topic:right"] == "coffee"
+
+
+def test_sem_groupby_proxy_only_unions_selected_edges_without_oracle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import lotus.sem_ops.sem_filter as sem_filter_module
+
+    def sem_filter(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise AssertionError("proxy-only must not call the oracle")
+
+    monkeypatch.setattr(sem_filter_module, "sem_filter", sem_filter)
+    source = pd.DataFrame(
+        {"topic": ["alpha", "alpha project", "tea"]}
+    )
+    query = QueryExpr(
+        op="sem_groupby",
+        inputs=(QueryExpr(op="materialized_view", params={"name": "rows"}),),
+        params={
+            "input_cols": ("topic",),
+            "instruction": "Group the same {topic}.",
+        },
+    )
+    provider = FakeEmbeddingProvider(
+        {
+            "text: topic: alpha": [1.0, 0.0],
+            "text: topic: alpha project": [0.9, 0.435889894],
+            "text: topic: tea": [0.0, 1.0],
+        }
+    )
+    context = FakeContext(
+        LotusExecutionConfig(
+            semantic_pair_profiles={
+                query_digest(query): _operator_pair_profile(
+                    mode="proxy-only",
+                    direction="symmetric",
+                    min_similarity=0.8,
+                )
+            }
+        ),
+        provider,
+    )
+
+    result = execute_sem_groupby(
+        query,
+        {"rows": source},
+        lambda expression, inputs: inputs[str(expression.params["name"])],
+        context,
+    )
+
+    assert list(result["_agent_memory_group_id"]) == [0, 0, 1]
+
+
 def test_sem_join_search_filter_zero_candidates_skips_oracle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -761,7 +950,10 @@ def test_sem_join_search_filter_zero_candidates_skips_oracle(
     assert list(result.columns) == ["topic:left", "topic:right"]
 
 
-def test_sem_join_search_filter_rejects_lotus_cascade() -> None:
+@pytest.mark.parametrize("mode", ("search-filter", "proxy-only"))
+def test_sem_join_profile_rejects_lotus_cascade_before_input_execution(
+    mode: str,
+) -> None:
     query = QueryExpr(
         op="sem_join",
         inputs=(
@@ -775,6 +967,7 @@ def test_sem_join_search_filter_rejects_lotus_cascade() -> None:
             sem_join_cascade_args={"sampling_percentage": 0.1},
             semantic_pair_profiles={
                 query_digest(query): _operator_pair_profile(
+                    mode=mode,
                     direction="left-to-right",
                     min_similarity=0.8,
                 )
@@ -790,7 +983,9 @@ def test_sem_join_search_filter_rejects_lotus_cascade() -> None:
                 "left": pd.DataFrame({"topic": ["alpha"]}),
                 "right": pd.DataFrame({"topic": ["alpha"]}),
             },
-            lambda expression, inputs: inputs[str(expression.params["name"])],
+            lambda _expression, _inputs: (_ for _ in ()).throw(
+                AssertionError("input execution must not run before validation")
+            ),
             context,
         )
 

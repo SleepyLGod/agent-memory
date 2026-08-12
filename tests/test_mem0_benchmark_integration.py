@@ -572,7 +572,9 @@ def test_mem0_enhanced_runner_uses_shared_maintenance_and_quick_retrieval(
     assert captured["closed"] is True
 
 
-def test_mem0_search_filter_runner_records_physical_contract(
+@pytest.mark.parametrize("profile_mode", ("search-filter", "proxy-only"))
+def test_mem0_profiled_runner_records_physical_contract(
+    profile_mode: str,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -635,7 +637,7 @@ def test_mem0_search_filter_runner_records_physical_contract(
         system_id="mem0-memory",
         output_dir=tmp_path / "output",
         memory_thinking_enabled=False,
-        semantic_pair_profile="search-filter",
+        semantic_pair_profile=profile_mode,
         semantic_pair_min_similarity=0.6,
         embedding_device="cuda",
     )
@@ -646,6 +648,7 @@ def test_mem0_search_filter_runner_records_physical_contract(
     assert isinstance(profiles, dict)
     assert len(profiles) == 1
     profile = next(iter(profiles.values()))
+    assert profile.mode == profile_mode
     assert profile.embedding_device == "cuda"
     assert factory["embedding_device"] == "cuda"
     runner = captured["runner"]
@@ -653,11 +656,14 @@ def test_mem0_search_filter_runner_records_physical_contract(
     contract = runner["system_contract"]
     assert isinstance(contract, MemorySystemContract)
     assert contract.maintenance_execution_id.startswith(
-        "semantic-pair-search-filter:"
+        f"semantic-pair-{profile_mode}:"
     )
-    assert "execution=semantic-pair-search-filter:" in contract.effective_condition_id
+    assert (
+        f"execution=semantic-pair-{profile_mode}:"
+        in contract.effective_condition_id
+    )
     execution = runner["runtime_provenance"]["runtime"]["lotus_execution"]
-    assert execution["semantic_pair_profile"] == "search-filter"
+    assert execution["semantic_pair_profile"] == profile_mode
     assert execution["semantic_pair_min_similarity"] == pytest.approx(0.6)
     assert execution["embedding_device"] == "cuda"
     assert execution["semantic_pair_execution_fingerprint"]

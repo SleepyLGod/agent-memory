@@ -125,7 +125,7 @@ def run_agent_memory_bundle(
         and embedding_device != "cpu"
     ):
         raise ValueError(
-            "Claude non-CPU embeddings require the search-filter profile"
+            "Claude non-CPU embeddings require search-filter or proxy-only"
         )
     if semantic_pair_top_k is not None and (
         isinstance(semantic_pair_top_k, bool) or semantic_pair_top_k < 1
@@ -144,12 +144,20 @@ def run_agent_memory_bundle(
     if semantic_pair_profile == "search-filter":
         if semantic_pair_top_k is None and semantic_pair_min_similarity is None:
             raise ValueError("search-filter requires top_k or min_similarity")
+    if (
+        semantic_pair_profile == "proxy-only"
+        and semantic_pair_min_similarity is None
+    ):
+        raise ValueError("proxy-only requires min_similarity")
     if sem_topk_method is None:
         sem_topk_method = (
             "pairwise-quick" if system_id == "mem0-enhanced" else "pairwise-naive"
         )
     semantic_pair_profiles = {}
-    if semantic_pair_profile == "search-filter" and system_id == "claude-memory":
+    if (
+        semantic_pair_profile in {"search-filter", "proxy-only"}
+        and system_id == "claude-memory"
+    ):
         import agent_memory as am
         from agent_memory.planner import DifferentialRules, PolicyDifferentiator
 
@@ -165,7 +173,10 @@ def run_agent_memory_bundle(
             top_k=semantic_pair_top_k,
             min_similarity=semantic_pair_min_similarity,
         )
-    elif semantic_pair_profile == "search-filter" and system_id == "zep-memory":
+    elif (
+        semantic_pair_profile in {"search-filter", "proxy-only"}
+        and system_id == "zep-memory"
+    ):
         import agent_memory as am
         from agent_memory.memories.zep.storage import (
             GRAPHITI_BGE_M3,
@@ -207,7 +218,8 @@ def run_agent_memory_bundle(
         semantic_pair_profiles
     )
     maintenance_execution_id = (
-        f"semantic-pair-search-filter:{semantic_pair_execution_fingerprint}"
+        f"semantic-pair-{semantic_pair_profile}:"
+        f"{semantic_pair_execution_fingerprint}"
         if semantic_pair_execution_fingerprint
         else f"embedding-device:{embedding_device}"
         if system_id in {"zep-memory", "mem0-memory", "mem0-enhanced"}

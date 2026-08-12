@@ -15,7 +15,7 @@ from agent_memory.adapters.lotus.pair_execution import (
     PAIR_RIGHT_TEXT_COLUMN,
     SemanticPairExecutionProfile,
     select_semantic_pair_candidates,
-    write_search_filter_trace,
+    write_semantic_pair_execution_trace,
 )
 from agent_memory.tracing.semantic import (
     query_digest,
@@ -35,18 +35,20 @@ def execute_sem_join(
 ) -> Any:
     """Execute semantic join with LOTUS predicate evaluation."""
 
+    digest = query_digest(query)
+    profile = context.config.semantic_pair_profiles.get(digest)
+    if profile is not None and profile.mode in {"search-filter", "proxy-only"}:
+        if context.config.sem_join_cascade_args is not None:
+            raise ValueError(
+                f"sem_join {profile.mode} cannot be combined with LOTUS cascade"
+            )
+        if context.pair_embedding_provider is None:
+            raise ValueError(
+                f"{profile.mode} requires a pair embedding provider"
+            )
     context.configure()
     left = execute(query.inputs[0], inputs)
     right = execute(query.inputs[1], inputs)
-    digest = query_digest(query)
-    profile = context.config.semantic_pair_profiles.get(digest)
-    if profile is not None and profile.mode == "search-filter":
-        if context.config.sem_join_cascade_args is not None:
-            raise ValueError(
-                "sem_join search-filter cannot be combined with LOTUS cascade"
-            )
-        if context.pair_embedding_provider is None:
-            raise ValueError("search-filter requires a pair embedding provider")
     if left.empty or right.empty:
         result = assemble_join_frame(
             left,
@@ -65,9 +67,9 @@ def execute_sem_join(
             },
         )
         return result
-    if profile is not None and profile.mode == "search-filter":
+    if profile is not None and profile.mode in {"search-filter", "proxy-only"}:
         assert context.pair_embedding_provider is not None
-        join_results = evaluate_search_filtered_semantic_join(
+        join_results = evaluate_profiled_semantic_join(
             query,
             left,
             right,
@@ -96,7 +98,8 @@ def execute_sem_join(
                     "semantic_pair_profile": profile.mode,
                     "semantic_pair_profile_fingerprint": profile.fingerprint,
                 }
-                if profile is not None and profile.mode == "search-filter"
+                if profile is not None
+                and profile.mode in {"search-filter", "proxy-only"}
                 else {}
             ),
         },
@@ -209,7 +212,7 @@ def evaluate_semantic_join(
     return list(output.join_results)
 
 
-def evaluate_search_filtered_semantic_join(
+def evaluate_profiled_semantic_join(
     query: QueryExpr,
     left: pd.DataFrame,
     right: pd.DataFrame,
@@ -218,11 +221,7 @@ def evaluate_search_filtered_semantic_join(
     profile: SemanticPairExecutionProfile,
     embedding_provider: EmbeddingProvider,
 ) -> list[tuple[Any, Any, str | None]]:
-    """Verify a sparse semantic-join candidate set with LOTUS sem_filter."""
-
-    import lotus
-    from lotus.sem_ops.sem_filter import sem_filter
-    from lotus.templates import task_instructions
+    """Execute one profiled semantic join over embedding-selected pairs."""
 
     left_series, right_series, left_label, right_label, instruction = join_series(
         left,
@@ -235,7 +234,7 @@ def evaluate_search_filtered_semantic_join(
         profile=profile,
         embedding_provider=embedding_provider,
     )
-    write_search_filter_trace(
+    write_semantic_pair_execution_trace(
         config.trace_dir(),
         operator="sem_join",
         query_digest_value=query_digest(query),
@@ -245,6 +244,19 @@ def evaluate_search_filtered_semantic_join(
     candidates = pairs.iloc[list(selection.selected_positions)].reset_index(drop=True)
     if candidates.empty:
         return []
+    if profile.mode == "proxy-only":
+        return [
+            (
+                row[PAIR_LEFT_ID_COLUMN],
+                row[PAIR_RIGHT_ID_COLUMN],
+                None,
+            )
+            for _row_index, row in candidates.iterrows()
+        ]
+
+    import lotus
+    from lotus.sem_ops.sem_filter import sem_filter
+    from lotus.templates import task_instructions
 
     oracle_frame = pd.DataFrame(
         {
