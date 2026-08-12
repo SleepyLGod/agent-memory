@@ -16,7 +16,7 @@ from agent_memory.adapters.lotus.pair_execution import (
     PAIR_RIGHT_TEXT_COLUMN,
     SemanticPairExecutionProfile,
     select_semantic_pair_candidates,
-    write_search_filter_trace,
+    write_semantic_pair_execution_trace,
 )
 from agent_memory.adapters.lotus.sem_join import row_text_series
 from agent_memory.adapters.lotus.structured import StructuredLMExecutor
@@ -42,11 +42,8 @@ def execute_sem_groupby(
 ) -> Any:
     """Assign deterministic semantic group ids to rows."""
 
-    context.configure()
-    source = execute(query.inputs[0], inputs)
     input_cols = tuple(str(column) for column in query.params["input_cols"])
     partition_by = tuple(str(column) for column in query.params.get("partition_by", ()))
-    validate_partition_by(source, partition_by)
     labels = tuple(query.params.get("labels") or ())
     digest = query_digest(query)
     profile = context.config.semantic_pair_profiles.get(digest)
@@ -54,11 +51,18 @@ def execute_sem_groupby(
         raise ValueError(
             "semantic pair profiles apply only to open-ended pairwise sem_groupby"
         )
-    if profile is not None and profile.mode == "search-filter":
+    if profile is not None and profile.mode in {"search-filter", "proxy-only"}:
         if profile.direction != "symmetric":
-            raise ValueError("pairwise sem_groupby search-filter must be symmetric")
+            raise ValueError(
+                f"pairwise sem_groupby {profile.mode} must be symmetric"
+            )
         if context.pair_embedding_provider is None:
-            raise ValueError("search-filter requires a pair embedding provider")
+            raise ValueError(
+                f"{profile.mode} requires a pair embedding provider"
+            )
+    context.configure()
+    source = execute(query.inputs[0], inputs)
+    validate_partition_by(source, partition_by)
     if partition_by:
         return execute_partitioned_sem_groupby(
             source,
@@ -384,27 +388,27 @@ def evaluate_group_matches(
     if len(unique_rows) < 2:
         return []
 
-    import lotus
-    from lotus.sem_ops.sem_filter import sem_filter
-    from lotus.templates import task_instructions
-
     if pair_batch_size is not None and pair_batch_size < 1:
         raise ValueError("sem_groupby pair_batch_size must be positive")
     if pair_batch_retries < 0:
         raise ValueError("sem_groupby pair_batch_retries cannot be negative")
 
     pairs = semantic_pair_candidates(unique_rows, input_cols)
-    if profile is not None and profile.mode == "search-filter":
+    if profile is not None and profile.mode in {"search-filter", "proxy-only"}:
         if profile.direction != "symmetric":
-            raise ValueError("pairwise sem_groupby search-filter must be symmetric")
+            raise ValueError(
+                f"pairwise sem_groupby {profile.mode} must be symmetric"
+            )
         if embedding_provider is None:
-            raise ValueError("search-filter requires a pair embedding provider")
+            raise ValueError(
+                f"{profile.mode} requires a pair embedding provider"
+            )
         selection = select_semantic_pair_candidates(
             groupby_pair_candidate_projection(pairs),
             profile=profile,
             embedding_provider=embedding_provider,
         )
-        write_search_filter_trace(
+        write_semantic_pair_execution_trace(
             trace_dir,
             operator="sem_groupby",
             query_digest_value=query_digest_value,
@@ -414,6 +418,15 @@ def evaluate_group_matches(
         pairs = pairs.iloc[list(selection.selected_positions)].reset_index(drop=True)
         if pairs.empty:
             return []
+        if profile.mode == "proxy-only":
+            return [
+                (int(row["_left_unique_id"]), int(row["_right_unique_id"]))
+                for _index, row in pairs.iterrows()
+            ]
+
+    import lotus
+    from lotus.sem_ops.sem_filter import sem_filter
+    from lotus.templates import task_instructions
     lowered_instruction = lower_pairwise_grouping_instruction(
         instruction,
         input_cols=input_cols,

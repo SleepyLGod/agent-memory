@@ -449,6 +449,48 @@ def test_symmetric_top_k_union_and_combined_threshold() -> None:
     assert metrics["top-k:1"]["selected_pair_count"] == 2
     assert metrics["top-k:1+threshold:0.85"]["selected_pair_count"] == 1
     assert all(row["positive_pair_recall"] == 1.0 for row in metrics.values())
+    threshold = metrics["threshold:0.85"]
+    assert threshold["true_positive_pair_count"] == 1
+    assert threshold["false_positive_pair_count"] == 0
+    assert threshold["false_negative_pair_count"] == 0
+    assert threshold["true_negative_pair_count"] == 2
+    assert threshold["proxy_precision"] == 1.0
+    assert threshold["proxy_recall"] == 1.0
+    assert threshold["proxy_f1"] == 1.0
+    assert threshold["connected_component_comparison_count"] == 1
+    assert threshold["connected_component_match_count"] == 1
+    assert threshold["connected_component_mismatch_count"] == 0
+
+
+def test_sem_groupby_reports_connected_component_difference() -> None:
+    group = PairGroup(
+        group_id="component-group",
+        operator="sem_groupby",
+        direction="symmetric",
+        source="static",
+        case_id="case-1",
+        session_id="session-1",
+        event_id="event-1",
+        query_digest="query-1",
+        pairs=(
+            PairRecord("ab", "A", "B", "A", "B", True),
+            PairRecord("ac", "A", "C", "A", "C", False),
+            PairRecord("bc", "B", "C", "B", "C", False),
+        ),
+    )
+    report = analyze_sources(
+        [StaticSource([group])],
+        strategies=[CandidateStrategy(threshold=0.8)],
+        scorer=FakeScorer({"ab": 0.9, "ac": 0.85, "bc": 0.1}),
+    )
+
+    metric = report["strategies"][0]
+    assert metric["true_positive_pair_count"] == 1
+    assert metric["false_positive_pair_count"] == 1
+    assert metric["proxy_precision"] == 0.5
+    assert metric["connected_component_comparison_count"] == 1
+    assert metric["connected_component_match_count"] == 0
+    assert metric["connected_component_mismatch_count"] == 1
 
 
 def test_right_to_left_top_k_is_per_later_row_and_reports_missed_positive() -> None:

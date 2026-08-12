@@ -12,7 +12,7 @@ from agent_memory.adapters.lotus.context import LotusExecutionConfig, LotusExecu
 from agent_memory.adapters.lotus.pair_execution import (
     PairCandidateSelection,
     select_semantic_pair_candidates,
-    write_search_filter_trace,
+    write_semantic_pair_execution_trace,
 )
 from agent_memory.tracing.semantic import write_compact_operator_trace
 from agent_memory.tracing.semantic import query_digest
@@ -32,22 +32,33 @@ def execute_sem_filter(
 ) -> Any:
     """Execute LOTUS native semantic filtering."""
 
-    context.configure()
-    source = execute(query.inputs[0], inputs)
     digest = query_digest(query)
     profile = context.config.semantic_pair_profiles.get(digest)
+    if profile is not None and profile.mode in {"search-filter", "proxy-only"}:
+        if (
+            profile.mode == "proxy-only"
+            and context.config.sem_filter_cascade_args is not None
+        ):
+            raise ValueError(
+                "sem_filter proxy-only cannot be combined with LOTUS cascade"
+            )
+        if context.pair_embedding_provider is None:
+            raise ValueError(
+                f"{profile.mode} requires a pair embedding provider"
+            )
+    context.configure()
+    source = execute(query.inputs[0], inputs)
     selection: PairCandidateSelection | None = None
     oracle_source = source
-    if profile is not None and profile.mode == "search-filter":
-        if context.pair_embedding_provider is None:
-            raise ValueError("search-filter requires a pair embedding provider")
+    if profile is not None and profile.mode in {"search-filter", "proxy-only"}:
+        assert context.pair_embedding_provider is not None
         selection = select_semantic_pair_candidates(
             source,
             profile=profile,
             embedding_provider=context.pair_embedding_provider,
         )
         oracle_source = source.iloc[list(selection.selected_positions)].copy()
-        write_search_filter_trace(
+        write_semantic_pair_execution_trace(
             context.config.trace_dir(),
             operator="sem_filter",
             query_digest_value=digest,
@@ -58,14 +69,15 @@ def execute_sem_filter(
         oracle_source,
         str(query.params["instruction"]),
     )
-    result = (
-        lotus_source.copy()
-        if selection is not None and lotus_source.empty
-        else lotus_source.sem_filter(
+    if profile is not None and profile.mode == "proxy-only":
+        result = lotus_source.copy()
+    elif selection is not None and lotus_source.empty:
+        result = lotus_source.copy()
+    else:
+        result = lotus_source.sem_filter(
             instruction,
             **native_sem_filter_kwargs(context.config),
         )
-    )
     if restore_columns:
         result = result.rename(columns=restore_columns)
     write_compact_operator_trace(

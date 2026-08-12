@@ -15,7 +15,11 @@ import pandas as pd
 from agent_memory.storage.embedding import EmbeddingProvider, EmbeddingSpec
 from agent_memory.tracing.semantic import write_trace_event
 
-SEMANTIC_PAIR_EXECUTION_MODES = ("oracle-only", "search-filter")
+SEMANTIC_PAIR_EXECUTION_MODES = (
+    "oracle-only",
+    "search-filter",
+    "proxy-only",
+)
 SEMANTIC_PAIR_DIRECTIONS = ("symmetric", "left-to-right", "right-to-left")
 PAIR_LEFT_ID_COLUMN = "_left_pair_id"
 PAIR_RIGHT_ID_COLUMN = "_right_pair_id"
@@ -79,9 +83,15 @@ class SemanticPairExecutionProfile:
             if self.embedding is not None or self.top_k is not None or self.min_similarity is not None:
                 raise ValueError("oracle-only semantic pair profiles cannot select candidates")
         elif self.embedding is None:
-            raise ValueError("search-filter semantic pair profiles require an embedding")
-        elif self.top_k is None and self.min_similarity is None:
+            raise ValueError(
+                f"{self.mode} semantic pair profiles require an embedding"
+            )
+        elif self.mode == "search-filter" and (
+            self.top_k is None and self.min_similarity is None
+        ):
             raise ValueError("search-filter requires top_k or min_similarity")
+        elif self.mode == "proxy-only" and self.min_similarity is None:
+            raise ValueError("proxy-only requires min_similarity")
 
     def to_dict(self) -> dict[str, object]:
         """Return the stable physical profile contract."""
@@ -132,8 +142,10 @@ def select_semantic_pair_candidates(
 ) -> PairCandidateSelection:
     """Select pair rows with an embedding threshold and optional directed top-k."""
 
-    if profile.mode != "search-filter" or profile.embedding is None:
-        raise ValueError("candidate selection requires a search-filter profile")
+    if profile.mode not in {"search-filter", "proxy-only"} or profile.embedding is None:
+        raise ValueError(
+            "candidate selection requires a search-filter or proxy-only profile"
+        )
     provider_device = getattr(embedding_provider, "device", None)
     if provider_device is not None and provider_device != profile.embedding_device:
         raise ValueError(
@@ -223,7 +235,7 @@ def semantic_pair_profiles_fingerprint(
     return sha256(encoded).hexdigest()
 
 
-def write_search_filter_trace(
+def write_semantic_pair_execution_trace(
     trace_dir: object,
     *,
     operator: str,
@@ -231,11 +243,11 @@ def write_search_filter_trace(
     profile: SemanticPairExecutionProfile,
     selection: PairCandidateSelection,
 ) -> None:
-    """Record candidate generation without persisting pairs or vectors."""
+    """Record physical pair selection without persisting pairs or vectors."""
 
     embedding = profile.embedding
     if embedding is None:
-        raise ValueError("search-filter trace requires an embedding")
+        raise ValueError("semantic pair execution trace requires an embedding")
     write_trace_event(
         trace_dir,
         operator=operator,
@@ -390,5 +402,5 @@ __all__ = [
     "SemanticPairExecutionProfile",
     "select_semantic_pair_candidates",
     "semantic_pair_profiles_fingerprint",
-    "write_search_filter_trace",
+    "write_semantic_pair_execution_trace",
 ]

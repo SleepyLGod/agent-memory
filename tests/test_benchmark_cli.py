@@ -34,8 +34,9 @@ def test_agent_benchmark_clis_share_sem_groupby_execution_options(
 
 
 @pytest.mark.parametrize("module", (locomo, longmemeval, memory_agent_bench))
+@pytest.mark.parametrize("profile", ("search-filter", "proxy-only"))
 def test_agent_benchmark_clis_share_semantic_pair_execution_options(
-    module, tmp_path
+    module, profile, tmp_path
 ) -> None:
     args = module.parse_args(
         [
@@ -47,7 +48,7 @@ def test_agent_benchmark_clis_share_semantic_pair_execution_options(
             "--system",
             "mem0-memory",
             "--semantic-pair-profile",
-            "search-filter",
+            profile,
             "--semantic-pair-top-k",
             "10",
             "--semantic-pair-min-similarity",
@@ -57,7 +58,7 @@ def test_agent_benchmark_clis_share_semantic_pair_execution_options(
         ]
     )
 
-    assert args.semantic_pair_profile == "search-filter"
+    assert args.semantic_pair_profile == profile
     assert args.semantic_pair_top_k == 10
     assert args.semantic_pair_min_similarity == pytest.approx(0.6)
     assert args.embedding_device == "cuda"
