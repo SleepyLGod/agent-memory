@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from array import array
 from collections import Counter, defaultdict
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -57,6 +58,9 @@ class PairGroup:
     event_id: str
     query_digest: str
     pairs: tuple[PairRecord, ...]
+    predicate: str = ""
+    predicate_source: str = "missing"
+    predicate_complete: bool = False
 
 
 @dataclass(frozen=True)
@@ -225,6 +229,7 @@ class DirectorySource:
         closed_call_ids: set[str] = set()
         group_evidence_digests: dict[str, str] = {}
         unproven_attempts: dict[tuple[str, str, str], tuple[int, int]] = {}
+        predicates_by_query_digest: dict[str, str] = {}
 
         def is_new_group(group: PairGroup) -> bool:
             evidence_digest = _group_evidence_digest(group)
@@ -281,6 +286,7 @@ class DirectorySource:
                 source=self.description,
                 read_bytes=self._read_bytes,
                 executor=executor,
+                predicates_by_query_digest=predicates_by_query_digest,
             )
             pending_call_id = None
             pending_events = []
@@ -295,6 +301,12 @@ class DirectorySource:
                     raw_line,
                     source=self.description,
                     line_number=trace_index + 1,
+                )
+                _collect_prompt_predicate(
+                    event,
+                    phase=phase,
+                    read_bytes=self._read_bytes,
+                    predicates_by_query_digest=predicates_by_query_digest,
                 )
                 kind = _pair_event_kind(event, phase=phase)
                 if kind == "pair_decision":
@@ -802,6 +814,309 @@ class SentenceTransformerCosineScorer:
         return scores
 
 
+class PredicateRerankerScorer:
+    """Score pair predicates with a local cross-encoder style model."""
+
+    scorer_kind = "predicate-reranker"
+    score_normalization = "probability"
+
+    def __init__(
+        self,
+        *,
+        model: str,
+        revision: str,
+        device: str = "cpu",
+        batch_size: int = 8,
+        max_length: int = 512,
+    ) -> None:
+        if not model or not revision or not device:
+            raise ValueError("reranker model, revision, and device must be non-empty")
+        _validate_positive_integer(batch_size, name="reranker batch size")
+        _validate_positive_integer(max_length, name="reranker max length")
+        self.model = model
+        self.revision = revision
+        self.requested_device = device
+        self.device = device
+        self.batch_size = batch_size
+        self.max_length = max_length
+        self._symmetric_pair_count = 0
+        self._symmetric_delta_sum = 0.0
+        self._symmetric_delta_max = 0.0
+        self._symmetric_label_disagreement_count = 0
+
+    @property
+    def metadata(self) -> Mapping[str, Any]:
+        """Return reproducibility and bidirectional-score diagnostics."""
+
+        return {
+            "kind": self.scorer_kind,
+            "model": self.model,
+            "revision": self.revision,
+            "requested_device": self.requested_device,
+            "effective_device": self.device,
+            "device": self.device,
+            "batch_size": self.batch_size,
+            "max_length": self.max_length,
+            "precision": "float32",
+            "score_normalization": self.score_normalization,
+            "symmetric_aggregation": "mean",
+            "symmetric_pair_count": self._symmetric_pair_count,
+            "symmetric_direction_mean_absolute_delta": (
+                self._symmetric_delta_sum / self._symmetric_pair_count
+                if self._symmetric_pair_count
+                else None
+            ),
+            "symmetric_direction_max_absolute_delta": (
+                self._symmetric_delta_max
+                if self._symmetric_pair_count
+                else None
+            ),
+            "symmetric_direction_label_disagreement_at_0_5_count": (
+                self._symmetric_label_disagreement_count
+            ),
+        }
+
+    def score(self, group: PairGroup) -> Sequence[float]:
+        """Score directed pairs and average both directions for symmetric groups."""
+
+        if not group.predicate_complete or not group.predicate:
+            raise PairTraceError(
+                "predicate reranking requires a complete semantic predicate: "
+                f"{group.group_id} ({group.predicate_source})"
+            )
+        if group.direction == "right-to-left":
+            queries = [pair.right for pair in group.pairs]
+            documents = [pair.left for pair in group.pairs]
+        else:
+            queries = [pair.left for pair in group.pairs]
+            documents = [pair.right for pair in group.pairs]
+        predicates = [group.predicate] * len(group.pairs)
+        forward = list(self._score_directed(predicates, queries, documents))
+        _validate_model_scores(forward, expected=len(group.pairs))
+        if group.direction != "symmetric":
+            return forward
+
+        reverse = list(self._score_directed(predicates, documents, queries))
+        _validate_model_scores(reverse, expected=len(group.pairs))
+        scores: list[float] = []
+        for left_to_right, right_to_left in zip(forward, reverse, strict=True):
+            delta = abs(left_to_right - right_to_left)
+            self._symmetric_pair_count += 1
+            self._symmetric_delta_sum += delta
+            self._symmetric_delta_max = max(self._symmetric_delta_max, delta)
+            if (left_to_right >= 0.5) != (right_to_left >= 0.5):
+                self._symmetric_label_disagreement_count += 1
+            scores.append((left_to_right + right_to_left) / 2.0)
+        return scores
+
+    def _score_directed(
+        self,
+        predicates: Sequence[str],
+        queries: Sequence[str],
+        documents: Sequence[str],
+    ) -> Sequence[float]:
+        """Return one normalized score for each directed predicate input."""
+
+        raise NotImplementedError
+
+
+class BgeRerankerScorer(PredicateRerankerScorer):
+    """Adapt the multilingual BGE relevance reranker to pair predicates."""
+
+    scorer_kind = "bge-reranker-predicate-adaptation"
+    score_normalization = "sigmoid-logit"
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        try:
+            import torch
+            from transformers import AutoModelForSequenceClassification, AutoTokenizer
+        except ImportError as error:
+            raise ImportError(
+                "BGE reranker analysis requires torch and transformers"
+            ) from error
+        self._torch = torch
+        self._tokenizer = AutoTokenizer.from_pretrained(
+            self.model,
+            revision=self.revision,
+        )
+        self._model = AutoModelForSequenceClassification.from_pretrained(
+            self.model,
+            revision=self.revision,
+            dtype=torch.float32,
+        )
+        self._model.to(self.requested_device)
+        self._model.eval()
+        self.device = str(next(self._model.parameters()).device)
+
+    def _score_directed(
+        self,
+        predicates: Sequence[str],
+        queries: Sequence[str],
+        documents: Sequence[str],
+    ) -> Sequence[float]:
+        scores: list[float] = []
+        for start in range(0, len(queries), self.batch_size):
+            batch_predicates = predicates[start : start + self.batch_size]
+            batch_queries = queries[start : start + self.batch_size]
+            batch_documents = documents[start : start + self.batch_size]
+            formatted_queries = [
+                _format_bge_predicate_query(predicate, query)
+                for predicate, query in zip(
+                    batch_predicates,
+                    batch_queries,
+                    strict=True,
+                )
+            ]
+            inputs = self._tokenizer(
+                formatted_queries,
+                list(batch_documents),
+                padding=True,
+                truncation="longest_first",
+                max_length=self.max_length,
+                return_tensors="pt",
+            )
+            inputs = {
+                key: value.to(self.device)
+                for key, value in inputs.items()
+            }
+            with self._torch.inference_mode():
+                logits = self._model(**inputs).logits.squeeze(-1)
+                values = self._torch.sigmoid(logits).detach().float().cpu().tolist()
+            if isinstance(values, float):
+                values = [values]
+            scores.extend(float(value) for value in values)
+        return scores
+
+
+class Qwen3RerankerScorer(PredicateRerankerScorer):
+    """Apply Qwen3's official instruction-aware yes/no reranker format."""
+
+    scorer_kind = "qwen3-instruction-reranker"
+    score_normalization = "yes-no-softmax-probability"
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        try:
+            import torch
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+        except ImportError as error:
+            raise ImportError(
+                "Qwen3 reranker analysis requires torch and transformers"
+            ) from error
+        self._torch = torch
+        self._tokenizer = AutoTokenizer.from_pretrained(
+            self.model,
+            revision=self.revision,
+            padding_side="left",
+        )
+        self._model: Any = AutoModelForCausalLM.from_pretrained(
+            self.model,
+            revision=self.revision,
+            dtype=torch.float32,
+        )
+        self._model.to(self.requested_device)
+        self._model.eval()
+        self.device = str(next(self._model.parameters()).device)
+        self._prefix_tokens = self._tokenizer.encode(
+            "<|im_start|>system\nJudge whether the Document meets the requirements "
+            "based on the Query and the Instruct provided. Note that the answer can "
+            "only be \"yes\" or \"no\".<|im_end|>\n<|im_start|>user\n",
+            add_special_tokens=False,
+        )
+        self._suffix_tokens = self._tokenizer.encode(
+            "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+            add_special_tokens=False,
+        )
+        self._false_token_id = _single_token_id(self._tokenizer, "no")
+        self._true_token_id = _single_token_id(self._tokenizer, "yes")
+        if self.max_length <= len(self._prefix_tokens) + len(self._suffix_tokens):
+            raise ValueError("Qwen3 reranker max_length is too small for its template")
+
+    def _score_directed(
+        self,
+        predicates: Sequence[str],
+        queries: Sequence[str],
+        documents: Sequence[str],
+    ) -> Sequence[float]:
+        scores: list[float] = []
+        content_limit = self.max_length - len(self._prefix_tokens) - len(
+            self._suffix_tokens
+        )
+        for start in range(0, len(queries), self.batch_size):
+            texts = [
+                _format_qwen3_instruction(predicate, query, document)
+                for predicate, query, document in zip(
+                    predicates[start : start + self.batch_size],
+                    queries[start : start + self.batch_size],
+                    documents[start : start + self.batch_size],
+                    strict=True,
+                )
+            ]
+            encoded = self._tokenizer(
+                texts,
+                padding=False,
+                truncation="longest_first",
+                max_length=content_limit,
+                add_special_tokens=False,
+            )
+            rows = [
+                self._prefix_tokens + values + self._suffix_tokens
+                for values in encoded["input_ids"]
+            ]
+            inputs = self._tokenizer.pad(
+                {"input_ids": rows},
+                padding=True,
+                return_tensors="pt",
+            )
+            inputs = {
+                key: value.to(self.device)
+                for key, value in inputs.items()
+            }
+            with self._torch.inference_mode():
+                logits = self._model(**inputs).logits[:, -1, :]
+                binary_logits = self._torch.stack(
+                    [
+                        logits[:, self._false_token_id],
+                        logits[:, self._true_token_id],
+                    ],
+                    dim=1,
+                )
+                values = (
+                    self._torch.softmax(binary_logits, dim=1)[:, 1]
+                    .detach()
+                    .float()
+                    .cpu()
+                    .tolist()
+                )
+            scores.extend(float(value) for value in values)
+        return scores
+
+
+def _format_bge_predicate_query(predicate: str, query: str) -> str:
+    return f"Predicate: {predicate}\nQuery row:\n{query}"
+
+
+def _format_qwen3_instruction(predicate: str, query: str, document: str) -> str:
+    return f"<Instruct>: {predicate}\n<Query>: {query}\n<Document>: {document}"
+
+
+def _single_token_id(tokenizer: Any, value: str) -> int:
+    token_ids = tokenizer(value, add_special_tokens=False)["input_ids"]
+    if len(token_ids) != 1:
+        raise ValueError(f"Qwen3 reranker label must be one token: {value!r}")
+    return int(token_ids[0])
+
+
+def _validate_model_scores(scores: Sequence[float], *, expected: int) -> None:
+    if len(scores) != expected:
+        raise PairTraceError(
+            f"predicate scorer returned {len(scores)} scores for {expected} pairs"
+        )
+    if not all(math.isfinite(float(score)) and 0.0 <= score <= 1.0 for score in scores):
+        raise PairTraceError("predicate scorer must return finite probabilities")
+
+
 @dataclass
 class _StrategyCounts:
     selected_pair_count: int = 0
@@ -1035,6 +1350,394 @@ def _connected_components(
     return frozenset(frozenset(component) for component in components.values())
 
 
+@dataclass(frozen=True)
+class _ScoredGroup:
+    """Compact numeric evidence retained only during calibration mode."""
+
+    split: str
+    operator: str
+    scores: array[float]
+    labels: bytes
+    left_nodes: array[int] | None
+    right_nodes: array[int] | None
+    node_count: int
+
+
+class ProxyCalibrationAccumulator:
+    """Calibrate thresholds without retaining pair text or embeddings."""
+
+    def __init__(self, *, split_seed: str, min_positive_pairs: int) -> None:
+        if not split_seed:
+            raise ValueError("split_seed cannot be empty")
+        _validate_positive_integer(
+            min_positive_pairs,
+            name="minimum split positive pairs",
+        )
+        self.split_seed = split_seed
+        self.min_positive_pairs = min_positive_pairs
+        self.groups: list[_ScoredGroup] = []
+        self.session_assignments: dict[str, str] = {}
+
+    def add_group(self, group: PairGroup, scores: Sequence[float]) -> None:
+        """Store only numeric labels, scores, and optional grouping edges."""
+
+        _validate_model_scores(scores, expected=len(group.pairs))
+        session_key = _session_key(group)
+        split = self.session_assignments.setdefault(
+            session_key,
+            _session_split(session_key, seed=self.split_seed),
+        )
+        left_nodes: array[int] | None = None
+        right_nodes: array[int] | None = None
+        node_count = 0
+        if group.operator == "sem_groupby":
+            node_ids: dict[str, int] = {}
+
+            def node_id(value: str) -> int:
+                return node_ids.setdefault(value, len(node_ids))
+
+            left_nodes = array("I", (node_id(pair.left_id) for pair in group.pairs))
+            right_nodes = array("I", (node_id(pair.right_id) for pair in group.pairs))
+            node_count = len(node_ids)
+        self.groups.append(
+            _ScoredGroup(
+                split=split,
+                operator=group.operator,
+                scores=array("d", (float(score) for score in scores)),
+                labels=bytes(int(pair.baseline_match) for pair in group.pairs),
+                left_nodes=left_nodes,
+                right_nodes=right_nodes,
+                node_count=node_count,
+            )
+        )
+
+    def report(self) -> dict[str, Any]:
+        """Select thresholds on calibration and evaluate all fixed splits."""
+
+        split_groups = {
+            split: [group for group in self.groups if group.split == split]
+            for split in ("calibration", "validation", "test")
+        }
+        split_baselines = {
+            split: _calibration_baseline(groups)
+            for split, groups in split_groups.items()
+        }
+        insufficient = [
+            split
+            for split, baseline in split_baselines.items()
+            if baseline["positive_pair_count"] < self.min_positive_pairs
+        ]
+        assignment_digest = _stable_digest(
+            {
+                key: value
+                for key, value in sorted(self.session_assignments.items())
+            }
+        )
+        base_report: dict[str, Any] = {
+            "split_contract": {
+                "unit": "case_id+session_id",
+                "assignment": "sha256-mod-100",
+                "boundaries": {
+                    "calibration": [0, 60],
+                    "validation": [60, 80],
+                    "test": [80, 100],
+                },
+                "seed": self.split_seed,
+                "minimum_positive_pairs_per_split": self.min_positive_pairs,
+                "session_count": len(self.session_assignments),
+                "assignment_digest": assignment_digest,
+            },
+            "baseline_by_split": split_baselines,
+        }
+        if insufficient:
+            return {
+                **base_report,
+                "status": "inconclusive",
+                "reason": "insufficient positive pairs in: " + ", ".join(insufficient),
+                "selected_profiles": [],
+            }
+
+        selected = _select_calibration_thresholds(split_groups["calibration"])
+        profiles: list[dict[str, Any]] = []
+        for name, mode, objective, threshold in selected:
+            if threshold is None:
+                profiles.append(
+                    {
+                        "name": name,
+                        "mode": mode,
+                        "objective": objective,
+                        "status": "unavailable",
+                        "threshold": None,
+                    }
+                )
+                continue
+            profiles.append(
+                {
+                    "name": name,
+                    "mode": mode,
+                    "objective": objective,
+                    "status": "selected",
+                    "threshold": threshold,
+                    "metrics": _calibration_profile_metrics(
+                        self.groups,
+                        threshold=threshold,
+                    ),
+                }
+            )
+        return {
+            **base_report,
+            "status": "complete",
+            "selected_profiles": profiles,
+        }
+
+
+def _session_key(group: PairGroup) -> str:
+    session_id = group.session_id
+    if not session_id and ":" in group.event_id:
+        session_id = group.event_id.split(":", 1)[0]
+    if not session_id:
+        raise PairTraceError(
+            "proxy calibration requires a complete session identity: "
+            f"{group.group_id}"
+        )
+    return json.dumps(
+        [group.case_id, session_id],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def _session_split(session_key: str, *, seed: str) -> str:
+    value = int.from_bytes(
+        hashlib.sha256(f"{seed}\x00{session_key}".encode("utf-8")).digest()[:8],
+        "big",
+    ) % 100
+    if value < 60:
+        return "calibration"
+    if value < 80:
+        return "validation"
+    return "test"
+
+
+def _calibration_baseline(groups: Sequence[_ScoredGroup]) -> dict[str, int]:
+    return {
+        "group_count": len(groups),
+        "pair_count": sum(len(group.labels) for group in groups),
+        "positive_pair_count": sum(sum(group.labels) for group in groups),
+    }
+
+
+def _select_calibration_thresholds(
+    groups: Sequence[_ScoredGroup],
+) -> tuple[tuple[str, str, str, float | None], ...]:
+    import numpy as np
+
+    score_parts = [np.frombuffer(group.scores, dtype=np.float64) for group in groups]
+    label_parts = [np.frombuffer(group.labels, dtype=np.uint8) for group in groups]
+    scores = np.concatenate(score_parts)
+    labels = np.concatenate(label_parts)
+    positive_scores = scores[labels == 1]
+    search_filter_threshold = (
+        float(positive_scores.min()) if positive_scores.size else None
+    )
+
+    order = np.argsort(-scores, kind="stable")
+    sorted_scores = scores[order]
+    sorted_labels = labels[order]
+    boundaries = np.flatnonzero(
+        np.r_[sorted_scores[1:] != sorted_scores[:-1], True]
+    )
+    selected = boundaries + 1
+    true_positives = np.cumsum(sorted_labels, dtype=np.int64)[boundaries]
+    total_positives = int(labels.sum())
+    precision = true_positives / selected
+    recall = true_positives / total_positives
+    f1 = np.divide(
+        2 * precision * recall,
+        precision + recall,
+        out=np.zeros_like(precision, dtype=np.float64),
+        where=(precision + recall) > 0,
+    )
+    thresholds = sorted_scores[boundaries]
+    best_f1_index = int(
+        np.lexsort((thresholds, recall, precision, f1))[-1]
+    )
+    precision_candidates = np.flatnonzero(precision >= 0.95)
+    precision_threshold: float | None = None
+    if precision_candidates.size:
+        local_index = int(
+            np.lexsort(
+                (
+                    thresholds[precision_candidates],
+                    precision[precision_candidates],
+                    recall[precision_candidates],
+                )
+            )[-1]
+        )
+        precision_threshold = float(thresholds[precision_candidates[local_index]])
+    return (
+        (
+            "search-filter-calibration-recall-1",
+            "search-filter",
+            "highest calibration threshold retaining every Oracle positive",
+            search_filter_threshold,
+        ),
+        (
+            "proxy-only-calibration-f1",
+            "proxy-only",
+            "maximum calibration F1",
+            float(thresholds[best_f1_index]),
+        ),
+        (
+            "proxy-only-calibration-precision-0.95",
+            "proxy-only",
+            "maximum calibration recall subject to precision >= 0.95",
+            precision_threshold,
+        ),
+    )
+
+
+def _calibration_profile_metrics(
+    groups: Sequence[_ScoredGroup], *, threshold: float
+) -> dict[str, Any]:
+    return {
+        "overall": _calibration_metrics(groups, threshold=threshold),
+        "by_split": {
+            split: _calibration_metrics(
+                [group for group in groups if group.split == split],
+                threshold=threshold,
+            )
+            for split in ("calibration", "validation", "test")
+        },
+        "by_operator": {
+            operator: _calibration_metrics(
+                [group for group in groups if group.operator == operator],
+                threshold=threshold,
+            )
+            for operator in sorted({group.operator for group in groups})
+        },
+    }
+
+
+def _calibration_metrics(
+    groups: Sequence[_ScoredGroup], *, threshold: float
+) -> dict[str, Any]:
+    true_positive = false_positive = false_negative = true_negative = 0
+    component_comparisons = component_matches = 0
+    for group in groups:
+        selected = [score >= threshold for score in group.scores]
+        for chosen, label in zip(selected, group.labels, strict=True):
+            if chosen and label:
+                true_positive += 1
+            elif chosen:
+                false_positive += 1
+            elif label:
+                false_negative += 1
+            else:
+                true_negative += 1
+        if group.operator == "sem_groupby":
+            component_comparisons += 1
+            if _numeric_components(group, selected) == _numeric_components(
+                group,
+                [bool(label) for label in group.labels],
+            ):
+                component_matches += 1
+    selected_count = true_positive + false_positive
+    positive_count = true_positive + false_negative
+    precision = true_positive / selected_count if selected_count else None
+    recall = true_positive / positive_count if positive_count else None
+    f1 = (
+        2 * precision * recall / (precision + recall)
+        if precision is not None and recall is not None and precision + recall > 0
+        else 0.0
+        if precision == 0.0 or recall == 0.0
+        else None
+    )
+    pair_count = selected_count + false_negative + true_negative
+    return {
+        "pair_count": pair_count,
+        "selected_pair_count": selected_count,
+        "pair_reduction": 1.0 - selected_count / pair_count if pair_count else 0.0,
+        "true_positive_pair_count": true_positive,
+        "false_positive_pair_count": false_positive,
+        "false_negative_pair_count": false_negative,
+        "true_negative_pair_count": true_negative,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "connected_component_comparison_count": component_comparisons,
+        "connected_component_match_count": component_matches,
+        "connected_component_mismatch_count": (
+            component_comparisons - component_matches
+        ),
+    }
+
+
+def _numeric_components(
+    group: _ScoredGroup, selected: Sequence[bool]
+) -> frozenset[frozenset[int]]:
+    if group.left_nodes is None or group.right_nodes is None:
+        return frozenset()
+    parent = list(range(group.node_count))
+
+    def find(node: int) -> int:
+        while parent[node] != node:
+            parent[node] = parent[parent[node]]
+            node = parent[node]
+        return node
+
+    for keep, left, right in zip(
+        selected,
+        group.left_nodes,
+        group.right_nodes,
+        strict=True,
+    ):
+        if not keep:
+            continue
+        left_root = find(left)
+        right_root = find(right)
+        if left_root != right_root:
+            parent[right_root] = left_root
+    components: dict[int, set[int]] = defaultdict(set)
+    for node in range(group.node_count):
+        components[find(node)].add(node)
+    return frozenset(frozenset(component) for component in components.values())
+
+
+def analyze_proxy_calibration(
+    sources: Sequence[PairSource],
+    *,
+    scorer: PairScorer,
+    phase: str = "insertion",
+    split_seed: str = "semantic-pair-proxy-v1",
+    min_positive_pairs: int = 5,
+) -> dict[str, Any]:
+    """Score immutable Oracle evidence and calibrate held-out thresholds."""
+
+    accumulator = ProxyCalibrationAccumulator(
+        split_seed=split_seed,
+        min_positive_pairs=min_positive_pairs,
+    )
+    accepted_group_ids: set[str] = set()
+    for source in sources:
+        for group in source.iter_groups(phase=phase):
+            if group.group_id in accepted_group_ids:
+                continue
+            accepted_group_ids.add(group.group_id)
+            source.stats.accepted_group_count += 1
+            accumulator.add_group(group, scorer.score(group))
+    return {
+        "schema_version": 4,
+        "analysis": "semantic-pair-proxy-calibration",
+        "read_only_inputs": True,
+        "source_order": "newest-to-oldest",
+        "phase": phase,
+        "sources": [vars(source.stats) for source in sources],
+        "scorer": dict(scorer.metadata),
+        "calibration": accumulator.report(),
+    }
+
+
 def analyze_sources(
     sources: Sequence[PairSource],
     *,
@@ -1129,6 +1832,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--embedding-revision")
     parser.add_argument("--embedding-device", default="cpu")
     parser.add_argument("--embedding-batch-size", type=int, default=32)
+    parser.add_argument(
+        "--scorer-kind",
+        choices=("bge-reranker", "qwen3-reranker"),
+    )
+    parser.add_argument("--scorer-model")
+    parser.add_argument("--scorer-revision")
+    parser.add_argument("--scorer-device", default="cpu")
+    parser.add_argument("--scorer-batch-size", type=int, default=8)
+    parser.add_argument("--scorer-max-length", type=int, default=512)
+    parser.add_argument("--calibrate", action="store_true")
+    parser.add_argument("--split-seed", default="semantic-pair-proxy-v1")
+    parser.add_argument("--min-split-positives", type=int, default=5)
     parser.add_argument("--read-workers", type=int, default=1)
     parser.add_argument("--max-counterexamples", type=int, default=20)
     parser.add_argument("--output", type=Path)
@@ -1144,17 +1859,46 @@ def main(argv: Sequence[str] | None = None) -> int:
         _validate_positive_integer(
             args.embedding_batch_size, name="embedding batch size"
         )
+        _validate_positive_integer(args.scorer_batch_size, name="scorer batch size")
+        _validate_positive_integer(args.scorer_max_length, name="scorer max length")
+        _validate_positive_integer(
+            args.min_split_positives,
+            name="minimum split positive pairs",
+        )
     except ValueError as error:
         raise SystemExit(str(error)) from error
     sources = [
         parse_source(value, read_workers=args.read_workers) for value in args.source
     ]
     strategies = build_strategies(top_ks=args.top_k, thresholds=args.threshold)
+    if args.calibrate and strategies:
+        raise SystemExit("--calibrate cannot be combined with --top-k or --threshold")
+    if args.scorer_kind and (args.embedding_model or args.embedding_revision):
+        raise SystemExit(
+            "reranker configuration cannot be combined with embedding scorer options"
+        )
     scorer: PairScorer | None = None
-    if strategies:
+    if args.scorer_kind:
+        if not args.scorer_model or not args.scorer_revision:
+            raise SystemExit(
+                "reranker scoring requires --scorer-model and --scorer-revision"
+            )
+        scorer_class = (
+            BgeRerankerScorer
+            if args.scorer_kind == "bge-reranker"
+            else Qwen3RerankerScorer
+        )
+        scorer = scorer_class(
+            model=args.scorer_model,
+            revision=args.scorer_revision,
+            device=args.scorer_device,
+            batch_size=args.scorer_batch_size,
+            max_length=args.scorer_max_length,
+        )
+    elif strategies or args.calibrate:
         if not args.embedding_model or not args.embedding_revision:
             raise SystemExit(
-                "candidate strategies require --embedding-model and --embedding-revision"
+                "cosine scoring requires --embedding-model and --embedding-revision"
             )
         scorer = SentenceTransformerCosineScorer(
             model=args.embedding_model,
@@ -1163,15 +1907,29 @@ def main(argv: Sequence[str] | None = None) -> int:
             batch_size=args.embedding_batch_size,
         )
     elif args.embedding_model or args.embedding_revision:
-        raise SystemExit("embedding configuration requires --top-k or --threshold")
+        raise SystemExit(
+            "embedding configuration requires --top-k, --threshold, or --calibrate"
+        )
+    if scorer is not None and not strategies and not args.calibrate:
+        raise SystemExit("pair scorer requires --top-k, --threshold, or --calibrate")
 
-    report = analyze_sources(
-        sources,
-        phase=args.phase,
-        strategies=strategies,
-        scorer=scorer,
-        max_examples=args.max_counterexamples,
-    )
+    if args.calibrate:
+        assert scorer is not None
+        report = analyze_proxy_calibration(
+            sources,
+            phase=args.phase,
+            scorer=scorer,
+            split_seed=args.split_seed,
+            min_positive_pairs=args.min_split_positives,
+        )
+    else:
+        report = analyze_sources(
+            sources,
+            phase=args.phase,
+            strategies=strategies,
+            scorer=scorer,
+            max_examples=args.max_counterexamples,
+        )
     rendered = json.dumps(report, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
     if args.output is None:
         print(rendered, end="")
@@ -1203,6 +1961,7 @@ def _pair_decision_group(
     source: str,
     read_bytes: Callable[[str], bytes],
     executor: ThreadPoolExecutor | None,
+    predicates_by_query_digest: Mapping[str, str] | None = None,
 ) -> PairGroup:
     first = events[0]
     operator = str(first.get("operator") or "")
@@ -1256,7 +2015,13 @@ def _pair_decision_group(
                 )
             )
         return _finalize_group(
-            first, source=source, direction=direction, drafts=drafts
+            first,
+            source=source,
+            direction=direction,
+            drafts=drafts,
+            predicate_override=(predicates_by_query_digest or {}).get(
+                str(first.get("query_digest") or "")
+            ),
         )
 
     if executor is None:
@@ -1329,6 +2094,7 @@ def _finalize_group(
     source: str,
     direction: str,
     drafts: Sequence[tuple[str, str, str, str, bool]],
+    predicate_override: str | None = None,
 ) -> PairGroup:
     occurrences: Counter[str] = Counter()
     pair_tokens: list[str] = []
@@ -1362,6 +2128,10 @@ def _finalize_group(
         )
         for left_id, right_id, left, right, matched, token in normalized
     )
+    predicate, predicate_source, predicate_complete = _group_predicate(
+        event,
+        override=predicate_override,
+    )
     return PairGroup(
         group_id=group_id,
         operator=str(event.get("operator") or ""),
@@ -1372,12 +2142,17 @@ def _finalize_group(
         event_id=str(event.get("event_id") or ""),
         query_digest=str(event.get("query_digest") or ""),
         pairs=pairs,
+        predicate=predicate,
+        predicate_source=predicate_source,
+        predicate_complete=predicate_complete,
     )
 
 
 def _group_evidence_digest(group: PairGroup) -> str:
     return _stable_digest(
         {
+            "predicate": group.predicate,
+            "predicate_complete": group.predicate_complete,
             "pairs": [
                 {
                     "pair_id": pair.pair_id,
@@ -1387,6 +2162,84 @@ def _group_evidence_digest(group: PairGroup) -> str:
             ]
         }
     )
+
+
+def _collect_prompt_predicate(
+    event: Mapping[str, Any],
+    *,
+    phase: str,
+    read_bytes: Callable[[str], bytes],
+    predicates_by_query_digest: dict[str, str],
+) -> None:
+    """Recover full legacy predicates from their immutable LOTUS prompt."""
+
+    if (
+        str(event.get("phase") or "") != phase
+        or event.get("event_type") != "llm_call"
+        or event.get("operator") not in {"sem_groupby", "sem_join"}
+    ):
+        return
+    prompt_path = event.get("prompt_path")
+    query_digest = str(event.get("query_digest") or "")
+    if not isinstance(prompt_path, str) or not prompt_path or not query_digest:
+        return
+    predicate = _predicate_from_prompt(
+        read_bytes(prompt_path),
+        source=prompt_path,
+        operator=str(event.get("operator")),
+    )
+    prior = predicates_by_query_digest.setdefault(query_digest, predicate)
+    if prior != predicate:
+        raise PairTraceError(
+            f"query digest maps to conflicting semantic predicates: {query_digest}"
+        )
+
+
+def _predicate_from_prompt(raw: bytes, *, source: str, operator: str) -> str:
+    """Extract the predicate suffix from one LOTUS pair-oracle prompt."""
+
+    try:
+        value = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise PairTraceError(f"invalid semantic pair prompt: {source}") from error
+    if not isinstance(value, list):
+        raise PairTraceError(f"semantic pair prompt must be a message list: {source}")
+    user_contents = [
+        message.get("content")
+        for message in value
+        if isinstance(message, dict) and message.get("role") == "user"
+    ]
+    if not user_contents or not isinstance(user_contents[-1], str):
+        raise PairTraceError(f"semantic pair prompt has no user content: {source}")
+    marker = {
+        "sem_join": "satisfy this semantic join condition:",
+        "sem_groupby": "satisfy this semantic grouping condition:",
+    }.get(operator)
+    if marker is None:
+        raise PairTraceError(f"unsupported semantic pair prompt operator: {operator}")
+    _prefix, separator, predicate = user_contents[-1].partition(marker)
+    if not separator or not predicate.strip():
+        raise PairTraceError(
+            f"semantic pair prompt does not expose its predicate: {source}"
+        )
+    return predicate.strip()
+
+
+def _group_predicate(
+    event: Mapping[str, Any], *, override: str | None = None
+) -> tuple[str, str, bool]:
+    """Return a full predicate when trace evidence supports one."""
+
+    for field_name in ("source_instruction", "instruction", "lowered_instruction"):
+        value = event.get(field_name)
+        if isinstance(value, str) and value:
+            return value, f"trace:{field_name}", True
+    if override:
+        return override, "trace:prompt", True
+    preview = event.get("instruction_preview")
+    if isinstance(preview, str) and preview:
+        return preview, "trace:instruction_preview", False
+    return "", "missing", False
 
 
 def _group_base(event: Mapping[str, Any], *, direction: str) -> dict[str, str]:
