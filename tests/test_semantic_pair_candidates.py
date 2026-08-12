@@ -12,6 +12,7 @@ from typing import Any, cast
 import pytest
 
 from tools.analysis.semantic_pair_candidates import (
+    PredicateRerankerScorer,
     CandidateStrategy,
     DirectorySource,
     PairGroup,
@@ -20,7 +21,11 @@ from tools.analysis.semantic_pair_candidates import (
     SentenceTransformerCosineScorer,
     SourceStats,
     TarSource,
+    _format_bge_predicate_query,
+    _format_qwen3_instruction,
+    _session_split,
     _write_single_report,
+    analyze_proxy_calibration,
     analyze_sources,
     build_strategies,
 )
@@ -36,6 +41,28 @@ class FakeScorer:
 
     def score(self, group: PairGroup) -> Sequence[float]:
         return [self.scores[pair.pair_id] for pair in group.pairs]
+
+
+class RecordingPredicateScorer(PredicateRerankerScorer):
+    def __init__(self, scores: Sequence[Sequence[float]]) -> None:
+        super().__init__(
+            model="model",
+            revision="revision",
+            device="cpu",
+            batch_size=2,
+            max_length=128,
+        )
+        self.scores = iter(scores)
+        self.calls: list[tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]] = []
+
+    def _score_directed(
+        self,
+        predicates: Sequence[str],
+        queries: Sequence[str],
+        documents: Sequence[str],
+    ) -> Sequence[float]:
+        self.calls.append((tuple(predicates), tuple(queries), tuple(documents)))
+        return next(self.scores)
 
 
 class StaticSource:
@@ -1287,3 +1314,179 @@ def test_parallelism_arguments_must_be_positive(
             revision="revision",
             batch_size=value,
         )
+
+
+def test_legacy_prompt_recovers_complete_semantic_predicate(tmp_path: Path) -> None:
+    run = tmp_path / "run"
+    prompt_path = "trace/prompts/join.json"
+    predicate = "Rows describe the same durable memory topic."
+    prompt = [
+        {"role": "system", "content": "Judge the claim."},
+        {
+            "role": "user",
+            "content": (
+                "Context:\n[Left]: A\n[Right]: B\n\nClaim: {left} and {right} "
+                f"satisfy this semantic join condition: {predicate}"
+            ),
+        },
+    ]
+    prompt_target = run / prompt_path
+    prompt_target.parent.mkdir(parents=True)
+    prompt_target.write_text(json.dumps(prompt), encoding="utf-8")
+    parsed_path = "trace/outputs/pair.json"
+    parsed_target = run / parsed_path
+    parsed_target.parent.mkdir(parents=True)
+    parsed_target.write_text("true\n", encoding="utf-8")
+    pair_event = _sem_join_event(
+        call_id="join-call",
+        trace_id="pair",
+        left_id=1,
+        right_id=2,
+        left="A",
+        right="B",
+        parsed_path=parsed_path,
+    )
+    pair_event.pop("source_instruction")
+    pair_event["instruction_preview"] = "truncated..."
+    llm_event = {
+        "trace_id": "llm",
+        "phase": "add",
+        "operator": "sem_join",
+        "event_type": "llm_call",
+        "operator_call_id": "join-call",
+        "query_digest": "query-1",
+        "prompt_path": prompt_path,
+    }
+    _write_jsonl(run / "trace/events.jsonl", [llm_event, pair_event])
+
+    groups = list(DirectorySource(run).iter_groups(phase="add"))
+
+    assert len(groups) == 1
+    assert groups[0].predicate == predicate
+    assert groups[0].predicate_source == "trace:prompt"
+    assert groups[0].predicate_complete is True
+
+
+def test_predicate_reranker_preserves_direction_and_averages_symmetric() -> None:
+    directed = PairGroup(
+        group_id="directed",
+        operator="sem_filter",
+        direction="right-to-left",
+        source="static",
+        case_id="case",
+        session_id="session",
+        event_id="D1:1",
+        query_digest="query",
+        pairs=(PairRecord("pair", "old", "new", "OLD", "NEW", True),),
+        predicate="same fact",
+        predicate_source="trace:instruction",
+        predicate_complete=True,
+    )
+    directed_scorer = RecordingPredicateScorer([[0.8]])
+    assert directed_scorer.score(directed) == [0.8]
+    assert directed_scorer.calls == [
+        (("same fact",), ("NEW",), ("OLD",))
+    ]
+
+    symmetric = PairGroup(
+        **{
+            **vars(directed),
+            "group_id": "symmetric",
+            "operator": "sem_groupby",
+            "direction": "symmetric",
+        }
+    )
+    symmetric_scorer = RecordingPredicateScorer([[0.9], [0.3]])
+    assert symmetric_scorer.score(symmetric) == pytest.approx([0.6])
+    assert symmetric_scorer.calls[0][1:] == (("OLD",), ("NEW",))
+    assert symmetric_scorer.calls[1][1:] == (("NEW",), ("OLD",))
+    assert symmetric_scorer.metadata["symmetric_pair_count"] == 1
+    assert symmetric_scorer.metadata[
+        "symmetric_direction_label_disagreement_at_0_5_count"
+    ] == 1
+
+
+def test_official_reranker_input_formats_keep_predicate_and_roles() -> None:
+    assert _format_bge_predicate_query("same fact", "new row") == (
+        "Predicate: same fact\nQuery row:\nnew row"
+    )
+    assert _format_qwen3_instruction("same fact", "new row", "old row") == (
+        "<Instruct>: same fact\n<Query>: new row\n<Document>: old row"
+    )
+
+
+def test_proxy_calibration_selects_only_from_calibration_sessions() -> None:
+    split_sessions: dict[str, str] = {}
+    for index in range(10000):
+        session_id = f"session-{index}"
+        session_key = json.dumps(
+            ["case", session_id],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        split_sessions.setdefault(
+            _session_split(session_key, seed="seed"),
+            session_id,
+        )
+        if len(split_sessions) == 3:
+            break
+    score_rows = {
+        "calibration": (0.8, 0.7),
+        "validation": (0.75, 0.2),
+        "test": (0.9, 0.85),
+    }
+    groups: list[PairGroup] = []
+    scores: dict[str, float] = {}
+    for split, session_id in split_sessions.items():
+        positive_id = f"{split}-positive"
+        negative_id = f"{split}-negative"
+        positive_score, negative_score = score_rows[split]
+        scores[positive_id] = positive_score
+        scores[negative_id] = negative_score
+        groups.append(
+            PairGroup(
+                group_id=split,
+                operator="sem_groupby",
+                direction="symmetric",
+                source="static",
+                case_id="case",
+                session_id=session_id,
+                event_id=f"{session_id}:1",
+                query_digest="query",
+                pairs=(
+                    PairRecord(positive_id, "A", "B", "A", "B", True),
+                    PairRecord(negative_id, "A", "C", "A", "C", False),
+                ),
+            )
+        )
+
+    report = analyze_proxy_calibration(
+        [StaticSource(groups)],
+        scorer=FakeScorer(scores),
+        split_seed="seed",
+        min_positive_pairs=1,
+    )
+
+    calibration = report["calibration"]
+    assert calibration["status"] == "complete"
+    assert calibration["split_contract"]["session_count"] == 3
+    profiles = {row["name"]: row for row in calibration["selected_profiles"]}
+    search_filter = profiles["search-filter-calibration-recall-1"]
+    assert search_filter["threshold"] == 0.8
+    assert search_filter["metrics"]["by_split"]["calibration"]["recall"] == 1.0
+    assert search_filter["metrics"]["by_split"]["validation"]["recall"] == 0.0
+    assert search_filter["metrics"]["by_split"]["test"]["precision"] == 0.5
+    assert search_filter["metrics"]["by_split"]["test"][
+        "connected_component_mismatch_count"
+    ] == 1
+
+
+def test_proxy_calibration_is_inconclusive_without_split_positives() -> None:
+    report = analyze_proxy_calibration(
+        [StaticSource([_manual_group("symmetric")])],
+        scorer=FakeScorer({"ab": 0.9, "ac": 0.2, "bc": 0.1}),
+        min_positive_pairs=1,
+    )
+
+    assert report["calibration"]["status"] == "inconclusive"
+    assert report["calibration"]["selected_profiles"] == []
