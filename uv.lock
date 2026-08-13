@@ -1,5 +1,5 @@
 version = 1
-revision = 2
+revision = 3
 requires-python = ">=3.12"
 resolution-markers = [
     "python_full_version >= '3.14'",
@@ -28,6 +28,10 @@ mem0 = [
     { name = "qdrant-client" },
     { name = "sentence-transformers" },
 ]
+simplemem = [
+    { name = "neo4j" },
+    { name = "sentence-transformers" },
+]
 zep = [
     { name = "neo4j" },
     { name = "sentence-transformers" },
@@ -49,6 +53,7 @@ requires-dist = [
     { name = "dspy", specifier = ">=3.2.0" },
     { name = "editdistance", marker = "extra == 'benchmarks'", specifier = ">=0.8.1" },
     { name = "lotus-ai", specifier = "==1.1.4" },
+    { name = "neo4j", marker = "extra == 'simplemem'", specifier = "==6.1.0" },
     { name = "neo4j", marker = "extra == 'zep'", specifier = "==6.1.0" },
     { name = "nltk", specifier = ">=3.9.1" },
     { name = "pandas", specifier = ">=2.3.3" },
@@ -56,10 +61,11 @@ requires-dist = [
     { name = "python-dotenv", specifier = ">=1.2.2" },
     { name = "qdrant-client", marker = "extra == 'mem0'", specifier = "==1.12.1" },
     { name = "sentence-transformers", marker = "extra == 'mem0'", specifier = "==3.4.1" },
+    { name = "sentence-transformers", marker = "extra == 'simplemem'", specifier = "==3.4.1" },
     { name = "sentence-transformers", marker = "extra == 'zep'", specifier = "==3.4.1" },
     { name = "tiktoken", marker = "extra == 'benchmarks'", specifier = ">=0.8.0" },
 ]
-provides-extras = ["benchmarks", "zep", "mem0"]
+provides-extras = ["benchmarks", "zep", "mem0", "simplemem"]
 
 [package.metadata.requires-dev]
 dev = [
