@@ -341,3 +341,33 @@ def test_simplemem_query_requires_a_search_capable_storage_backend() -> None:
 
     with pytest.raises(NotImplementedError, match="requires a storage backend"):
         memory.query("Which memories are useful for collaboration?")
+
+
+def test_simplemem_checkpoint_restore_reproduces_public_state() -> None:
+    memory = SimpleMemMemory(adapter=_FakeSimpleMemAdapter())
+
+    for index in range(WINDOW_SIZE + WINDOW_SLIDE):
+        memory.add(_dialogue(index))
+
+    snapshot = memory._runtime.snapshot_state()
+    assert snapshot["schema_version"] == 2
+
+    recovered = SimpleMemMemory(adapter=_FakeSimpleMemAdapter())
+    recovered._runtime.restore_state(snapshot)
+
+    original_log = memory._runtime._state["log"]
+    recovered_log = recovered._runtime._state["log"]
+    assert recovered_log.reset_index(drop=True).equals(
+        original_log.reset_index(drop=True)
+    )
+
+    original_facts = memory._runtime._state["facts"]
+    recovered_facts = recovered._runtime._state["facts"]
+    assert recovered_facts.reset_index(drop=True).equals(
+        original_facts.reset_index(drop=True)
+    )
+    assert recovered_facts["lossless_restatement"].tolist() == [
+        "Fact extracted from dialogue-0.",
+        "Fact extracted from dialogue-38.",
+    ]
+    assert len(recovered._runtime._state["log"]) == WINDOW_SIZE + WINDOW_SLIDE
