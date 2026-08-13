@@ -151,6 +151,12 @@ def print_frame(label: str, frame: Any) -> None:
                 print(f"       {col}: {val!r}")
 
 
+def _frames_match(left: Any, right: Any) -> bool:
+    left_frame = left if isinstance(left, pd.DataFrame) else pd.DataFrame(left or [])
+    right_frame = right if isinstance(right, pd.DataFrame) else pd.DataFrame(right or [])
+    return left_frame.reset_index(drop=True).equals(right_frame.reset_index(drop=True))
+
+
 def usage_snapshot() -> dict[str, float | int]:
     import lotus
     retry_stats = structured_retry_stats()
@@ -362,11 +368,6 @@ def main() -> None:
         "differential/query_result": write_csv("query_result", query_frame, differential_dir),
     }
 
-    steps_frame = pd.DataFrame(step_metrics)
-    phases_frame = pd.DataFrame(phase_metrics)
-    written["metrics/steps"] = write_csv("steps", steps_frame, metrics_dir)
-    written["metrics/phases"] = write_csv("phases", phases_frame, metrics_dir)
-
     checkpoint_dir = output_dir / "checkpoint"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     snapshot = memory._runtime.snapshot_state()
@@ -379,6 +380,65 @@ def main() -> None:
     )
     written["checkpoint/state"] = checkpoint_dir / "state.pkl"
     written["checkpoint/metadata"] = checkpoint_dir / "metadata.json"
+
+    recovery_dir = output_dir / "recovery"
+    recovery_dir.mkdir(parents=True, exist_ok=True)
+
+    snapshot = pickle.loads((checkpoint_dir / "state.pkl").read_bytes())
+    recovered = memory_cls(adapter=adapter, storage=storage)
+    _restore_result, restore_metric = run_measured(
+        run_kind="differential",
+        phase="checkpoint_restore",
+        action=lambda: recovered._runtime.restore_state(snapshot),
+    )
+    phase_metrics.append(restore_metric)
+
+    recovered_log = recovered._runtime._state.get("log", pd.DataFrame())
+    recovered_facts = recovered._runtime._state.get("facts", pd.DataFrame())
+    log_ok = _frames_match(log_state, recovered_log)
+    facts_ok = _frames_match(facts, recovered_facts)
+
+    recovered_result, recovery_query_metric = run_measured(
+        run_kind="differential",
+        phase="recovery_query",
+        action=lambda: recovered.query(args.query),
+    )
+    if isinstance(recovered_result, RetrievalResult):
+        recovered_query_frame = recovered_result.channels["facts"]
+    else:
+        recovered_query_frame = recovered_result
+    query_ok = _frames_match(query_frame, recovered_query_frame)
+    recovery_query_metric.update({
+        "recovered_state_matches": log_ok and facts_ok,
+        "recovered_query_matches": query_ok,
+        "recovered_query_result_rows": len(recovered_query_frame),
+    })
+    phase_metrics.append(recovery_query_metric)
+
+    print_frame("recovered log", recovered_log)
+    print_frame("recovered facts", recovered_facts)
+    print_frame("recovered query result", recovered_query_frame)
+    print(
+        "recovery: state matches="
+        f"{log_ok and facts_ok}, query matches={query_ok}"
+    )
+
+    if not (log_ok and facts_ok and query_ok):
+        raise SystemExit(
+            "Checkpoint restore did not reproduce the original runtime state; "
+            "see recovery/ artifacts."
+        )
+
+    written["recovery/log"] = write_csv("log", recovered_log, recovery_dir)
+    written["recovery/facts"] = write_csv("facts", recovered_facts, recovery_dir)
+    written["recovery/query_result"] = write_csv(
+        "query_result", recovered_query_frame, recovery_dir
+    )
+
+    steps_frame = pd.DataFrame(step_metrics)
+    phases_frame = pd.DataFrame(phase_metrics)
+    written["metrics/steps"] = write_csv("steps", steps_frame, metrics_dir)
+    written["metrics/phases"] = write_csv("phases", phases_frame, metrics_dir)
 
     if trace_dir is not None:
         append_trace_metrics(trace_dir, [*step_metrics, *phase_metrics])
