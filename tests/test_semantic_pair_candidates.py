@@ -25,6 +25,7 @@ from tools.analysis.semantic_pair_candidates import (
     _format_bge_predicate_query,
     _format_qwen3_instruction,
     _qwen3_last_token_logits,
+    _select_candidates,
     _session_split,
     _write_single_report,
     analyze_proxy_calibration,
@@ -675,6 +676,41 @@ def test_left_to_right_top_k_is_per_left_query() -> None:
     assert metric["selected_pair_count"] == 2
     assert metric["positive_pair_recall"] == 0.5
     assert metric["groups_losing_positive_count"] == 1
+
+
+def test_top_k_ties_use_original_index_before_bucket_grouping() -> None:
+    pairs = tuple(
+        PairRecord(
+            f"pair-{index}",
+            "left",
+            "right",
+            "same left",
+            "same right",
+            index == 1,
+        )
+        for index in range(129)
+    )
+    group = PairGroup(
+        group_id="stable-ties",
+        operator="sem_filter",
+        direction="right-to-left",
+        source="static",
+        case_id="case-1",
+        session_id="session-1",
+        event_id="event-1",
+        query_digest="query-1",
+        pairs=pairs,
+    )
+    scores = [0.1] * len(pairs)
+    scores[1] = scores[128] = 0.9
+
+    selected = _select_candidates(
+        group,
+        scores,
+        CandidateStrategy(top_k=1, threshold=0.5),
+    )
+
+    assert selected == {1}
 
 
 def test_tar_and_directory_sem_filter_reports_match(tmp_path: Path) -> None:
@@ -1501,6 +1537,50 @@ def test_qwen3_scorer_computes_only_unchanged_last_token_logits() -> None:
 
     assert model.kwargs == {"input_ids": input_ids, "logits_to_keep": 1}
     assert np.array_equal(actual, full_logits[:, -1, :])
+
+
+@pytest.mark.parametrize("score", [-0.1, 1.1])
+def test_predicate_reranker_rejects_scores_outside_probability_range(
+    score: float,
+) -> None:
+    scorer = RecordingPredicateScorer([[score]])
+    group = PairGroup(
+        group_id="reranker-probability",
+        operator="sem_filter",
+        direction="right-to-left",
+        source="static",
+        case_id="case-1",
+        session_id="session-1",
+        event_id="event-1",
+        query_digest="query-1",
+        pairs=(PairRecord("pair", "left", "right", "L", "R", False),),
+        predicate="same fact",
+        predicate_complete=True,
+    )
+
+    with pytest.raises(PairTraceError, match="probabilities in \\[0, 1\\]"):
+        scorer.score(group)
+
+
+def test_proxy_calibration_accepts_finite_negative_cosine_scores() -> None:
+    report = analyze_proxy_calibration(
+        [StaticSource([_manual_group("symmetric")])],
+        scorer=FakeScorer({"ab": -0.2, "ac": -0.4, "bc": -0.6}),
+        min_positive_pairs=1,
+    )
+
+    baseline = report["calibration"]["baseline_by_split"]
+    assert sum(row["pair_count"] for row in baseline.values()) == 3
+
+
+@pytest.mark.parametrize("score", [float("nan"), float("inf"), float("-inf")])
+def test_proxy_calibration_rejects_non_finite_scores(score: float) -> None:
+    with pytest.raises(PairTraceError, match="finite scores"):
+        analyze_proxy_calibration(
+            [StaticSource([_manual_group("symmetric")])],
+            scorer=FakeScorer({"ab": score, "ac": 0.2, "bc": 0.1}),
+            min_positive_pairs=1,
+        )
 
 
 def test_proxy_calibration_selects_only_from_calibration_sessions() -> None:
