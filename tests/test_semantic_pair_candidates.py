@@ -445,6 +445,17 @@ def test_compact_sem_filter_pair_decisions_do_not_require_snapshots(
                 "right": "memory: The user likes Paris",
                 "decision": False,
             },
+            {
+                **base,
+                "trace_id": "filter-result",
+                "event_type": "operator_result",
+                "semantic_trace_snapshot_mode": "compact",
+                "lowered_instruction": (
+                    "Existing {memory_earlier}; New {memory_later}"
+                ),
+                "input_rows": 2,
+                "output_rows": 1,
+            },
         ],
     )
 
