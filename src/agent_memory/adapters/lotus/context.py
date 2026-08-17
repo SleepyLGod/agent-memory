@@ -44,6 +44,7 @@ class LotusExecutionConfig:
     structured_max_tokens: int = DEFAULT_STRUCTURED_MAX_TOKENS
     structured_parse_retries: int = DEFAULT_STRUCTURED_PARSE_RETRIES
     semantic_trace_dir: Path | str | None = None
+    semantic_trace_snapshot_mode: str = "compact"
     semantic_pair_profiles: Mapping[str, SemanticPairExecutionProfile] = field(
         default_factory=dict
     )
@@ -96,6 +97,10 @@ class LotusExecutionConfig:
             raise ValueError("sem_groupby_pair_batch_size must be positive")
         if self.sem_groupby_pair_batch_retries < 0:
             raise ValueError("sem_groupby_pair_batch_retries cannot be negative")
+        if self.semantic_trace_snapshot_mode not in {"compact", "full"}:
+            raise ValueError(
+                "semantic_trace_snapshot_mode must be 'compact' or 'full'"
+            )
         for query_digest, profile in self.semantic_pair_profiles.items():
             if not isinstance(query_digest, str) or not query_digest:
                 raise ValueError("semantic pair profile keys must be query digests")

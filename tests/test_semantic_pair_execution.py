@@ -477,6 +477,18 @@ def test_sem_filter_search_filter_sends_only_candidates_to_oracle(tmp_path) -> N
     assert candidate["embedding_device"] == "cpu"
     assert "vectors" not in candidate
     assert "pairs" not in candidate
+    decisions = [
+        event for event in events if event["event_type"] == "pair_decision"
+    ]
+    assert len(decisions) == 1
+    assert decisions[0]["operator"] == "sem_filter"
+    assert decisions[0]["direction"] == "right-to-left"
+    assert decisions[0]["decision_source"] == "oracle"
+    assert decisions[0]["decision"] is True
+    assert decisions[0]["left"] == "memory: old alpha"
+    assert decisions[0]["right"] == "memory: new alpha"
+    assert "parsed_output_path" not in decisions[0]
+    assert "pairs_snapshot_path" not in decisions[0]
 
 
 def test_sem_filter_without_matching_profile_keeps_oracle_path() -> None:

@@ -406,6 +406,56 @@ def test_sem_filter_preserves_direction_and_multiplicity(tmp_path: Path) -> None
     assert {pair.right_id for pair in groups[0].pairs} == {groups[0].pairs[0].right_id}
 
 
+def test_compact_sem_filter_pair_decisions_do_not_require_snapshots(
+    tmp_path: Path,
+) -> None:
+    run = tmp_path / "run"
+    base = {
+        "run_kind": "mem0-locomo",
+        "phase": "insertion",
+        "case_id": "case-1",
+        "session_id": "session-1",
+        "event_id": "event-2",
+        "query_digest": "query-2",
+        "operator": "sem_filter",
+        "operator_call_id": "filter-call",
+        "event_type": "pair_decision",
+        "instruction": "Existing {memory:earlier}; New {memory:later}",
+        "direction": "right-to-left",
+        "decision_source": "oracle",
+    }
+    _write_jsonl(
+        run / "trace/events.jsonl",
+        [
+            {
+                **base,
+                "trace_id": "pair-1",
+                "left_id": "old-1",
+                "right_id": "new-1",
+                "left": "memory: User likes Paris",
+                "right": "memory: The user likes Paris",
+                "decision": True,
+            },
+            {
+                **base,
+                "trace_id": "pair-2",
+                "left_id": "old-2",
+                "right_id": "new-1",
+                "left": "memory: User has a dog",
+                "right": "memory: The user likes Paris",
+                "decision": False,
+            },
+        ],
+    )
+
+    groups = list(DirectorySource(run).iter_groups(phase="insertion"))
+
+    assert len(groups) == 1
+    assert groups[0].operator == "sem_filter"
+    assert groups[0].direction == "right-to-left"
+    assert [pair.baseline_match for pair in groups[0].pairs] == [True, False]
+
+
 @pytest.mark.parametrize("read_workers", [1, 4, 8])
 def test_directory_read_workers_preserve_pair_order_and_labels(
     tmp_path: Path, read_workers: int

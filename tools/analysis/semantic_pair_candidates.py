@@ -1948,8 +1948,12 @@ def _pair_event_kind(event: Mapping[str, Any], *, phase: str) -> str | None:
     if str(event.get("phase") or "") != phase:
         return None
     if (
-        event.get("operator") in {"sem_groupby", "sem_join"}
+        event.get("operator") in {"sem_groupby", "sem_join", "sem_filter"}
         and event.get("event_type") == "pair_decision"
+        and (
+            event.get("operator") != "sem_filter"
+            or event.get("decision_source") == "oracle"
+        )
     ):
         return "pair_decision"
     if (
@@ -1974,28 +1978,35 @@ def _pair_decision_group(
     direction = {
         "sem_groupby": "symmetric",
         "sem_join": "left-to-right",
+        "sem_filter": "right-to-left",
     }.get(operator)
     if direction is None:
         raise PairTraceError(f"unsupported pair-decision operator: {operator}")
     base = _group_base(first, direction=direction)
     drafts: list[tuple[str, str, str, str, bool]] = []
     labels_by_pair: dict[tuple[str, str, str, str], bool] = {}
-    def read_output(event: Mapping[str, Any]) -> tuple[str, bytes]:
+    def read_output(event: Mapping[str, Any]) -> tuple[str, bytes | bool]:
+        decision = event.get("decision")
+        if isinstance(decision, bool):
+            return "inline decision", decision
         parsed_path = _required_string(event, "parsed_output_path")
         return parsed_path, read_bytes(parsed_path)
 
-    def build_group(outputs: Iterator[tuple[str, bytes]]) -> PairGroup:
+    def build_group(outputs: Iterator[tuple[str, bytes | bool]]) -> PairGroup:
         for event, (parsed_path, raw_output) in zip(events, outputs, strict=True):
             if _group_base(event, direction=direction) != base:
                 raise PairTraceError(
                     "one physical pair-decision call contains mixed logical groups"
                 )
-            try:
-                parsed = json.loads(raw_output)
-            except (UnicodeDecodeError, json.JSONDecodeError) as error:
-                raise PairTraceError(
-                    f"invalid semantic pair parsed output: {parsed_path}"
-                ) from error
+            if isinstance(raw_output, bool):
+                parsed = raw_output
+            else:
+                try:
+                    parsed = json.loads(raw_output)
+                except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                    raise PairTraceError(
+                        f"invalid semantic pair parsed output: {parsed_path}"
+                    ) from error
             if not isinstance(parsed, bool):
                 raise PairTraceError(
                     f"semantic pair parsed output must be boolean: {parsed_path}"

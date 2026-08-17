@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections import Counter
+from collections.abc import Callable, Mapping, Sequence
+import json
 import re
 from typing import Any
 
@@ -14,8 +16,12 @@ from agent_memory.adapters.lotus.pair_execution import (
     select_semantic_pair_candidates,
     write_semantic_pair_execution_trace,
 )
-from agent_memory.tracing.semantic import write_compact_operator_trace
-from agent_memory.tracing.semantic import query_digest
+from agent_memory.tracing.semantic import (
+    query_digest,
+    semantic_trace_scope,
+    write_compact_operator_trace,
+    write_pair_trace,
+)
 from agent_memory.adapters.lotus.structured import examples_dataframe, normalize_strategy
 from agent_memory.policy.logical import QueryExpr
 
@@ -80,27 +86,151 @@ def execute_sem_filter(
         )
     if restore_columns:
         result = result.rename(columns=restore_columns)
-    write_compact_operator_trace(
-        context.config.trace_dir(),
-        operator="sem_filter",
-        event_type="operator_result",
-        input_frame=source,
-        output_frame=result,
-        payload={
-            "instruction": str(query.params["instruction"]),
-            "lowered_instruction": instruction,
-            "semantic_pair_profile": (
-                "oracle-only" if profile is None else profile.mode
-            ),
-            "semantic_pair_profile_fingerprint": (
-                None if profile is None else profile.fingerprint
-            ),
-            "candidate_pair_count": (
-                None if selection is None else selection.candidate_pair_count
-            ),
-        },
-    )
+    with semantic_trace_scope(
+        semantic_trace_snapshot_mode=context.config.semantic_trace_snapshot_mode,
+    ):
+        write_pairwise_sem_filter_trace(
+            context.config.trace_dir(),
+            source=oracle_source,
+            result=result,
+            instruction=str(query.params["instruction"]),
+            profile=profile,
+        )
+        write_compact_operator_trace(
+            context.config.trace_dir(),
+            operator="sem_filter",
+            event_type="operator_result",
+            input_frame=source,
+            output_frame=result,
+            payload={
+                "instruction": str(query.params["instruction"]),
+                "lowered_instruction": instruction,
+                "semantic_pair_profile": (
+                    "oracle-only" if profile is None else profile.mode
+                ),
+                "semantic_pair_profile_fingerprint": (
+                    None if profile is None else profile.fingerprint
+                ),
+                "candidate_pair_count": (
+                    None if selection is None else selection.candidate_pair_count
+                ),
+            },
+        )
     return result
+
+
+def write_pairwise_sem_filter_trace(
+    trace_dir: object,
+    *,
+    source: pd.DataFrame,
+    result: pd.DataFrame,
+    instruction: str,
+    profile: Any,
+) -> None:
+    """Record pair-shaped filter decisions without full relation snapshots."""
+
+    columns = _pairwise_filter_columns(source, instruction, profile)
+    if columns is None or source.empty:
+        return
+    left_id_columns, right_id_columns, left_text_columns, right_text_columns, direction = (
+        columns
+    )
+    result_counts = Counter(_row_signature(row) for _, row in result.iterrows())
+    decision_source = (
+        "proxy" if profile is not None and profile.mode == "proxy-only" else "oracle"
+    )
+    rows: list[dict[str, Any]] = []
+    for _, row in source.iterrows():
+        signature = _row_signature(row)
+        matched = result_counts[signature] > 0
+        if matched:
+            result_counts[signature] -= 1
+        rows.append(
+            {
+                "instruction": instruction,
+                "direction": direction,
+                "decision_source": decision_source,
+                "left_id": _endpoint_id(row, left_id_columns),
+                "right_id": _endpoint_id(row, right_id_columns),
+                "left": _endpoint_text(row, left_text_columns),
+                "right": _endpoint_text(row, right_text_columns),
+                "parsed_output": matched,
+            }
+        )
+    if any(result_counts.values()):
+        raise ValueError("sem_filter output contains rows absent from its oracle input")
+    write_pair_trace(trace_dir, operator="sem_filter", rows=rows)
+
+
+def _pairwise_filter_columns(
+    source: pd.DataFrame,
+    instruction: str,
+    profile: Any,
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...], tuple[str, ...], str] | None:
+    if profile is not None:
+        return (
+            tuple(profile.left_id_columns),
+            tuple(profile.right_id_columns),
+            tuple(profile.left_text_columns),
+            tuple(profile.right_text_columns),
+            str(profile.direction),
+        )
+    placeholders = QUALIFIED_PLACEHOLDER_PATTERN.findall(instruction)
+    bases = sorted(
+        base
+        for base in {base for base, _qualifier in placeholders}
+        if {qualifier for candidate, qualifier in placeholders if candidate == base}
+        == {"earlier", "later"}
+    )
+    if not bases:
+        return None
+    left_text = tuple(f"{base}:earlier" for base in bases)
+    right_text = tuple(f"{base}:later" for base in bases)
+    if not set((*left_text, *right_text)).issubset(source.columns):
+        return None
+    left_ids = tuple(
+        column
+        for column in source.columns
+        if str(column).endswith(":earlier")
+        and str(column).split(":", 1)[0] in {"_row_id", "_memory_ordinal"}
+    )
+    right_ids = tuple(
+        column
+        for column in source.columns
+        if str(column).endswith(":later")
+        and str(column).split(":", 1)[0] in {"_row_id", "_memory_ordinal"}
+    )
+    return (
+        left_ids or left_text,
+        right_ids or right_text,
+        left_text,
+        right_text,
+        "right-to-left",
+    )
+
+
+def _endpoint_id(row: pd.Series, columns: Sequence[str]) -> str:
+    return json.dumps(
+        [row[column] for column in columns],
+        ensure_ascii=False,
+        default=str,
+        separators=(",", ":"),
+    )
+
+
+def _endpoint_text(row: pd.Series, columns: Sequence[str]) -> str:
+    return "\n".join(
+        f"{column.split(':', 1)[0]}: {row[column]}" for column in columns
+    )
+
+
+def _row_signature(row: pd.Series) -> str:
+    return json.dumps(
+        [(str(column), row[column]) for column in row.index],
+        ensure_ascii=False,
+        default=str,
+        separators=(",", ":"),
+    )
 
 
 def bind_qualified_filter_columns(
