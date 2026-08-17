@@ -5,12 +5,14 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import csv
 import hashlib
 import json
 from pathlib import Path
 from threading import Lock
+from time import perf_counter
 from typing import Any, Iterator
 from uuid import uuid4
 
@@ -38,7 +40,34 @@ _TRACE_SCOPE: ContextVar[dict[str, Any]] = ContextVar(
     "agent_memory_semantic_trace_scope",
     default={},
 )
+_TRACE_IO_MEASUREMENT: ContextVar[SemanticTraceIOMeasurement | None]
 _TRACE_WRITE_LOCK = Lock()
+
+
+@dataclass
+class SemanticTraceIOMeasurement:
+    """Accumulate synchronous semantic trace serialization and write costs."""
+
+    latency_ms: float = 0.0
+    bytes_written: int = 0
+
+
+_TRACE_IO_MEASUREMENT = ContextVar(
+    "agent_memory_semantic_trace_io_measurement",
+    default=None,
+)
+
+
+@contextmanager
+def measure_semantic_trace_io() -> Iterator[SemanticTraceIOMeasurement]:
+    """Measure trace serialization and writes performed in the current context."""
+
+    measurement = SemanticTraceIOMeasurement()
+    token = _TRACE_IO_MEASUREMENT.set(measurement)
+    try:
+        yield measurement
+    finally:
+        _TRACE_IO_MEASUREMENT.reset(token)
 
 
 @contextmanager
@@ -109,13 +138,14 @@ def write_trace_event(
             "parsed.json",
             parsed_output,
         )
-    for name, snapshot in (snapshots or {}).items():
-        event[f"{name}_snapshot_path"] = _write_snapshot(
-            root / TRACE_SNAPSHOTS_DIR,
-            trace_id,
-            name,
-            snapshot,
-        )
+    if trace_scope_value("semantic_trace_snapshot_mode", "full") == "full":
+        for name, snapshot in (snapshots or {}).items():
+            event[f"{name}_snapshot_path"] = _write_snapshot(
+                root / TRACE_SNAPSHOTS_DIR,
+                trace_id,
+                name,
+                snapshot,
+            )
 
     _append_event(root, event)
     return event
@@ -259,15 +289,19 @@ def write_pair_trace(
         return []
 
     events: list[dict[str, Any]] = []
+    compact = trace_scope_value("semantic_trace_snapshot_mode", "full") == "compact"
     for index, row in enumerate(rows):
+        payload = {**dict(row), "pair_index": index}
+        if compact and isinstance(row.get("parsed_output"), bool):
+            payload["decision"] = row["parsed_output"]
         event = write_trace_event(
             trace_dir,
             operator=operator,
             event_type="pair_decision",
-            payload={**dict(row), "pair_index": index},
-            raw_output=row.get("raw_output"),
-            parsed_output=row.get("parsed_output"),
-            snapshots=snapshots if index == 0 else None,
+            payload=payload,
+            raw_output=None if compact else row.get("raw_output"),
+            parsed_output=None if compact else row.get("parsed_output"),
+            snapshots=None if compact or index != 0 else snapshots,
         )
         if event is not None:
             events.append(event)
@@ -379,11 +413,13 @@ def query_digest(query: Any) -> str:
 def _append_event(root: Path, event: Mapping[str, Any]) -> None:
     """Append one JSONL trace event without interleaving concurrent writers."""
 
+    started = perf_counter()
     events_path = root / TRACE_EVENTS_FILE
+    line = json.dumps(event, ensure_ascii=False, default=str) + "\n"
     with _TRACE_WRITE_LOCK:
         with events_path.open("a", encoding="utf-8") as file:
-            file.write(json.dumps(event, ensure_ascii=False, default=str))
-            file.write("\n")
+            file.write(line)
+    _record_trace_io(started, len(line.encode("utf-8")))
 
 
 def _event_root(trace_dir: Path | str) -> Path:
@@ -547,22 +583,37 @@ def _frame_shape_payload(frame: Any, *, prefix: str) -> dict[str, Any]:
 def _write_json_artifact(directory: Path, trace_id: str, name: str, value: Any) -> str:
     """Write a JSON artifact and return a relative trace path."""
 
+    started = perf_counter()
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"{trace_id}-{name}"
-    path.write_text(json.dumps(value, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+    text = json.dumps(value, ensure_ascii=False, indent=2, default=str)
+    path.write_text(text, encoding="utf-8")
+    _record_trace_io(started, len(text.encode("utf-8")))
     return _relative_trace_path(path)
 
 
 def _write_snapshot(directory: Path, trace_id: str, name: str, value: Any) -> str:
     """Write a snapshot artifact and return a relative trace path."""
 
+    started = perf_counter()
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"{trace_id}-{name}.csv"
     if hasattr(value, "to_csv"):
         value.to_csv(path, index=False)
     else:
         path.write_text(_to_text(value), encoding="utf-8")
+    _record_trace_io(started, path.stat().st_size)
     return _relative_trace_path(path)
+
+
+def _record_trace_io(started: float, bytes_written: int) -> None:
+    """Record one trace write in the active measurement, if any."""
+
+    measurement = _TRACE_IO_MEASUREMENT.get()
+    if measurement is None:
+        return
+    measurement.latency_ms += (perf_counter() - started) * 1000
+    measurement.bytes_written += bytes_written
 
 
 def _to_text(value: Any) -> str:

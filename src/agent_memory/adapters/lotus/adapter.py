@@ -158,18 +158,21 @@ class LotusAdapter:
     ) -> Any:
         """Execute a deterministic relational op and emit compact trace metadata."""
 
-        result = executor(query, inputs, self.execute)
-        write_compact_operator_trace(
-            self.config.trace_dir(),
-            operator=query.op,
-            event_type="operator_result",
-            output_frame=result,
-            payload={
-                "query_digest": query_digest(query),
-                "params": dict(query.params),
-                "input_count": len(query.inputs),
-            },
-        )
+        with semantic_trace_scope(
+            semantic_trace_snapshot_mode=self.config.semantic_trace_snapshot_mode,
+        ):
+            result = executor(query, inputs, self.execute)
+            write_compact_operator_trace(
+                self.config.trace_dir(),
+                operator=query.op,
+                event_type="operator_result",
+                output_frame=result,
+                payload={
+                    "query_digest": query_digest(query),
+                    "params": dict(query.params),
+                    "input_count": len(query.inputs),
+                },
+            )
         return result
 
     def _execute_traced_semantic(
@@ -186,5 +189,6 @@ class LotusAdapter:
             semantic_operator=query.op,
             operator_call_id=operator_call_id,
             query_digest=digest,
+            semantic_trace_snapshot_mode=self.config.semantic_trace_snapshot_mode,
         ):
             return executor(query, inputs, self.execute, self._context)
