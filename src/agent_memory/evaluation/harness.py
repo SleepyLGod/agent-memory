@@ -24,7 +24,10 @@ from agent_memory.evaluation.types import (
     BenchmarkQuestion,
     RetrievalRequest,
 )
-from agent_memory.tracing.semantic import semantic_trace_scope
+from agent_memory.tracing.semantic import (
+    measure_semantic_trace_io,
+    semantic_trace_scope,
+)
 
 
 def _digest(value: Mapping[str, Any]) -> str:
@@ -640,17 +643,27 @@ class BenchmarkRunner:
                 started = perf_counter()
                 operation_phase = "insertion"
                 insertion_recorded = False
+                trace_io_latency_ms = 0.0
+                trace_bytes_written = 0
+                trace_io = None
                 try:
-                    with semantic_trace_scope(
-                        phase="insertion",
-                        case_id=case.case_id,
-                        event_id=event.event_id,
-                        session_id=event.session_id,
-                        attempt=attempt,
-                        execution_attempt=attempt,
-                        unit_attempt=unit_attempt,
-                    ):
-                        metrics = driver.add(event)
+                    with measure_semantic_trace_io() as trace_io:
+                        with semantic_trace_scope(
+                            phase="insertion",
+                            case_id=case.case_id,
+                            event_id=event.event_id,
+                            session_id=event.session_id,
+                            attempt=attempt,
+                            execution_attempt=attempt,
+                            unit_attempt=unit_attempt,
+                        ):
+                            metrics = driver.add(event)
+                    trace_io_latency_ms = round(trace_io.latency_ms, 3)
+                    trace_bytes_written = trace_io.bytes_written
+                    insertion_latency_ms = round(
+                        (perf_counter() - started) * 1000,
+                        3,
+                    )
                     self.artifacts.trace_stage(
                         phase="insertion",
                         case_id=case.case_id,
@@ -660,8 +673,14 @@ class BenchmarkRunner:
                             "attempt": attempt,
                             "execution_attempt": attempt,
                             "unit_attempt": unit_attempt,
-                            "latency_ms": round(
-                                (perf_counter() - started) * 1000,
+                            "latency_ms": insertion_latency_ms,
+                            "semantic_trace_io_latency_ms": trace_io_latency_ms,
+                            "semantic_trace_bytes_written": trace_bytes_written,
+                            "insertion_latency_excluding_trace_io_ms": round(
+                                max(
+                                    0.0,
+                                    insertion_latency_ms - trace_io_latency_ms,
+                                ),
                                 3,
                             ),
                             **dict(metrics),
@@ -767,8 +786,15 @@ class BenchmarkRunner:
                 except ArtifactContractError:
                     raise
                 except Exception as error:
+                    if trace_io is not None:
+                        trace_io_latency_ms = round(trace_io.latency_ms, 3)
+                        trace_bytes_written = trace_io.bytes_written
                     retryable = is_retryable_unit_error(error)
                     if not insertion_recorded:
+                        insertion_latency_ms = round(
+                            (perf_counter() - started) * 1000,
+                            3,
+                        )
                         self.artifacts.trace_stage(
                             phase="insertion",
                             case_id=case.case_id,
@@ -779,9 +805,20 @@ class BenchmarkRunner:
                                 "execution_attempt": attempt,
                                 "unit_attempt": unit_attempt,
                                 "status": "error",
-                                "latency_ms": round(
-                                    (perf_counter() - started) * 1000,
+                                "latency_ms": insertion_latency_ms,
+                                "insertion_latency_excluding_trace_io_ms": round(
+                                    max(
+                                        0.0,
+                                        insertion_latency_ms
+                                        - trace_io_latency_ms,
+                                    ),
                                     3,
+                                ),
+                                "semantic_trace_io_latency_ms": (
+                                    trace_io_latency_ms
+                                ),
+                                "semantic_trace_bytes_written": (
+                                    trace_bytes_written
                                 ),
                                 "error_type": type(error).__name__,
                                 "error": str(error),

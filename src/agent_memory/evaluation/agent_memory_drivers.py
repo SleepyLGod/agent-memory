@@ -538,6 +538,7 @@ class ClaudeMemoryDriverFactory:
         sem_groupby_pair_batch_size: int | None = None,
         sem_groupby_pair_batch_retries: int = 0,
         semantic_pair_profiles: dict[str, SemanticPairExecutionProfile] | None = None,
+        semantic_trace_snapshot_mode: str = "compact",
         thinking_enabled: bool = True,
     ) -> None:
         from agent_memory.adapters.lotus.context import SEM_TOPK_METHODS
@@ -558,6 +559,7 @@ class ClaudeMemoryDriverFactory:
         self.sem_groupby_pair_batch_retries = sem_groupby_pair_batch_retries
         self.semantic_pair_profiles = dict(semantic_pair_profiles or {})
         _semantic_pair_embedding_contract(self.semantic_pair_profiles)
+        self.semantic_trace_snapshot_mode = semantic_trace_snapshot_mode
         self.thinking_enabled = thinking_enabled
 
     def __call__(
@@ -607,6 +609,7 @@ class ClaudeMemoryDriverFactory:
                 sem_groupby_pair_batch_size=self.sem_groupby_pair_batch_size,
                 sem_groupby_pair_batch_retries=self.sem_groupby_pair_batch_retries,
                 semantic_pair_profiles=self.semantic_pair_profiles,
+                semantic_trace_snapshot_mode=self.semantic_trace_snapshot_mode,
             ),
             pair_embedding_provider=pair_embedding_provider,
         )
@@ -632,6 +635,7 @@ class ZepMemoryDriverFactory:
         sem_groupby_pair_batch_retries: int = 0,
         semantic_pair_profiles: dict[str, SemanticPairExecutionProfile] | None = None,
         embedding_device: str = "cpu",
+        semantic_trace_snapshot_mode: str = "compact",
         thinking_enabled: bool = True,
         neo4j_image: str,
         neo4j_image_digest: str,
@@ -669,6 +673,7 @@ class ZepMemoryDriverFactory:
                 "Zep connector and configured embedding devices do not match"
             )
         self.embedding_device = embedding_device
+        self.semantic_trace_snapshot_mode = semantic_trace_snapshot_mode
         self.thinking_enabled = thinking_enabled
         self.neo4j_image = neo4j_image
         self.neo4j_image_digest = neo4j_image_digest
@@ -685,6 +690,7 @@ class ZepMemoryDriverFactory:
         sem_groupby_pair_batch_retries: int = 0,
         semantic_pair_profiles: dict[str, SemanticPairExecutionProfile] | None = None,
         embedding_device: str = "cpu",
+        semantic_trace_snapshot_mode: str = "compact",
         thinking_enabled: bool = True,
     ) -> ZepMemoryDriverFactory:
         """Create the pinned Graphiti-compatible deployment connector."""
@@ -730,6 +736,7 @@ class ZepMemoryDriverFactory:
             sem_groupby_pair_batch_retries=sem_groupby_pair_batch_retries,
             semantic_pair_profiles=semantic_pair_profiles,
             embedding_device=embedding_device,
+            semantic_trace_snapshot_mode=semantic_trace_snapshot_mode,
             thinking_enabled=thinking_enabled,
             neo4j_image=neo4j_image,
             neo4j_image_digest=neo4j_image_digest,
@@ -795,6 +802,7 @@ class ZepMemoryDriverFactory:
                 sem_groupby_pair_batch_size=self.sem_groupby_pair_batch_size,
                 sem_groupby_pair_batch_retries=self.sem_groupby_pair_batch_retries,
                 semantic_pair_profiles=self.semantic_pair_profiles,
+                semantic_trace_snapshot_mode=self.semantic_trace_snapshot_mode,
             ),
             pair_embedding_provider=(
                 traced_embedding_provider if self.semantic_pair_profiles else None
@@ -841,6 +849,7 @@ class Mem0MemoryDriverFactory:
         sem_groupby_pair_batch_retries: int = 0,
         semantic_pair_profiles: dict[str, SemanticPairExecutionProfile] | None = None,
         embedding_device: str = "cpu",
+        semantic_trace_snapshot_mode: str = "compact",
         thinking_enabled: bool = False,
     ) -> None:
         if not base_namespace:
@@ -853,6 +862,7 @@ class Mem0MemoryDriverFactory:
         if embedding_device not in {"cpu", "cuda"}:
             raise ValueError("Mem0 embedding_device must be 'cpu' or 'cuda'")
         self.embedding_device = embedding_device
+        self.semantic_trace_snapshot_mode = semantic_trace_snapshot_mode
         self.thinking_enabled = thinking_enabled
         self.sem_topk_method = "pairwise-naive"
 
@@ -942,6 +952,7 @@ class Mem0MemoryDriverFactory:
                     sem_groupby_pair_batch_size=self.sem_groupby_pair_batch_size,
                     sem_groupby_pair_batch_retries=self.sem_groupby_pair_batch_retries,
                     semantic_pair_profiles=self.semantic_pair_profiles,
+                    semantic_trace_snapshot_mode=self.semantic_trace_snapshot_mode,
                 ),
                 pair_embedding_provider=embedding_provider,
             )
@@ -982,6 +993,7 @@ class Mem0MemoryEnhancedDriverFactory(Mem0MemoryDriverFactory):
         sem_groupby_pair_batch_retries: int = 0,
         semantic_pair_profiles: dict[str, SemanticPairExecutionProfile] | None = None,
         embedding_device: str = "cpu",
+        semantic_trace_snapshot_mode: str = "compact",
         thinking_enabled: bool = False,
     ) -> None:
         from agent_memory.adapters.lotus.context import SEM_TOPK_METHODS
@@ -997,6 +1009,7 @@ class Mem0MemoryEnhancedDriverFactory(Mem0MemoryDriverFactory):
             sem_groupby_pair_batch_retries=sem_groupby_pair_batch_retries,
             semantic_pair_profiles=semantic_pair_profiles,
             embedding_device=embedding_device,
+            semantic_trace_snapshot_mode=semantic_trace_snapshot_mode,
             thinking_enabled=thinking_enabled,
         )
         self.sem_topk_method = sem_topk_method

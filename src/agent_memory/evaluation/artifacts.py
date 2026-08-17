@@ -1304,6 +1304,15 @@ class BenchmarkArtifactStore:
                     "successful_path": final_path,
                     "replayed": occurrence > 1,
                     "wall_latency_ms": event.get("latency_ms", ""),
+                    "semantic_trace_io_latency_ms": event.get(
+                        "semantic_trace_io_latency_ms", ""
+                    ),
+                    "semantic_trace_bytes_written": event.get(
+                        "semantic_trace_bytes_written", ""
+                    ),
+                    "insertion_latency_excluding_trace_io_ms": event.get(
+                        "insertion_latency_excluding_trace_io_ms", ""
+                    ),
                     "status": event.get("status", "success"),
                     "error_type": event.get("error_type", ""),
                     "error": event.get("error", ""),
@@ -1423,6 +1432,55 @@ class BenchmarkArtifactStore:
                             for row in recovery_rows
                         ),
                         3,
+                    ),
+                    "semantic_trace_io_latency_ms": (
+                        round(
+                            sum(
+                                float(row["semantic_trace_io_latency_ms"])
+                                for row in rows
+                            ),
+                            3,
+                        )
+                        if rows
+                        and all(
+                            row.get("semantic_trace_io_latency_ms")
+                            not in {"", None}
+                            for row in rows
+                        )
+                        else None
+                    ),
+                    "semantic_trace_bytes_written": (
+                        sum(
+                            int(row["semantic_trace_bytes_written"])
+                            for row in rows
+                        )
+                        if rows
+                        and all(
+                            row.get("semantic_trace_bytes_written")
+                            not in {"", None}
+                            for row in rows
+                        )
+                        else None
+                    ),
+                    "insertion_latency_excluding_trace_io_ms": (
+                        round(
+                            sum(
+                                float(
+                                    row[
+                                        "insertion_latency_excluding_trace_io_ms"
+                                    ]
+                                )
+                                for row in rows
+                            ),
+                            3,
+                        )
+                        if rows
+                        and all(
+                            row.get("insertion_latency_excluding_trace_io_ms")
+                            not in {"", None}
+                            for row in rows
+                        )
+                        else None
                     ),
                     "consolidation_wall_latency_ms": consolidation.get(
                         "latency_ms", 0
@@ -1598,6 +1656,26 @@ class BenchmarkArtifactStore:
             for row in per_event_rows
             if row.get("wall_latency_ms") not in {"", None}
         ]
+        trace_io_metrics_available = bool(per_event_rows) and all(
+            row.get("semantic_trace_io_latency_ms") not in {"", None}
+            and row.get("semantic_trace_bytes_written") not in {"", None}
+            and row.get("insertion_latency_excluding_trace_io_ms")
+            not in {"", None}
+            for row in per_event_rows
+        )
+        semantic_trace_io_latencies = (
+            [float(row["semantic_trace_io_latency_ms"]) for row in per_event_rows]
+            if trace_io_metrics_available
+            else []
+        )
+        insertion_latencies_excluding_trace_io = (
+            [
+                float(row["insertion_latency_excluding_trace_io_ms"])
+                for row in per_event_rows
+            ]
+            if trace_io_metrics_available
+            else []
+        )
         retrieval_latencies = [
             float(row["retrieval_latency_ms"])
             for row in question_rows
@@ -1742,6 +1820,55 @@ class BenchmarkArtifactStore:
                         sum(float(row.get("wall_latency_ms") or 0) for row in case_events),
                         3,
                     ),
+                    "semantic_trace_io_latency_ms": (
+                        round(
+                            sum(
+                                float(row["semantic_trace_io_latency_ms"])
+                                for row in case_events
+                            ),
+                            3,
+                        )
+                        if case_events
+                        and all(
+                            row.get("semantic_trace_io_latency_ms")
+                            not in {"", None}
+                            for row in case_events
+                        )
+                        else None
+                    ),
+                    "semantic_trace_bytes_written": (
+                        sum(
+                            int(row["semantic_trace_bytes_written"])
+                            for row in case_events
+                        )
+                        if case_events
+                        and all(
+                            row.get("semantic_trace_bytes_written")
+                            not in {"", None}
+                            for row in case_events
+                        )
+                        else None
+                    ),
+                    "insertion_latency_excluding_trace_io_ms": (
+                        round(
+                            sum(
+                                float(
+                                    row[
+                                        "insertion_latency_excluding_trace_io_ms"
+                                    ]
+                                )
+                                for row in case_events
+                            ),
+                            3,
+                        )
+                        if case_events
+                        and all(
+                            row.get("insertion_latency_excluding_trace_io_ms")
+                            not in {"", None}
+                            for row in case_events
+                        )
+                        else None
+                    ),
                     "retrieval_wall_latency_ms": round(
                         sum(
                             float(row.get("retrieval_latency_ms") or 0)
@@ -1805,6 +1932,25 @@ class BenchmarkArtifactStore:
             "memory_system_error_question_count": memory_system_error_questions,
             "framework_cache_mode": manifest.get("framework_cache_mode"),
             "insertion_wall_latency": _latency_stats(insertion_latencies),
+            "semantic_trace_io_wall_latency": _latency_stats(
+                semantic_trace_io_latencies
+            ),
+            "semantic_trace_io_latency_sum_ms": (
+                round(sum(semantic_trace_io_latencies), 3)
+                if trace_io_metrics_available
+                else None
+            ),
+            "semantic_trace_bytes_written": (
+                sum(
+                    int(row["semantic_trace_bytes_written"])
+                    for row in per_event_rows
+                )
+                if trace_io_metrics_available
+                else None
+            ),
+            "insertion_wall_latency_excluding_trace_io": _latency_stats(
+                insertion_latencies_excluding_trace_io
+            ),
             "retrieval_wall_latency": _latency_stats(retrieval_latencies),
             "answering_wall_latency": _latency_stats(answer_latencies),
             "grading_wall_latency_by_scorer": {

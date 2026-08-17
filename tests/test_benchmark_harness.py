@@ -511,6 +511,64 @@ def test_embedding_usage_metrics_remain_separate_from_provider_costs(
     assert all(row["estimated_cost_usd"] == "0.0" for row in event_rows)
 
 
+def test_insertion_metrics_separate_measured_semantic_trace_io(
+    tmp_path: Path,
+) -> None:
+    class TraceWritingDriver(_Driver):
+        trace_dir: Path
+
+        def add(self, event: BenchmarkEvent) -> dict[str, int]:
+            write_trace_event(
+                self.trace_dir,
+                operator="sem_filter",
+                event_type="pair_decision",
+                payload={"decision": True, "evidence": "x" * 256},
+            )
+            return super().add(event)
+
+    def factory(case_id: str, state_dir: Path, trace_dir: Path) -> _Driver:
+        del case_id
+        driver = TraceWritingDriver(state_dir)
+        driver.trace_dir = trace_dir
+        return driver
+
+    BenchmarkRunner(
+        system_contract=_system_contract(),
+        contracts={"task-1": _contract()},
+        driver_factory=factory,
+        answer_model=_Model(),
+        judge_model=_Model(),
+        artifacts=BenchmarkArtifactStore(tmp_path),
+    ).run(_bundle())
+
+    with (tmp_path / "metrics" / "per_event.csv").open(
+        newline="", encoding="utf-8"
+    ) as stream:
+        event_rows = list(csv.DictReader(stream))
+    with (tmp_path / "metrics" / "per_case.csv").open(
+        newline="", encoding="utf-8"
+    ) as stream:
+        case_row = next(csv.DictReader(stream))
+    summary = json.loads((tmp_path / "metrics" / "summary.json").read_text())
+
+    assert len(event_rows) == 2
+    for row in event_rows:
+        wall_ms = float(row["wall_latency_ms"])
+        trace_ms = float(row["semantic_trace_io_latency_ms"])
+        adjusted_ms = float(row["insertion_latency_excluding_trace_io_ms"])
+        assert int(row["semantic_trace_bytes_written"]) > 0
+        assert 0 <= trace_ms <= wall_ms
+        assert adjusted_ms == pytest.approx(max(0.0, wall_ms - trace_ms), abs=0.002)
+    assert int(case_row["semantic_trace_bytes_written"]) == sum(
+        int(row["semantic_trace_bytes_written"]) for row in event_rows
+    )
+    assert summary["semantic_trace_bytes_written"] == int(
+        case_row["semantic_trace_bytes_written"]
+    )
+    assert summary["semantic_trace_io_wall_latency"]["mean_ms"] is not None
+    assert summary["insertion_wall_latency_excluding_trace_io"]["mean_ms"] is not None
+
+
 def test_operation_usage_separates_calls_batches_and_provider_responses(
     tmp_path: Path,
 ) -> None:
@@ -693,6 +751,42 @@ def test_bundle_run_mode_is_written_to_manifest(tmp_path) -> None:
 
     manifest = json.loads((tmp_path / "manifest.json").read_text())
     assert manifest["run_mode"] == "integration-smoke"
+
+
+def test_resume_rejects_changed_semantic_trace_snapshot_mode(tmp_path: Path) -> None:
+    def provenance(mode: str) -> dict[str, object]:
+        return {
+            "source": {"commit": "source", "dirty": False},
+            "runtime": {
+                "python": "3.12",
+                "lotus_execution": {
+                    "semantic_trace_snapshot_mode": mode,
+                },
+            },
+        }
+
+    first = BenchmarkRunner(
+        system_contract=_system_contract(),
+        contracts={"task-1": _contract()},
+        driver_factory=lambda case_id, state_dir, trace_dir: _Driver(state_dir),
+        answer_model=_Model(),
+        judge_model=_Model(),
+        artifacts=BenchmarkArtifactStore(tmp_path),
+        runtime_provenance=provenance("compact"),
+    )
+    first.run(_bundle())
+
+    changed = BenchmarkRunner(
+        system_contract=_system_contract(),
+        contracts={"task-1": _contract()},
+        driver_factory=lambda case_id, state_dir, trace_dir: _Driver(state_dir),
+        answer_model=_Model(),
+        judge_model=_Model(),
+        artifacts=BenchmarkArtifactStore(tmp_path),
+        runtime_provenance=provenance("full"),
+    )
+    with pytest.raises(ValueError, match="different run contract"):
+        changed.run(_bundle())
 
 
 def test_retrieval_system_error_scores_zero_and_completed_case_is_skipped(
