@@ -892,12 +892,12 @@ class PredicateRerankerScorer:
             documents = [pair.right for pair in group.pairs]
         predicates = [group.predicate] * len(group.pairs)
         forward = list(self._score_directed(predicates, queries, documents))
-        _validate_model_scores(forward, expected=len(group.pairs))
+        _validate_probability_scores(forward, expected=len(group.pairs))
         if group.direction != "symmetric":
             return forward
 
         reverse = list(self._score_directed(predicates, documents, queries))
-        _validate_model_scores(reverse, expected=len(group.pairs))
+        _validate_probability_scores(reverse, expected=len(group.pairs))
         scores: list[float] = []
         for left_to_right, right_to_left in zip(forward, reverse, strict=True):
             delta = abs(left_to_right - right_to_left)
@@ -1114,13 +1114,19 @@ def _single_token_id(tokenizer: Any, value: str) -> int:
     return int(token_ids[0])
 
 
-def _validate_model_scores(scores: Sequence[float], *, expected: int) -> None:
+def _validate_finite_scores(scores: Sequence[float], *, expected: int) -> None:
     if len(scores) != expected:
         raise PairTraceError(
-            f"predicate scorer returned {len(scores)} scores for {expected} pairs"
+            f"pair scorer returned {len(scores)} scores for {expected} pairs"
         )
-    if not all(math.isfinite(float(score)) and 0.0 <= score <= 1.0 for score in scores):
-        raise PairTraceError("predicate scorer must return finite probabilities")
+    if not all(math.isfinite(float(score)) for score in scores):
+        raise PairTraceError("pair scorer must return finite scores")
+
+
+def _validate_probability_scores(scores: Sequence[float], *, expected: int) -> None:
+    _validate_finite_scores(scores, expected=expected)
+    if not all(0.0 <= float(score) <= 1.0 for score in scores):
+        raise PairTraceError("predicate scorer must return probabilities in [0, 1]")
 
 
 @dataclass
@@ -1387,7 +1393,7 @@ class ProxyCalibrationAccumulator:
     def add_group(self, group: PairGroup, scores: Sequence[float]) -> None:
         """Store only numeric labels, scores, and optional grouping edges."""
 
-        _validate_model_scores(scores, expected=len(group.pairs))
+        _validate_finite_scores(scores, expected=len(group.pairs))
         session_key = _session_key(group)
         split = self.session_assignments.setdefault(
             session_key,
@@ -2291,7 +2297,7 @@ def _select_candidates(
     if strategy.top_k is None:
         return eligible
     buckets: dict[str, list[int]] = defaultdict(list)
-    for index in eligible:
+    for index in sorted(eligible):
         pair = group.pairs[index]
         if group.direction == "left-to-right":
             buckets[f"left:{pair.left_id}"].append(index)
