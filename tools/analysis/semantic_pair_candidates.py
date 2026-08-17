@@ -1074,7 +1074,7 @@ class Qwen3RerankerScorer(PredicateRerankerScorer):
                 for key, value in inputs.items()
             }
             with self._torch.inference_mode():
-                logits = self._model(**inputs).logits[:, -1, :]
+                logits = _qwen3_last_token_logits(self._model, inputs)
                 binary_logits = self._torch.stack(
                     [
                         logits[:, self._false_token_id],
@@ -1091,6 +1091,12 @@ class Qwen3RerankerScorer(PredicateRerankerScorer):
                 )
             scores.extend(float(value) for value in values)
         return scores
+
+
+def _qwen3_last_token_logits(model: Any, inputs: Mapping[str, Any]) -> Any:
+    """Compute only the final token logits used by the yes/no scorer."""
+
+    return model(**inputs, logits_to_keep=1).logits[:, -1, :]
 
 
 def _format_bge_predicate_query(predicate: str, query: str) -> str:
