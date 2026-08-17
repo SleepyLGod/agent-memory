@@ -1959,6 +1959,7 @@ def _pair_event_kind(event: Mapping[str, Any], *, phase: str) -> str | None:
     if (
         event.get("operator") == "sem_filter"
         and event.get("event_type") == "operator_result"
+        and event.get("semantic_trace_snapshot_mode") != "compact"
         and _is_pairwise_sem_filter_event(event)
     ):
         return "sem_filter"
