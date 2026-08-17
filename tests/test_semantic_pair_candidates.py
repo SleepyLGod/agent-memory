@@ -9,6 +9,7 @@ import tarfile
 from types import SimpleNamespace
 from typing import Any, cast
 
+import numpy as np
 import pytest
 
 from tools.analysis.semantic_pair_candidates import (
@@ -23,6 +24,7 @@ from tools.analysis.semantic_pair_candidates import (
     TarSource,
     _format_bge_predicate_query,
     _format_qwen3_instruction,
+    _qwen3_last_token_logits,
     _session_split,
     _write_single_report,
     analyze_proxy_calibration,
@@ -1413,6 +1415,31 @@ def test_official_reranker_input_formats_keep_predicate_and_roles() -> None:
     assert _format_qwen3_instruction("same fact", "new row", "old row") == (
         "<Instruct>: same fact\n<Query>: new row\n<Document>: old row"
     )
+
+
+def test_qwen3_scorer_computes_only_unchanged_last_token_logits() -> None:
+    full_logits = np.asarray(
+        [
+            [[1.0, 2.0], [3.0, 4.0]],
+            [[5.0, 6.0], [7.0, 8.0]],
+        ]
+    )
+
+    class FakeModel:
+        def __init__(self) -> None:
+            self.kwargs: dict[str, Any] = {}
+
+        def __call__(self, **kwargs: Any) -> SimpleNamespace:
+            self.kwargs = kwargs
+            return SimpleNamespace(logits=full_logits[:, -1:, :])
+
+    model = FakeModel()
+    input_ids = object()
+
+    actual = _qwen3_last_token_logits(model, {"input_ids": input_ids})
+
+    assert model.kwargs == {"input_ids": input_ids, "logits_to_keep": 1}
+    assert np.array_equal(actual, full_logits[:, -1, :])
 
 
 def test_proxy_calibration_selects_only_from_calibration_sessions() -> None:
