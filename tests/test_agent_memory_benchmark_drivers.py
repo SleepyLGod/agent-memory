@@ -270,6 +270,7 @@ def test_case_factories_create_isolated_policy_instances(monkeypatch, tmp_path) 
         sem_topk_method="listwise",
         sem_groupby_pair_batch_size=12,
         sem_groupby_pair_batch_retries=2,
+        semantic_trace_snapshot_mode="full",
         thinking_enabled=False,
     )
     claude = claude_factory(
@@ -284,6 +285,7 @@ def test_case_factories_create_isolated_policy_instances(monkeypatch, tmp_path) 
     assert created[-1].adapter.config.sem_topk_method == "listwise"
     assert created[-1].adapter.config.sem_groupby_pair_batch_size == 12
     assert created[-1].adapter.config.sem_groupby_pair_batch_retries == 2
+    assert created[-1].adapter.config.semantic_trace_snapshot_mode == "full"
     assert created[-1].adapter.config.lm_model_kwargs == {
         "extra_body": {"thinking": {"type": "disabled"}}
     }
@@ -317,6 +319,7 @@ def test_case_factories_create_isolated_policy_instances(monkeypatch, tmp_path) 
     assert created[-1].adapter.config.structured_max_tokens == 32_768
     assert created[-1].adapter.config.sem_groupby_pair_batch_size == 12
     assert created[-1].adapter.config.sem_groupby_pair_batch_retries == 2
+    assert created[-1].adapter.config.semantic_trace_snapshot_mode == "compact"
     assert created[-1].adapter.config.lm_model_kwargs == {
         "extra_body": {"thinking": {"type": "disabled"}}
     }
@@ -602,6 +605,7 @@ def test_zep_run_configures_existing_factory_and_checkpoint_flow(
         "sem_groupby_pair_batch_retries": 2,
         "semantic_pair_profiles": {},
         "embedding_device": "cpu",
+        "semantic_trace_snapshot_mode": "compact",
         "thinking_enabled": False,
     }
     system_contract = captured["runner"]["system_contract"]
@@ -618,6 +622,7 @@ def test_zep_run_configures_existing_factory_and_checkpoint_flow(
         "semantic_pair_top_k": None,
         "semantic_pair_min_similarity": None,
         "embedding_device": "cpu",
+        "semantic_trace_snapshot_mode": "compact",
         "semantic_pair_execution_fingerprint": None,
         "semantic_pair_query_profiles": {},
     }

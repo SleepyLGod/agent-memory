@@ -98,6 +98,7 @@ def run_agent_memory_bundle(
     semantic_pair_top_k: int | None = None,
     semantic_pair_min_similarity: float | None = None,
     embedding_device: str = "cpu",
+    semantic_trace_snapshot_mode: str = "compact",
     memory_thinking_enabled: bool = True,
     condition_id: str = "",
     maintenance_only: bool = False,
@@ -119,6 +120,10 @@ def run_agent_memory_bundle(
         )
     if embedding_device not in {"cpu", "cuda"}:
         raise ValueError("embedding_device must be 'cpu' or 'cuda'")
+    if semantic_trace_snapshot_mode not in {"compact", "full"}:
+        raise ValueError(
+            "semantic_trace_snapshot_mode must be 'compact' or 'full'"
+        )
     if (
         system_id == "claude-memory"
         and semantic_pair_profile == "oracle-only"
@@ -265,6 +270,7 @@ def run_agent_memory_bundle(
         "semantic_pair_top_k": semantic_pair_top_k,
         "semantic_pair_min_similarity": semantic_pair_min_similarity,
         "embedding_device": embedding_device,
+        "semantic_trace_snapshot_mode": semantic_trace_snapshot_mode,
         "semantic_pair_execution_fingerprint": (
             semantic_pair_execution_fingerprint or None
         ),
@@ -333,6 +339,7 @@ def run_agent_memory_bundle(
             sem_groupby_pair_batch_size=sem_groupby_pair_batch_size,
             sem_groupby_pair_batch_retries=sem_groupby_pair_batch_retries,
             semantic_pair_profiles=semantic_pair_profiles,
+            semantic_trace_snapshot_mode=semantic_trace_snapshot_mode,
             thinking_enabled=memory_thinking_enabled,
         )
     elif system_id == "zep-memory":
@@ -344,6 +351,7 @@ def run_agent_memory_bundle(
             sem_groupby_pair_batch_retries=sem_groupby_pair_batch_retries,
             semantic_pair_profiles=semantic_pair_profiles,
             embedding_device=embedding_device,
+            semantic_trace_snapshot_mode=semantic_trace_snapshot_mode,
             thinking_enabled=memory_thinking_enabled,
         )
     elif system_id == "mem0-memory":
@@ -354,6 +362,7 @@ def run_agent_memory_bundle(
             sem_groupby_pair_batch_retries=sem_groupby_pair_batch_retries,
             semantic_pair_profiles=semantic_pair_profiles,
             embedding_device=embedding_device,
+            semantic_trace_snapshot_mode=semantic_trace_snapshot_mode,
             thinking_enabled=memory_thinking_enabled,
         )
     else:
@@ -365,6 +374,7 @@ def run_agent_memory_bundle(
             sem_groupby_pair_batch_retries=sem_groupby_pair_batch_retries,
             semantic_pair_profiles=semantic_pair_profiles,
             embedding_device=embedding_device,
+            semantic_trace_snapshot_mode=semantic_trace_snapshot_mode,
             thinking_enabled=memory_thinking_enabled,
         )
     try:

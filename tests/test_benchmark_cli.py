@@ -31,6 +31,28 @@ def test_agent_benchmark_clis_share_sem_groupby_execution_options(
 
     assert args.sem_groupby_pair_batch_size == 12
     assert args.sem_groupby_pair_batch_retries == 2
+    assert args.semantic_trace_snapshot_mode == "compact"
+
+
+@pytest.mark.parametrize("module", (locomo, longmemeval, memory_agent_bench))
+def test_agent_benchmark_clis_accept_full_semantic_trace_snapshots(
+    module, tmp_path
+) -> None:
+    args = module.parse_args(
+        [
+            "run",
+            "--bundle-dir",
+            str(tmp_path / "bundle"),
+            "--output-dir",
+            str(tmp_path / "output"),
+            "--system",
+            "mem0-memory",
+            "--semantic-trace-snapshot-mode",
+            "full",
+        ]
+    )
+
+    assert args.semantic_trace_snapshot_mode == "full"
 
 
 @pytest.mark.parametrize("module", (locomo, longmemeval, memory_agent_bench))
