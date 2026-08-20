@@ -11,12 +11,14 @@ import re
 
 from .agent_memory_drivers import (
     ClaudeMemoryDriverFactory,
+    LOTUS_CACHE_MODES,
     Mem0MemoryDriverFactory,
     Mem0MemoryEnhancedDriverFactory,
     SEMANTIC_PAIR_BGE_M3,
     ZepMemoryDriverFactory,
     build_mem0_semantic_pair_profiles,
     build_operator_semantic_pair_profiles,
+    build_site_semantic_pair_profiles,
 )
 from agent_memory.adapters.lotus.pair_execution import (
     SEMANTIC_PAIR_EXECUTION_MODES,
@@ -27,6 +29,7 @@ from .bundle import BenchmarkBundle
 from .harness import BenchmarkRunner, MemorySystemContract, TaskContract
 from .models import LiteLLMBenchmarkModel
 from .provenance import collect_runtime_provenance, validate_run_provenance
+from .semantic_pair_config import load_semantic_pair_profile_config
 
 AGENT_MEMORY_SYSTEMS = (
     "claude-memory",
@@ -97,6 +100,8 @@ def run_agent_memory_bundle(
     semantic_pair_profile: str = "oracle-only",
     semantic_pair_top_k: int | None = None,
     semantic_pair_min_similarity: float | None = None,
+    semantic_pair_profile_config: Path | None = None,
+    lotus_cache_mode: str = "disabled",
     embedding_device: str = "cpu",
     semantic_trace_snapshot_mode: str = "compact",
     memory_thinking_enabled: bool = True,
@@ -118,6 +123,19 @@ def run_agent_memory_bundle(
             "semantic_pair_profile must be one of: "
             + ", ".join(SEMANTIC_PAIR_PROFILES)
         )
+    if lotus_cache_mode not in LOTUS_CACHE_MODES:
+        raise ValueError(
+            "lotus_cache_mode must be one of: " + ", ".join(LOTUS_CACHE_MODES)
+        )
+    if semantic_pair_profile_config is not None and (
+        semantic_pair_profile != "oracle-only"
+        or semantic_pair_top_k is not None
+        or semantic_pair_min_similarity is not None
+    ):
+        raise ValueError(
+            "semantic_pair_profile_config is mutually exclusive with global "
+            "semantic pair profile bounds"
+        )
     if embedding_device not in {"cpu", "cuda"}:
         raise ValueError("embedding_device must be 'cpu' or 'cuda'")
     if semantic_trace_snapshot_mode not in {"compact", "full"}:
@@ -127,6 +145,7 @@ def run_agent_memory_bundle(
     if (
         system_id == "claude-memory"
         and semantic_pair_profile == "oracle-only"
+        and semantic_pair_profile_config is None
         and embedding_device != "cpu"
     ):
         raise ValueError(
@@ -158,8 +177,51 @@ def run_agent_memory_bundle(
         sem_topk_method = (
             "pairwise-quick" if system_id == "mem0-enhanced" else "pairwise-naive"
         )
+    site_profile_config = (
+        load_semantic_pair_profile_config(semantic_pair_profile_config)
+        if semantic_pair_profile_config is not None
+        else None
+    )
     semantic_pair_profiles = {}
-    if (
+    semantic_pair_sites = {}
+    if site_profile_config is not None:
+        if system_id not in {"claude-memory", "zep-memory"}:
+            raise ValueError(
+                "semantic pair site configs currently support Claude and Zep policies"
+            )
+        import agent_memory as am
+        from agent_memory.planner import DifferentialRules, PolicyDifferentiator
+
+        if system_id == "claude-memory":
+            policy = PolicyDifferentiator(
+                rules=DifferentialRules(grouped_agg_rule=grouped_agg_rule)
+            ).differentiate(am.ClaudeMemory.spec())
+            operators = ("sem_join",)
+            embedding = SEMANTIC_PAIR_BGE_M3
+        else:
+            from agent_memory.memories.zep.storage import (
+                GRAPHITI_BGE_M3,
+                GRAPHITI_NEO4J_STATEMENTS,
+            )
+
+            policy = PolicyDifferentiator(
+                rules=DifferentialRules(grouped_agg_rule=grouped_agg_rule)
+            ).differentiate(
+                am.ZepMemory.spec(),
+                statements=GRAPHITI_NEO4J_STATEMENTS,
+            )
+            operators = ("sem_groupby",)
+            embedding = GRAPHITI_BGE_M3
+        semantic_pair_profiles, semantic_pair_sites = (
+            build_site_semantic_pair_profiles(
+                policy,
+                bindings=site_profile_config.bindings,
+                operators=operators,
+                embedding=embedding,
+                embedding_device=embedding_device,
+            )
+        )
+    elif (
         semantic_pair_profile in {"search-filter", "proxy-only"}
         and system_id == "claude-memory"
     ):
@@ -222,14 +284,28 @@ def run_agent_memory_bundle(
     semantic_pair_execution_fingerprint = semantic_pair_profiles_fingerprint(
         semantic_pair_profiles
     )
-    maintenance_execution_id = (
-        f"semantic-pair-{semantic_pair_profile}:"
+    semantic_pair_execution_id = (
+        f"semantic-pair-{'site-config' if site_profile_config else semantic_pair_profile}:"
         f"{semantic_pair_execution_fingerprint}"
         if semantic_pair_execution_fingerprint
         else f"embedding-device:{embedding_device}"
         if system_id in {"zep-memory", "mem0-memory", "mem0-enhanced"}
         and embedding_device != "cpu"
         else ""
+    )
+    maintenance_execution_parts = [
+        part
+        for part in (
+            semantic_pair_execution_id,
+            "lotus-cache:lotus-memory:1024"
+            if lotus_cache_mode == "memory"
+            else "",
+        )
+        if part
+    ]
+    maintenance_execution_id = "|".join(maintenance_execution_parts)
+    framework_cache_mode = (
+        "lotus-memory:1024" if lotus_cache_mode == "memory" else "disabled"
     )
     bundle_run_mode = bundle.metadata.get("run_mode")
     if bundle_run_mode is not None and (
@@ -263,7 +339,7 @@ def run_agent_memory_bundle(
             ),
         ),
     )
-    runtime_provenance["runtime"]["lotus_execution"] = {
+    lotus_execution_provenance = {
         "sem_groupby_pair_batch_size": sem_groupby_pair_batch_size,
         "sem_groupby_pair_batch_retries": sem_groupby_pair_batch_retries,
         "semantic_pair_profile": semantic_pair_profile,
@@ -279,6 +355,26 @@ def run_agent_memory_bundle(
             for digest, profile in sorted(semantic_pair_profiles.items())
         },
     }
+    if site_profile_config is not None:
+        lotus_execution_provenance.update(
+            {
+                "semantic_pair_profile_config": site_profile_config.to_dict(),
+                "semantic_pair_site_inventory": {
+                    site_id: site.to_dict()
+                    for site_id, site in sorted(semantic_pair_sites.items())
+                },
+            }
+        )
+    if lotus_cache_mode == "memory":
+        lotus_execution_provenance.update(
+            {
+                "lotus_cache_mode": "memory",
+                "lotus_cache_max_entries": 1024,
+            }
+        )
+    runtime_provenance["runtime"]["lotus_execution"] = (
+        lotus_execution_provenance
+    )
     validate_run_provenance(runtime_provenance, run_mode=run_mode)
     _require_environment(system_id)
     if (
@@ -328,7 +424,7 @@ def run_agent_memory_bundle(
         maintenance_execution_id=maintenance_execution_id,
         thinking_enabled=memory_thinking_enabled,
         consolidation_mode="none",
-        framework_cache_mode="disabled",
+        framework_cache_mode=framework_cache_mode,
         checkpoint_enabled=True,
     )
     if system_id == "claude-memory":
@@ -340,6 +436,7 @@ def run_agent_memory_bundle(
             sem_groupby_pair_batch_retries=sem_groupby_pair_batch_retries,
             semantic_pair_profiles=semantic_pair_profiles,
             semantic_trace_snapshot_mode=semantic_trace_snapshot_mode,
+            lotus_cache_mode=lotus_cache_mode,
             thinking_enabled=memory_thinking_enabled,
         )
     elif system_id == "zep-memory":
@@ -352,6 +449,7 @@ def run_agent_memory_bundle(
             semantic_pair_profiles=semantic_pair_profiles,
             embedding_device=embedding_device,
             semantic_trace_snapshot_mode=semantic_trace_snapshot_mode,
+            lotus_cache_mode=lotus_cache_mode,
             thinking_enabled=memory_thinking_enabled,
         )
     elif system_id == "mem0-memory":
@@ -363,6 +461,7 @@ def run_agent_memory_bundle(
             semantic_pair_profiles=semantic_pair_profiles,
             embedding_device=embedding_device,
             semantic_trace_snapshot_mode=semantic_trace_snapshot_mode,
+            lotus_cache_mode=lotus_cache_mode,
             thinking_enabled=memory_thinking_enabled,
         )
     else:
@@ -375,6 +474,7 @@ def run_agent_memory_bundle(
             semantic_pair_profiles=semantic_pair_profiles,
             embedding_device=embedding_device,
             semantic_trace_snapshot_mode=semantic_trace_snapshot_mode,
+            lotus_cache_mode=lotus_cache_mode,
             thinking_enabled=memory_thinking_enabled,
         )
     try:

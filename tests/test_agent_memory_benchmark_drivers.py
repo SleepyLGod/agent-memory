@@ -4,6 +4,7 @@ from dataclasses import replace
 from hashlib import sha256
 import json
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 import pytest
@@ -22,11 +23,14 @@ from agent_memory.evaluation.agent_memory_drivers import (
     ZepMemoryDriverFactory,
     ZepMemoryDriver,
     build_operator_semantic_pair_profiles,
+    build_site_semantic_pair_profiles,
     event_to_zep_log_row,
+    inventory_operator_semantic_pair_sites,
 )
 from agent_memory.evaluation.bundle import BenchmarkBundle
 from agent_memory.evaluation.embedding_trace import TracingEmbeddingProvider
 from agent_memory.evaluation.run import run_agent_memory_bundle
+from agent_memory.evaluation.semantic_pair_config import SemanticPairSiteBinding
 from agent_memory.evaluation.types import (
     BenchmarkCase,
     BenchmarkQuestion,
@@ -602,12 +606,13 @@ def test_zep_run_configures_existing_factory_and_checkpoint_flow(
         "model_id": "provider-model",
         "grouped_agg_rule": "prefer-join-map",
         "sem_groupby_pair_batch_size": 12,
-        "sem_groupby_pair_batch_retries": 2,
-        "semantic_pair_profiles": {},
-        "embedding_device": "cpu",
-        "semantic_trace_snapshot_mode": "compact",
-        "thinking_enabled": False,
-    }
+            "sem_groupby_pair_batch_retries": 2,
+            "semantic_pair_profiles": {},
+            "embedding_device": "cpu",
+            "semantic_trace_snapshot_mode": "compact",
+            "lotus_cache_mode": "disabled",
+            "thinking_enabled": False,
+        }
     system_contract = captured["runner"]["system_contract"]
     assert system_contract.system_id == "zep-memory"
     assert system_contract.condition_id == "ZEP-SMOKE"
@@ -726,6 +731,267 @@ def test_operator_profiles_target_claude_join_and_zep_groupby(mode: str) -> None
     assert {profile.mode for profile in zep_profiles.values()} == {mode}
 
 
+def test_zep_differential_groupby_queries_form_two_predicate_sites() -> None:
+    import agent_memory as am
+    from agent_memory.memories.zep.storage import (
+        GRAPHITI_BGE_M3,
+        GRAPHITI_NEO4J_STATEMENTS,
+    )
+    from agent_memory.planner import DifferentialRules, PolicyDifferentiator
+
+    zep = PolicyDifferentiator(
+        rules=DifferentialRules(grouped_agg_rule="rule-re-group")
+    ).differentiate(
+        am.ZepMemory.spec(),
+        statements=GRAPHITI_NEO4J_STATEMENTS,
+    )
+    sites = inventory_operator_semantic_pair_sites(
+        zep,
+        operators=("sem_groupby",),
+    )
+
+    assert len(sites) == 2
+    assert sorted(len(site.query_digests) for site in sites.values()) == [3, 3]
+    entity_site = next(site for site in sites.values() if not site.partition_by)
+    fact_site = next(site for site in sites.values() if site.partition_by)
+    assert entity_site.semantic_columns == ("name",)
+    assert fact_site.semantic_columns == ("relation_type", "fact")
+    assert fact_site.partition_by == ("source_entity_id", "target_entity_id")
+
+    profiles, resolved_sites = build_site_semantic_pair_profiles(
+        zep,
+        bindings=(
+            SemanticPairSiteBinding(
+                site_id=entity_site.site_id,
+                mode="search-filter",
+                top_k=15,
+                min_similarity=0.6,
+            ),
+            SemanticPairSiteBinding(
+                site_id=fact_site.site_id,
+                mode="search-filter",
+                top_k=10,
+                min_similarity=None,
+            ),
+        ),
+        operators=("sem_groupby",),
+        embedding=GRAPHITI_BGE_M3,
+        embedding_device="cuda",
+    )
+
+    assert resolved_sites == sites
+    assert len(profiles) == 6
+    assert {
+        (profile.top_k, profile.min_similarity)
+        for digest, profile in profiles.items()
+        if digest in entity_site.query_digests
+    } == {(15, 0.6)}
+    assert {
+        (profile.top_k, profile.min_similarity)
+        for digest, profile in profiles.items()
+        if digest in fact_site.query_digests
+    } == {(10, None)}
+
+
+def test_site_profiles_reject_stale_site_before_external_setup() -> None:
+    import agent_memory as am
+    from agent_memory.memories.zep.storage import GRAPHITI_NEO4J_STATEMENTS
+    from agent_memory.planner import DifferentialRules, PolicyDifferentiator
+
+    zep = PolicyDifferentiator(
+        rules=DifferentialRules(grouped_agg_rule="rule-re-group")
+    ).differentiate(
+        am.ZepMemory.spec(),
+        statements=GRAPHITI_NEO4J_STATEMENTS,
+    )
+
+    with pytest.raises(ValueError, match="not found in policy"):
+        build_site_semantic_pair_profiles(
+            zep,
+            bindings=(
+                SemanticPairSiteBinding(
+                    site_id="sem_groupby:stale",
+                    mode="search-filter",
+                    top_k=10,
+                    min_similarity=None,
+                ),
+            ),
+            operators=("sem_groupby",),
+            embedding=SEMANTIC_PAIR_BGE_M3,
+        )
+
+
+def test_run_rejects_stale_site_before_provenance_and_environment(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import agent_memory.evaluation.run as run_module
+
+    profile_path = tmp_path / "profiles.json"
+    profile_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "bindings": [
+                    {
+                        "site_id": "sem_groupby:stale",
+                        "mode": "search-filter",
+                        "top_k": 10,
+                        "min_similarity": None,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        run_module,
+        "collect_runtime_provenance",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("provenance must not run before site validation")
+        ),
+    )
+    bundle = BenchmarkBundle(
+        "locomo",
+        "revision",
+        "sha256",
+        (
+            BenchmarkCase(
+                case_id="case-1",
+                task_id="locomo",
+                events=(_event(),),
+                questions=(BenchmarkQuestion("q1", "case-1", "?", "answer", ()),),
+            ),
+        ),
+        {"run_mode": "integration-smoke"},
+    )
+
+    with pytest.raises(ValueError, match="not found in policy"):
+        run_agent_memory_bundle(
+            bundle=bundle,
+            contracts={},
+            system_id="zep-memory",
+            output_dir=tmp_path / "output",
+            grouped_agg_rule="rule-re-group",
+            semantic_pair_profile_config=profile_path,
+            memory_thinking_enabled=False,
+        )
+
+
+def test_run_resolves_site_config_into_manifest_and_query_profiles(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import agent_memory as am
+    import agent_memory.evaluation.run as run_module
+    from agent_memory.memories.zep.storage import GRAPHITI_NEO4J_STATEMENTS
+    from agent_memory.planner import DifferentialRules, PolicyDifferentiator
+
+    policy = PolicyDifferentiator(
+        rules=DifferentialRules(grouped_agg_rule="rule-re-group")
+    ).differentiate(
+        am.ZepMemory.spec(),
+        statements=GRAPHITI_NEO4J_STATEMENTS,
+    )
+    sites = inventory_operator_semantic_pair_sites(
+        policy,
+        operators=("sem_groupby",),
+    )
+    bindings = [
+        {
+            "site_id": site.site_id,
+            "mode": "search-filter",
+            "top_k": 10 if site.partition_by else 15,
+            "min_similarity": None if site.partition_by else 0.6,
+        }
+        for site in sites.values()
+    ]
+    profile_path = tmp_path / "profiles.json"
+    profile_path.write_text(
+        json.dumps({"schema_version": 1, "bindings": bindings}),
+        encoding="utf-8",
+    )
+    captured: dict[str, Any] = {}
+
+    class FakeFactory:
+        @classmethod
+        def from_environment(cls, **kwargs):
+            captured["factory"] = kwargs
+            return cls()
+
+        def runtime_provenance(self):
+            return {
+                "connector": "neo4j",
+                "image": "neo4j:5.26.2",
+                "image_digest": "sha256:image",
+                "server_version": "5.26.2",
+                "driver_version": "6.1.0",
+                "embedding_device": "cuda",
+            }
+
+        def close(self) -> None:
+            pass
+
+    class FakeRunner:
+        def __init__(self, **kwargs) -> None:
+            captured["runner"] = kwargs
+
+        def run(self, bundle) -> None:
+            captured["bundle"] = bundle
+
+    monkeypatch.setattr(run_module, "_require_environment", lambda _system: None)
+    monkeypatch.setattr(
+        run_module,
+        "collect_runtime_provenance",
+        lambda *args, **kwargs: {"source": {}, "runtime": {}},
+    )
+    monkeypatch.setattr(
+        run_module,
+        "validate_run_provenance",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(run_module, "ZepMemoryDriverFactory", FakeFactory)
+    monkeypatch.setattr(run_module, "BenchmarkRunner", FakeRunner)
+    bundle = BenchmarkBundle(
+        "locomo",
+        "revision",
+        "sha256",
+        (
+            BenchmarkCase(
+                case_id="case-1",
+                task_id="locomo",
+                events=(_event(),),
+                questions=(BenchmarkQuestion("q1", "case-1", "?", "answer", ()),),
+            ),
+        ),
+        {"run_mode": "integration-smoke"},
+    )
+
+    run_agent_memory_bundle(
+        bundle=bundle,
+        contracts={},
+        system_id="zep-memory",
+        output_dir=tmp_path / "output",
+        grouped_agg_rule="rule-re-group",
+        semantic_pair_profile_config=profile_path,
+        embedding_device="cuda",
+        lotus_cache_mode="memory",
+        memory_thinking_enabled=False,
+    )
+
+    factory = captured["factory"]
+    assert len(factory["semantic_pair_profiles"]) == 6
+    runner = captured["runner"]
+    contract = runner["system_contract"]
+    assert contract.framework_cache_mode == "lotus-memory:1024"
+    execution = runner["runtime_provenance"]["runtime"]["lotus_execution"]
+    assert execution["semantic_pair_profile"] == "oracle-only"
+    assert len(execution["semantic_pair_site_inventory"]) == 2
+    assert execution["semantic_pair_profile_config"]["source_sha256"] == sha256(
+        profile_path.read_bytes()
+    ).hexdigest()
+
+
 @pytest.mark.parametrize(
     ("system_id", "grouped_agg_rule", "top_k", "expected_count"),
     (
@@ -814,6 +1080,7 @@ def test_run_wires_search_filter_profiles_before_external_execution(
         semantic_pair_profile="search-filter",
         semantic_pair_top_k=top_k,
         semantic_pair_min_similarity=0.5,
+        lotus_cache_mode="memory",
         embedding_device="cuda",
         memory_thinking_enabled=False,
     )
@@ -821,6 +1088,7 @@ def test_run_wires_search_filter_profiles_before_external_execution(
     profiles = captured["factory"]["semantic_pair_profiles"]
     assert len(profiles) == expected_count
     assert {profile.embedding_device for profile in profiles.values()} == {"cuda"}
+    assert captured["factory"]["lotus_cache_mode"] == "memory"
     if system_id == "zep-memory":
         assert captured["factory"]["embedding_device"] == "cuda"
         assert captured["closed"] is True
@@ -828,11 +1096,16 @@ def test_run_wires_search_filter_profiles_before_external_execution(
     assert contract.maintenance_execution_id.startswith(
         "semantic-pair-search-filter:"
     )
+    assert contract.maintenance_execution_id.endswith(
+        "|lotus-cache:lotus-memory:1024"
+    )
+    assert contract.framework_cache_mode == "lotus-memory:1024"
     execution = captured["runner"]["runtime_provenance"]["runtime"][
         "lotus_execution"
     ]
     assert len(execution["semantic_pair_query_profiles"]) == expected_count
     assert execution["embedding_device"] == "cuda"
+    assert execution["lotus_cache_mode"] == "memory"
 
 
 def test_claude_search_filter_rejects_rule_without_join_before_external_setup(

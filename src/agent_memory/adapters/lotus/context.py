@@ -16,6 +16,7 @@ from agent_memory.storage.embedding import EmbeddingProvider
 
 DEFAULT_STRUCTURED_MAX_TOKENS = 8192
 DEFAULT_STRUCTURED_PARSE_RETRIES = 3
+LOTUS_MEMORY_CACHE_MAX_SIZE = 1024
 SEM_TOPK_METHODS = (
     "pairwise-naive",
     "pairwise-quick",
@@ -23,6 +24,7 @@ SEM_TOPK_METHODS = (
     "listwise",
 )
 _LM_OWNED_KWARGS = {
+    "cache",
     "max_batch_size",
     "model",
     "num_retries",
@@ -124,6 +126,7 @@ class LotusExecutionContext:
     config: LotusExecutionConfig = field(default_factory=LotusExecutionConfig)
     pair_embedding_provider: EmbeddingProvider | None = None
     _configured: bool = field(default=False, init=False, repr=False)
+    _lm: Any | None = field(default=None, init=False, repr=False)
 
     def configure(self) -> None:
         """Configure LOTUS before invoking semantic dataframe operators."""
@@ -132,6 +135,7 @@ class LotusExecutionContext:
             return
 
         import lotus
+        from lotus.cache import InMemoryCache
         from lotus.models import LM
 
         lm_kwargs: dict[str, Any] = {
@@ -151,6 +155,10 @@ class LotusExecutionContext:
                 + ", ".join(conflicting)
             )
         lm_kwargs.update(self.config.lm_model_kwargs)
+        if self.config.lm_enable_cache is True:
+            lm_kwargs["cache"] = InMemoryCache(
+                max_size=LOTUS_MEMORY_CACHE_MAX_SIZE
+            )
 
         trace_dir = self.config.trace_dir()
         base_lm = (
@@ -159,8 +167,39 @@ class LotusExecutionContext:
             else LM(**lm_kwargs)
         )
         lm = TracedLM(base_lm, trace_dir) if trace_dir is not None else base_lm
+        self._lm = lm
         settings_kwargs: dict[str, Any] = {"lm": lm}
         if self.config.lm_enable_cache is not None:
             settings_kwargs["enable_cache"] = self.config.lm_enable_cache
         lotus.settings.configure(**settings_kwargs)
         self._configured = True
+
+    def cache_usage_snapshot(self) -> dict[str, int]:
+        """Return physical, virtual, and framework-cache counters for this LM."""
+
+        stats = getattr(self._lm, "stats", None)
+        if stats is None:
+            return {
+                "lm_cache_hits": 0,
+                "operator_cache_hits": 0,
+                "physical_prompt_tokens": 0,
+                "physical_completion_tokens": 0,
+                "physical_total_tokens": 0,
+                "virtual_prompt_tokens": 0,
+                "virtual_completion_tokens": 0,
+                "virtual_total_tokens": 0,
+            }
+        return {
+            "lm_cache_hits": int(getattr(stats, "cache_hits", 0)),
+            "operator_cache_hits": int(
+                getattr(stats, "operator_cache_hits", 0)
+            ),
+            "physical_prompt_tokens": int(stats.physical_usage.prompt_tokens),
+            "physical_completion_tokens": int(
+                stats.physical_usage.completion_tokens
+            ),
+            "physical_total_tokens": int(stats.physical_usage.total_tokens),
+            "virtual_prompt_tokens": int(stats.virtual_usage.prompt_tokens),
+            "virtual_completion_tokens": int(stats.virtual_usage.completion_tokens),
+            "virtual_total_tokens": int(stats.virtual_usage.total_tokens),
+        }

@@ -96,6 +96,98 @@ def summarize_provider_calls(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any
     return summary
 
 
+def normalize_framework_cache_usage(
+    events: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return one normalized row per cache-observed semantic operation."""
+
+    rows: list[dict[str, Any]] = []
+    for event in events:
+        if event.get("event_type") != "framework_cache_usage":
+            continue
+        rows.append(
+            {
+                "trace_id": str(event.get("trace_id") or ""),
+                "logical_call_id": str(event.get("operator_call_id") or ""),
+                "case_id": str(event.get("case_id") or ""),
+                "event_id": str(event.get("event_id") or ""),
+                "session_id": str(event.get("session_id") or ""),
+                "question_id": str(event.get("question_id") or ""),
+                "phase": _canonical_phase(event.get("phase")),
+                "operator": str(event.get("operator") or ""),
+                "operation": str(event.get("operation") or ""),
+                "attempt": _optional_int(event.get("attempt")),
+                "execution_attempt": _optional_int(
+                    event.get("execution_attempt")
+                ),
+                "unit_attempt": _optional_int(event.get("unit_attempt")),
+                "query_digest": str(event.get("query_digest") or ""),
+                "cache_mode": str(event.get("cache_mode") or ""),
+                "status": str(event.get("status") or ""),
+                "output_row_count": _optional_int(
+                    event.get("output_row_count")
+                ),
+                "lm_cache_hits": _counter(event, "lm_cache_hits"),
+                "operator_cache_hits": _counter(
+                    event,
+                    "operator_cache_hits",
+                ),
+                "physical_prompt_tokens": _counter(
+                    event,
+                    "physical_prompt_tokens",
+                ),
+                "physical_completion_tokens": _counter(
+                    event,
+                    "physical_completion_tokens",
+                ),
+                "physical_total_tokens": _counter(
+                    event,
+                    "physical_total_tokens",
+                ),
+                "virtual_prompt_tokens": _counter(
+                    event,
+                    "virtual_prompt_tokens",
+                ),
+                "virtual_completion_tokens": _counter(
+                    event,
+                    "virtual_completion_tokens",
+                ),
+                "virtual_total_tokens": _counter(
+                    event,
+                    "virtual_total_tokens",
+                ),
+                "error_type": str(event.get("error_type") or ""),
+                "error_message": str(event.get("error_message") or ""),
+            }
+        )
+    return rows
+
+
+def summarize_framework_cache_usage(
+    rows: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Summarize framework cache counters separately from provider usage."""
+
+    counter_keys = (
+        "lm_cache_hits",
+        "operator_cache_hits",
+        "physical_prompt_tokens",
+        "physical_completion_tokens",
+        "physical_total_tokens",
+        "virtual_prompt_tokens",
+        "virtual_completion_tokens",
+        "virtual_total_tokens",
+    )
+    return {
+        "observed_operation_count": len(rows),
+        "error_count": sum(row.get("status") == "error" for row in rows),
+        **{
+            key: sum(int(row.get(key) or 0) for row in rows)
+            for key in counter_keys
+        },
+    }
+
+
 def _agent_provider_row(
     event: Mapping[str, Any],
     output_dir: Path,
@@ -386,4 +478,14 @@ def _optional_float(value: Any) -> float | None:
     return round(float(value), 3)
 
 
-__all__ = ["normalize_provider_calls", "summarize_provider_calls"]
+def _counter(event: Mapping[str, Any], key: str) -> int:
+    value = _optional_int(event.get(key))
+    return value if value is not None else 0
+
+
+__all__ = [
+    "normalize_framework_cache_usage",
+    "normalize_provider_calls",
+    "summarize_framework_cache_usage",
+    "summarize_provider_calls",
+]

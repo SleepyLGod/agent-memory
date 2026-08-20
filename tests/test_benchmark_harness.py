@@ -97,6 +97,44 @@ def _system_contract() -> MemorySystemContract:
     )
 
 
+def test_framework_cache_mode_changes_only_maintenance_identity() -> None:
+    disabled = _system_contract()
+    enabled = replace(disabled, framework_cache_mode="lotus-memory:1024")
+
+    assert disabled.maintenance_fingerprint != enabled.maintenance_fingerprint
+    assert disabled.retrieval_recipe_id == enabled.retrieval_recipe_id
+
+
+def test_checkpoint_restore_rejects_changed_framework_cache_mode(
+    tmp_path: Path,
+) -> None:
+    bundle = _session_bundle()
+    disabled = _system_contract()
+    maintenance_dir = tmp_path / "maintenance"
+    BenchmarkRunner(
+        system_contract=disabled,
+        contracts={"task-1": _contract()},
+        driver_factory=lambda case_id, state_dir, trace_dir: _Driver(state_dir),
+        answer_model=_Model(),
+        judge_model=_Model(),
+        artifacts=BenchmarkArtifactStore(maintenance_dir),
+        maintenance_only=True,
+    ).run(bundle)
+    enabled = replace(disabled, framework_cache_mode="lotus-memory:1024")
+    runner = BenchmarkRunner(
+        system_contract=enabled,
+        contracts={"task-1": _contract()},
+        driver_factory=lambda case_id, state_dir, trace_dir: _Driver(state_dir),
+        answer_model=_Model(["one"]),
+        judge_model=_Model(),
+        artifacts=BenchmarkArtifactStore(tmp_path / "retrieval"),
+        maintenance_checkpoint_source=BenchmarkArtifactStore(maintenance_dir),
+    )
+
+    with pytest.raises(ValueError, match="maintenance_fingerprint"):
+        runner.run(bundle)
+
+
 @pytest.mark.parametrize(
     ("response", "expected"),
     [
@@ -284,6 +322,18 @@ def test_runner_injects_once_queries_many_and_writes_contract(tmp_path) -> None:
     assert summary["driver_setup_wall_latency"]["mean_ms"] is not None
     assert summary["embedding_call_count"] == 0
     assert summary["embedding_error_count"] == 0
+    assert summary["framework_cache_usage"] == {
+        "observed_operation_count": 0,
+        "error_count": 0,
+        "lm_cache_hits": 0,
+        "operator_cache_hits": 0,
+        "physical_prompt_tokens": 0,
+        "physical_completion_tokens": 0,
+        "physical_total_tokens": 0,
+        "virtual_prompt_tokens": 0,
+        "virtual_completion_tokens": 0,
+        "virtual_total_tokens": 0,
+    }
     assert summary["phases"]["answering"]["prompt_tokens"] == 4
     for filename in (
         "overview.csv",
@@ -292,6 +342,7 @@ def test_runner_injects_once_queries_many_and_writes_contract(tmp_path) -> None:
         "per_question.csv",
         "provider_usage.csv",
         "embedding_usage.csv",
+        "framework_cache_usage.csv",
         "operation_usage.csv",
         "per_case.csv",
         "state_shape.csv",

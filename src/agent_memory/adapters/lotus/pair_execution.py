@@ -8,7 +8,9 @@ from dataclasses import dataclass
 from hashlib import sha256
 import json
 import math
+import re
 from time import perf_counter
+from typing import Any
 
 import pandas as pd
 
@@ -132,6 +134,77 @@ class PairCandidateSelection:
     candidate_pair_count: int
     pair_reduction: float
     embedding_latency_ms: float
+
+
+@dataclass(frozen=True)
+class SemanticPairSite:
+    """One semantic predicate shared by one or more physical query copies."""
+
+    site_id: str
+    operator: str
+    predicate_sha256: str
+    instruction: str
+    semantic_columns: tuple[str, ...]
+    partition_by: tuple[str, ...]
+    query_digests: tuple[str, ...]
+
+    def to_dict(self) -> dict[str, object]:
+        """Return a stable, human-auditable site inventory row."""
+
+        return {
+            "site_id": self.site_id,
+            "operator": self.operator,
+            "predicate_sha256": self.predicate_sha256,
+            "instruction": self.instruction,
+            "semantic_columns": list(self.semantic_columns),
+            "partition_by": list(self.partition_by),
+            "query_digests": list(self.query_digests),
+        }
+
+
+def semantic_pair_site_contract(query: Any) -> dict[str, object]:
+    """Return the input-lineage-independent predicate contract for a query."""
+
+    operator = str(query.op)
+    params = query.params
+    if operator == "sem_groupby":
+        semantic_columns = _string_tuple(params.get("input_cols"), "input_cols")
+        partition_by = _string_tuple(
+            params.get("partition_by") or (),
+            "partition_by",
+        )
+    elif operator == "sem_join":
+        instruction = str(params.get("instruction") or "")
+        semantic_columns = tuple(sorted(set(re.findall(r"\{([^{}]+)\}", instruction))))
+        partition_by = ()
+    else:
+        raise ValueError(
+            "semantic pair sites support sem_join and pairwise sem_groupby"
+        )
+    instruction = str(params.get("instruction") or "")
+    if not instruction:
+        raise ValueError("semantic pair site instruction must be non-empty")
+    if not semantic_columns:
+        raise ValueError("semantic pair site semantic columns must be non-empty")
+    return {
+        "operator": operator,
+        "instruction": instruction,
+        "semantic_columns": list(semantic_columns),
+        "partition_by": list(partition_by),
+    }
+
+
+def semantic_pair_site_id(query: Any) -> str:
+    """Return a stable identity for one natural-language pair predicate."""
+
+    contract = semantic_pair_site_contract(query)
+    encoded = json.dumps(
+        contract,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return f"{query.op}:{sha256(encoded).hexdigest()}"
 
 
 def select_semantic_pair_candidates(
@@ -285,6 +358,15 @@ def _require_columns(
         raise ValueError(f"semantic pair source columns not found: {missing}")
 
 
+def _string_tuple(value: object, name: str) -> tuple[str, ...]:
+    if not isinstance(value, (list, tuple)):
+        raise TypeError(f"semantic pair site {name} must be a sequence")
+    result = tuple(value)
+    if not all(isinstance(item, str) and item for item in result):
+        raise ValueError(f"semantic pair site {name} must contain non-empty strings")
+    return result
+
+
 def _endpoint_text(row: pd.Series, columns: Sequence[str]) -> str:
     return "\n".join(
         f"{column.split(':', 1)[0]}: {row[column]}" for column in columns
@@ -400,7 +482,10 @@ __all__ = [
     "SEMANTIC_PAIR_DIRECTIONS",
     "SEMANTIC_PAIR_EXECUTION_MODES",
     "SemanticPairExecutionProfile",
+    "SemanticPairSite",
     "select_semantic_pair_candidates",
+    "semantic_pair_site_contract",
+    "semantic_pair_site_id",
     "semantic_pair_profiles_fingerprint",
     "write_semantic_pair_execution_trace",
 ]
