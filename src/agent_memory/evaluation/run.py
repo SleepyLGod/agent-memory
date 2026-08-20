@@ -210,7 +210,7 @@ def run_agent_memory_bundle(
                 am.ZepMemory.spec(),
                 statements=GRAPHITI_NEO4J_STATEMENTS,
             )
-            operators = ("sem_groupby",)
+            operators = ("sem_join", "sem_groupby")
             embedding = GRAPHITI_BGE_M3
         semantic_pair_profiles, semantic_pair_sites = (
             build_site_semantic_pair_profiles(

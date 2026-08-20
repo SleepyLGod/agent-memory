@@ -878,7 +878,17 @@ def test_run_rejects_stale_site_before_provenance_and_environment(
         )
 
 
+@pytest.mark.parametrize(
+    ("grouped_agg_rule", "expected_profile_count", "expected_site_count"),
+    (
+        ("rule-re-group", 6, 2),
+        ("prefer-join-map", 4, 3),
+    ),
+)
 def test_run_resolves_site_config_into_manifest_and_query_profiles(
+    grouped_agg_rule: str,
+    expected_profile_count: int,
+    expected_site_count: int,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -888,14 +898,14 @@ def test_run_resolves_site_config_into_manifest_and_query_profiles(
     from agent_memory.planner import DifferentialRules, PolicyDifferentiator
 
     policy = PolicyDifferentiator(
-        rules=DifferentialRules(grouped_agg_rule="rule-re-group")
+        rules=DifferentialRules(grouped_agg_rule=grouped_agg_rule)
     ).differentiate(
         am.ZepMemory.spec(),
         statements=GRAPHITI_NEO4J_STATEMENTS,
     )
     sites = inventory_operator_semantic_pair_sites(
         policy,
-        operators=("sem_groupby",),
+        operators=("sem_join", "sem_groupby"),
     )
     bindings = [
         {
@@ -905,6 +915,9 @@ def test_run_resolves_site_config_into_manifest_and_query_profiles(
             "min_similarity": None if site.partition_by else 0.6,
         }
         for site in sites.values()
+        if grouped_agg_rule == "rule-re-group"
+        or site.operator == "sem_join"
+        or site.partition_by
     ]
     profile_path = tmp_path / "profiles.json"
     profile_path.write_text(
@@ -972,7 +985,7 @@ def test_run_resolves_site_config_into_manifest_and_query_profiles(
         contracts={},
         system_id="zep-memory",
         output_dir=tmp_path / "output",
-        grouped_agg_rule="rule-re-group",
+        grouped_agg_rule=grouped_agg_rule,
         semantic_pair_profile_config=profile_path,
         embedding_device="cuda",
         lotus_cache_mode="memory",
@@ -980,13 +993,23 @@ def test_run_resolves_site_config_into_manifest_and_query_profiles(
     )
 
     factory = captured["factory"]
-    assert len(factory["semantic_pair_profiles"]) == 6
+    assert len(factory["semantic_pair_profiles"]) == expected_profile_count
+    bound_query_digests = set(factory["semantic_pair_profiles"])
+    expected_bound_digests = {
+        query_digest
+        for site in sites.values()
+        if grouped_agg_rule == "rule-re-group"
+        or site.operator == "sem_join"
+        or site.partition_by
+        for query_digest in site.query_digests
+    }
+    assert bound_query_digests == expected_bound_digests
     runner = captured["runner"]
     contract = runner["system_contract"]
     assert contract.framework_cache_mode == "lotus-memory:1024"
     execution = runner["runtime_provenance"]["runtime"]["lotus_execution"]
     assert execution["semantic_pair_profile"] == "oracle-only"
-    assert len(execution["semantic_pair_site_inventory"]) == 2
+    assert len(execution["semantic_pair_site_inventory"]) == expected_site_count
     assert execution["semantic_pair_profile_config"]["source_sha256"] == sha256(
         profile_path.read_bytes()
     ).hexdigest()
