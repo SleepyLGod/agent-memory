@@ -18,6 +18,7 @@ from agent_memory.adapters.lotus.pair_execution import (
     PAIR_RIGHT_TEXT_COLUMN,
     SemanticPairExecutionProfile,
     select_semantic_pair_candidates,
+    semantic_pair_site_id,
 )
 from agent_memory.evaluation.harness import MemorySystemContract
 from agent_memory.adapters.lotus.context import LotusExecutionConfig
@@ -139,6 +140,42 @@ def _filter_query() -> QueryExpr:
                 "New Memory: {memory:later}"
             )
         },
+    )
+
+
+def test_semantic_pair_site_id_tracks_predicate_columns_and_partition() -> None:
+    source_a = QueryExpr(op="materialized_view", params={"name": "delta-a"})
+    source_b = QueryExpr(op="materialized_view", params={"name": "delta-b"})
+    base_params = {
+        "input_cols": ("fact",),
+        "instruction": "Group duplicate {fact} values.",
+        "partition_by": ("source_id",),
+    }
+    first = QueryExpr(op="sem_groupby", inputs=(source_a,), params=base_params)
+    different_lineage = QueryExpr(
+        op="sem_groupby",
+        inputs=(source_b,),
+        params=base_params,
+    )
+    different_partition = QueryExpr(
+        op="sem_groupby",
+        inputs=(source_a,),
+        params={**base_params, "partition_by": ("target_id",)},
+    )
+    different_predicate = QueryExpr(
+        op="sem_groupby",
+        inputs=(source_a,),
+        params={**base_params, "instruction": "Group related {fact} values."},
+    )
+
+    assert semantic_pair_site_id(first) == semantic_pair_site_id(
+        different_lineage
+    )
+    assert semantic_pair_site_id(first) != semantic_pair_site_id(
+        different_partition
+    )
+    assert semantic_pair_site_id(first) != semantic_pair_site_id(
+        different_predicate
     )
 
 

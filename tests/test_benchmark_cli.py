@@ -86,6 +86,53 @@ def test_agent_benchmark_clis_share_semantic_pair_execution_options(
     assert args.embedding_device == "cuda"
 
 
+@pytest.mark.parametrize("module", (locomo, longmemeval, memory_agent_bench))
+def test_agent_benchmark_clis_share_site_profiles_and_cache_mode(
+    module, tmp_path
+) -> None:
+    profile_path = tmp_path / "profiles.json"
+    args = module.parse_args(
+        [
+            "run",
+            "--bundle-dir",
+            str(tmp_path / "bundle"),
+            "--output-dir",
+            str(tmp_path / "output"),
+            "--system",
+            "zep-memory",
+            "--semantic-pair-profile-config",
+            str(profile_path),
+            "--lotus-cache-mode",
+            "memory",
+        ]
+    )
+
+    assert args.semantic_pair_profile_config == profile_path
+    assert args.lotus_cache_mode == "memory"
+
+
+@pytest.mark.parametrize("module", (locomo, longmemeval, memory_agent_bench))
+def test_agent_benchmark_clis_reject_site_and_global_profiles(
+    module, tmp_path
+) -> None:
+    with pytest.raises(SystemExit):
+        module.parse_args(
+            [
+                "run",
+                "--bundle-dir",
+                str(tmp_path / "bundle"),
+                "--output-dir",
+                str(tmp_path / "output"),
+                "--system",
+                "zep-memory",
+                "--semantic-pair-profile-config",
+                str(tmp_path / "profiles.json"),
+                "--semantic-pair-profile",
+                "oracle-only",
+            ]
+        )
+
+
 def test_longmemeval_cli_separates_bundle_preparation_from_system_run(tmp_path) -> None:
     prepared = longmemeval.parse_args(
         [

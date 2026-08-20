@@ -29,7 +29,9 @@ from agent_memory.evaluation.recovery import (
     UnitAttemptStore,
 )
 from agent_memory.evaluation.trace_metrics import (
+    normalize_framework_cache_usage,
     normalize_provider_calls,
+    summarize_framework_cache_usage,
     summarize_provider_calls,
 )
 from agent_memory.evaluation.types import (
@@ -1044,6 +1046,7 @@ class BenchmarkArtifactStore:
                     )
 
         trace_rows = _read_jsonl(self.trace_dir / "events.jsonl")
+        framework_cache_rows = normalize_framework_cache_usage(trace_rows)
         embedding_rows = [
             {
                 "trace_id": row.get("trace_id", ""),
@@ -1154,9 +1157,18 @@ class BenchmarkArtifactStore:
             durable_units=durable_units,
             authoritative_cases=authoritative_cases,
         )
+        framework_cache_rows = classify_attempt_rows(
+            framework_cache_rows,
+            durable_units=durable_units,
+            authoritative_cases=authoritative_cases,
+        )
         self._write_csv(
             self.output_dir / "metrics" / "embedding_usage.csv",
             embedding_rows,
+        )
+        self._write_csv(
+            self.output_dir / "metrics" / "framework_cache_usage.csv",
+            framework_cache_rows,
         )
         for question_row in question_rows:
             question_provider_rows = [
@@ -1651,6 +1663,9 @@ class BenchmarkArtifactStore:
         recovery_provider_summary = summarize_provider_calls(
             recovery_provider_rows
         )
+        framework_cache_summary = summarize_framework_cache_usage(
+            framework_cache_rows
+        )
         insertion_latencies = [
             float(row["wall_latency_ms"])
             for row in per_event_rows
@@ -1931,6 +1946,7 @@ class BenchmarkArtifactStore:
             "memory_system_error_case_count": len(memory_system_error_cases),
             "memory_system_error_question_count": memory_system_error_questions,
             "framework_cache_mode": manifest.get("framework_cache_mode"),
+            "framework_cache_usage": framework_cache_summary,
             "insertion_wall_latency": _latency_stats(insertion_latencies),
             "semantic_trace_io_wall_latency": _latency_stats(
                 semantic_trace_io_latencies
@@ -2049,6 +2065,18 @@ class BenchmarkArtifactStore:
                         else None
                     ),
                     "framework_cache_mode": manifest.get("framework_cache_mode"),
+                    "framework_lm_cache_hits": framework_cache_summary[
+                        "lm_cache_hits"
+                    ],
+                    "framework_operator_cache_hits": framework_cache_summary[
+                        "operator_cache_hits"
+                    ],
+                    "framework_physical_total_tokens": framework_cache_summary[
+                        "physical_total_tokens"
+                    ],
+                    "framework_virtual_total_tokens": framework_cache_summary[
+                        "virtual_total_tokens"
+                    ],
                     "completion_tokens": provider_summary["completion_tokens"],
                     "reasoning_tokens": provider_summary["reasoning_tokens"],
                     "estimated_cost_usd": provider_summary["estimated_cost_usd"],

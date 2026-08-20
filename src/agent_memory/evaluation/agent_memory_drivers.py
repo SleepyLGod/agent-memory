@@ -20,10 +20,14 @@ from agent_memory.adapters.lotus.pair_execution import (
     PAIR_RIGHT_TEXT_COLUMN,
     SEMANTIC_PAIR_EXECUTION_MODES,
     SemanticPairExecutionProfile,
+    SemanticPairSite,
+    semantic_pair_site_contract,
+    semantic_pair_site_id,
 )
 from agent_memory.evaluation.claude_memory.bindings import event_to_claude_log_row
 from agent_memory.evaluation.embedding_trace import TracingEmbeddingProvider
 from agent_memory.evaluation.harness import RetrievalOutput
+from agent_memory.evaluation.semantic_pair_config import SemanticPairSiteBinding
 from agent_memory.evaluation.types import BenchmarkEvent, RetrievalRequest
 from agent_memory.evaluation.zep.answering import format_retrieval_context
 from agent_memory.policy.retrieval import RetrievalResult
@@ -32,6 +36,7 @@ from agent_memory.storage import EmbeddingSpec
 
 BENCHMARK_STRUCTURED_MAX_TOKENS = 32_768
 BENCHMARK_LM_NUM_RETRIES = 2
+LOTUS_CACHE_MODES = ("disabled", "memory")
 SEMANTIC_PAIR_BGE_M3 = EmbeddingSpec(
     source_column="semantic_pair_text",
     property_name="semantic_pair_embedding",
@@ -68,9 +73,43 @@ def build_operator_semantic_pair_profiles(
     if unknown:
         raise ValueError(f"unsupported semantic pair operators: {unknown}")
 
+    profiles: dict[str, SemanticPairExecutionProfile] = {}
+    sites = inventory_operator_semantic_pair_sites(policy, operators=operators)
+    for site in sites.values():
+        direction = "left-to-right" if site.operator == "sem_join" else "symmetric"
+        profile = _operator_semantic_pair_profile(
+            mode=mode,
+            direction=direction,
+            embedding=embedding,
+            embedding_device=embedding_device,
+            top_k=top_k,
+            min_similarity=min_similarity,
+        )
+        profiles.update(
+            {query_digest_value: profile for query_digest_value in site.query_digests}
+        )
+    if not profiles:
+        raise ValueError(
+            f"{mode} found no eligible " + ", ".join(operators) + " queries"
+        )
+    return profiles
+
+
+def inventory_operator_semantic_pair_sites(
+    policy: Any,
+    *,
+    operators: tuple[str, ...],
+) -> dict[str, SemanticPairSite]:
+    """Group differential query copies by their semantic predicate contract."""
+
+    supported = {"sem_join", "sem_groupby"}
+    unknown = sorted(set(operators) - supported)
+    if unknown:
+        raise ValueError(f"unsupported semantic pair operators: {unknown}")
+
     from agent_memory.tracing.semantic import query_digest
 
-    profiles: dict[str, SemanticPairExecutionProfile] = {}
+    grouped: dict[str, dict[str, Any]] = {}
     pending = [node.query for node in policy.nodes.values()]
     pending.extend(
         node.maintenance_query
@@ -88,24 +127,94 @@ def build_operator_semantic_pair_profiles(
             continue
         if query.op == "sem_groupby" and query.params.get("labels"):
             continue
-        direction = "left-to-right" if query.op == "sem_join" else "symmetric"
-        profiles[query_digest(query)] = SemanticPairExecutionProfile(
-            mode=mode,
+        site_id = semantic_pair_site_id(query)
+        contract = semantic_pair_site_contract(query)
+        group = grouped.setdefault(
+            site_id,
+            {
+                "operator": query.op,
+                "contract": contract,
+                "query_digests": set(),
+            },
+        )
+        if group["contract"] != contract:
+            raise RuntimeError("semantic pair site digest collision")
+        group["query_digests"].add(query_digest(query))
+
+    result: dict[str, SemanticPairSite] = {}
+    for site_id, group in sorted(grouped.items()):
+        contract = group["contract"]
+        predicate_sha256 = site_id.split(":", 1)[1]
+        result[site_id] = SemanticPairSite(
+            site_id=site_id,
+            operator=str(group["operator"]),
+            predicate_sha256=predicate_sha256,
+            instruction=str(contract["instruction"]),
+            semantic_columns=tuple(contract["semantic_columns"]),
+            partition_by=tuple(contract["partition_by"]),
+            query_digests=tuple(sorted(group["query_digests"])),
+        )
+    return result
+
+
+def build_site_semantic_pair_profiles(
+    policy: Any,
+    *,
+    bindings: tuple[SemanticPairSiteBinding, ...],
+    operators: tuple[str, ...],
+    embedding: EmbeddingSpec,
+    embedding_device: str = "cpu",
+) -> tuple[
+    dict[str, SemanticPairExecutionProfile],
+    dict[str, SemanticPairSite],
+]:
+    """Resolve site bindings into the query-addressed adapter profile map."""
+
+    sites = inventory_operator_semantic_pair_sites(policy, operators=operators)
+    unknown = sorted({binding.site_id for binding in bindings} - set(sites))
+    if unknown:
+        raise ValueError(f"semantic pair site bindings not found in policy: {unknown}")
+    profiles: dict[str, SemanticPairExecutionProfile] = {}
+    for binding in bindings:
+        if binding.mode == "oracle-only":
+            continue
+        site = sites[binding.site_id]
+        direction = "left-to-right" if site.operator == "sem_join" else "symmetric"
+        profile = _operator_semantic_pair_profile(
+            mode=binding.mode,
             direction=direction,
-            left_id_columns=(PAIR_LEFT_ID_COLUMN,),
-            right_id_columns=(PAIR_RIGHT_ID_COLUMN,),
-            left_text_columns=(PAIR_LEFT_TEXT_COLUMN,),
-            right_text_columns=(PAIR_RIGHT_TEXT_COLUMN,),
             embedding=embedding,
             embedding_device=embedding_device,
-            top_k=top_k,
-            min_similarity=min_similarity,
+            top_k=binding.top_k,
+            min_similarity=binding.min_similarity,
         )
-    if not profiles:
-        raise ValueError(
-            f"{mode} found no eligible " + ", ".join(operators) + " queries"
+        profiles.update(
+            {query_digest_value: profile for query_digest_value in site.query_digests}
         )
-    return profiles
+    return profiles, sites
+
+
+def _operator_semantic_pair_profile(
+    *,
+    mode: str,
+    direction: str,
+    embedding: EmbeddingSpec,
+    embedding_device: str,
+    top_k: int | None,
+    min_similarity: float | None,
+) -> SemanticPairExecutionProfile:
+    return SemanticPairExecutionProfile(
+        mode=mode,
+        direction=direction,
+        left_id_columns=(PAIR_LEFT_ID_COLUMN,),
+        right_id_columns=(PAIR_RIGHT_ID_COLUMN,),
+        left_text_columns=(PAIR_LEFT_TEXT_COLUMN,),
+        right_text_columns=(PAIR_RIGHT_TEXT_COLUMN,),
+        embedding=embedding,
+        embedding_device=embedding_device,
+        top_k=top_k,
+        min_similarity=min_similarity,
+    )
 
 
 def _semantic_pair_embedding_contract(
@@ -124,6 +233,13 @@ def _semantic_pair_embedding_contract(
     embedding = next(iter(embeddings))
     assert embedding is not None
     return embedding, next(iter(devices))
+
+
+def _validate_lotus_cache_mode(mode: str) -> None:
+    if mode not in LOTUS_CACHE_MODES:
+        raise ValueError(
+            "lotus_cache_mode must be one of: " + ", ".join(LOTUS_CACHE_MODES)
+        )
 
 
 def build_mem0_semantic_pair_profiles(
@@ -539,6 +655,7 @@ class ClaudeMemoryDriverFactory:
         sem_groupby_pair_batch_retries: int = 0,
         semantic_pair_profiles: dict[str, SemanticPairExecutionProfile] | None = None,
         semantic_trace_snapshot_mode: str = "compact",
+        lotus_cache_mode: str = "disabled",
         thinking_enabled: bool = True,
     ) -> None:
         from agent_memory.adapters.lotus.context import SEM_TOPK_METHODS
@@ -560,6 +677,8 @@ class ClaudeMemoryDriverFactory:
         self.semantic_pair_profiles = dict(semantic_pair_profiles or {})
         _semantic_pair_embedding_contract(self.semantic_pair_profiles)
         self.semantic_trace_snapshot_mode = semantic_trace_snapshot_mode
+        _validate_lotus_cache_mode(lotus_cache_mode)
+        self.lotus_cache_mode = lotus_cache_mode
         self.thinking_enabled = thinking_enabled
 
     def __call__(
@@ -603,7 +722,7 @@ class ClaudeMemoryDriverFactory:
                         }
                     }
                 },
-                lm_enable_cache=False,
+                lm_enable_cache=self.lotus_cache_mode == "memory",
                 structured_max_tokens=BENCHMARK_STRUCTURED_MAX_TOKENS,
                 sem_topk_method=self.sem_topk_method,
                 sem_groupby_pair_batch_size=self.sem_groupby_pair_batch_size,
@@ -636,6 +755,7 @@ class ZepMemoryDriverFactory:
         semantic_pair_profiles: dict[str, SemanticPairExecutionProfile] | None = None,
         embedding_device: str = "cpu",
         semantic_trace_snapshot_mode: str = "compact",
+        lotus_cache_mode: str = "disabled",
         thinking_enabled: bool = True,
         neo4j_image: str,
         neo4j_image_digest: str,
@@ -674,6 +794,8 @@ class ZepMemoryDriverFactory:
             )
         self.embedding_device = embedding_device
         self.semantic_trace_snapshot_mode = semantic_trace_snapshot_mode
+        _validate_lotus_cache_mode(lotus_cache_mode)
+        self.lotus_cache_mode = lotus_cache_mode
         self.thinking_enabled = thinking_enabled
         self.neo4j_image = neo4j_image
         self.neo4j_image_digest = neo4j_image_digest
@@ -691,6 +813,7 @@ class ZepMemoryDriverFactory:
         semantic_pair_profiles: dict[str, SemanticPairExecutionProfile] | None = None,
         embedding_device: str = "cpu",
         semantic_trace_snapshot_mode: str = "compact",
+        lotus_cache_mode: str = "disabled",
         thinking_enabled: bool = True,
     ) -> ZepMemoryDriverFactory:
         """Create the pinned Graphiti-compatible deployment connector."""
@@ -737,6 +860,7 @@ class ZepMemoryDriverFactory:
             semantic_pair_profiles=semantic_pair_profiles,
             embedding_device=embedding_device,
             semantic_trace_snapshot_mode=semantic_trace_snapshot_mode,
+            lotus_cache_mode=lotus_cache_mode,
             thinking_enabled=thinking_enabled,
             neo4j_image=neo4j_image,
             neo4j_image_digest=neo4j_image_digest,
@@ -797,7 +921,7 @@ class ZepMemoryDriverFactory:
                         }
                     }
                 },
-                lm_enable_cache=False,
+                lm_enable_cache=self.lotus_cache_mode == "memory",
                 structured_max_tokens=BENCHMARK_STRUCTURED_MAX_TOKENS,
                 sem_groupby_pair_batch_size=self.sem_groupby_pair_batch_size,
                 sem_groupby_pair_batch_retries=self.sem_groupby_pair_batch_retries,
@@ -850,6 +974,7 @@ class Mem0MemoryDriverFactory:
         semantic_pair_profiles: dict[str, SemanticPairExecutionProfile] | None = None,
         embedding_device: str = "cpu",
         semantic_trace_snapshot_mode: str = "compact",
+        lotus_cache_mode: str = "disabled",
         thinking_enabled: bool = False,
     ) -> None:
         if not base_namespace:
@@ -863,6 +988,8 @@ class Mem0MemoryDriverFactory:
             raise ValueError("Mem0 embedding_device must be 'cpu' or 'cuda'")
         self.embedding_device = embedding_device
         self.semantic_trace_snapshot_mode = semantic_trace_snapshot_mode
+        _validate_lotus_cache_mode(lotus_cache_mode)
+        self.lotus_cache_mode = lotus_cache_mode
         self.thinking_enabled = thinking_enabled
         self.sem_topk_method = "pairwise-naive"
 
@@ -946,7 +1073,7 @@ class Mem0MemoryDriverFactory:
                             }
                         }
                     },
-                    lm_enable_cache=False,
+                    lm_enable_cache=self.lotus_cache_mode == "memory",
                     structured_max_tokens=BENCHMARK_STRUCTURED_MAX_TOKENS,
                     sem_topk_method=self.sem_topk_method,
                     sem_groupby_pair_batch_size=self.sem_groupby_pair_batch_size,
@@ -994,6 +1121,7 @@ class Mem0MemoryEnhancedDriverFactory(Mem0MemoryDriverFactory):
         semantic_pair_profiles: dict[str, SemanticPairExecutionProfile] | None = None,
         embedding_device: str = "cpu",
         semantic_trace_snapshot_mode: str = "compact",
+        lotus_cache_mode: str = "disabled",
         thinking_enabled: bool = False,
     ) -> None:
         from agent_memory.adapters.lotus.context import SEM_TOPK_METHODS
@@ -1010,6 +1138,7 @@ class Mem0MemoryEnhancedDriverFactory(Mem0MemoryDriverFactory):
             semantic_pair_profiles=semantic_pair_profiles,
             embedding_device=embedding_device,
             semantic_trace_snapshot_mode=semantic_trace_snapshot_mode,
+            lotus_cache_mode=lotus_cache_mode,
             thinking_enabled=thinking_enabled,
         )
         self.sem_topk_method = sem_topk_method
@@ -1023,10 +1152,13 @@ __all__ = [
     "Mem0MemoryEnhancedDriver",
     "Mem0MemoryEnhancedDriverFactory",
     "SEMANTIC_PAIR_BGE_M3",
+    "LOTUS_CACHE_MODES",
     "ZepMemoryDriver",
     "ZepMemoryDriverFactory",
     "build_mem0_semantic_pair_profiles",
     "build_operator_semantic_pair_profiles",
+    "build_site_semantic_pair_profiles",
+    "inventory_operator_semantic_pair_sites",
     "event_to_mem0_log_row",
     "event_to_zep_log_row",
 ]

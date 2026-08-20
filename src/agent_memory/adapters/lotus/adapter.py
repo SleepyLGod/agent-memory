@@ -42,6 +42,7 @@ from agent_memory.tracing.semantic import (
     query_digest,
     semantic_trace_scope,
     write_compact_operator_trace,
+    write_trace_event,
 )
 from agent_memory.adapters.lotus.sources import execute_log, execute_materialized_view
 from agent_memory.adapters.lotus.window import (
@@ -191,4 +192,67 @@ class LotusAdapter:
             query_digest=digest,
             semantic_trace_snapshot_mode=self.config.semantic_trace_snapshot_mode,
         ):
-            return executor(query, inputs, self.execute, self._context)
+            cache_enabled = self.config.lm_enable_cache is True
+            if cache_enabled:
+                self._context.configure()
+            before = self._context.cache_usage_snapshot()
+            try:
+                result = executor(query, inputs, self.execute, self._context)
+            except BaseException as error:
+                if cache_enabled:
+                    self._write_framework_cache_usage(
+                        query,
+                        before=before,
+                        after=self._context.cache_usage_snapshot(),
+                        status="error",
+                        error=error,
+                    )
+                raise
+            if cache_enabled:
+                self._write_framework_cache_usage(
+                    query,
+                    before=before,
+                    after=self._context.cache_usage_snapshot(),
+                    status="success",
+                    output=result,
+                )
+            return result
+
+    def _write_framework_cache_usage(
+        self,
+        query: QueryExpr,
+        *,
+        before: Mapping[str, int],
+        after: Mapping[str, int],
+        status: str,
+        output: Any | None = None,
+        error: BaseException | None = None,
+    ) -> None:
+        """Record one cache delta without changing provider accounting."""
+
+        delta = {
+            key: max(0, int(after.get(key, 0)) - int(before.get(key, 0)))
+            for key in before
+        }
+        payload: dict[str, Any] = {
+            "query_digest": query_digest(query),
+            "cache_mode": "lotus-memory:1024",
+            "status": status,
+            **delta,
+        }
+        output_frame = output[0] if isinstance(output, tuple) and output else output
+        if hasattr(output_frame, "__len__"):
+            payload["output_row_count"] = len(output_frame)
+        if error is not None:
+            payload.update(
+                {
+                    "error_type": type(error).__name__,
+                    "error_message": str(error),
+                }
+            )
+        write_trace_event(
+            self.config.trace_dir(),
+            operator=query.op,
+            event_type="framework_cache_usage",
+            payload=payload,
+        )

@@ -87,6 +87,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     run.add_argument("--semantic-pair-top-k", type=int)
     run.add_argument("--semantic-pair-min-similarity", type=float)
+    run.add_argument("--semantic-pair-profile-config", type=Path)
+    run.add_argument(
+        "--lotus-cache-mode",
+        choices=("disabled", "memory"),
+        default="disabled",
+    )
     run.add_argument("--embedding-device", choices=("cpu", "cuda"), default="cpu")
     run.add_argument(
         "--semantic-trace-snapshot-mode",
@@ -95,6 +101,19 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     args = parser.parse_args(raw_args)
     if args.command == "run":
+        if args.semantic_pair_profile_config is not None and any(
+            argument == option or argument.startswith(f"{option}=")
+            for option in (
+                "--semantic-pair-profile",
+                "--semantic-pair-top-k",
+                "--semantic-pair-min-similarity",
+            )
+            for argument in raw_args
+        ):
+            parser.error(
+                "--semantic-pair-profile-config is mutually exclusive with "
+                "global semantic-pair profile options"
+            )
         invalid = [
             option
             for option in (
@@ -179,6 +198,8 @@ def main(argv: Sequence[str] | None = None) -> Path:
         semantic_pair_profile=args.semantic_pair_profile,
         semantic_pair_top_k=args.semantic_pair_top_k,
         semantic_pair_min_similarity=args.semantic_pair_min_similarity,
+        semantic_pair_profile_config=args.semantic_pair_profile_config,
+        lotus_cache_mode=args.lotus_cache_mode,
         embedding_device=args.embedding_device,
         semantic_trace_snapshot_mode=args.semantic_trace_snapshot_mode,
         memory_thinking_enabled=False,

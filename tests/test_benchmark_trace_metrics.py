@@ -4,7 +4,9 @@ import json
 from pathlib import Path
 
 from agent_memory.evaluation.trace_metrics import (
+    normalize_framework_cache_usage,
     normalize_provider_calls,
+    summarize_framework_cache_usage,
     summarize_provider_calls,
 )
 
@@ -220,3 +222,48 @@ def test_normalize_provider_calls_preserves_batch_identity_and_usage(
     assert summary["cache_miss_tokens"] == 24
     assert summary["completion_tokens"] == 12
     assert summary["estimated_cost_usd"] == 6.8208e-06
+
+
+def test_framework_cache_usage_is_separate_from_provider_usage(
+    tmp_path: Path,
+) -> None:
+    events = [
+        {
+            "trace_id": "cache-1",
+            "operator_call_id": "operator-1",
+            "event_type": "framework_cache_usage",
+            "operator": "sem_filter",
+            "phase": "insertion",
+            "case_id": "case-1",
+            "event_id": "event-1",
+            "cache_mode": "lotus-memory:1024",
+            "status": "success",
+            "output_row_count": 2,
+            "lm_cache_hits": 1,
+            "operator_cache_hits": 2,
+            "physical_prompt_tokens": 3,
+            "physical_completion_tokens": 1,
+            "physical_total_tokens": 4,
+            "virtual_prompt_tokens": 9,
+            "virtual_completion_tokens": 3,
+            "virtual_total_tokens": 12,
+        }
+    ]
+
+    rows = normalize_framework_cache_usage(events)
+    summary = summarize_framework_cache_usage(rows)
+
+    assert normalize_provider_calls(events, output_dir=tmp_path) == []
+    assert rows[0]["cache_mode"] == "lotus-memory:1024"
+    assert summary == {
+        "observed_operation_count": 1,
+        "error_count": 0,
+        "lm_cache_hits": 1,
+        "operator_cache_hits": 2,
+        "physical_prompt_tokens": 3,
+        "physical_completion_tokens": 1,
+        "physical_total_tokens": 4,
+        "virtual_prompt_tokens": 9,
+        "virtual_completion_tokens": 3,
+        "virtual_total_tokens": 12,
+    }
