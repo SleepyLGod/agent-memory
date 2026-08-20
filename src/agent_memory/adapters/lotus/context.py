@@ -127,6 +127,11 @@ class LotusExecutionContext:
     pair_embedding_provider: EmbeddingProvider | None = None
     _configured: bool = field(default=False, init=False, repr=False)
     _lm: Any | None = field(default=None, init=False, repr=False)
+    _reported_cache_usage: dict[str, int] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+    )
 
     def configure(self) -> None:
         """Configure LOTUS before invoking semantic dataframe operators."""
@@ -203,3 +208,17 @@ class LotusExecutionContext:
             "virtual_completion_tokens": int(stats.virtual_usage.completion_tokens),
             "virtual_total_tokens": int(stats.virtual_usage.total_tokens),
         }
+
+    def consume_cache_usage_delta(self) -> dict[str, int]:
+        """Return counters not already attributed to an earlier trace event."""
+
+        current = self.cache_usage_snapshot()
+        delta = {
+            key: value - self._reported_cache_usage.get(key, 0)
+            for key, value in current.items()
+        }
+        decreased = {key: value for key, value in delta.items() if value < 0}
+        if decreased:
+            raise RuntimeError(f"LOTUS cache counters decreased: {decreased}")
+        self._reported_cache_usage = current
+        return delta

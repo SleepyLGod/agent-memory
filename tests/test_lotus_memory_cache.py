@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 
 import pandas as pd
@@ -87,6 +88,32 @@ def test_lotus_exact_lm_cache_counts_virtual_not_physical_usage(
     assert lm.stats.cache_hits == 1
     assert lm.stats.physical_usage.total_tokens == physical_after_first
     assert lm.stats.virtual_usage.total_tokens > virtual_after_first
+
+
+def test_cache_trace_deltas_do_not_double_count_nested_operations() -> None:
+    usage = SimpleNamespace(prompt_tokens=3, completion_tokens=1, total_tokens=4)
+    stats = SimpleNamespace(
+        cache_hits=1,
+        operator_cache_hits=0,
+        physical_usage=usage,
+        virtual_usage=usage,
+    )
+    context = LotusExecutionContext(model="test/model")
+    context._lm = SimpleNamespace(stats=stats)
+
+    inner = context.consume_cache_usage_delta()
+    outer = context.consume_cache_usage_delta()
+    usage.prompt_tokens = 5
+    usage.completion_tokens = 2
+    usage.total_tokens = 7
+    stats.cache_hits = 2
+    later = context.consume_cache_usage_delta()
+
+    assert inner["physical_total_tokens"] == 4
+    assert outer["physical_total_tokens"] == 0
+    assert later["physical_total_tokens"] == 3
+    assert sum(row["physical_total_tokens"] for row in (inner, outer, later)) == 7
+    assert sum(row["lm_cache_hits"] for row in (inner, outer, later)) == 2
 
 
 def test_lotus_operator_cache_skips_repeated_operator_execution(

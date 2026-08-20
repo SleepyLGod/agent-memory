@@ -195,15 +195,13 @@ class LotusAdapter:
             cache_enabled = self.config.lm_enable_cache is True
             if cache_enabled:
                 self._context.configure()
-            before = self._context.cache_usage_snapshot()
             try:
                 result = executor(query, inputs, self.execute, self._context)
             except BaseException as error:
                 if cache_enabled:
                     self._write_framework_cache_usage(
                         query,
-                        before=before,
-                        after=self._context.cache_usage_snapshot(),
+                        usage=self._context.consume_cache_usage_delta(),
                         status="error",
                         error=error,
                     )
@@ -211,8 +209,7 @@ class LotusAdapter:
             if cache_enabled:
                 self._write_framework_cache_usage(
                     query,
-                    before=before,
-                    after=self._context.cache_usage_snapshot(),
+                    usage=self._context.consume_cache_usage_delta(),
                     status="success",
                     output=result,
                 )
@@ -222,23 +219,18 @@ class LotusAdapter:
         self,
         query: QueryExpr,
         *,
-        before: Mapping[str, int],
-        after: Mapping[str, int],
+        usage: Mapping[str, int],
         status: str,
         output: Any | None = None,
         error: BaseException | None = None,
     ) -> None:
         """Record one cache delta without changing provider accounting."""
 
-        delta = {
-            key: max(0, int(after.get(key, 0)) - int(before.get(key, 0)))
-            for key in before
-        }
         payload: dict[str, Any] = {
             "query_digest": query_digest(query),
             "cache_mode": "lotus-memory:1024",
             "status": status,
-            **delta,
+            **usage,
         }
         output_frame = output[0] if isinstance(output, tuple) and output else output
         if hasattr(output_frame, "__len__"):
