@@ -701,6 +701,7 @@ class ClaudeMemoryDriverFactory:
         )
         if embedding_contract is not None:
             embedding, device = embedding_contract
+            # The benchmark's zep extra supplies sentence-transformers here.
             pair_embedding_provider = TracingEmbeddingProvider(
                 SentenceTransformerEmbeddingProvider(
                     embedding,
