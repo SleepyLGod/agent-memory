@@ -404,7 +404,7 @@ def test_claude_factory_creates_traced_pair_provider_only_for_profile(
     assert captured == {
         "spec": SEMANTIC_PAIR_BGE_M3,
         "device": "cuda",
-        "dependency_extra": "zep or mem0",
+        "dependency_extra": "zep",
     }
     assert isinstance(adapter.pair_embedding_provider, TracingEmbeddingProvider)
     assert adapter.config.semantic_pair_profiles == profiles
