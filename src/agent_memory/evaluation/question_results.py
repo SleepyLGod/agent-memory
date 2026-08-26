@@ -23,6 +23,8 @@ def _json_value(value: Any) -> Any:
         value, (str, bytes, bytearray)
     ):
         return [_json_value(item) for item in value]
+    if type(value).__module__.startswith("neo4j.time"):
+        return str(value)
     return value
 
 

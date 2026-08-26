@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from types import MappingProxyType
 
+from neo4j.time import DateTime
 import pytest
 
 from agent_memory.evaluation.attempt_metrics import (
@@ -94,6 +95,36 @@ def test_atomic_question_store_serializes_read_only_nested_mappings(
 
     assert (tmp_path / "retrieval.jsonl").read_text(encoding="utf-8") == (
         '{"channels": {"memories": [{"memory": "tea"}]}}\n'
+    )
+
+
+def test_atomic_question_store_serializes_neo4j_temporal_values(
+    tmp_path: Path,
+) -> None:
+    store = AtomicQuestionStore(tmp_path)
+    store.publish(
+        question_id="q1",
+        contract_fingerprint="contract",
+        retrieval={
+            "channels": {
+                "facts": [
+                    {
+                        "valid_at": DateTime(2026, 8, 26, 13, 14, 15, 0),
+                    }
+                ]
+            }
+        },
+        answer={"answer": "tea"},
+        grades=({"scorer_id": "exact", "score": 1.0},),
+        execution_attempt=1,
+        unit_attempt=1,
+    )
+
+    store.rebuild_jsonl(("q1",))
+
+    assert (tmp_path / "retrieval.jsonl").read_text(encoding="utf-8") == (
+        '{"channels": {"facts": [{"valid_at": '
+        '"2026-08-26T13:14:15.000000000"}]}}\n'
     )
 
 
