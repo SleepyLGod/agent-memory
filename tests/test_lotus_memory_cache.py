@@ -2,17 +2,22 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+import json
 from types import SimpleNamespace
 from typing import Any
 
 import pandas as pd
 import pytest
 
+from agent_memory.adapters.lotus import LotusAdapter
 from agent_memory.adapters.lotus.context import (
+    LOTUS_MEMORY_CACHE_ID,
     LOTUS_MEMORY_CACHE_MAX_SIZE,
     LotusExecutionConfig,
     LotusExecutionContext,
 )
+from agent_memory.policy.logical import QueryExpr
 
 
 def test_lotus_context_uses_one_bounded_native_memory_cache(
@@ -32,6 +37,131 @@ def test_lotus_context_uses_one_bounded_native_memory_cache(
     assert lotus.settings.enable_cache is True
     assert isinstance(lotus.settings.lm.cache, InMemoryCache)
     assert lotus.settings.lm.cache.max_size == LOTUS_MEMORY_CACHE_MAX_SIZE
+    assert LOTUS_MEMORY_CACHE_ID == "lotus-memory:1024"
+
+
+class _OriginalExecutorError(RuntimeError):
+    pass
+
+
+class _CacheTraceError(RuntimeError):
+    pass
+
+
+def _failing_executor(
+    error: BaseException,
+) -> Callable[..., None]:
+    def execute(*_args: object) -> None:
+        raise error
+
+    return execute
+
+
+def _cache_enabled_adapter(monkeypatch: pytest.MonkeyPatch) -> LotusAdapter:
+    adapter = LotusAdapter(
+        config=LotusExecutionConfig(lm_enable_cache=True),
+    )
+    monkeypatch.setattr(adapter._context, "configure", lambda: None)
+    return adapter
+
+
+def test_cache_counter_failure_does_not_mask_executor_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _cache_enabled_adapter(monkeypatch)
+    original = _OriginalExecutorError("executor failed")
+
+    def fail_counter() -> dict[str, int]:
+        raise _CacheTraceError("counter failed")
+
+    monkeypatch.setattr(
+        adapter._context,
+        "consume_cache_usage_delta",
+        fail_counter,
+    )
+
+    with pytest.raises(_OriginalExecutorError) as captured:
+        adapter._execute_traced_semantic(
+            QueryExpr(op="sem_map"),
+            {},
+            _failing_executor(original),
+        )
+
+    assert captured.value is original
+    assert captured.value.__notes__ == [
+        "LOTUS cache usage trace failed: _CacheTraceError: counter failed"
+    ]
+
+
+def test_cache_trace_failure_does_not_mask_executor_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _cache_enabled_adapter(monkeypatch)
+    original = _OriginalExecutorError("executor failed")
+    monkeypatch.setattr(
+        adapter._context,
+        "consume_cache_usage_delta",
+        lambda: {},
+    )
+
+    def fail_trace(*_args: object, **_kwargs: object) -> None:
+        raise _CacheTraceError("trace failed")
+
+    monkeypatch.setattr(adapter, "_write_framework_cache_usage", fail_trace)
+
+    with pytest.raises(_OriginalExecutorError) as captured:
+        adapter._execute_traced_semantic(
+            QueryExpr(op="sem_map"),
+            {},
+            _failing_executor(original),
+        )
+
+    assert captured.value is original
+    assert captured.value.__notes__ == [
+        "LOTUS cache usage trace failed: _CacheTraceError: trace failed"
+    ]
+
+
+def test_successful_executor_still_fails_when_cache_trace_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _cache_enabled_adapter(monkeypatch)
+    monkeypatch.setattr(
+        adapter._context,
+        "consume_cache_usage_delta",
+        lambda: {},
+    )
+
+    def fail_trace(*_args: object, **_kwargs: object) -> None:
+        raise _CacheTraceError("trace failed")
+
+    monkeypatch.setattr(adapter, "_write_framework_cache_usage", fail_trace)
+
+    with pytest.raises(_CacheTraceError, match="trace failed"):
+        adapter._execute_traced_semantic(
+            QueryExpr(op="sem_map"),
+            {},
+            lambda *_args: "result",
+        )
+
+
+def test_framework_cache_trace_uses_shared_cache_identity(tmp_path) -> None:
+    adapter = LotusAdapter(
+        config=LotusExecutionConfig(semantic_trace_dir=tmp_path),
+    )
+
+    adapter._write_framework_cache_usage(
+        QueryExpr(op="sem_map"),
+        usage={},
+        status="success",
+        output=pd.DataFrame({"value": [1]}),
+    )
+
+    event = json.loads(
+        (tmp_path / "events.jsonl").read_text(encoding="utf-8")
+    )
+    assert event["cache_mode"] == LOTUS_MEMORY_CACHE_ID
+    assert event["cache_mode"] == "lotus-memory:1024"
 
 
 def test_lotus_exact_lm_cache_counts_virtual_not_physical_usage(

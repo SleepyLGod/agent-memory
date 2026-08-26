@@ -7,7 +7,11 @@ from dataclasses import dataclass, field
 from typing import Any
 from uuid import uuid4
 
-from agent_memory.adapters.lotus.context import LotusExecutionConfig, LotusExecutionContext
+from agent_memory.adapters.lotus.context import (
+    LOTUS_MEMORY_CACHE_ID,
+    LotusExecutionConfig,
+    LotusExecutionContext,
+)
 from agent_memory.adapters.lotus.pair_execution import (
     semantic_pair_profiles_fingerprint,
 )
@@ -199,12 +203,18 @@ class LotusAdapter:
                 result = executor(query, inputs, self.execute, self._context)
             except BaseException as error:
                 if cache_enabled:
-                    self._write_framework_cache_usage(
-                        query,
-                        usage=self._context.consume_cache_usage_delta(),
-                        status="error",
-                        error=error,
-                    )
+                    try:
+                        self._write_framework_cache_usage(
+                            query,
+                            usage=self._context.consume_cache_usage_delta(),
+                            status="error",
+                            error=error,
+                        )
+                    except Exception as trace_error:
+                        error.add_note(
+                            "LOTUS cache usage trace failed: "
+                            f"{type(trace_error).__name__}: {trace_error}"
+                        )
                 raise
             if cache_enabled:
                 self._write_framework_cache_usage(
@@ -228,7 +238,7 @@ class LotusAdapter:
 
         payload: dict[str, Any] = {
             "query_digest": query_digest(query),
-            "cache_mode": "lotus-memory:1024",
+            "cache_mode": LOTUS_MEMORY_CACHE_ID,
             "status": status,
             **usage,
         }

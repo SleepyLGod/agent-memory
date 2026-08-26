@@ -17,6 +17,7 @@ from agent_memory.storage.embedding import EmbeddingProvider
 DEFAULT_STRUCTURED_MAX_TOKENS = 8192
 DEFAULT_STRUCTURED_PARSE_RETRIES = 3
 LOTUS_MEMORY_CACHE_MAX_SIZE = 1024
+LOTUS_MEMORY_CACHE_ID = f"lotus-memory:{LOTUS_MEMORY_CACHE_MAX_SIZE}"
 SEM_TOPK_METHODS = (
     "pairwise-naive",
     "pairwise-quick",
