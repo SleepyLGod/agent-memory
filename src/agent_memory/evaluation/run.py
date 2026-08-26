@@ -24,6 +24,10 @@ from agent_memory.adapters.lotus.pair_execution import (
     SEMANTIC_PAIR_EXECUTION_MODES,
     semantic_pair_profiles_fingerprint,
 )
+from agent_memory.adapters.lotus.context import (
+    LOTUS_MEMORY_CACHE_ID,
+    LOTUS_MEMORY_CACHE_MAX_SIZE,
+)
 from .artifacts import BenchmarkArtifactStore
 from .bundle import BenchmarkBundle
 from .harness import BenchmarkRunner, MemorySystemContract, TaskContract
@@ -297,7 +301,7 @@ def run_agent_memory_bundle(
         part
         for part in (
             semantic_pair_execution_id,
-            "lotus-cache:lotus-memory:1024"
+            f"lotus-cache:{LOTUS_MEMORY_CACHE_ID}"
             if lotus_cache_mode == "memory"
             else "",
         )
@@ -305,7 +309,7 @@ def run_agent_memory_bundle(
     ]
     maintenance_execution_id = "|".join(maintenance_execution_parts)
     framework_cache_mode = (
-        "lotus-memory:1024" if lotus_cache_mode == "memory" else "disabled"
+        LOTUS_MEMORY_CACHE_ID if lotus_cache_mode == "memory" else "disabled"
     )
     bundle_run_mode = bundle.metadata.get("run_mode")
     if bundle_run_mode is not None and (
@@ -369,7 +373,7 @@ def run_agent_memory_bundle(
         lotus_execution_provenance.update(
             {
                 "lotus_cache_mode": "memory",
-                "lotus_cache_max_entries": 1024,
+                "lotus_cache_max_entries": LOTUS_MEMORY_CACHE_MAX_SIZE,
             }
         )
     runtime_provenance["runtime"]["lotus_execution"] = (

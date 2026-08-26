@@ -1129,6 +1129,7 @@ def test_run_wires_search_filter_profiles_before_external_execution(
     assert len(execution["semantic_pair_query_profiles"]) == expected_count
     assert execution["embedding_device"] == "cuda"
     assert execution["lotus_cache_mode"] == "memory"
+    assert execution["lotus_cache_max_entries"] == 1024
 
 
 def test_claude_search_filter_rejects_rule_without_join_before_external_setup(
