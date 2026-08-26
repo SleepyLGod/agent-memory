@@ -280,6 +280,8 @@ def test_embedding_device_changes_profile_identity_and_must_match_provider() -> 
             profile=cuda,
             embedding_provider=provider,
         )
+
+
 @pytest.mark.parametrize(
     ("direction", "expected"),
     [

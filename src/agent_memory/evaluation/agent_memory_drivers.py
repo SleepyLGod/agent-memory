@@ -705,7 +705,7 @@ class ClaudeMemoryDriverFactory:
                 SentenceTransformerEmbeddingProvider(
                     embedding,
                     device=device,
-                    dependency_extra="zep or mem0",
+                    dependency_extra="zep",
                 ),
                 trace_dir=trace_dir,
             )
