@@ -5,7 +5,6 @@ from __future__ import annotations
 from hashlib import sha256
 from importlib import import_module
 from importlib.metadata import version
-import json
 import os
 from pathlib import Path
 import pickle
@@ -32,6 +31,7 @@ from agent_memory.evaluation.types import BenchmarkEvent, RetrievalRequest
 from agent_memory.evaluation.zep.answering import format_retrieval_context
 from agent_memory.policy.retrieval import RetrievalResult
 from agent_memory.storage import EmbeddingSpec
+from agent_memory.tracing.semantic import trace_event_count
 
 
 BENCHMARK_STRUCTURED_MAX_TOKENS = 32_768
@@ -342,37 +342,21 @@ def _records(frame: pd.DataFrame) -> tuple[dict[str, Any], ...]:
 
 
 def _generative_trace_count(trace_dir: Path) -> int:
-    events_path = trace_dir / "events.jsonl"
-    if not events_path.is_file():
-        return 0
-    count = 0
-    with events_path.open(encoding="utf-8") as handle:
-        for line in handle:
-            if not line.strip():
-                continue
-            event = json.loads(line)
-            if event.get("event_type") in {
-                "llm_call",
-                "llm_call_finish",
-                "llm_call_error",
-                "provider_usage",
-            }:
-                count += 1
-    return count
+    return trace_event_count(
+        trace_dir,
+        event_types={
+            "llm_call",
+            "llm_call_finish",
+            "llm_call_error",
+            "provider_usage",
+        },
+    )
 
 
 def _provider_usage_trace_count(trace_dir: Path) -> int:
     """Count provider attempts recorded in the semantic trace."""
 
-    events_path = trace_dir / "events.jsonl"
-    if not events_path.is_file():
-        return 0
-    with events_path.open(encoding="utf-8") as handle:
-        return sum(
-            1
-            for line in handle
-            if line.strip() and json.loads(line).get("event_type") == "provider_usage"
-        )
+    return trace_event_count(trace_dir, event_types={"provider_usage"})
 
 
 def _save_runtime_state(memory: Any, directory: Path) -> dict[str, Any]:
