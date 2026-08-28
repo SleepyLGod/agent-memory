@@ -29,7 +29,7 @@ from agent_memory.evaluation.types import (
 from agent_memory.policy.retrieval import RetrievalResult
 from agent_memory.storage.embedding import EmbeddingSpec
 from agent_memory.memories.mem0.storage import MEM0_BGE_M3
-from agent_memory.tracing.semantic import semantic_trace_scope
+from agent_memory.tracing.semantic import semantic_trace_scope, write_trace_event
 from tools.evaluation import locomo, longmemeval, memory_agent_bench
 
 
@@ -229,9 +229,10 @@ def test_mem0_enhanced_driver_records_generative_semantic_retrieval(
     class Memory:
         def query(self, query: str) -> pd.DataFrame:
             assert query == "Where did Caroline visit?"
-            (tmp_path / "events.jsonl").write_text(
-                '{"event_type":"provider_usage","phase":"retrieval"}\n',
-                encoding="utf-8",
+            write_trace_event(
+                tmp_path,
+                operator="sem_topk",
+                event_type="provider_usage",
             )
             return pd.DataFrame(
                 [

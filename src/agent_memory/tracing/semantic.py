@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -42,6 +42,7 @@ _TRACE_SCOPE: ContextVar[dict[str, Any]] = ContextVar(
 )
 _TRACE_IO_MEASUREMENT: ContextVar[SemanticTraceIOMeasurement | None]
 _TRACE_WRITE_LOCK = Lock()
+_TRACE_EVENT_COUNTS: dict[tuple[Path, str], int] = {}
 
 
 @dataclass
@@ -94,6 +95,23 @@ def trace_scope_value(key: str, default: Any = None) -> Any:
     """Return one active semantic trace scope value."""
 
     return _TRACE_SCOPE.get().get(key, default)
+
+
+def trace_event_count(
+    trace_dir: Path | str | None,
+    *,
+    event_types: Collection[str],
+) -> int:
+    """Return the in-process count for selected trace event types."""
+
+    if trace_dir is None:
+        return 0
+    root = _event_root(trace_dir)
+    with _TRACE_WRITE_LOCK:
+        return sum(
+            _TRACE_EVENT_COUNTS.get((root, event_type), 0)
+            for event_type in event_types
+        )
 
 
 def write_trace_event(
@@ -419,6 +437,9 @@ def _append_event(root: Path, event: Mapping[str, Any]) -> None:
     with _TRACE_WRITE_LOCK:
         with events_path.open("a", encoding="utf-8") as file:
             file.write(line)
+        event_type = str(event.get("event_type", ""))
+        key = (root, event_type)
+        _TRACE_EVENT_COUNTS[key] = _TRACE_EVENT_COUNTS.get(key, 0) + 1
     _record_trace_io(started, len(line.encode("utf-8")))
 
 

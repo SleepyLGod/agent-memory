@@ -39,7 +39,7 @@ from agent_memory.evaluation.types import (
 )
 from agent_memory.policy.retrieval import RetrievalResult
 from agent_memory.storage.embedding import EmbeddingSpec
-from agent_memory.tracing.semantic import semantic_trace_scope
+from agent_memory.tracing.semantic import semantic_trace_scope, write_trace_event
 
 
 class _Memory:
@@ -174,13 +174,26 @@ def test_zep_driver_preserves_native_entity_and_fact_channels(tmp_path) -> None:
     }
 
 
+def test_zep_driver_does_not_scan_historical_trace_events(tmp_path) -> None:
+    (tmp_path / "events.jsonl").write_text("not-json\n", encoding="utf-8")
+    memory = _Memory(
+        RetrievalResult(
+            query="question",
+            channels={"entities": pd.DataFrame(), "facts": pd.DataFrame()},
+        )
+    )
+    driver = ZepMemoryDriver(memory, trace_dir=tmp_path)
+
+    driver.retrieve(RetrievalRequest("q1", "question"))
+
+
 def test_zep_driver_rejects_generative_retrieval(tmp_path) -> None:
     class GenerativeMemory(_Memory):
         def query(self, text: str):
-            trace_dir = tmp_path
-            (trace_dir / "events.jsonl").write_text(
-                '{"event_type":"llm_call"}\n',
-                encoding="utf-8",
+            write_trace_event(
+                tmp_path,
+                operator="llm",
+                event_type="provider_usage",
             )
             return super().query(text)
 
