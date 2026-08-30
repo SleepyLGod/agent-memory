@@ -14,11 +14,11 @@ System drivers only add events and retrieve context. The runner owns case
 isolation, resume, answering, grading, trace, and artifacts.
 
 All agent-memory runners accept the planner's complete
-`--grouped-agg-rule` choice set. In particular, `rule-re-group`,
-`rule-join-map`, and `prefer-join-map` have the same meaning for every policy
-and benchmark. A strict strategy remains selectable even when a particular
-policy cannot compile it; that run fails before insertion instead of being
-hidden or silently changed by the CLI.
+`--grouped-agg-rule` choice set. In particular, `rule-re-group` and
+`rule-join-map` have the same meaning for every policy and benchmark. A
+strict strategy remains selectable even when a particular policy cannot
+compile it; that run fails before insertion instead of being hidden or silently
+changed by the CLI.
 
 ## Install
 
@@ -67,6 +67,88 @@ Real runs require `DEEPSEEK_API_KEY`. Zep runs additionally require the
 `AGENT_MEMORY_NEO4J_*` variables. Native Graphiti uses `NEO4J_URI`,
 `NEO4J_USER`, and `NEO4J_PASSWORD` and should point to a separate empty Neo4j
 5.26.2 instance.
+
+### Zep join-map physical execution
+
+Zep declares exclusive semantic grouping in its policy. With
+`rule-join-map`, the compiler compares only changed groups with the current
+view and lowers each changed group to a zero-or-one-target semantic join.
+Fact groups also carry exact source/target endpoint keys, so semantic matching
+never crosses those deterministic partitions.
+
+The policy does not choose how the bounded semantic join is executed. Select
+that physical access path at run time:
+
+```bash
+uv run --extra benchmarks --extra zep \
+  python tools/evaluation/locomo.py run \
+  --bundle-dir .memory-test/bundles/locomo-s0 \
+  --system zep-memory \
+  --output-dir .memory-test/runs/locomo-zep-join-map \
+  --grouped-agg-rule rule-join-map \
+  --sem-join-topk-method listwise \
+  --semantic-pair-profile-config /path/to/zep-site-profiles.json \
+  --lotus-cache-mode disabled \
+  --embedding-device cuda \
+  --semantic-trace-snapshot-mode compact
+```
+
+`--sem-join-topk-method` accepts `listwise`, `pairwise-naive`,
+`pairwise-quick`, or `pairwise-heap`. It is currently valid only for Zep when
+`--grouped-agg-rule` is `join-map` or `rule-join-map`. The policy still contains
+the same `sem_join(k=1)` expression; this flag changes only how the adapter
+resolves that join.
+
+`--semantic-pair-profile-config` binds Search-Filter or Proxy-Only profiles to
+stable semantic predicate site IDs. A config has this strict shape:
+
+```json
+{
+  "schema_version": 1,
+  "bindings": [
+    {
+      "site_id": "sem_join:<entity-site-digest>",
+      "mode": "search-filter",
+      "top_k": 15,
+      "min_similarity": 0.6
+    },
+    {
+      "site_id": "sem_join:<fact-site-digest>",
+      "mode": "search-filter",
+      "top_k": 10,
+      "min_similarity": null
+    },
+    {
+      "site_id": "sem_filter:<contradiction-site-digest>",
+      "mode": "search-filter",
+      "top_k": 10,
+      "min_similarity": null
+    }
+  ]
+}
+```
+
+Replace the placeholders with site IDs inventoried from the exact compiled
+policy revision; do not copy digests between revisions by hand. Unknown,
+duplicate, or drifted sites fail before model and storage initialization.
+Site-level config is mutually exclusive with the global
+`--semantic-pair-profile`, `--semantic-pair-top-k`, and
+`--semantic-pair-min-similarity` options.
+
+The remaining flags belong to separate physical layers:
+
+- `--lotus-cache-mode disabled|memory` controls LOTUS's process-local exact
+  cache. `memory` is an independent experiment condition and is not the same as
+  DeepSeek provider prompt caching.
+- `--embedding-device cpu|cuda` selects where the configured embedding model
+  runs. It does not choose or change the embedding model.
+- `--semantic-trace-snapshot-mode compact|full` controls trace detail.
+  `compact` keeps pair decisions and accounting without full intermediate
+  DataFrame snapshots; use `full` only for bounded debugging.
+
+These physical settings enter run provenance and checkpoint identity. Do not
+restore a checkpoint under a different join resolver, site profile, cache mode,
+embedding device, or trace contract.
 
 ## LongMemEval v1
 

@@ -10,6 +10,52 @@ from tools.evaluation import locomo, longmemeval, memory_agent_bench
 
 
 @pytest.mark.parametrize("module", (locomo, longmemeval, memory_agent_bench))
+@pytest.mark.parametrize("method", ("pairwise-quick", "listwise"))
+def test_agent_benchmark_clis_select_sem_join_topk_access_path(
+    module, method, tmp_path
+) -> None:
+    args = module.parse_args(
+        [
+            "run",
+            "--bundle-dir",
+            str(tmp_path / "bundle"),
+            "--output-dir",
+            str(tmp_path / "output"),
+            "--system",
+            "zep-memory",
+            "--grouped-agg-rule",
+            "rule-join-map",
+            "--sem-join-topk-method",
+            method,
+        ]
+    )
+
+    assert args.sem_join_topk_method == method
+
+
+@pytest.mark.parametrize("module", (locomo, longmemeval, memory_agent_bench))
+def test_agent_benchmark_clis_reject_sem_join_topk_without_zep_join_map(
+    module, tmp_path
+) -> None:
+    with pytest.raises(SystemExit):
+        module.parse_args(
+            [
+                "run",
+                "--bundle-dir",
+                str(tmp_path / "bundle"),
+                "--output-dir",
+                str(tmp_path / "output"),
+                "--system",
+                "zep-memory",
+                "--grouped-agg-rule",
+                "rule-re-group",
+                "--sem-join-topk-method",
+                "listwise",
+            ]
+        )
+
+
+@pytest.mark.parametrize("module", (locomo, longmemeval, memory_agent_bench))
 def test_agent_benchmark_clis_share_sem_groupby_execution_options(
     module, tmp_path
 ) -> None:
@@ -262,7 +308,7 @@ def test_longmemeval_cli_rejects_explicit_claude_options_for_zep(
 @pytest.mark.parametrize("system_id", ("claude-memory", "zep-memory"))
 @pytest.mark.parametrize(
     "grouped_agg_rule",
-    ("rule-re-group", "rule-join-map", "prefer-join-map"),
+    ("rule-re-group", "rule-join-map"),
 )
 def test_longmemeval_cli_accepts_planner_strategies_for_all_agent_policies(
     tmp_path, system_id, grouped_agg_rule

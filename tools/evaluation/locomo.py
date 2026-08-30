@@ -21,6 +21,7 @@ from agent_memory.evaluation.run import (  # noqa: E402
     AGENT_MEMORY_SYSTEMS,
     DEFAULT_PROVIDER_MODEL_ID,
     SEMANTIC_PAIR_PROFILES,
+    SEM_JOIN_TOPK_METHODS,
     run_agent_memory_bundle,
 )
 from agent_memory.planner import GROUPED_AGG_RULES  # noqa: E402
@@ -73,6 +74,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         choices=("pairwise-naive", "pairwise-quick", "pairwise-heap", "listwise"),
         default=None,
     )
+    run.add_argument(
+        "--sem-join-topk-method",
+        choices=SEM_JOIN_TOPK_METHODS,
+    )
     run.add_argument("--sem-groupby-pair-batch-size", type=int)
     run.add_argument("--sem-groupby-pair-batch-retries", type=int, default=0)
     run.add_argument(
@@ -96,6 +101,20 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     args = parser.parse_args(raw_args)
     if args.command == "run":
+        sem_join_topk_requested = any(
+            argument == "--sem-join-topk-method"
+            or argument.startswith("--sem-join-topk-method=")
+            for argument in raw_args
+        )
+        if sem_join_topk_requested and (
+            args.system != "zep-memory"
+            or args.grouped_agg_rule
+            not in {"join-map", "rule-join-map"}
+        ):
+            parser.error(
+                "--sem-join-topk-method requires --system zep-memory and a "
+                "join-map grouped aggregate rule"
+            )
         if args.semantic_pair_profile_config is not None and any(
             argument == option or argument.startswith(f"{option}=")
             for option in (
@@ -186,6 +205,7 @@ def main(argv: Sequence[str] | None = None) -> Path:
         base_namespace=args.namespace,
         grouped_agg_rule=args.grouped_agg_rule,
         sem_topk_method=args.sem_topk_method,
+        sem_join_topk_method=args.sem_join_topk_method,
         sem_groupby_pair_batch_size=args.sem_groupby_pair_batch_size,
         sem_groupby_pair_batch_retries=args.sem_groupby_pair_batch_retries,
         semantic_pair_profile=args.semantic_pair_profile,
