@@ -146,6 +146,11 @@ class SemanticPairSite:
     instruction: str
     semantic_columns: tuple[str, ...]
     partition_by: tuple[str, ...]
+    direction: str
+    left_id_columns: tuple[str, ...]
+    right_id_columns: tuple[str, ...]
+    left_text_columns: tuple[str, ...]
+    right_text_columns: tuple[str, ...]
     query_digests: tuple[str, ...]
 
     def to_dict(self) -> dict[str, object]:
@@ -158,6 +163,11 @@ class SemanticPairSite:
             "instruction": self.instruction,
             "semantic_columns": list(self.semantic_columns),
             "partition_by": list(self.partition_by),
+            "direction": self.direction,
+            "left_id_columns": list(self.left_id_columns),
+            "right_id_columns": list(self.right_id_columns),
+            "left_text_columns": list(self.left_text_columns),
+            "right_text_columns": list(self.right_text_columns),
             "query_digests": list(self.query_digests),
         }
 
@@ -177,9 +187,15 @@ def semantic_pair_site_contract(query: Any) -> dict[str, object]:
         instruction = str(params.get("instruction") or "")
         semantic_columns = tuple(sorted(set(re.findall(r"\{([^{}]+)\}", instruction))))
         partition_by = ()
+    elif operator == "sem_filter":
+        instruction = str(params.get("instruction") or "")
+        semantic_columns = tuple(
+            sorted(set(re.findall(r"\{([^{}]+:[^{}]+)\}", instruction)))
+        )
+        partition_by = ()
     else:
         raise ValueError(
-            "semantic pair sites support sem_join and pairwise sem_groupby"
+            "semantic pair sites support sem_filter, sem_join, and pairwise sem_groupby"
         )
     instruction = str(params.get("instruction") or "")
     if not instruction:
@@ -191,6 +207,79 @@ def semantic_pair_site_contract(query: Any) -> dict[str, object]:
         "instruction": instruction,
         "semantic_columns": list(semantic_columns),
         "partition_by": list(partition_by),
+    }
+
+
+def semantic_pair_site_physical_contract(query: Any) -> dict[str, object]:
+    """Return endpoint columns for one supported semantic pair site."""
+
+    if query.op == "sem_join":
+        return {
+            "direction": "left-to-right",
+            "left_id_columns": [PAIR_LEFT_ID_COLUMN],
+            "right_id_columns": [PAIR_RIGHT_ID_COLUMN],
+            "left_text_columns": [PAIR_LEFT_TEXT_COLUMN],
+            "right_text_columns": [PAIR_RIGHT_TEXT_COLUMN],
+        }
+    if query.op == "sem_groupby":
+        return {
+            "direction": "symmetric",
+            "left_id_columns": [PAIR_LEFT_ID_COLUMN],
+            "right_id_columns": [PAIR_RIGHT_ID_COLUMN],
+            "left_text_columns": [PAIR_LEFT_TEXT_COLUMN],
+            "right_text_columns": [PAIR_RIGHT_TEXT_COLUMN],
+        }
+    if query.op != "sem_filter":
+        raise ValueError(f"unsupported semantic pair site operator {query.op!r}")
+
+    instruction = str(query.params.get("instruction") or "")
+    placeholders = tuple(
+        dict.fromkeys(re.findall(r"\{([^{}]+):([^{}]+)\}", instruction))
+    )
+    qualifiers = {qualifier for _column, qualifier in placeholders}
+    earlier = [qualifier for qualifier in qualifiers if qualifier.startswith("earlier")]
+    later = [qualifier for qualifier in qualifiers if qualifier.startswith("later")]
+    if len(earlier) != 1 or len(later) != 1 or len(qualifiers) != 2:
+        raise ValueError(
+            "pair-shaped sem_filter sites require one earlier and one later qualifier"
+        )
+    earlier_qualifier = earlier[0]
+    later_qualifier = later[0]
+    left_text = tuple(
+        f"{column}:{qualifier}"
+        for column, qualifier in placeholders
+        if qualifier == earlier_qualifier
+    )
+    right_text = tuple(
+        f"{column}:{qualifier}"
+        for column, qualifier in placeholders
+        if qualifier == later_qualifier
+    )
+    input_columns = tuple(
+        str(column) for column in query.inputs[0].params.get("columns", ())
+    )
+    left_ids = tuple(
+        column
+        for column in input_columns
+        if column.endswith(f":{earlier_qualifier}")
+        and column.split(":", 1)[0].endswith("_id")
+    )
+    right_ids = tuple(
+        column
+        for column in input_columns
+        if column.endswith(f":{later_qualifier}")
+        and column.split(":", 1)[0].endswith("_id")
+    )
+    if not left_text or not right_text:
+        raise ValueError(
+            "pair-shaped sem_filter sites require semantic text on both sides"
+        )
+    return {
+        "direction": "right-to-left",
+        "left_id_columns": list(left_ids or left_text),
+        "right_id_columns": list(right_ids or right_text),
+        "left_text_columns": list(left_text),
+        "right_text_columns": list(right_text),
     }
 
 
@@ -486,6 +575,7 @@ __all__ = [
     "select_semantic_pair_candidates",
     "semantic_pair_site_contract",
     "semantic_pair_site_id",
+    "semantic_pair_site_physical_contract",
     "semantic_pair_profiles_fingerprint",
     "write_semantic_pair_execution_trace",
 ]

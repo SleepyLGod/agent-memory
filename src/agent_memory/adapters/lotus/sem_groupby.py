@@ -42,6 +42,13 @@ def execute_sem_groupby(
 ) -> Any:
     """Assign deterministic semantic group ids to rows."""
 
+    membership = query.params.get("membership")
+    if membership == "overlapping":
+        raise NotImplementedError(
+            "overlapping sem_groupby membership is not implemented"
+        )
+    if membership not in {None, "exclusive"}:
+        raise ValueError(f"Unsupported sem_groupby membership: {membership!r}")
     input_cols = tuple(str(column) for column in query.params["input_cols"])
     partition_by = tuple(str(column) for column in query.params.get("partition_by", ()))
     labels = tuple(query.params.get("labels") or ())

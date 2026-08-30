@@ -1041,6 +1041,39 @@ def test_sem_join_profile_rejects_lotus_cascade_before_input_execution(
         )
 
 
+def test_exact_key_sem_join_rejects_lotus_cascade_before_input_execution() -> None:
+    query = QueryExpr(
+        op="sem_join",
+        inputs=(
+            QueryExpr(op="materialized_view", params={"name": "left"}),
+            QueryExpr(op="materialized_view", params={"name": "right"}),
+        ),
+        params={
+            "instruction": "Rows match.",
+            "how": "inner",
+            "on": ("tenant_id",),
+        },
+    )
+    context = FakeContext(
+        LotusExecutionConfig(
+            sem_join_cascade_args={"sampling_percentage": 0.1},
+        )
+    )
+
+    with pytest.raises(ValueError, match="exact-key sem_join cannot be combined"):
+        execute_sem_join(
+            query,
+            {
+                "left": pd.DataFrame({"tenant_id": ["a"], "topic": ["alpha"]}),
+                "right": pd.DataFrame({"tenant_id": ["a"], "topic": ["alpha"]}),
+            },
+            lambda _expression, _inputs: (_ for _ in ()).throw(
+                AssertionError("input execution must not run before validation")
+            ),
+            context,
+        )
+
+
 def test_sem_groupby_search_filter_zero_candidates_skips_oracle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

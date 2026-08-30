@@ -24,6 +24,7 @@ SEM_TOPK_METHODS = (
     "pairwise-heap",
     "listwise",
 )
+SEM_JOIN_TOPK_METHODS = SEM_TOPK_METHODS
 _LM_OWNED_KWARGS = {
     "cache",
     "max_batch_size",
@@ -81,6 +82,7 @@ class LotusExecutionConfig:
     sem_join_cascade_args: Mapping[str, Any] | None = None
     sem_join_safe_mode: bool = False
     sem_join_progress_bar_desc: str = "Join comparisons"
+    sem_join_topk_method: str = "listwise"
 
     sem_groupby_default: bool = False
     sem_groupby_pair_batch_size: int | None = None
@@ -103,6 +105,11 @@ class LotusExecutionConfig:
         if self.semantic_trace_snapshot_mode not in {"compact", "full"}:
             raise ValueError(
                 "semantic_trace_snapshot_mode must be 'compact' or 'full'"
+            )
+        if self.sem_join_topk_method not in SEM_JOIN_TOPK_METHODS:
+            raise ValueError(
+                "sem_join_topk_method must be one of: "
+                + ", ".join(SEM_JOIN_TOPK_METHODS)
             )
         for query_digest, profile in self.semantic_pair_profiles.items():
             if not isinstance(query_digest, str) or not query_digest:

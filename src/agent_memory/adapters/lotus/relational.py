@@ -74,6 +74,26 @@ def execute_group_by(
     return source
 
 
+def execute_let(
+    query: QueryExpr,
+    inputs: Mapping[str, Any],
+    execute: Callable[[QueryExpr, Mapping[str, Any]], Any],
+) -> Any:
+    """Evaluate one relation once and bind it while executing a local query body."""
+
+    if len(query.inputs) != 2:
+        raise ValueError("let expects one bound relation and one query body")
+    name = str(query.params.get("name", ""))
+    if not name:
+        raise ValueError("let requires a non-empty binding name")
+    if name in inputs:
+        raise ValueError(f"let binding conflicts with an existing input: {name!r}")
+    value = execute(query.inputs[0], inputs)
+    scoped_inputs = dict(inputs)
+    scoped_inputs[name] = value
+    return execute(query.inputs[1], scoped_inputs)
+
+
 def execute_concat(
     query: QueryExpr,
     inputs: Mapping[str, Any],

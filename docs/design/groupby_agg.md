@@ -423,10 +423,35 @@ entities = (
 group_id, name, entity_type, summary
 ```
 
+### 1.10 `sem_groupby` 的 `membership`
+
+`membership` 说明一条 row 最终允许属于几个 semantic groups。它不决定模型调用
+是 pairwise 还是 listwise，也不决定是否启用 embedding Search-Filter。
+
+```text
+membership=None
+  保留旧合同。当前静态执行仍给每条row一个group ID；join-map不额外限制一个
+  changed group可以匹配多少个current groups。
+
+membership="exclusive"
+  每条row只属于一个semantic group。join-map把这个合同lower为每个changed group
+  最多选择一个current group，也就是sem_join(k=1)。没有合适target时仍可新建group。
+
+membership="overlapping"
+  一条row可以属于多个semantic groups。API保留了这个名字，但当前静态执行和
+  differential lowering尚未实现，调用时明确失败。
+```
+
+这里最重要的边界是：`exclusive`是logical membership contract；`k=1`是compiler
+为join-map选择的关系表达；pairwise/listwise和Search-Filter则是更下面的physical
+execution。三层不能混在一起。
+
 ## 2. Paper-wise differential rules
 
-这一节只写 paper-wise rules。公式尽量一行写完，不引入中间变量。这里默认
-`V` row 是可继续 merge 的 aggregate state。
+这一节只写paper-wise rules，不展开implementation-only的列投影。简单rule保持一行；
+join-map显式写出changed groups和join result，避免把确定性keys、semantic predicate
+和target merge压在一条难读的公式里。这里默认`V` row是可继续merge的aggregate
+state。
 
 记号：
 
@@ -438,6 +463,8 @@ Ks  = semantic keys
 Kr  = partition_by relational keys
 θg  = sem_groupby instruction
 θa  = sem_agg / sem_map instruction
+M   = sem_groupby membership contract
+κ(M)= 1 when M is exclusive; omitted when M is unspecified
 O   = sem_agg output columns
 C   = array_agg input columns
 o   = array_agg output column
@@ -446,23 +473,51 @@ m   = min output column
 A*  = A1, A2, ..., An
 ```
 
+本文用下面的缩写表示changed aggregate groups和current view之间的semantic
+join-map：
+
+```text
+JoinGroups(GΔ, V, Kr, θg, M) =
+  GΔ.sem_join(
+    V,
+    instruction=group_match(θg),
+    how="outer",
+    on=Kr when Kr is non-empty,
+    k=κ(M),
+  )
+```
+
+`group_match(θg)`是compiler从原`sem_groupby` instruction改写出的“changed group
+和current group是否属于同一组”谓词。`Ks`只是这个semantic predicate读取的内容，
+绝不能写成`on=Ks`：`on`只接受必须精确相等的`partition_by` keys `Kr`。
+
+`MergeByTarget`表示：matched rows按选中的current target合并；没有target的changed
+group形成新row；未被触及的current row原样保留。如果多个changed groups命中同一个
+target，只生成一次合并后的target row。
+
 ### 2.1 `sem_groupby(...).sem_agg(...)`
 
 ```text
-V = D.sem_groupby(Ks, θg).sem_agg(O, θa)
+V = D.sem_groupby(Ks, partition_by=Kr, membership=M, θg).sem_agg(O, θa)
 ```
 
 rule-re-group:
 
 ```text
-V' = ΔD.sem_groupby(Ks, θg).sem_agg(O, θa).union(V).sem_groupby(Ks, θg).sem_agg(O, θa)
+V' = ΔD.sem_groupby(Ks, partition_by=Kr, membership=M, θg).sem_agg(O, θa).union(V).sem_groupby(Ks, partition_by=Kr, membership=M, θg).sem_agg(O, θa)
 ```
 
 rule-join-map:
 
 ```text
-V' = ΔD.sem_groupby(Ks, θg).sem_agg(O, θa).sem_outer_join(V, on=Ks).sem_map(output_cols=O, instruction=θa)
+GΔ = ΔD.sem_groupby(Ks, partition_by=Kr, membership=M, θg).sem_agg(O, θa)
+J  = JoinGroups(GΔ, V, Kr, θg, M)
+V' = MergeByTarget(J, sem_agg(O, θa)).select(Kr + O)
 ```
+
+说人话：delta先在自己的确定性partition内形成changed groups；changed groups只和
+同partition的current groups做semantic匹配；最后只更新命中的旧group，并把未命中的
+delta作为新group加入。旧groups彼此不会重新比较。
 
 ### 2.2 `group_by(...).sem_agg(...)`
 
@@ -543,19 +598,21 @@ V' = ΔD.group_by(K).agg(A*).full_outer_join(V, on=K).merge(A*).select(K + outpu
 ### 2.6 `sem_groupby(...).agg(A1, ..., An)`
 
 ```text
-V = D.sem_groupby(Ks, θg).agg(A1, A2, ..., An)
+V = D.sem_groupby(Ks, partition_by=Kr, membership=M, θg).agg(A1, A2, ..., An)
 ```
 
 rule-re-group:
 
 ```text
-V' = ΔD.sem_groupby(Ks, θg).agg(A*).union(V).sem_groupby(Ks, θg).agg_merge(A*)
+V' = ΔD.sem_groupby(Ks, partition_by=Kr, membership=M, θg).agg(A*).union(V).sem_groupby(Ks, partition_by=Kr, membership=M, θg).agg_merge(A*)
 ```
 
 rule-join-map:
 
 ```text
-V' = ΔD.sem_groupby(Ks, θg).agg(A*).sem_outer_join(V, on=Ks).merge(A*).select(outputs(A*))
+GΔ = ΔD.sem_groupby(Ks, partition_by=Kr, membership=M, θg).agg(A*)
+J  = JoinGroups(GΔ, V, Kr, θg, M)
+V' = MergeByTarget(J, A*).select(Kr + outputs(A*))
 ```
 
 ### 2.7 `merge` and `agg_merge`
@@ -583,7 +640,8 @@ agg_merge(min(c, m)) = min(m, m)
 
 ### 2.8 `partition_by`
 
-`partition_by` 不改变 rule 形状。它只是把：
+`partition_by` 不创造新的semantic rule family。它把输入先按普通关系key分区，
+然后在每个分区内应用同一条semantic rule。也就是说，它把：
 
 ```text
 sem_groupby(Ks, θg)
@@ -595,8 +653,13 @@ sem_groupby(Ks, θg)
 sem_groupby(Ks, partition_by=Kr, θg)
 ```
 
-输出和 join key 中额外带上 deterministic partition keys `Kr`。semantic keys `Ks`
-仍然按 `sem_groupby` 的规则处理。
+输出中额外带上deterministic partition keys `Kr`。在join-map中，`Kr`还会下推成
+`sem_join(on=Kr)`，从而保证不同partition的rows根本不会成为semantic candidates。
+semantic keys `Ks`仍然只参与`θg`，不要求精确相等。
+
+普通deterministic `group_by(Kr)`的增量维护不是semantic join。delta row可以直接按
+`Kr`找到受影响的partition；只有这些partition内部的changed semantic groups需要继续
+执行join-map或re-group。未被delta触及的partition原样保留。
 
 ## 3. Implementation-wise differential rules
 
@@ -633,19 +696,21 @@ aggregate state 的情况。
 ### 3.2 `sem_groupby(...).sem_agg(...)`
 
 ```text
-V = D.sem_groupby(Ks, θg).sem_agg(input_cols=I, output_cols=O, instruction=θa)
+V = D.sem_groupby(Ks, partition_by=Kr, membership=M, θg).sem_agg(input_cols=I, output_cols=O, instruction=θa)
 ```
 
 rule-join-map:
 
 ```text
-V' = ΔD.sem_groupby(Ks, θg).sem_agg(input_cols=I, output_cols=O, instruction=θa).sem_outer_join(V, on=Ks).sem_map(output_cols=O, instruction=θa)
+GΔ = ΔD.sem_groupby(Ks, partition_by=Kr, membership=M, θg).sem_agg(input_cols=I, output_cols=O, instruction=θa)
+J  = JoinGroups(GΔ, V, Kr, θg, M)
+V' = MergeByTarget(J, sem_agg(input_cols=None, output_cols=O, instruction=θa)).select(Kr + O)
 ```
 
 rule-re-group:
 
 ```text
-V' = ΔD.sem_groupby(Ks, θg).sem_agg(input_cols=I, output_cols=O, instruction=θa).union(V).sem_groupby(Ks, θg).sem_agg(input_cols=None, output_cols=O, instruction=θa)
+V' = ΔD.sem_groupby(Ks, partition_by=Kr, membership=M, θg).sem_agg(input_cols=I, output_cols=O, instruction=θa).union(V).sem_groupby(Ks, partition_by=Kr, membership=M, θg).sem_agg(input_cols=None, output_cols=O, instruction=θa)
 ```
 
 rule-all-group:
@@ -769,19 +834,23 @@ state，而不是把 old aggregate-state row 当作 raw evidence row 再做普�
 ### 3.7 `sem_groupby(...).agg(A1, ..., An)`
 
 ```text
-V = D.sem_groupby(Ks, θg).agg(A1, A2, ..., An)
+V = D.sem_groupby(Ks, partition_by=Kr, membership=M, θg).agg(A1, A2, ..., An)
 ```
 
 rule-join-map:
 
 ```text
-V' = ΔD.sem_groupby(Ks, θg).agg(A*).sem_outer_join(V, on=Ks).merge(A*).select(outputs(A*))
+GΔ = ΔD.sem_groupby(Ks, partition_by=Kr, membership=M, θg).agg(A*)
+J  = JoinGroups(GΔ, V, Kr, θg, M)
+V' = MergeByTarget(J, A*).select(Kr + outputs(A*))
 ```
 
 rule-re-group:
 
 ```text
-V' = ΔD.sem_groupby(Ks, θg).agg(A*).union(V).sem_groupby(Ks, θg).agg_merge(A*)
+V' = ΔD.sem_groupby(Ks, partition_by=Kr, membership=M, θg).agg(A*)
+       .union(V)
+       .sem_groupby(Ks, partition_by=Kr, membership=M, θg).agg_merge(A*)
 ```
 
 和 deterministic `group_by(...).agg(A*)` 一样，mixed semantic `.agg(A*)` 暂不定义
@@ -812,14 +881,24 @@ agg_merge(min(c, m)) = min(m, m)
 
 ### 3.9 `partition_by`
 
-`partition_by` 不改变 implementation rule shape。它只是在
-`sem_groupby(..., partition_by=Kr, ...)` 的 output、join key 和 touched-group key
-里额外带上 deterministic partition keys `Kr`。
+`partition_by` 不改变implementation rule family，但会改变候选范围和output
+identity：
 
-当前 `rule-re-group` 支持 `partition_by`。当前 `rule-join-map` 明确拒绝
-`sem_groupby(..., partition_by=...)`，因为 semantic join 还不能同时强制
-deterministic partition equality；不能只在 join 后 filter，否则 outer-join 语义
-会改变。
+```text
+static execution:
+  先按Kr拆分DataFrame，再在每个partition内执行sem_groupby
+
+rule-re-group:
+  Kr随aggregate state保留，重新分组仍然只发生在各partition内部
+
+rule-join-map:
+  compiler把Kr下推为sem_join(on=Kr)
+  先做exact-key candidate restriction，再做semantic predicate
+```
+
+当前`rule-re-group`和`rule-join-map`都支持`partition_by`。这里不允许“先做全局
+semantic outer join，再在结果上filter Kr”，因为那会丢失本应保留的unmatched rows，
+改变outer-join语义。
 
 ## 4. 本文档不定义什么
 

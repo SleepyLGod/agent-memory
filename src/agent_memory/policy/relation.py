@@ -41,6 +41,7 @@ LOG_SYSTEM_COLUMN_SPECS = (
 ColumnInput = Sequence[str] | None
 ColumnOutput = Sequence[str] | Mapping[str, str]
 JoinOn = str | Sequence[str] | object
+SEM_GROUPBY_MEMBERSHIPS = ("exclusive", "overlapping")
 
 
 def _normalize_input_cols(input_cols: ColumnInput) -> tuple[str, ...] | None:
@@ -73,6 +74,19 @@ def _normalize_group_labels(
     if not labels:
         raise ValueError("sem_groupby labels cannot be empty")
     return tuple(ColumnSpec(name=name, description=desc) for name, desc in labels.items())
+
+
+def _normalize_sem_groupby_membership(membership: str | None) -> str | None:
+    """Normalize an optional semantic-group membership contract."""
+
+    if membership is None:
+        return None
+    if membership not in SEM_GROUPBY_MEMBERSHIPS:
+        raise ValueError(
+            "sem_groupby membership must be one of: "
+            + ", ".join(SEM_GROUPBY_MEMBERSHIPS)
+        )
+    return membership
 
 
 def _require_relation(value: Any, *, argument: str) -> "Relation":
@@ -117,6 +131,20 @@ def _normalize_group_keys(keys: str | Sequence[str]) -> tuple[str, ...]:
         raise ValueError("group_by requires at least one key column")
     if any(not key for key in normalized):
         raise ValueError("group_by key columns cannot be empty")
+    return normalized
+
+
+def _normalize_sem_join_keys(keys: str | Sequence[str]) -> tuple[str, ...]:
+    """Normalize exact semantic-join key columns."""
+
+    if isinstance(keys, str):
+        normalized = (keys,)
+    else:
+        normalized = tuple(str(key) for key in keys)
+    if not normalized:
+        raise ValueError("sem_join on requires at least one key column")
+    if any(not key for key in normalized):
+        raise ValueError("sem_join on key columns cannot be empty")
     return normalized
 
 
@@ -578,10 +606,12 @@ class Relation(RelationHandle):
         partition_by: str | Sequence[str] | None = None,
         labels: Mapping[str, str] | None = None,
         label_col: str = "_label",
+        membership: str | None = None,
     ) -> "GroupedRelation":
         """Create a grouped semantic relation expression."""
 
         normalized_partition_by = _normalize_partition_by(partition_by)
+        normalized_membership = _normalize_sem_groupby_membership(membership)
         params: dict[str, Any] = {
             "input_cols": _normalize_input_cols(input_cols),
             "instruction": instruction,
@@ -590,6 +620,8 @@ class Relation(RelationHandle):
         }
         if normalized_partition_by is not None:
             params["partition_by"] = normalized_partition_by
+        if normalized_membership is not None:
+            params["membership"] = normalized_membership
         expr = QueryExpr(
             op="sem_groupby",
             inputs=(self.expr,),
@@ -603,16 +635,23 @@ class Relation(RelationHandle):
         *,
         instruction: str,
         how: str = "inner",
+        on: str | Sequence[str] | None = None,
+        k: int | None = None,
     ) -> "Relation":
         """Add a semantic join expression."""
 
         other = _require_relation(other, argument="other")
-        return self._derive(
-            "sem_join",
-            inputs=(self.expr, other.expr),
-            instruction=instruction,
-            how=how,
-        )
+        params: dict[str, Any] = {
+            "instruction": instruction,
+            "how": how,
+        }
+        if on is not None:
+            params["on"] = _normalize_sem_join_keys(on)
+        if k is not None:
+            if not isinstance(k, int) or isinstance(k, bool) or k < 1:
+                raise ValueError("sem_join k must be a positive integer")
+            params["k"] = k
+        return self._derive("sem_join", inputs=(self.expr, other.expr), **params)
 
     def sem_topk(
         self,

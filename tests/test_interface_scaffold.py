@@ -36,6 +36,7 @@ from agent_memory.adapters.lotus.relational import (
     execute_filter,
     execute_flatten,
     execute_join,
+    execute_let,
     execute_min,
     execute_subtract,
     execute_unnest,
@@ -560,6 +561,42 @@ def test_grouped_relation_sem_agg_returns_normal_relation() -> None:
     assert isinstance(aggregated, Relation)
     assert aggregated.expr.op == "sem_agg"
     assert aggregated.expr.inputs[0].op == "sem_groupby"
+
+
+def test_sem_groupby_membership_contract_is_optional_and_validated() -> None:
+    log = am.Log({"topic_name": "Topic name."})
+    unspecified = log.sem_groupby(
+        input_cols=["topic_name"],
+        instruction="Group matching topics.",
+    )
+    exclusive = log.sem_groupby(
+        input_cols=["topic_name"],
+        instruction="Group matching topics.",
+        membership="exclusive",
+    )
+    overlapping = log.sem_groupby(
+        input_cols=["topic_name"],
+        instruction="Group matching topics.",
+        membership="overlapping",
+    )
+
+    assert "membership" not in unspecified.expr.params
+    assert exclusive.expr.params["membership"] == "exclusive"
+    assert overlapping.expr.params["membership"] == "overlapping"
+    with pytest.raises(ValueError, match="membership must be one of"):
+        log.sem_groupby(
+            input_cols=["topic_name"],
+            instruction="Group matching topics.",
+            membership="unknown",
+        )
+    with pytest.raises(
+        NotImplementedError,
+        match="overlapping sem_groupby membership",
+    ):
+        LotusAdapter().execute(
+            overlapping.expr,
+            {"log": pd.DataFrame({"topic_name": ["a", "b"]})},
+        )
 
 
 def test_grouped_relation_agg_accepts_public_aggregate_specs() -> None:
@@ -1155,6 +1192,40 @@ def test_sem_join_query_expr_keeps_only_logical_params() -> None:
             instruction="{message:left} and {message:right} describe the same memory fact.",
             cascade_args={"recall_target": 0.95},
         )
+
+
+def test_sem_join_accepts_exact_keys_and_per_left_result_limit() -> None:
+    log = am.Log({"tenant_id": "Exact tenant key.", "message": "Raw message."})
+
+    joined = log.sem_join(
+        log,
+        instruction="{message:left} and {message:right} describe the same entity.",
+        how="outer",
+        on="tenant_id",
+        k=3,
+    )
+
+    assert joined.expr.params == {
+        "instruction": "{message:left} and {message:right} describe the same entity.",
+        "how": "outer",
+        "on": ("tenant_id",),
+        "k": 3,
+    }
+
+
+@pytest.mark.parametrize("k", [0, -1, True, 1.5])
+def test_sem_join_rejects_invalid_result_limit(k: Any) -> None:
+    log = am.Log({"message": "Raw message."})
+
+    with pytest.raises(ValueError, match="positive integer"):
+        log.sem_join(log, instruction="Rows match.", k=k)
+
+
+def test_sem_join_rejects_empty_exact_key_domain() -> None:
+    log = am.Log({"message": "Raw message."})
+
+    with pytest.raises(ValueError, match="at least one key"):
+        log.sem_join(log, instruction="Rows match.", on=[])
 
 
 def test_sem_filter_query_expr_keeps_only_logical_params() -> None:
@@ -1859,7 +1930,7 @@ def test_differential_query_planner_supports_group_by_mixed_agg_join_map_rule() 
     assert assignments["earliest"]["kind"] == "least"
 
 
-def test_join_map_rejects_partitioned_semantic_grouping() -> None:
+def test_join_map_composes_partitioned_semantic_grouping_with_exact_keys() -> None:
     log = am.Log(
         {"group_id": "Partition.", "name": "Name.", "body": "Evidence."}
     )
@@ -1876,6 +1947,7 @@ def test_join_map_rejects_partitioned_semantic_grouping() -> None:
         input_cols=["name"],
         partition_by="group_id",
         instruction="Rows with {name} refer to the same entity.",
+        membership="exclusive",
     ).agg(
         am.sem_agg(
             input_cols=["name", "body"],
@@ -1885,20 +1957,59 @@ def test_join_map_rejects_partitioned_semantic_grouping() -> None:
         am.min(column="body", output_col="first_body"),
     ).expr
 
-    for query in (direct, mixed):
-        with pytest.raises(
-            NotImplementedError,
-            match="partition_by.*rule-join-map",
-        ):
-            DifferentialRules(grouped_agg_rule="rule-join-map").differentiate(
-                query,
-                source_input=QueryExpr(op="log"),
-                current_view=QueryExpr(
-                    op="materialized_view",
-                    params={"name": "view", "columns": output_columns(query)},
-                ),
-                is_view_boundary=True,
-            )
+    for query, expected_k in ((direct, None), (mixed, 1)):
+        differentiated = DifferentialRules(
+            grouped_agg_rule="rule-join-map"
+        ).differentiate(
+            query,
+            source_input=QueryExpr(op="log"),
+            current_view=QueryExpr(
+                op="materialized_view",
+                params={"name": "view", "columns": output_columns(query)},
+            ),
+            is_view_boundary=True,
+        )
+        sem_join_expr = next(
+            node for node in _query_nodes(differentiated) if node.op == "sem_join"
+        )
+        assert sem_join_expr.params["on"] == ("group_id",)
+        if expected_k is None:
+            assert "k" not in sem_join_expr.params
+        else:
+            assert sem_join_expr.params["k"] == expected_k
+        assert sem_join_expr.params["how"] == "outer"
+        assert sem_join_expr.params["id_columns"] == (
+            "_agent_memory_join_map_left_id",
+            "_agent_memory_join_map_right_id",
+        )
+        assert output_columns(differentiated) == output_columns(query)
+
+
+def test_join_map_rejects_unimplemented_overlapping_membership() -> None:
+    log = am.Log({"name": "Name.", "body": "Evidence."})
+    query = log.sem_groupby(
+        input_cols=["name"],
+        instruction="Rows with {name} refer to the same entity.",
+        membership="overlapping",
+    ).sem_agg(
+        input_cols=["name", "body"],
+        output_cols={"name": "Canonical name.", "summary": "Summary."},
+        instruction="Return {name} and summarize {body} as {summary}.",
+    ).expr
+
+    with pytest.raises(
+        NotImplementedError,
+        match="overlapping sem_groupby membership",
+    ):
+        DifferentialRules(grouped_agg_rule="rule-join-map").differentiate(
+            query,
+            source_input=QueryExpr(op="log"),
+            current_view=QueryExpr(
+                op="materialized_view",
+                params={"name": "view", "columns": output_columns(query)},
+            ),
+            is_view_boundary=True,
+        )
 
 
 def test_differential_rules_reject_array_agg_outside_view_boundary() -> None:
@@ -2096,17 +2207,17 @@ def test_join_map_grouped_agg_rule_emits_join_map_shape() -> None:
     ).differentiate(view)
     ops = _query_ops(differentiated)
 
-    assert differentiated.op == "select"
-    assert differentiated.params["columns"] == ("name", "description", "type", "body")
-    sem_map_expr = differentiated.inputs[0]
-    assert sem_map_expr.op == "sem_map"
-    sem_join_expr = sem_map_expr.inputs[0]
+    assert differentiated.op == "let"
+    sem_join_expr = next(node for node in _query_nodes(differentiated) if node.op == "sem_join")
     assert sem_join_expr.op == "sem_join"
     assert sem_join_expr.params["how"] == "outer"
+    assert "k" not in sem_join_expr.params
     assert "sem_join" in ops
-    assert "sem_map" in ops
+    assert "sem_map" not in ops
+    assert "sem_agg" in ops
+    assert ops.count("filter") >= 3
     assert "{name:left} and {name:right}" in sem_join_expr.params["instruction"]
-    assert "{body:left} and {body:right}" in sem_map_expr.params["instruction"]
+    assert output_columns(differentiated) == ("name", "description", "type", "body")
 
 
 def test_changed_aware_grouped_agg_execution_keeps_old_only_groups() -> None:
@@ -2133,6 +2244,134 @@ def test_changed_aware_grouped_agg_execution_keeps_old_only_groups() -> None:
     assert GROUP_ID_COLUMN not in result.columns
 
 
+def test_join_map_grouped_agg_execution_keeps_untouched_groups_without_lm() -> None:
+    view = am.ClaudeMemory.spec().views["topics"]
+    query = QueryDifferentiator(
+        rules=DifferentialRules(grouped_agg_rule="rule-join-map"),
+    ).differentiate(view)
+    current = pd.DataFrame(
+        [
+            {
+                "name": "caroline_adoption_goal",
+                "description": "Caroline's adoption plan.",
+                "type": "profile",
+                "body": "Caroline is researching adoption agencies.",
+            }
+        ]
+    )
+    changed_log = pd.DataFrame(columns=["role", "message", "timestamp", "session_id"])
+
+    result = LotusAdapter().execute(query, {"log": changed_log, "topics": current})
+
+    assert result.to_dict(orient="records") == current.to_dict(orient="records")
+    assert "_agent_memory_join_map_left_id" not in result.columns
+    assert "_agent_memory_join_map_right_id" not in result.columns
+
+
+def test_join_map_merges_multiple_changed_groups_into_one_selected_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import agent_memory.adapters.lotus.adapter as lotus_adapter_module
+
+    log = am.Log({"name": "Name.", "body": "Body."})
+    view = log.sem_groupby(
+        input_cols=["name"],
+        instruction="Rows with {name} refer to the same entity.",
+    ).sem_agg(
+        input_cols=["name", "body"],
+        output_cols={"name": "Canonical name.", "summary": "Summary."},
+        instruction="Return {name} and summarize {body} as {summary}.",
+    )
+    query = DifferentialRules(grouped_agg_rule="rule-join-map").differentiate(
+        view.expr,
+        source_input=QueryExpr(op="log"),
+        current_view=QueryExpr(
+            op="materialized_view",
+            params={"name": "entities", "columns": ("name", "summary")},
+        ),
+        is_view_boundary=True,
+    )
+    changed = pd.DataFrame(
+        [
+            {"name": "Melanie", "summary": "First update."},
+            {"name": "Mel", "summary": "Second update."},
+        ]
+    )
+    current = pd.DataFrame(
+        [
+            {"name": "Melanie", "summary": "Existing summary."},
+            {"name": "Max", "summary": "Untouched summary."},
+        ]
+    )
+    calls = {"join": 0, "reaggregate": 0}
+
+    def execute_sem_join_for_test(
+        expr: QueryExpr,
+        inputs: dict[str, Any],
+        execute: Any,
+        _context: Any,
+    ) -> pd.DataFrame:
+        calls["join"] += 1
+        left = execute(expr.inputs[0], inputs)
+        right = execute(expr.inputs[1], inputs)
+        return assemble_join_frame(
+            left,
+            right,
+            [(0, 0, None), (1, 0, None)],
+            how="outer",
+            id_columns=tuple(expr.params["id_columns"]),
+        )
+
+    def execute_sem_agg_for_test(
+        expr: QueryExpr,
+        inputs: dict[str, Any],
+        execute: Any,
+        _context: Any,
+    ) -> pd.DataFrame:
+        if expr.inputs[0].op == "sem_groupby":
+            return changed.copy()
+        calls["reaggregate"] += 1
+        state_rows = execute(expr.inputs[0], inputs)
+        assert len(state_rows) == 3
+        return pd.DataFrame(
+            [
+                {
+                    "_agent_memory_join_map_right_id": 0,
+                    "name": "Melanie",
+                    "summary": "Existing summary. First update. Second update.",
+                }
+            ]
+        )
+
+    monkeypatch.setattr(
+        lotus_adapter_module,
+        "execute_sem_join",
+        execute_sem_join_for_test,
+    )
+    monkeypatch.setattr(
+        lotus_adapter_module,
+        "execute_sem_agg",
+        execute_sem_agg_for_test,
+    )
+
+    result = LotusAdapter().execute(
+        query,
+        {
+            "log": pd.DataFrame(columns=["name", "body"]),
+            "entities": current,
+        },
+    )
+
+    assert calls == {"join": 1, "reaggregate": 1}
+    assert result.to_dict(orient="records") == [
+        {"name": "Max", "summary": "Untouched summary."},
+        {
+            "name": "Melanie",
+            "summary": "Existing summary. First update. Second update.",
+        },
+    ]
+
+
 def test_differential_rules_reject_unknown_grouped_agg_strategy() -> None:
     with pytest.raises(ValueError, match="grouped_agg_rule"):
         DifferentialRules(grouped_agg_rule="unknown")
@@ -2153,23 +2392,16 @@ def test_claude_topics_join_map_candidate_builder_rewrites_placeholders() -> Non
     )
 
     assert candidate is not None
-    assert candidate.op == "select"
-    assert candidate.params["columns"] == ("name", "description", "type", "body")
-    sem_map_expr = candidate.inputs[0]
-    assert sem_map_expr.op == "sem_map"
-    sem_join_expr = sem_map_expr.inputs[0]
+    assert candidate.op == "let"
+    sem_join_expr = next(node for node in _query_nodes(candidate) if node.op == "sem_join")
     assert sem_join_expr.op == "sem_join"
     assert sem_join_expr.params["how"] == "outer"
+    assert "k" not in sem_join_expr.params
     assert "{name:left} and {name:right}" in sem_join_expr.params["instruction"]
     assert "{description:left} and {description:right}" in sem_join_expr.params["instruction"]
     assert "{type:left} and {type:right}" in sem_join_expr.params["instruction"]
-    assert "{body:left} and {body:right}" in sem_map_expr.params["instruction"]
-    assert tuple(col.name for col in sem_map_expr.params["output_cols"]) == (
-        "name",
-        "description",
-        "type",
-        "body",
-    )
+    assert "sem_map" not in _query_ops(candidate)
+    assert output_columns(candidate) == ("name", "description", "type", "body")
 
 
 def test_differential_query_planner_recomputes_views_from_materialized_dependencies() -> None:
@@ -4262,6 +4494,28 @@ def test_relational_execution_ops_follow_dataframe_semantics() -> None:
         {"message": "hello", "source": "first"},
         {"message": "world", "source": "third"},
     ]
+
+
+def test_relational_let_evaluates_bound_relation_once() -> None:
+    bound = QueryExpr(op="source")
+    body = QueryExpr(
+        op="materialized_view",
+        params={"name": "__bound", "columns": ("value",)},
+    )
+    query = QueryExpr(op="let", inputs=(bound, body), params={"name": "__bound"})
+    calls = 0
+
+    def execute(expr: QueryExpr, inputs: dict[str, Any]) -> pd.DataFrame:
+        nonlocal calls
+        if expr.op == "source":
+            calls += 1
+            return pd.DataFrame({"value": [1, 2]})
+        return inputs[str(expr.params["name"])]
+
+    result = execute_let(query, {}, execute)
+
+    assert calls == 1
+    assert result.to_dict(orient="records") == [{"value": 1}, {"value": 2}]
 
 
 def test_union_by_name_aligns_missing_columns_and_deduplicates() -> None:

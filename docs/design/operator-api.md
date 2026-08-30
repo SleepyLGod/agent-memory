@@ -733,6 +733,10 @@ Semantic grouping. In v0, grouped aggregation is expressed by chaining
 df.sem_groupby(
     input_cols=[...],
     instruction="...",
+    partition_by=None,
+    labels=None,
+    label_col="_label",
+    membership=None,
 ).sem_agg(...)
 ```
 
@@ -769,6 +773,35 @@ input and output.
 By default, `sem_groupby` is open-world grouping: groups are discovered from
 the rows using the membership condition.
 
+`membership` states how many semantic groups one row is allowed to belong to.
+It is a logical contract, not a choice between pairwise and listwise execution:
+
+```text
+membership=None
+  Preserve the legacy contract. The current static executor still emits one
+  group id per row, but differential join-map does not assume that each
+  changed group has only one matching current group.
+
+membership="exclusive"
+  Each row belongs to exactly one semantic group. Under rule-join-map, each
+  changed group may therefore select at most one current group; the compiler
+  lowers this contract to sem_join(k=1).
+
+membership="overlapping"
+  One row may belong to multiple semantic groups. The name is reserved by the
+  API, but the static executor and differential planner do not implement this
+  output contract yet and fail explicitly.
+```
+
+In plain language, `exclusive` means “put this row in one group.” It does not
+mean “the first semantically similar row wins,” and it does not prescribe how
+the backend finds or ranks candidates. Those are physical execution choices.
+
+The current open-world static implementation uses pairwise semantic judgments
+and forms one group from connected positive judgments. A future listwise
+implementation may produce the same logical output through a different model
+call shape. That physical choice is intentionally not part of this API.
+
 For closed-world grouping, policy authors may provide explicit `labels`.
 The model must assign each row to exactly one declared label; if an `other`
 bucket is desired, it must be declared explicitly. The assigned label is written
@@ -788,6 +821,8 @@ papers = rows.sem_groupby(
 ```
 
 Multi-label and hierarchical labels are not part of the current contract.
+Closed-world `labels` already define an exclusive classification task; do not
+use `membership="overlapping"` with that form.
 
 `partition_by` optionally adds deterministic partition keys to semantic
 grouping. The semantic grouping rule is applied only within each partition, and
@@ -800,6 +835,12 @@ entities = extracted_entities.sem_groupby(
     instruction="Rows refer to the same real-world entity.",
 )
 ```
+
+This is equivalent in meaning to “first split rows by exact `group_id`, then
+run semantic grouping independently inside each exact group.” Rows from
+different partitions never reach the embedding model or LLM as semantic pairs.
+`partition_by` is therefore not a fuzzy grouping hint and is not another
+Search-Filter threshold.
 
 ### `group_by(...).agg(...)` and `sem_groupby(...).agg(...)`
 
@@ -927,6 +968,8 @@ left.sem_join(
     right,
     instruction=instruction,
     how="inner",
+    on=None,
+    k=None,
 )
 ```
 
@@ -948,12 +991,55 @@ left.sem_right_join(right, instruction=instruction)
 left.sem_outer_join(right, instruction=instruction)
 ```
 
-The canonical documentation form is `sem_join(..., instruction=..., how=...)`,
-because it follows DataFrame style.
+The canonical documentation form is
+`sem_join(..., instruction=..., how=..., on=..., k=...)`, because it keeps the
+logical join condition, deterministic keys, and match cardinality in one
+DataFrame operator.
+
+`on` is an optional exact equality condition evaluated before the semantic
+predicate:
+
+```python
+changed_facts.sem_join(
+    current_facts,
+    on=["source_entity_id", "target_entity_id"],
+    instruction="The two rows express the same factual relationship.",
+    how="outer",
+)
+```
+
+Only rows with equal `source_entity_id` and `target_entity_id` values are
+eligible for semantic comparison. The columns named by `on` are ordinary
+relational keys. They are not embedded and are not interpreted by the LLM.
+
+`k` optionally limits the number of matched right rows for each left row:
+
+```text
+k=None  Keep every right row that satisfies the semantic predicate.
+k=1     Keep zero or one matching right row per left row.
+k=K     Keep zero to K matching right rows per left row.
+```
+
+The limit is left-to-right. It does not force a match: when no right row
+satisfies the instruction, the left row remains unmatched and `how` determines
+whether it appears in the assembled result. `k` must be a positive integer
+when supplied.
+
+For `k` joins, the backend may use a listwise resolver or a pairwise resolver.
+The listwise resolver gives one left row and its eligible right rows to the LM
+and asks for at most `k` matching IDs. The pairwise resolver first verifies the
+predicate pair by pair, then ranks verified matches. These are physical access
+paths for the same `sem_join(..., k=K)` policy expression; policy code does not
+choose them.
 
 Backend execution choices such as cascade, helper models, examples, and
 explanation tracing belong to the runtime/adapter layer. They should not appear
 in the policy author's logical join definition.
+
+Search-Filter is also a physical optimization. When enabled for this join, it
+uses embedding similarity to remove unlikely pairs before the listwise or
+pairwise semantic resolver runs. It does not change `on`, `k`, `how`, or the
+natural-language predicate, and it is not configured through this API.
 
 Example:
 
@@ -966,6 +1052,7 @@ joined = topic_candidates.sem_join(
     contradictions, supersession, or forget/delete targets.
     """,
     how="left",
+    k=1,
 )
 ```
 
@@ -1148,42 +1235,51 @@ V_prime = V.union(
 )
 ```
 
-Semantic group-by with aggregation can use a coarse full-next-view maintenance
-rule:
+Semantic group-by with aggregation can use either re-group or join-map
+maintenance. These are differential-rule choices, not alternative meanings of
+the static `sem_groupby` API.
+
+For join-map, the compiler first aggregates the delta into changed groups, then
+matches those changed groups against the current view:
 
 ```python
 V = (
     D
-    .sem_groupby(input_cols=[...], instruction=group_instruction)
+    .sem_groupby(
+        input_cols=[...],
+        partition_by=partition_keys,
+        membership="exclusive",
+        instruction=group_instruction,
+    )
     .sem_agg(...)
 )
 
 delta_groups = (
     delta_D
-    .sem_groupby(input_cols=[...], instruction=group_instruction)
+    .sem_groupby(
+        input_cols=[...],
+        partition_by=partition_keys,
+        membership="exclusive",
+        instruction=group_instruction,
+    )
     .sem_agg(...)
 )
 
-V_prime = (
-    delta_groups
-    .sem_join(V, instruction=join_instruction_prime, how="outer")
-    .sem_map(
-        output_cols=V.columns,
-        instruction="""
-        Produce one next-view row:
-        merge matched delta group and existing view row;
-        keep unmatched existing view row;
-        add unmatched delta group row.
-        """,
-    )
-    .select(V.columns)
+joined = delta_groups.sem_join(
+    V,
+    instruction=join_instruction_prime,
+    how="outer",
+    on=partition_keys,
+    k=1,
 )
 ```
 
-This is a coarse full-view rule. It does not split `delta_minus` and
-`delta_plus`, and it does not introduce a separate delta-application operator.
-The final `sem_map` is a column-level semantic merge over joined rows, not a
-`sem_agg`.
+The compiler then merges rows by the selected current target, emits unmatched
+delta groups as new targets, and carries untouched current targets forward.
+When `partition_keys` is empty, `on` is omitted. When membership is not
+declared, `k` is omitted and the legacy all-matches join-map contract is
+preserved. See `groupby_agg.md` for the complete paper-wise and
+implementation-wise formulas.
 
 Join follows the usual relational delta shape:
 
