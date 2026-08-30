@@ -26,6 +26,9 @@ ROW_LOCAL_UNARY_OPS = {
 CHANGED_FRAGMENT_BINARY_OPS = {"concat", "union"}
 GROUP_ID_COLUMN = "_agent_memory_group_id"
 CHANGED_MARKER_COLUMN = "_changed"
+JOIN_MAP_LEFT_ID_COLUMN = "_agent_memory_join_map_left_id"
+JOIN_MAP_RIGHT_ID_COLUMN = "_agent_memory_join_map_right_id"
+JOIN_MAP_BINDING_NAME = "__agent_memory_join_map_pairs"
 GROUPED_AGG_RULE_ALIASES = {
     "compressed": "rule-all-group",
     "changed-aware": "rule-all-group-optimized",
@@ -37,7 +40,6 @@ GROUPED_AGG_RULES = (
     "join-map",
     "rule-join-map",
     "rule-re-group",
-    "prefer-join-map",
     "rule-all-group",
     "rule-all-group-optimized",
 )
@@ -156,15 +158,6 @@ class DifferentialRules:
         """Return the canonical grouped aggregate rule name."""
 
         return self._grouped_agg_rule
-
-    def _grouped_agg_rule_for(self, groupby: QueryExpr) -> str:
-        """Select a supported grouped rule without executing a speculative rewrite."""
-
-        if self._grouped_agg_rule != "prefer-join-map":
-            return self._grouped_agg_rule
-        if groupby.op == "sem_groupby" and groupby.params.get("partition_by"):
-            return "rule-re-group"
-        return "rule-join-map"
 
     def differentiate(
         self,
@@ -445,7 +438,7 @@ class DifferentialRules:
             )
             keys = tuple(str(key) for key in source.params["keys"])
             output_col = str(aggregate.params["output_col"])
-            if self._grouped_agg_rule_for(source) == "rule-join-map":
+            if self._grouped_agg_rule == "rule-join-map":
                 joined = QueryExpr(
                     op="join",
                     inputs=(changed_aggregate, current_view),
@@ -620,7 +613,7 @@ class DifferentialRules:
             source_query=source_query,
             instruction_rewriter=instruction_rewriter,
         )
-        if self._grouped_agg_rule_for(groupby) == "rule-join-map":
+        if self._grouped_agg_rule == "rule-join-map":
             return self._build_grouped_agg_join_map_candidate(
                 aggregate=aggregate,
                 groupby=groupby,
@@ -777,12 +770,6 @@ class DifferentialRules:
     ) -> QueryExpr:
         """Build rule-join-map for grouped agg(A*) patterns without array specs."""
 
-        if groupby.op == "sem_groupby" and groupby.params.get("partition_by"):
-            raise NotImplementedError(
-                "sem_groupby partition_by is not supported by rule-join-map; "
-                "the semantic join cannot yet enforce deterministic partition keys."
-            )
-
         changed_groupby = QueryExpr(
             op=groupby.op,
             inputs=(changed_group_input,),
@@ -793,6 +780,15 @@ class DifferentialRules:
             inputs=(changed_groupby,),
             params=aggregate.params,
         )
+        if groupby.op == "sem_groupby":
+            return self._build_semantic_join_map(
+                aggregate=aggregate,
+                groupby=groupby,
+                changed_aggregate=changed_aggregate,
+                current_view=current_view,
+                final_columns=final_columns,
+                instruction_rewriter=instruction_rewriter,
+            )
         if groupby.op == "group_by":
             joined: QueryExpr = QueryExpr(
                 op="join",
@@ -800,17 +796,7 @@ class DifferentialRules:
                 params={"on": tuple(str(key) for key in groupby.params["keys"]), "how": "outer"},
             )
         else:
-            joined = QueryExpr(
-                op="sem_join",
-                inputs=(changed_aggregate, current_view),
-                params={
-                    "instruction": instruction_rewriter.groupby_to_join(
-                        str(groupby.params["instruction"]),
-                        input_cols=tuple(str(column) for column in groupby.params["input_cols"]),
-                    ),
-                    "how": "outer",
-                },
-            )
+            raise TypeError(f"Unsupported grouped aggregate input: {groupby.op}")
         preserved_columns = self._grouped_preserved_columns(groupby)
         mapped = joined
         array_outputs: list[str] = []
@@ -869,6 +855,245 @@ class DifferentialRules:
             params={"columns": tuple(final_columns)},
         )
 
+    def _build_semantic_join_map(
+        self,
+        *,
+        aggregate: QueryExpr,
+        groupby: QueryExpr,
+        changed_aggregate: QueryExpr,
+        current_view: QueryExpr,
+        final_columns: Sequence[str],
+        instruction_rewriter: DifferentialInstructionRewriter,
+    ) -> QueryExpr:
+        """Join changed groups to current targets and merge each target once."""
+
+        reserved = {
+            JOIN_MAP_LEFT_ID_COLUMN,
+            JOIN_MAP_RIGHT_ID_COLUMN,
+        }.intersection(final_columns)
+        if reserved:
+            raise ValueError(
+                "join-map internal ID columns conflict with view columns: "
+                f"{sorted(reserved)}"
+            )
+        partition_keys = tuple(
+            str(key) for key in groupby.params.get("partition_by", ())
+        )
+        join_params: dict[str, object] = {
+            "instruction": instruction_rewriter.groupby_to_join(
+                str(groupby.params["instruction"]),
+                input_cols=tuple(
+                    str(column) for column in groupby.params["input_cols"]
+                ),
+            ),
+            "how": "outer",
+            "id_columns": (
+                JOIN_MAP_LEFT_ID_COLUMN,
+                JOIN_MAP_RIGHT_ID_COLUMN,
+            ),
+        }
+        membership = groupby.params.get("membership")
+        if membership == "exclusive":
+            join_params["k"] = 1
+        elif membership == "overlapping":
+            raise NotImplementedError(
+                "overlapping sem_groupby membership is not implemented"
+            )
+        elif membership is not None:
+            raise ValueError(f"Unsupported sem_groupby membership: {membership!r}")
+        if partition_keys:
+            join_params["on"] = partition_keys
+        joined = QueryExpr(
+            op="sem_join",
+            inputs=(changed_aggregate, current_view),
+            params=join_params,
+        )
+        joined_ref = QueryExpr(
+            op="materialized_view",
+            params={
+                "name": JOIN_MAP_BINDING_NAME,
+                "columns": output_columns(joined),
+            },
+        )
+
+        matched = self._filter_join_map_rows(
+            joined_ref,
+            left_present=True,
+            right_present=True,
+        )
+        left_only = self._filter_join_map_rows(
+            joined_ref,
+            left_present=True,
+            right_present=False,
+        )
+        right_only = self._filter_join_map_rows(
+            joined_ref,
+            left_present=False,
+            right_present=True,
+        )
+
+        matched_changed = self._project_join_map_side(
+            matched,
+            side="left",
+            final_columns=final_columns,
+            include_target_id=True,
+        )
+        matched_current = QueryExpr(
+            op="drop_duplicates",
+            inputs=(
+                self._project_join_map_side(
+                    matched,
+                    side="right",
+                    final_columns=final_columns,
+                    include_target_id=True,
+                ),
+            ),
+            params={"subset": (JOIN_MAP_RIGHT_ID_COLUMN,)},
+        )
+        state_rows = QueryExpr(
+            op="concat",
+            inputs=(matched_changed, matched_current),
+        )
+        grouped_states = QueryExpr(
+            op="group_by",
+            inputs=(state_rows,),
+            params={
+                "keys": (
+                    JOIN_MAP_RIGHT_ID_COLUMN,
+                    *partition_keys,
+                )
+            },
+        )
+        updates = self._reaggregate_join_map_states(
+            grouped_states,
+            aggregate=aggregate,
+            final_columns=final_columns,
+            instruction_rewriter=instruction_rewriter,
+        )
+        new_groups = self._project_join_map_side(
+            left_only,
+            side="left",
+            final_columns=final_columns,
+        )
+        untouched = self._project_join_map_side(
+            right_only,
+            side="right",
+            final_columns=final_columns,
+        )
+        kept_and_updated = QueryExpr(
+            op="union_by_name",
+            inputs=(untouched, updates),
+            params={"allow_missing_columns": False},
+        )
+        body = QueryExpr(
+            op="union_by_name",
+            inputs=(kept_and_updated, new_groups),
+            params={"allow_missing_columns": False},
+        )
+        return QueryExpr(
+            op="let",
+            inputs=(joined, body),
+            params={"name": JOIN_MAP_BINDING_NAME},
+        )
+
+    def _filter_join_map_rows(
+        self,
+        joined: QueryExpr,
+        *,
+        left_present: bool,
+        right_present: bool,
+    ) -> QueryExpr:
+        """Select one matched or unmatched side of an outer semantic join."""
+
+        left_id = ColumnExpr(JOIN_MAP_LEFT_ID_COLUMN)
+        right_id = ColumnExpr(JOIN_MAP_RIGHT_ID_COLUMN)
+        predicate = (
+            left_id.is_not_null() if left_present else left_id.is_null()
+        ) & (
+            right_id.is_not_null() if right_present else right_id.is_null()
+        )
+        return QueryExpr(
+            op="filter",
+            inputs=(joined,),
+            params={"predicate": predicate.to_param()},
+        )
+
+    def _project_join_map_side(
+        self,
+        source: QueryExpr,
+        *,
+        side: str,
+        final_columns: Sequence[str],
+        include_target_id: bool = False,
+    ) -> QueryExpr:
+        """Project one outer-join side back to the materialized view schema."""
+
+        assignments = {
+            str(column): ColumnExpr(str(column), qualifier=side).to_param()
+            for column in final_columns
+        }
+        columns: tuple[str, ...] = tuple(str(column) for column in final_columns)
+        if include_target_id:
+            assignments[JOIN_MAP_RIGHT_ID_COLUMN] = ColumnExpr(
+                JOIN_MAP_RIGHT_ID_COLUMN
+            ).to_param()
+            columns = (JOIN_MAP_RIGHT_ID_COLUMN, *columns)
+        assigned = QueryExpr(
+            op="assign",
+            inputs=(source,),
+            params={"assignments": assignments},
+        )
+        return QueryExpr(
+            op="select",
+            inputs=(assigned,),
+            params={"columns": columns},
+        )
+
+    def _reaggregate_join_map_states(
+        self,
+        grouped_states: QueryExpr,
+        *,
+        aggregate: QueryExpr,
+        final_columns: Sequence[str],
+        instruction_rewriter: DifferentialInstructionRewriter,
+    ) -> QueryExpr:
+        """Merge current and changed aggregate state once for each selected target."""
+
+        if aggregate.op == "agg":
+            merged = self._build_aggregate_remerge(
+                grouped=grouped_states,
+                aggregate=aggregate,
+                state_cols=final_columns,
+                instruction_rewriter=instruction_rewriter,
+            )
+            return self._select_after_array_remerge_flatten(
+                merged,
+                aggregate,
+                final_columns,
+            )
+        if aggregate.op != "sem_agg":
+            raise TypeError(f"Unsupported join-map aggregate: {aggregate.op}")
+
+        reaggregate_params = dict(aggregate.params)
+        reaggregate_params["input_cols"] = None
+        reaggregate_params["instruction"] = instruction_rewriter.state_reaggregation(
+            str(aggregate.params["instruction"]),
+            state_cols=final_columns,
+            raw_input_cols=tuple(
+                str(column) for column in (aggregate.params.get("input_cols") or ())
+            ),
+        )
+        reaggregated = QueryExpr(
+            op="sem_agg",
+            inputs=(grouped_states,),
+            params=reaggregate_params,
+        )
+        return QueryExpr(
+            op="select",
+            inputs=(reaggregated,),
+            params={"columns": tuple(final_columns)},
+        )
+
     def _differentiate_sem_groupby_agg_view(
         self,
         query: QueryExpr,
@@ -893,7 +1118,7 @@ class DifferentialRules:
             instruction_rewriter=instruction_rewriter,
         )
 
-        selected_rule = self._grouped_agg_rule_for(groupby)
+        selected_rule = self._grouped_agg_rule
         if selected_rule == "rule-re-group":
             return self._build_grouped_sem_agg_re_group_candidate(
                 aggregate=aggregate,
@@ -1121,11 +1346,6 @@ class DifferentialRules:
             return None
 
         groupby = aggregate.inputs[0]
-        if groupby.op == "sem_groupby" and groupby.params.get("partition_by"):
-            raise NotImplementedError(
-                "sem_groupby partition_by is not supported by rule-join-map; "
-                "the semantic join cannot yet enforce deterministic partition keys."
-            )
         changed_groupby = QueryExpr(
             op="sem_groupby",
             inputs=(changed_group_input,),
@@ -1136,6 +1356,15 @@ class DifferentialRules:
             inputs=(changed_groupby,),
             params=aggregate.params,
         )
+        if groupby.op == "sem_groupby":
+            return self._build_semantic_join_map(
+                aggregate=aggregate,
+                groupby=groupby,
+                changed_aggregate=changed_aggregate,
+                current_view=current_view,
+                final_columns=final_columns,
+                instruction_rewriter=instruction_rewriter,
+            )
         preserved_columns = self._grouped_preserved_columns(groupby)
         if groupby.op == "group_by":
             joined = QueryExpr(

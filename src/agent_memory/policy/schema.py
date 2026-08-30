@@ -46,6 +46,8 @@ def output_columns(
         return source_columns + metadata_columns
     if query.op in {"alias", "group_by"}:
         return output_columns(query.inputs[0], window_source_columns=window_source_columns)
+    if query.op == "let":
+        return output_columns(query.inputs[1], window_source_columns=window_source_columns)
     if query.op == "over":
         return output_columns(query.inputs[0], window_source_columns=window_source_columns)
     if query.op == "array_agg":
@@ -287,6 +289,8 @@ def semantic_join_columns(
         columns.append(f"{column}:left" if column in overlapping else column)
     for column in right_columns:
         columns.append(f"{column}:right" if column in overlapping else column)
+    for column in query.params.get("id_columns", ()):
+        columns.append(str(column))
     return tuple(columns)
 
 

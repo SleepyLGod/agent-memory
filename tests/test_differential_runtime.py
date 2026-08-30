@@ -219,18 +219,6 @@ def test_policy_fingerprint_includes_the_selected_rule() -> None:
     assert join_map.grouped_agg_rule == "rule-join-map"
 
 
-def test_claude_policy_prefer_join_map_matches_strict_join_map_plan() -> None:
-    strict = planner.PolicyDifferentiator(
-        rules=DifferentialRules(grouped_agg_rule="rule-join-map")
-    ).differentiate(am.ClaudeMemory.spec())
-    preferred = planner.PolicyDifferentiator(
-        rules=DifferentialRules(grouped_agg_rule="prefer-join-map")
-    ).differentiate(am.ClaudeMemory.spec())
-
-    assert preferred.grouped_agg_rule == "prefer-join-map"
-    assert preferred.fingerprint == strict.fingerprint
-
-
 def test_policy_compiler_rejects_process_window_external_relation_capture() -> None:
     source_log = am.Log({"message": "Message body."})
     external = source_log.select(["message"])

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from hashlib import sha256
 from typing import Any
 from uuid import uuid4
 
@@ -28,6 +29,7 @@ from agent_memory.adapters.lotus.relational import (
     execute_flatten,
     execute_group_by,
     execute_join,
+    execute_let,
     execute_min,
     execute_select,
     execute_subtract,
@@ -82,9 +84,16 @@ class LotusAdapter:
     def maintenance_execution_fingerprint(self) -> str:
         """Identify physical settings that can change maintained state."""
 
-        return semantic_pair_profiles_fingerprint(
+        pair_fingerprint = semantic_pair_profiles_fingerprint(
             self.config.semantic_pair_profiles
         )
+        if self.config.sem_join_topk_method == "listwise":
+            return pair_fingerprint
+        payload = (
+            f"semantic_pair_profiles={pair_fingerprint}\n"
+            f"sem_join_topk_method={self.config.sem_join_topk_method}"
+        )
+        return sha256(payload.encode("utf-8")).hexdigest()
 
     def execute(self, query: QueryExpr, inputs: Mapping[str, Any]) -> Any:
         """Execute a logical query expression through LOTUS."""
@@ -106,6 +115,8 @@ class LotusAdapter:
                 return self._execute_traced_relational(query, inputs, execute_filter)
             case "group_by":
                 return self._execute_traced_relational(query, inputs, execute_group_by)
+            case "let":
+                return self._execute_traced_relational(query, inputs, execute_let)
             case "array_agg":
                 return self._execute_traced_relational(query, inputs, execute_array_agg)
             case "array_cat":
