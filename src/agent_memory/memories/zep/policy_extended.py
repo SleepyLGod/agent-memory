@@ -352,6 +352,7 @@ class ZepMemoryExtended(Memory):
         _extracted_entities.sem_groupby(
             input_cols=["name"],
             instruction=_ENTITY_GROUP_INSTRUCTION,
+            membership="exclusive",
         )
         .agg(
             sem_agg(
@@ -507,6 +508,7 @@ class ZepMemoryExtended(Memory):
             input_cols=["relation_type", "fact"],
             partition_by=["source_entity_id", "target_entity_id"],
             instruction=_FACT_GROUP_INSTRUCTION,
+            membership="exclusive",
         )
         .agg(
             sem_agg(
@@ -668,6 +670,7 @@ class ZepMemoryExtended(Memory):
         .sem_groupby(
             input_cols=["name", "summary"],
             instruction=_COMMUNITY_GROUP_INSTRUCTION,
+            membership="exclusive",
         )
         .agg(
             sem_agg(

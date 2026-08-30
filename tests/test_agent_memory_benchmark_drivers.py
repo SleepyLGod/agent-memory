@@ -313,7 +313,7 @@ def test_case_factories_create_isolated_policy_instances(monkeypatch, tmp_path) 
         connector=connector,
         base_namespace="benchmark-run",
         model_id="model",
-        grouped_agg_rule="prefer-join-map",
+        grouped_agg_rule="rule-join-map",
         sem_groupby_pair_batch_size=12,
         sem_groupby_pair_batch_retries=2,
         semantic_pair_profiles={"query": _search_filter_profile()},
@@ -342,7 +342,7 @@ def test_case_factories_create_isolated_policy_instances(monkeypatch, tmp_path) 
     }
     assert created[-1]._runtime.policy == (
         am.ZepMemory.spec(),
-        "prefer-join-map",
+        "rule-join-map",
         storage.statements,
     )
     assert isinstance(connector.embedding_provider, TracingEmbeddingProvider)
@@ -602,7 +602,8 @@ def test_zep_run_configures_existing_factory_and_checkpoint_flow(
         system_id="zep-memory",
         output_dir=output_dir,
         memory_provider_model_id="provider-model",
-        grouped_agg_rule="prefer-join-map",
+        grouped_agg_rule="rule-join-map",
+        sem_join_topk_method="pairwise-quick",
         sem_groupby_pair_batch_size=12,
         sem_groupby_pair_batch_retries=2,
         memory_thinking_enabled=False,
@@ -617,7 +618,8 @@ def test_zep_run_configures_existing_factory_and_checkpoint_flow(
     assert captured["factory"] == {
         "base_namespace": f"longmemeval-v1-cleaned-s-{namespace_digest}",
         "model_id": "provider-model",
-        "grouped_agg_rule": "prefer-join-map",
+        "grouped_agg_rule": "rule-join-map",
+        "sem_join_topk_method": "pairwise-quick",
         "sem_groupby_pair_batch_size": 12,
             "sem_groupby_pair_batch_retries": 2,
             "semantic_pair_profiles": {},
@@ -629,13 +631,17 @@ def test_zep_run_configures_existing_factory_and_checkpoint_flow(
     system_contract = captured["runner"]["system_contract"]
     assert system_contract.system_id == "zep-memory"
     assert system_contract.condition_id == "ZEP-SMOKE"
-    assert system_contract.maintenance_rule == "prefer-join-map"
+    assert system_contract.maintenance_rule == "rule-join-map"
+    assert system_contract.maintenance_execution_id == (
+        "sem-join-topk:pairwise-quick"
+    )
     assert system_contract.thinking_enabled is False
     assert captured["runner"]["runtime_provenance"]["runtime"][
         "lotus_execution"
     ] == {
         "sem_groupby_pair_batch_size": 12,
         "sem_groupby_pair_batch_retries": 2,
+        "sem_join_topk_method": "pairwise-quick",
         "semantic_pair_profile": "oracle-only",
         "semantic_pair_top_k": None,
         "semantic_pair_min_similarity": None,
@@ -744,7 +750,7 @@ def test_operator_profiles_target_claude_join_and_zep_groupby(mode: str) -> None
     assert {profile.mode for profile in zep_profiles.values()} == {mode}
 
 
-def test_zep_differential_groupby_queries_form_two_predicate_sites() -> None:
+def test_zep_differential_queries_expose_grouping_and_contradiction_sites() -> None:
     import agent_memory as am
     from agent_memory.memories.zep.storage import (
         GRAPHITI_BGE_M3,
@@ -760,16 +766,32 @@ def test_zep_differential_groupby_queries_form_two_predicate_sites() -> None:
     )
     sites = inventory_operator_semantic_pair_sites(
         zep,
-        operators=("sem_groupby",),
+        operators=("sem_filter", "sem_groupby"),
     )
 
-    assert len(sites) == 2
-    assert sorted(len(site.query_digests) for site in sites.values()) == [3, 3]
-    entity_site = next(site for site in sites.values() if not site.partition_by)
-    fact_site = next(site for site in sites.values() if site.partition_by)
+    assert len(sites) == 3
+    assert sorted(len(site.query_digests) for site in sites.values()) == [1, 3, 3]
+    entity_site = next(
+        site
+        for site in sites.values()
+        if site.operator == "sem_groupby" and not site.partition_by
+    )
+    fact_site = next(
+        site
+        for site in sites.values()
+        if site.operator == "sem_groupby" and site.partition_by
+    )
+    contradiction_site = next(
+        site for site in sites.values() if site.operator == "sem_filter"
+    )
     assert entity_site.semantic_columns == ("name",)
     assert fact_site.semantic_columns == ("relation_type", "fact")
     assert fact_site.partition_by == ("source_entity_id", "target_entity_id")
+    assert contradiction_site.direction == "right-to-left"
+    assert contradiction_site.left_text_columns == ("fact:earlier_added",)
+    assert contradiction_site.right_text_columns == ("fact:later_added",)
+    assert "fact_id:earlier_added" in contradiction_site.left_id_columns
+    assert "fact_id:later_added" in contradiction_site.right_id_columns
 
     profiles, resolved_sites = build_site_semantic_pair_profiles(
         zep,
@@ -786,14 +808,20 @@ def test_zep_differential_groupby_queries_form_two_predicate_sites() -> None:
                 top_k=10,
                 min_similarity=None,
             ),
+            SemanticPairSiteBinding(
+                site_id=contradiction_site.site_id,
+                mode="search-filter",
+                top_k=10,
+                min_similarity=None,
+            ),
         ),
-        operators=("sem_groupby",),
+        operators=("sem_filter", "sem_groupby"),
         embedding=GRAPHITI_BGE_M3,
         embedding_device="cuda",
     )
 
     assert resolved_sites == sites
-    assert len(profiles) == 6
+    assert len(profiles) == 7
     assert {
         (profile.top_k, profile.min_similarity)
         for digest, profile in profiles.items()
@@ -804,6 +832,11 @@ def test_zep_differential_groupby_queries_form_two_predicate_sites() -> None:
         for digest, profile in profiles.items()
         if digest in fact_site.query_digests
     } == {(10, None)}
+    assert {
+        (profile.direction, profile.top_k, profile.min_similarity)
+        for digest, profile in profiles.items()
+        if digest in contradiction_site.query_digests
+    } == {("right-to-left", 10, None)}
 
 
 def test_site_profiles_reject_stale_site_before_external_setup() -> None:
@@ -893,9 +926,9 @@ def test_run_rejects_stale_site_before_provenance_and_environment(
 
 @pytest.mark.parametrize(
     ("grouped_agg_rule", "expected_profile_count", "expected_site_count"),
-    (
-        ("rule-re-group", 6, 2),
-        ("prefer-join-map", 4, 3),
+        (
+            ("rule-re-group", 7, 3),
+            ("rule-join-map", 5, 5),
     ),
 )
 def test_run_resolves_site_config_into_manifest_and_query_profiles(
@@ -918,18 +951,21 @@ def test_run_resolves_site_config_into_manifest_and_query_profiles(
     )
     sites = inventory_operator_semantic_pair_sites(
         policy,
-        operators=("sem_join", "sem_groupby"),
+        operators=("sem_filter", "sem_join", "sem_groupby"),
     )
     bindings = [
         {
             "site_id": site.site_id,
             "mode": "search-filter",
-            "top_k": 10 if site.partition_by else 15,
-            "min_similarity": None if site.partition_by else 0.6,
+            "top_k": 10 if site.partition_by or site.operator == "sem_filter" else 15,
+            "min_similarity": (
+                None if site.partition_by or site.operator == "sem_filter" else 0.6
+            ),
         }
         for site in sites.values()
         if grouped_agg_rule == "rule-re-group"
         or site.operator == "sem_join"
+        or site.operator == "sem_filter"
         or site.partition_by
     ]
     profile_path = tmp_path / "profiles.json"
@@ -1013,6 +1049,7 @@ def test_run_resolves_site_config_into_manifest_and_query_profiles(
         for site in sites.values()
         if grouped_agg_rule == "rule-re-group"
         or site.operator == "sem_join"
+        or site.operator == "sem_filter"
         or site.partition_by
         for query_digest in site.query_digests
     }
@@ -1262,7 +1299,7 @@ def test_proxy_only_requires_threshold_before_external_setup(
         )
 
 
-def test_strict_zep_join_map_fails_before_storage_side_effects(tmp_path) -> None:
+def test_strict_zep_join_map_compiles_before_storage_side_effects(tmp_path) -> None:
     class CountingConnector:
         def __init__(self) -> None:
             self.prepare_count = 0
@@ -1285,16 +1322,22 @@ def test_strict_zep_join_map_fails_before_storage_side_effects(tmp_path) -> None
         connector=connector,
         base_namespace="strict-join-map",
         grouped_agg_rule="rule-join-map",
+        sem_join_topk_method="pairwise-quick",
         neo4j_image="neo4j:5.26.2",
         neo4j_image_digest="sha256:image",
     )
 
-    with pytest.raises(NotImplementedError, match="partition_by.*rule-join-map"):
-        factory(
-            "case-1",
-            tmp_path / "attempt-0001",
-            tmp_path / "trace",
-        )
+    driver = factory(
+        "case-1",
+        tmp_path / "attempt-0001",
+        tmp_path / "trace",
+    )
 
-    assert connector.prepare_count == 0
+    assert isinstance(driver, ZepMemoryDriver)
+    assert factory.sem_join_topk_method == "pairwise-quick"
+    assert (
+        driver._memory._runtime._engine.adapter.config.sem_join_topk_method
+        == "pairwise-quick"
+    )
+    assert connector.prepare_count == 1
     assert connector.transaction_count == 0

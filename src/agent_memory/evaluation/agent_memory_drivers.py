@@ -13,15 +13,12 @@ from typing import Any
 import pandas as pd
 
 from agent_memory.adapters.lotus.pair_execution import (
-    PAIR_LEFT_ID_COLUMN,
-    PAIR_LEFT_TEXT_COLUMN,
-    PAIR_RIGHT_ID_COLUMN,
-    PAIR_RIGHT_TEXT_COLUMN,
     SEMANTIC_PAIR_EXECUTION_MODES,
     SemanticPairExecutionProfile,
     SemanticPairSite,
     semantic_pair_site_contract,
     semantic_pair_site_id,
+    semantic_pair_site_physical_contract,
 )
 from agent_memory.evaluation.claude_memory.bindings import event_to_claude_log_row
 from agent_memory.evaluation.embedding_trace import TracingEmbeddingProvider
@@ -68,7 +65,7 @@ def build_operator_semantic_pair_profiles(
         if top_k is not None or min_similarity is not None:
             raise ValueError("oracle-only does not accept semantic pair bounds")
         return {}
-    supported = {"sem_join", "sem_groupby"}
+    supported = {"sem_filter", "sem_join", "sem_groupby"}
     unknown = sorted(set(operators) - supported)
     if unknown:
         raise ValueError(f"unsupported semantic pair operators: {unknown}")
@@ -76,10 +73,9 @@ def build_operator_semantic_pair_profiles(
     profiles: dict[str, SemanticPairExecutionProfile] = {}
     sites = inventory_operator_semantic_pair_sites(policy, operators=operators)
     for site in sites.values():
-        direction = "left-to-right" if site.operator == "sem_join" else "symmetric"
         profile = _operator_semantic_pair_profile(
             mode=mode,
-            direction=direction,
+            site=site,
             embedding=embedding,
             embedding_device=embedding_device,
             top_k=top_k,
@@ -102,7 +98,7 @@ def inventory_operator_semantic_pair_sites(
 ) -> dict[str, SemanticPairSite]:
     """Group differential query copies by their semantic predicate contract."""
 
-    supported = {"sem_join", "sem_groupby"}
+    supported = {"sem_filter", "sem_join", "sem_groupby"}
     unknown = sorted(set(operators) - supported)
     if unknown:
         raise ValueError(f"unsupported semantic pair operators: {unknown}")
@@ -129,21 +125,26 @@ def inventory_operator_semantic_pair_sites(
             continue
         site_id = semantic_pair_site_id(query)
         contract = semantic_pair_site_contract(query)
+        physical_contract = semantic_pair_site_physical_contract(query)
         group = grouped.setdefault(
             site_id,
             {
                 "operator": query.op,
                 "contract": contract,
+                "physical_contract": physical_contract,
                 "query_digests": set(),
             },
         )
         if group["contract"] != contract:
             raise RuntimeError("semantic pair site digest collision")
+        if group["physical_contract"] != physical_contract:
+            raise RuntimeError("semantic pair site physical contract mismatch")
         group["query_digests"].add(query_digest(query))
 
     result: dict[str, SemanticPairSite] = {}
     for site_id, group in sorted(grouped.items()):
         contract = group["contract"]
+        physical_contract = group["physical_contract"]
         predicate_sha256 = site_id.split(":", 1)[1]
         result[site_id] = SemanticPairSite(
             site_id=site_id,
@@ -152,6 +153,11 @@ def inventory_operator_semantic_pair_sites(
             instruction=str(contract["instruction"]),
             semantic_columns=tuple(contract["semantic_columns"]),
             partition_by=tuple(contract["partition_by"]),
+            direction=str(physical_contract["direction"]),
+            left_id_columns=tuple(physical_contract["left_id_columns"]),
+            right_id_columns=tuple(physical_contract["right_id_columns"]),
+            left_text_columns=tuple(physical_contract["left_text_columns"]),
+            right_text_columns=tuple(physical_contract["right_text_columns"]),
             query_digests=tuple(sorted(group["query_digests"])),
         )
     return result
@@ -179,10 +185,9 @@ def build_site_semantic_pair_profiles(
         if binding.mode == "oracle-only":
             continue
         site = sites[binding.site_id]
-        direction = "left-to-right" if site.operator == "sem_join" else "symmetric"
         profile = _operator_semantic_pair_profile(
             mode=binding.mode,
-            direction=direction,
+            site=site,
             embedding=embedding,
             embedding_device=embedding_device,
             top_k=binding.top_k,
@@ -197,7 +202,7 @@ def build_site_semantic_pair_profiles(
 def _operator_semantic_pair_profile(
     *,
     mode: str,
-    direction: str,
+    site: SemanticPairSite,
     embedding: EmbeddingSpec,
     embedding_device: str,
     top_k: int | None,
@@ -205,11 +210,11 @@ def _operator_semantic_pair_profile(
 ) -> SemanticPairExecutionProfile:
     return SemanticPairExecutionProfile(
         mode=mode,
-        direction=direction,
-        left_id_columns=(PAIR_LEFT_ID_COLUMN,),
-        right_id_columns=(PAIR_RIGHT_ID_COLUMN,),
-        left_text_columns=(PAIR_LEFT_TEXT_COLUMN,),
-        right_text_columns=(PAIR_RIGHT_TEXT_COLUMN,),
+        direction=site.direction,
+        left_id_columns=site.left_id_columns,
+        right_id_columns=site.right_id_columns,
+        left_text_columns=site.left_text_columns,
+        right_text_columns=site.right_text_columns,
         embedding=embedding,
         embedding_device=embedding_device,
         top_k=top_k,
@@ -735,6 +740,7 @@ class ZepMemoryDriverFactory:
         base_namespace: str,
         model_id: str = "deepseek/deepseek-v4-flash",
         grouped_agg_rule: str = "rule-re-group",
+        sem_join_topk_method: str = "listwise",
         sem_groupby_pair_batch_size: int | None = None,
         sem_groupby_pair_batch_retries: int = 0,
         semantic_pair_profiles: dict[str, SemanticPairExecutionProfile] | None = None,
@@ -757,6 +763,7 @@ class ZepMemoryDriverFactory:
         self.base_namespace = base_namespace
         self.model_id = model_id
         self.grouped_agg_rule = grouped_agg_rule
+        self.sem_join_topk_method = sem_join_topk_method
         self.sem_groupby_pair_batch_size = sem_groupby_pair_batch_size
         self.sem_groupby_pair_batch_retries = sem_groupby_pair_batch_retries
         self.semantic_pair_profiles = dict(semantic_pair_profiles or {})
@@ -793,6 +800,7 @@ class ZepMemoryDriverFactory:
         base_namespace: str,
         model_id: str = "deepseek/deepseek-v4-flash",
         grouped_agg_rule: str = "rule-re-group",
+        sem_join_topk_method: str = "listwise",
         sem_groupby_pair_batch_size: int | None = None,
         sem_groupby_pair_batch_retries: int = 0,
         semantic_pair_profiles: dict[str, SemanticPairExecutionProfile] | None = None,
@@ -840,6 +848,7 @@ class ZepMemoryDriverFactory:
             base_namespace=base_namespace,
             model_id=model_id,
             grouped_agg_rule=grouped_agg_rule,
+            sem_join_topk_method=sem_join_topk_method,
             sem_groupby_pair_batch_size=sem_groupby_pair_batch_size,
             sem_groupby_pair_batch_retries=sem_groupby_pair_batch_retries,
             semantic_pair_profiles=semantic_pair_profiles,
@@ -908,6 +917,7 @@ class ZepMemoryDriverFactory:
                 },
                 lm_enable_cache=self.lotus_cache_mode == "memory",
                 structured_max_tokens=BENCHMARK_STRUCTURED_MAX_TOKENS,
+                sem_join_topk_method=self.sem_join_topk_method,
                 sem_groupby_pair_batch_size=self.sem_groupby_pair_batch_size,
                 sem_groupby_pair_batch_retries=self.sem_groupby_pair_batch_retries,
                 semantic_pair_profiles=self.semantic_pair_profiles,

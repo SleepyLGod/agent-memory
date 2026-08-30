@@ -27,6 +27,7 @@ from agent_memory.adapters.lotus.pair_execution import (
 from agent_memory.adapters.lotus.context import (
     LOTUS_MEMORY_CACHE_ID,
     LOTUS_MEMORY_CACHE_MAX_SIZE,
+    SEM_JOIN_TOPK_METHODS,
 )
 from .artifacts import BenchmarkArtifactStore
 from .bundle import BenchmarkBundle
@@ -99,6 +100,7 @@ def run_agent_memory_bundle(
     base_namespace: str | None = None,
     grouped_agg_rule: str = "rule-all-group",
     sem_topk_method: str | None = None,
+    sem_join_topk_method: str | None = None,
     sem_groupby_pair_batch_size: int | None = None,
     sem_groupby_pair_batch_retries: int = 0,
     semantic_pair_profile: str = "oracle-only",
@@ -122,6 +124,14 @@ def run_agent_memory_bundle(
         raise ValueError("sem_groupby_pair_batch_size must be positive")
     if sem_groupby_pair_batch_retries < 0:
         raise ValueError("sem_groupby_pair_batch_retries cannot be negative")
+    if (
+        sem_join_topk_method is not None
+        and sem_join_topk_method not in SEM_JOIN_TOPK_METHODS
+    ):
+        raise ValueError(
+            "sem_join_topk_method must be one of: "
+            + ", ".join(SEM_JOIN_TOPK_METHODS)
+        )
     if semantic_pair_profile not in SEMANTIC_PAIR_PROFILES:
         raise ValueError(
             "semantic_pair_profile must be one of: "
@@ -181,6 +191,15 @@ def run_agent_memory_bundle(
         sem_topk_method = (
             "pairwise-quick" if system_id == "mem0-enhanced" else "pairwise-naive"
         )
+    uses_sem_join_topk = system_id == "zep-memory" and grouped_agg_rule in {
+        "join-map",
+        "rule-join-map",
+    }
+    if sem_join_topk_method is not None and not uses_sem_join_topk:
+        raise ValueError(
+            "sem_join_topk_method requires Zep with a join-map grouped aggregate rule"
+        )
+    resolved_sem_join_topk_method = sem_join_topk_method or "listwise"
     site_profile_config = (
         load_semantic_pair_profile_config(semantic_pair_profile_config)
         if semantic_pair_profile_config is not None
@@ -214,7 +233,7 @@ def run_agent_memory_bundle(
                 am.ZepMemory.spec(),
                 statements=GRAPHITI_NEO4J_STATEMENTS,
             )
-            operators = ("sem_join", "sem_groupby")
+            operators = ("sem_filter", "sem_join", "sem_groupby")
             embedding = GRAPHITI_BGE_M3
         semantic_pair_profiles, semantic_pair_sites = (
             build_site_semantic_pair_profiles(
@@ -301,6 +320,11 @@ def run_agent_memory_bundle(
         part
         for part in (
             semantic_pair_execution_id,
+            (
+                f"sem-join-topk:{resolved_sem_join_topk_method}"
+                if uses_sem_join_topk
+                else ""
+            ),
             f"lotus-cache:{LOTUS_MEMORY_CACHE_ID}"
             if lotus_cache_mode == "memory"
             else "",
@@ -346,6 +370,9 @@ def run_agent_memory_bundle(
     lotus_execution_provenance = {
         "sem_groupby_pair_batch_size": sem_groupby_pair_batch_size,
         "sem_groupby_pair_batch_retries": sem_groupby_pair_batch_retries,
+        "sem_join_topk_method": (
+            resolved_sem_join_topk_method if uses_sem_join_topk else None
+        ),
         "semantic_pair_profile": semantic_pair_profile,
         "semantic_pair_top_k": semantic_pair_top_k,
         "semantic_pair_min_similarity": semantic_pair_min_similarity,
@@ -448,6 +475,7 @@ def run_agent_memory_bundle(
             base_namespace=base_namespace or _namespace(bundle.benchmark_id, output_dir),
             model_id=memory_provider_model_id,
             grouped_agg_rule=grouped_agg_rule,
+            sem_join_topk_method=resolved_sem_join_topk_method,
             sem_groupby_pair_batch_size=sem_groupby_pair_batch_size,
             sem_groupby_pair_batch_retries=sem_groupby_pair_batch_retries,
             semantic_pair_profiles=semantic_pair_profiles,

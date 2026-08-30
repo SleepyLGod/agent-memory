@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import agent_memory as am
-import pytest
 from agent_memory.policy.aggregates import (
     ArrayAggregateSpec,
     MinAggregateSpec,
@@ -194,47 +193,28 @@ def test_zep_retrieval_is_one_two_channel_storage_backed_dag() -> None:
     ).fingerprint
 
 
-def test_prefer_join_map_selects_rules_by_grouping_capability() -> None:
+def test_strict_join_map_supports_partitioned_zep_facts() -> None:
     policy = PolicyDifferentiator(
-        rules=DifferentialRules(grouped_agg_rule="prefer-join-map")
+        rules=DifferentialRules(grouped_agg_rule="rule-join-map")
     ).differentiate(
         ZepMemory.spec(),
         statements=GRAPHITI_NEO4J_STATEMENTS,
     )
-    grouped_nodes = [
+    semantic_joins = [
         node
-        for node in policy.nodes.values()
-        if node.execution_kind == "semantic_state"
-        and node.query.op == "agg"
-        and node.query.inputs[0].op == "sem_groupby"
+        for plan_node in policy.nodes.values()
+        if plan_node.maintenance_query is not None
+        for node in _walk(plan_node.maintenance_query)
+        if node.op == "sem_join"
     ]
-    unpartitioned = next(
-        node
-        for node in grouped_nodes
-        if not node.query.inputs[0].params.get("partition_by")
+
+    assert semantic_joins
+    assert all(join.params["k"] == 1 for join in semantic_joins)
+    assert any(
+        join.params.get("on")
+        == ("source_entity_id", "target_entity_id")
+        for join in semantic_joins
     )
-    partitioned = next(
-        node
-        for node in grouped_nodes
-        if node.query.inputs[0].params.get("partition_by")
-    )
-
-    assert policy.grouped_agg_rule == "prefer-join-map"
-    assert unpartitioned.maintenance_query is not None
-    assert "sem_join" in _ops(unpartitioned.maintenance_query)
-    assert partitioned.maintenance_query is not None
-    assert "sem_join" not in _ops(partitioned.maintenance_query)
-    assert "concat" in _ops(partitioned.maintenance_query)
-
-
-def test_strict_join_map_still_rejects_partitioned_zep_facts() -> None:
-    with pytest.raises(NotImplementedError, match="partition_by.*rule-join-map"):
-        PolicyDifferentiator(
-            rules=DifferentialRules(grouped_agg_rule="rule-join-map")
-        ).differentiate(
-            ZepMemory.spec(),
-            statements=GRAPHITI_NEO4J_STATEMENTS,
-        )
 
 
 def test_zep_episodes_view_uses_select_not_map() -> None:
@@ -302,6 +282,7 @@ def test_zep_entities_view_uses_context_extraction_and_semantic_aggregation() ->
     assert "Always extract the speaker" in extraction.params["instruction"]
     assert "When in doubt, do not extract" in extraction.params["instruction"]
     grouped_agg = next(node for node in _walk(query) if node.op == "agg")
+    assert grouped_agg.inputs[0].params["membership"] == "exclusive"
     specs = grouped_agg.params["aggregates"]
     entity_id = next(
         specification
@@ -411,6 +392,7 @@ def test_zep_facts_view_contains_temporal_self_join_paths() -> None:
         "source_entity_id",
         "target_entity_id",
     )
+    assert fact_grouping.params["membership"] == "exclusive"
     specs = deduplicated_agg.params["aggregates"]
     assert any(isinstance(specification, SemanticAggregateSpec) for specification in specs)
     assert any(isinstance(specification, ArrayAggregateSpec) for specification in specs)
@@ -516,6 +498,7 @@ def test_zep_communities_view_is_semantic_grouping_not_label_propagation() -> No
     assert "label_propagation" not in ops
     groupby = next(node for node in _walk(query) if node.op == "sem_groupby")
     assert "partition_by" not in groupby.params
+    assert groupby.params["membership"] == "exclusive"
     aggregate = next(node for node in _walk(query) if node.op == "agg")
     aggregate_specs = aggregate.params["aggregates"]
     community_id = next(

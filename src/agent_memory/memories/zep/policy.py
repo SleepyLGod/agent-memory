@@ -337,6 +337,7 @@ class ZepMemory(Memory):
         _extracted_entities.sem_groupby(
             input_cols=["name"],
             instruction=_ENTITY_GROUP_INSTRUCTION,
+            membership="exclusive",
         )
         .agg(
             sem_agg(
@@ -492,6 +493,7 @@ class ZepMemory(Memory):
             input_cols=["relation_type", "fact"],
             partition_by=["source_entity_id", "target_entity_id"],
             instruction=_FACT_GROUP_INSTRUCTION,
+            membership="exclusive",
         )
         .agg(
             sem_agg(
@@ -542,6 +544,9 @@ class ZepMemory(Memory):
     _earlier_added_facts = _deduplicated_facts.alias("earlier_added")
     _later_added_facts = _deduplicated_facts.alias("later_added")
 
+    # Contradiction candidates are global within the graph. Native Graphiti
+    # physically blocks this domain with hybrid top-10 retrieval; that choice
+    # belongs to an explicit execution profile, not this logical view.
     # Each row is one pair of facts judged to contradict each other.
     _contradictory_fact_pairs = _earlier_added_facts.join(
         _later_added_facts,

@@ -2017,9 +2017,6 @@ def test_maintenance_fingerprint_separates_rules_but_not_retrieval() -> None:
         retrieval_recipe_id="claude-memory:listwise",
     )
     re_group = replace(join_map, maintenance_rule="rule-re-group")
-    preferred = replace(join_map, maintenance_rule="prefer-join-map")
 
     assert join_map.maintenance_fingerprint == join_map_listwise.maintenance_fingerprint
     assert join_map.maintenance_fingerprint != re_group.maintenance_fingerprint
-    assert preferred.maintenance_fingerprint != join_map.maintenance_fingerprint
-    assert preferred.maintenance_fingerprint != re_group.maintenance_fingerprint
