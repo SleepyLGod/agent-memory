@@ -243,20 +243,27 @@ class _DifferentialPolicyBuilder:
         execution_kind = (
             "semantic_row" if query.op in _ROW_LOCAL_SEMANTIC_OPS else "deterministic"
         )
-        if query.op == "sem_agg":
+        maintenance_query: QueryExpr | None = None
+        if query.op == "join" and str(query.params.get("how", "inner")) == "inner":
+            execution_kind = "relational_state"
+            maintenance_query = self._relational_inner_join_maintenance_query(
+                local_query,
+                input_node_ids,
+                current_node_id=self._node_id(query),
+            )
+        elif query.op == "sem_agg":
             execution_kind = "semantic_state"
+            maintenance_query = self._semantic_maintenance_query(
+                local_query,
+                input_node_ids,
+                current_node_id=self._node_id(query),
+            )
         node = self._make_node(
             query=query,
             local_query=local_query,
             input_node_ids=input_node_ids,
             execution_kind=execution_kind,
-            maintenance_query=self._semantic_maintenance_query(
-                local_query,
-                input_node_ids,
-                current_node_id=self._node_id(query),
-            )
-            if execution_kind == "semantic_state"
-            else None,
+            maintenance_query=maintenance_query,
         )
         return self._register(query, node)
 
@@ -388,6 +395,78 @@ class _DifferentialPolicyBuilder:
             source_query=source,
             source_input=changed_source,
         )
+
+    def _relational_inner_join_maintenance_query(
+        self,
+        local_query: QueryExpr,
+        input_node_ids: tuple[str, ...],
+        *,
+        current_node_id: str,
+    ) -> QueryExpr:
+        """Build bag-preserving append maintenance for one relational inner join."""
+
+        if local_query.op != "join" or str(local_query.params.get("how", "inner")) != "inner":
+            raise ValueError("Relational join maintenance requires how='inner'")
+        if len(input_node_ids) != 2 or len(local_query.inputs) != 2:
+            raise ValueError("Relational inner join requires exactly two inputs")
+
+        left_node_id, right_node_id = input_node_ids
+        left_old = self._node_leaf(left_node_id)
+        right_old = self._node_leaf(right_node_id)
+        left_inserted = self._inserted_node_leaf(left_node_id)
+        right_inserted = self._inserted_node_leaf(right_node_id)
+
+        def join(left: QueryExpr, right: QueryExpr) -> QueryExpr:
+            return QueryExpr(
+                op="join",
+                inputs=(
+                    self._preserve_input_alias(local_query.inputs[0], left),
+                    self._preserve_input_alias(local_query.inputs[1], right),
+                ),
+                params=local_query.params,
+            )
+
+        current_join = QueryExpr(
+            op="materialized_view",
+            params={
+                "name": current_node_id,
+                "columns": output_columns(local_query),
+            },
+        )
+        delta_join = QueryExpr(
+            op="concat",
+            inputs=(
+                QueryExpr(
+                    op="concat",
+                    inputs=(
+                        join(left_inserted, right_old),
+                        join(left_old, right_inserted),
+                    ),
+                ),
+                join(left_inserted, right_inserted),
+            ),
+        )
+        return QueryExpr(op="concat", inputs=(current_join, delta_join))
+
+    def _inserted_node_leaf(self, node_id: str) -> QueryExpr:
+        """Return the runtime binding for one policy node's inserted rows."""
+
+        source = self._node_leaf(node_id)
+        return QueryExpr(
+            op="materialized_view",
+            params={
+                "name": f"{node_id}__inserted",
+                "columns": source.params["columns"],
+            },
+        )
+
+    @staticmethod
+    def _preserve_input_alias(template: QueryExpr, source: QueryExpr) -> QueryExpr:
+        """Apply a compiled join-side alias to a replacement materialized input."""
+
+        if template.op != "alias":
+            return source
+        return QueryExpr(op="alias", inputs=(source,), params=template.params)
 
     def _bind_direct_inputs(
         self,
