@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from datetime import datetime
 import json
 from pathlib import Path
 
@@ -24,7 +25,10 @@ from agent_memory.evaluation.harness import MemorySystemContract
 from agent_memory.adapters.lotus.context import LotusExecutionConfig
 from agent_memory.adapters.lotus.sem_filter import execute_sem_filter
 from agent_memory.adapters.lotus.sem_groupby import execute_sem_groupby
-from agent_memory.adapters.lotus.sem_join import execute_sem_join
+from agent_memory.adapters.lotus.sem_join import (
+    execute_sem_join,
+    semantic_join_pair_candidates,
+)
 from agent_memory.policy.logical import ColumnSpec, QueryExpr
 from agent_memory.planner import PolicyDifferentiator
 from agent_memory.runtime import MemoryRuntime
@@ -1072,6 +1076,53 @@ def test_exact_key_sem_join_rejects_lotus_cascade_before_input_execution() -> No
             ),
             context,
         )
+
+
+def test_exact_key_sem_join_does_not_match_stringified_values() -> None:
+    left = pd.Series(["left fact"], index=["left-row"])
+    right = pd.Series(["right fact"], index=["right-row"])
+
+    candidates = semantic_join_pair_candidates(
+        left,
+        right,
+        left_frame=pd.DataFrame(
+            {"partition": [datetime(2026, 1, 1)]},
+            index=left.index,
+        ),
+        right_frame=pd.DataFrame(
+            {"partition": ["2026-01-01 00:00:00"]},
+            index=right.index,
+        ),
+        on=("partition",),
+    )
+
+    assert candidates.empty
+
+
+def test_exact_key_sem_join_supports_zep_style_composite_tuple_keys() -> None:
+    left = pd.Series(["changed fact"], index=["left-row"])
+    right = pd.Series(["current fact"], index=["right-row"])
+    partition = {
+        "source_entity_id": (12, 3),
+        "target_entity_id": (7, 1),
+    }
+
+    candidates = semantic_join_pair_candidates(
+        left,
+        right,
+        left_frame=pd.DataFrame([partition], index=left.index),
+        right_frame=pd.DataFrame([partition], index=right.index),
+        on=("source_entity_id", "target_entity_id"),
+    )
+
+    assert candidates.loc[:, [PAIR_LEFT_ID_COLUMN, PAIR_RIGHT_ID_COLUMN]].to_dict(
+        orient="records"
+    ) == [
+        {
+            PAIR_LEFT_ID_COLUMN: "left-row",
+            PAIR_RIGHT_ID_COLUMN: "right-row",
+        }
+    ]
 
 
 def test_sem_groupby_search_filter_zero_candidates_skips_oracle(
