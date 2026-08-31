@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Callable, Mapping, Sequence
-import json
 from typing import Any
 
 import pandas as pd
@@ -431,7 +430,7 @@ def semantic_join_pair_candidates(
     if missing:
         raise ValueError(f"sem_join on columns not found on both sides: {missing}")
 
-    right_by_key: dict[str, list[Any]] = defaultdict(list)
+    right_by_key: dict[tuple[object, ...], list[Any]] = defaultdict(list)
     if on:
         assert right_frame is not None
         for right_id in right.index:
@@ -471,13 +470,18 @@ def semantic_join_pair_candidates(
     )
 
 
-def _semantic_join_key(row: pd.Series, columns: Sequence[str]) -> str:
-    return json.dumps(
-        [row[column] for column in columns],
-        ensure_ascii=False,
-        default=str,
-        separators=(",", ":"),
-    )
+def _semantic_join_key(
+    row: pd.Series,
+    columns: Sequence[str],
+) -> tuple[object, ...]:
+    key = tuple(row[column] for column in columns)
+    try:
+        hash(key)
+    except TypeError as error:
+        raise TypeError(
+            "sem_join exact-key columns must contain hashable scalar values"
+        ) from error
+    return key
 
 
 def aligned_join_values(
