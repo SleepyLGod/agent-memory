@@ -155,6 +155,13 @@ class PolicyExecutor:
 
             if node.execution_kind == "deterministic":
                 next_state = self._execute_deterministic(node_id, staged_node_state)
+            elif node.execution_kind == "relational_state":
+                next_state = self._execute_relational_state(
+                    node_id,
+                    old_state=old_state,
+                    parent_updates=parent_updates,
+                    staged_node_state=staged_node_state,
+                )
             elif node.execution_kind == "semantic_row":
                 next_state = self._execute_semantic_row(
                     node_id,
@@ -600,6 +607,37 @@ class PolicyExecutor:
             for parent_id in node.input_node_ids
         }
         return self.adapter.execute(node.query, inputs)
+
+    def _execute_relational_state(
+        self,
+        node_id: str,
+        *,
+        old_state: pd.DataFrame,
+        parent_updates: tuple[NodeOutputUpdate, ...],
+        staged_node_state: Mapping[str, pd.DataFrame],
+    ) -> pd.DataFrame:
+        """Incrementally maintain an inner join or fully recompute on retractions."""
+
+        node = self.policy.nodes[node_id]
+        if len(node.input_node_ids) != 2 or len(parent_updates) != 2:
+            raise RuntimeError("Relational state nodes require exactly two inputs")
+        if any(not update.retracted_rows.empty for update in parent_updates):
+            return self._execute_deterministic(node_id, staged_node_state)
+        if node.maintenance_query is None:
+            raise RuntimeError(f"Relational state node {node_id} has no maintenance query")
+
+        inputs: dict[str, pd.DataFrame] = {node_id: old_state}
+        for parent_id, update in zip(
+            node.input_node_ids,
+            parent_updates,
+            strict=True,
+        ):
+            inputs[parent_id] = self._node_state.get(
+                parent_id,
+                self._empty_node_frame(parent_id),
+            )
+            inputs[f"{parent_id}__inserted"] = update.inserted_rows
+        return self.adapter.execute(node.maintenance_query, inputs)
 
     def _execute_semantic_row(
         self,
