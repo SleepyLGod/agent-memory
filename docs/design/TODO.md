@@ -1,8 +1,52 @@
 # TODO: Semantic IVM Implementation Questions
 
-Status: the current golden line is `docs/optimization/incremental-semantic-view-maintenance.tex` plus  `docs/design/operator-api.md`. This file tracks unresolved implementation questions. It is intentionally question-first, not a decision spec.
+Status: the current golden line is
+`docs/optimization/incremental-semantic-view-maintenance.tex` plus
+`docs/design/operator-api.md`. This is the single current backlog for unresolved
+interface, operator, rule, runtime, and optimizer questions. It is intentionally
+question-first, not a decision spec.
 
-## V0.0 -> V0.1 Interface Contracts
+## Current Consolidated Backlog
+
+### Operator execution
+
+- Audit LOTUS Cascade with real traces before exposing it as a supported physical
+  profile. Keep examples, raw outputs, explanations, helper decisions, and stats
+  in a trace side-channel rather than logical result columns.
+- Add an indexed or hybrid execution path for `sem_topk` without changing its
+  logical ranking contract.
+- Evaluate candidate pruning and indexed access for `sem_groupby`; pair batching
+  improves stability but does not reduce the number of semantic pairs by itself.
+- Validate large-group structured `sem_agg` for context limits, retries, trace,
+  and cost before claiming that path is production-stable.
+- Add `min_by` / `arg_min` only when a view needs the payload associated with a
+  minimum ordering value. Removing a current minimum still requires retraction
+  state or recomputation.
+
+### Differential rules and runtime
+
+- Define source deletion and general negative-delta semantics.
+- Define old-state binding or an explicit full-recompute fallback for semantic
+  joins over arbitrary subqueries.
+- Define correct maintenance for materialized left, right, and outer semantic
+  joins, where a new match can retract an old unmatched row.
+- Support dependencies that mix base-log input with changed upstream views.
+- Add recursive/fixpoint planning only with an explicit recursive-view contract.
+- Add physical optimization such as indexed join/aggregate state and shared
+  arrangements without changing logical or maintenance fingerprints silently.
+- Add spec-time placeholder validation and view-aware planner errors once column
+  scope inference is reliable.
+- Define when a standalone semantic aggregate's current output is sufficient
+  maintenance state; schema compatibility alone is not a proof.
+
+### Runtime scheduling
+
+- Define concurrent and multi-writer ordering beyond the current single-process
+  append sequence.
+- Keep maintenance batching, refresh gates, and background consolidation as
+  runtime scheduling decisions unless they change the logical input scope.
+
+## Interface Contracts
 
 - Shared finite dependency maintenance is represented by `DifferentiatedPolicy`
   and executed by `PolicyExecutor`; see
@@ -52,28 +96,6 @@ Status: the current golden line is `docs/optimization/incremental-semantic-view-
   v0.1 should decide whether to hide the expression behind `_expr` or promote a
   stable debug/inspection API.
 
-- The first stateful differential rewrite rule must decide how executable `ΔQ`
-  references current view state `V` and changed input rows `ΔD`. v0.0 keeps
-  `ΔD` as a mathematical/runtime concept rather than modeling it as a
-  `QueryExpr` operator; current row-local fragment rules work by binding the
-  source log to changed rows at runtime.
-
-- The first `sem_groupby(...).sem_agg(...)` view-boundary rule is implemented as
-  a Claude-style full-next-view query shape:
-
-  ```text
-  ΔC = ΔD.sem_flat_map(...)
-  ΔT = ΔC.sem_groupby(...).sem_agg(...)
-  M = ΔT.sem_join(V, how="outer", instruction=<same topic identity instruction>)
-  V' = M.sem_map(instruction=<same consolidation instruction>)
-  ```
-
-  Current limits: it only applies at a public view boundary, returns full `V'`
-  rather than minimal `DeltaV`, and is not a generic exact `sem_agg`
-  maintenance proof. Deterministic placeholder rewrite is separate from future
-  semantic prompt rewriting. If a later design computes `DeltaV` instead, the
-  same logical maintenance may become `left join + upsert/delete/skip`.
-
 - Adapter capability and default adapter injection are still unresolved. Before
   adding non-LOTUS engines, decide what capability contract each execution
   adapter exposes and where the default adapter is injected.
@@ -82,28 +104,6 @@ Status: the current golden line is `docs/optimization/incremental-semantic-view-
   whether API keys, base URLs, provider names, temperature, and token limits live
   on the adapter dataclass or are delegated to LOTUS/provider-native
   configuration.
-
-
-## Claude Code native memory path alignment
-
-Detailed native Claude Code memory analysis now lives in
-`docs/design/native-claude-memory-audit.zh.md`. Keep that document as the
-canonical design note instead of duplicating long native-path analysis here.
-
-Current TODOs:
-
-- Keep native comparison experiments separated by path: main-agent inline write,
-  `extractMemories` background extraction, and `autoDream` consolidation.
-- Do not use a CLI `-p` LOCOMO replay as evidence that `extractMemories` or
-  `autoDream` ran; it is only a native CLI / main-agent behavior audit unless
-  debug artifacts prove otherwise.
-- Add an extract-only component harness before claiming parity with
-  `agent-memory` `sem_flat_map -> sem_groupby.sem_agg`.
-- Treat `--turn-size 1` native CLI runs as one-row-per-turn behavior, not strict
-  one-message extractor tests.
-- If comparing consolidation, prefer an extract-only + seeded `autoDream` gate
-  experiment so native `autoDream` itself runs while the scheduler conditions are
-  explicit.
 
 ## Open Research Questions
 

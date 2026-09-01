@@ -101,10 +101,8 @@ examples/helloworld/
 
 ## Design Documents
 
-- `docs/design/v0.0-interface.md`: current v0.0 interface boundary
 - `docs/design/operator-api.md`: DataFrame-style semantic operator API
-- `docs/design/groupby-aggregation-api-rationale.md`: chain aggregation rationale
-- `docs/design/TODO.md`: unresolved v0.0 -> v0.1 interface and research questions
+- `docs/design/TODO.md`: unresolved interface, runtime, and research questions
 - `docs/optimization/incremental-semantic-view-maintenance.tex`: semantic IVM theory draft
 
 ## Development
