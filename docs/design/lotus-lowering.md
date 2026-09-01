@@ -1,8 +1,7 @@
-# Next-Step 设计：LOTUS Lowering、Storage、Claude Consolidation
+# LOTUS Lowering 设计
 
-本文记录 `agent-memory` 近期下一步的工程设计边界。当前主要包括三件事：
-语义 operator 如何接 LOTUS、storage backend 如何保持独立、Claude-style
-topic view 如何对齐 markdown memory 文件。
+本文记录 `agent-memory` 如何把逻辑 `QueryExpr` lower 到 LOTUS-backed
+operator execution。它是一份稳定的执行层设计说明，不是实施路线图。
 
 其中 LOTUS 部分讨论的是 `QueryExpr -> LOTUS-backed execution`，不是
 `Q -> Q'` 的 differential rewrite。
@@ -21,28 +20,7 @@ topic view 如何对齐 markdown memory 文件。
   topology、change/state、共享 node 和原子提交；详细边界见
   `policy-differentiation-dataflow-runtime.zh.md`。
 
-## 1. Implementation Roadmap
-
-近期实现顺序必须先补齐 operator execution，再谈 rules、Claude policy 和
-storage。推荐里程碑如下：
-
-1. **Complete `QueryExpr -> LOTUS-backed execution`**：先让当前 public
-   operators 都能从 `QueryExpr` 执行到 dataframe result。没有完整 execution
-   layer，differential rules 和 Claude policy 都没有可靠执行目标。
-2. **Implement `Q -> Q'` differential rules**：在 full-query operator
-   execution 完整后，再扩展 `QueryDifferentiator`。Rules 只负责 query
-   rewrite，不负责 backend lowering。
-3. **Claude policy full-query and differential comparison**：用同一批 log
-   rows 比较 `Q(D ∪ ΔD)` 和 differential maintenance 的结果，验证 Claude
-   policy 的语义和 `Q -> Q'` 是否对齐。
-4. **StatementSet + storage connectors**：最后接 durable materialization。
-   Storage 持久化 materialized relations，不定义 logical query 语义，也不替代
-   operator/rule correctness；Markdown 只是未来的一个 connector/profile。
-
-这个顺序避免把四个问题混在一起：operator 是否能执行、`Q -> Q'` 是否正确、
-Claude policy 是否合理、view 是否能持久化。
-
-## 2. Operator Implementation Strategy
+## 1. Operator Implementation Strategy
 
 Operator 实现要分清两类：
 
@@ -95,35 +73,7 @@ Public `Relation` API 只保存 logical query 参数到 `QueryExpr.params`。例
 和 `how`，`sem_topk` 保存 instruction 和 `k`。LOTUS method、cascade、examples、
 safe mode、stats、trace 等不进入 policy class，也不进入 query tree。
 
-## 3. Rule / Storage Sequencing
-
-Differential rules、Claude policy validation 和 storage 要保持顺序和分层：
-
-- Storage 负责持久化 materialized views，不定义 logical query。
-- `QueryDifferentiator` 负责 `Q -> Q'`，不关心 markdown 文件怎么写。
-- `ExecutionAdapter` 负责执行 `QueryExpr`，不负责 durable persistence。
-- `QueryDifferentiator` 必须在 operator execution 完整后再扩展，否则
-  rewrite 出来的 `Q'` 没有完整 execution target。
-- Claude policy validation 必须在 operator execution 和 rules 之后；它是
-  full-query 与 differential result 的对照实验，不是 operator layer 的替代。
-- Storage 排在 Claude operator/rule correctness 之后；它只决定 durable
-  materialization，不决定 logical semantics。
-
-在 `apply_delta` / upsert 语义出现前，Claude-style stateful differential 可以
-先计算下一版 full view：
-
-```text
-ΔC = ΔD.sem_flat_map(...)
-ΔT = ΔC.sem_groupby(...).sem_agg(...)
-M = ΔT.sem_join(V, how="outer", instruction=<same topic identity instruction>)
-V' = M.sem_map(instruction=<same consolidation instruction>)
-```
-
-后续如果设计出 `ΔV + apply_delta`，可以把这条路径替换成
-`left join + upsert/delete/skip`，前提是 storage contract 明确支持这些
-应用语义。
-
-## 4. 分层边界
+## 2. 分层边界
 
 推荐保持如下分层：
 
@@ -149,7 +99,7 @@ differentiated maintenance query `Q'`。它不应该知道 LOTUS 的 pandas acce
 细节。`LotusAdapter` 负责执行已经生成好的 `QueryExpr`，它不应该修改
 operator 的逻辑语义。
 
-## 5. 不直接改 LOTUS
+## 3. 不直接改 LOTUS
 
 不要直接改 LOTUS 源码，也不要覆盖或 monkeypatch `df.sem_map`、
 `df.sem_filter` 等 pandas accessor。
@@ -164,7 +114,7 @@ operator 的逻辑语义。
 正确做法是：在 `agent-memory` 里实现自己的 lowering，底层复用 LOTUS 的
 LM、cache、templates、pandas accessors、top-k/filter/join 等能力。
 
-## 6. 推荐模块结构
+## 4. 推荐模块结构
 
 `LotusAdapter` 不应该膨胀成一个包含所有 operator 细节的大文件。LOTUS
 lowering 使用专门的 adapter package：
@@ -197,7 +147,7 @@ src/agent_memory/adapters/lotus/
 这个 package 不是新的 public adapter surface；public 入口仍然是
 `LotusAdapter`。
 
-## 7. Lowering Matrix
+## 5. Lowering Matrix
 
 | agent_memory op | LOTUS 支持情况 | 状态 | lowering |
 |---|---|---|
@@ -216,7 +166,7 @@ src/agent_memory/adapters/lotus/
 | `sem_agg` 多输出 | 无精确等价 | implemented | agent-memory structured aggregate lowering |
 | `filter(...)` / `assign(...)` / predicate `join(...)` | pandas 本地实现 | implemented | minimal relation-bound expression subset via `relation.col(...)` |
 
-## 8. `sem_map`
+## 6. `sem_map`
 
 LOTUS 原生 `sem_map` 是：
 
@@ -247,7 +197,7 @@ option 注入结果列。
 这不是自动 lower 到 `sem_extract`。`sem_extract` 的语义是抽取字段；
 multi-output `sem_map` 的语义仍然是按 instruction 生成 / 改写字段。
 
-## 9. `sem_flat_map`
+## 7. `sem_flat_map`
 
 `sem_flat_map` 的语义是：
 
@@ -277,7 +227,7 @@ input DataFrame
 
 但 operator contract 属于 `agent-memory`，不是 LOTUS 原生 accessor。
 
-## 10. `sem_join(how=...)`
+## 8. `sem_join(how=...)`
 
 `agent-memory sem_join` 支持 DataFrame-style `how`：
 
@@ -294,7 +244,7 @@ left.sem_join(right, instruction=..., how="outer")
 - `inner` 可以 lower 到 LOTUS native `df.sem_join(...)`。
 - `left/right/outer` 不能宣称是 LOTUS native。
 
-推荐 future lowering：
+当前 lowering：
 
 ```text
 inner:
@@ -317,7 +267,7 @@ outer:
 注意：这只是 join shape 的补全。semantic predicate 本身仍由 LOTUS inner
 join 执行。unmatched rows 的补全是 deterministic pandas work。
 
-## 11. `sem_groupby -> sem_agg`
+## 9. `sem_groupby -> sem_agg`
 
 `agent-memory sem_groupby` 是 semantic partition / assignment，不是 pandas
 exact groupby。
@@ -331,7 +281,7 @@ exact groupby。
 LOTUS 的 `sem_agg(group_by=...)` 只能在已有 exact group key 或 group id 时
 做分组聚合。它不能替代 semantic grouping 本身。
 
-因此 future lowering 应该是两步：
+因此当前 lowering 分成两步：
 
 ```text
 rows
@@ -350,7 +300,7 @@ rows
 但这些都不是 `agent-memory sem_groupby` 的直接等价物。lowering 必须明确
 说明选择了哪一种物理策略。
 
-## 12. `sem_agg`
+## 10. `sem_agg`
 
 `sem_agg` 有两个 receiver scope：
 
@@ -380,22 +330,7 @@ partition ids 的 tree fold。因此：
 原生 `sem_agg`。Structured aggregate 的 schema/prompt contract 是
 `agent-memory` operator lowering 的显式部分。
 
-## 13. Storage Backend and Claude Markdown Materialization
-
-本节早期提出的 `StorageBackend.load_state/save_view` 草案已被
-[`zep-graphiti-storage-retrieval-benchmark.zh.md`](./zep-graphiti-storage-retrieval-benchmark.zh.md)
-中的通用 storage contract 取代，不应实现成第二套平行接口。
-
-当前统一边界是：policy writer 通过 immutable `StatementSet` 声明 relation sink；
-`StorageDeployment` 绑定 connector 和 namespace；planner 将 sink roots 编译进共享 DAG；
-runtime 把该 DAG 产生的 inserted/retracted rows 事务性写入 connector。Storage 仍然不定义
-logical query 语义，也不进入 `LotusAdapter`。
-
-未来 Claude Markdown materialization 应实现为同一 contract 下的 connector/profile，
-而不是恢复这里的 `load_state/save_view` 接口。Topic files、`MEMORY.md` layout 和 path
-derivation 都属于该 physical profile，不属于 `MemoryView`。
-
-## 14. 工程原则
+## 11. 工程原则
 
 Adapter lowering 可以做：
 
