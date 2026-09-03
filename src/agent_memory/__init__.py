@@ -1,6 +1,6 @@
 """Semantic memory framework experiments for agent developers."""
 
-from .api import Memory, Message
+from .api import CountRefresh, Memory, Message
 from .memories import (
     ClaudeMemory,
     Mem0Memory,
@@ -34,6 +34,7 @@ __all__ = [
     "BFS",
     "BM25",
     "CosineSimilarity",
+    "CountRefresh",
     "CrossEncoder",
     "Log",
     "Mem0Memory",

@@ -100,6 +100,38 @@ episodes = log.assign(
 field such as `reference_time` or `valid_at` when real-world temporal order
 matters.
 
+### Count-triggered refresh
+
+Memory maintenance is eager by default: each `add(...)` publishes one source
+row through the differential plan before returning. A caller may instead make
+the refresh boundary explicit:
+
+```python
+memory = MyMemory(refresh=am.CountRefresh(every=32))
+
+memory.add(event)       # accepts and buffers one normalized source row
+memory.pending_count    # rows accepted but not yet published
+memory.flush()          # publishes the current tail as one delta relation
+```
+
+At the 32nd pending row, `add(...)` synchronously applies those rows as one
+atomic relation-valued delta. If maintenance fails, the published view is
+unchanged and the same normalized pending rows remain available for retry.
+`flush()` is a no-op when nothing is pending.
+
+`query(...)` reads the most recently published view and never flushes
+implicitly. Between successful refreshes, `every=32` may therefore omit up to
+31 accepted rows; a failed refresh may leave a complete batch pending for
+retry. This is a refresh-scheduling choice, not semantic prompt batching:
+operators still choose their own prompt construction and provider dispatch.
+
+Omitting `refresh`, or using `CountRefresh(every=1)`, preserves eager execution
+and the existing checkpoint format. `every > 1` uses a separate checkpoint
+contract that records both the refresh configuration and normalized pending
+rows. The first implementation is synchronous and count-triggered only; it
+does not provide a timer, background worker, query-triggered refresh, or a
+crash-durable pending log.
+
 ### `select`
 
 Projection over columns.

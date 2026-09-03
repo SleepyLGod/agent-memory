@@ -100,10 +100,39 @@ class PolicyExecutor:
 
         return self._node_state
 
+    @property
+    def source_columns(self) -> tuple[str, ...]:
+        """Return the declared source relation columns in stable order."""
+
+        return tuple(
+            column.name for column in self.spec.log.expr.params.get("columns", ())
+        )
+
+    @property
+    def source_row_count(self) -> int:
+        """Return the number of source rows in the committed state."""
+
+        return len(self._state.get("log", ()))
+
     def add(self, message: MessageInput) -> None:
         """Append one source row and propagate its change through the shared DAG."""
 
-        row = self._normalize_message(message)
+        row = self.normalize_source_row(message)
+        self.apply_delta(pd.DataFrame([row], columns=self.source_columns))
+
+    def apply_delta(self, changed_rows: pd.DataFrame) -> None:
+        """Propagate one relation-valued source delta and publish it atomically."""
+
+        if not isinstance(changed_rows, pd.DataFrame):
+            raise TypeError("changed_rows must be a pandas DataFrame")
+        if changed_rows.empty:
+            return
+        expected_columns = list(self.source_columns)
+        if list(changed_rows.columns) != expected_columns:
+            raise ValueError(
+                "source delta columns must exactly match the declared log schema"
+            )
+        changed_rows = changed_rows.copy()
         staged_next_occurrence = self._next_occurrence
 
         def allocate(node_id: str) -> str:
@@ -112,14 +141,16 @@ class PolicyExecutor:
             staged_next_occurrence += 1
             return occurrence
 
-        changed_rows = pd.DataFrame([row])
         source_node_ids = tuple(
             node_id
             for node_id in self.policy.execution_order
             if self.policy.nodes[node_id].execution_kind == "source"
         )
         source_prefix = source_node_ids[0] if source_node_ids else "log"
-        changed_rows.index = pd.Index([allocate(source_prefix)], dtype="object")
+        changed_rows.index = pd.Index(
+            [allocate(source_prefix) for _ in range(len(changed_rows))],
+            dtype="object",
+        )
         current_log = (
             self._node_state.get(source_node_ids[0])
             if source_node_ids
@@ -805,7 +836,14 @@ class PolicyExecutor:
     def _empty_view_frame(self, view: MemoryView) -> pd.DataFrame:
         return pd.DataFrame(columns=self.query_output_columns(view.query))
 
-    def _normalize_message(self, message: MessageInput) -> dict[str, Any]:
+    def normalize_source_row(
+        self,
+        message: MessageInput,
+        *,
+        add_seq: int | None = None,
+    ) -> dict[str, Any]:
+        """Normalize one accepted message into the declared source schema."""
+
         row: dict[str, Any]
         if isinstance(message, str):
             row = {"message": message}
@@ -832,13 +870,12 @@ class PolicyExecutor:
                 {
                     LOG_ROW_ID_COLUMN: str(uuid4()),
                     LOG_ADDED_AT_COLUMN: datetime.now(timezone.utc),
-                    LOG_ADD_SEQ_COLUMN: len(self._state.get("log", ())),
+                    LOG_ADD_SEQ_COLUMN: (
+                        self.source_row_count if add_seq is None else add_seq
+                    ),
                 }
             )
-        declared_columns = tuple(
-            column.name for column in self.spec.log.expr.params.get("columns", ())
-        )
-        return {column: row.get(column) for column in declared_columns}
+        return {column: row.get(column) for column in self.source_columns}
 
     def _bind_user_query(self, query: QueryExpr, text: str) -> QueryExpr:
         return QueryExpr(

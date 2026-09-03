@@ -366,7 +366,11 @@ class _RecordingConnector:
             self.markers[namespace] = next_commit
 
 
-def _stored_memory(connector: _RecordingConnector) -> am.Memory:
+def _stored_memory(
+    connector: _RecordingConnector,
+    *,
+    refresh: am.CountRefresh | None = None,
+) -> am.Memory:
     class StoredMemory(am.Memory):
         log = am.Log({"value": "Value."})
         rows = log.select(["value"])
@@ -379,6 +383,7 @@ def _stored_memory(connector: _RecordingConnector) -> am.Memory:
             statements=statements,
             namespace="test",
         ),
+        refresh=refresh,
     )
 
 
@@ -394,6 +399,42 @@ def test_storage_receives_exact_sink_changelog_after_successful_step() -> None:
     assert inserted.to_dict("records") == [{"value": 7}]
     assert retracted.empty
     assert memory._runtime._state["rows"].to_dict("records") == [{"value": 7}]
+
+
+def test_count_refresh_commits_one_storage_transaction_for_the_delta_batch() -> None:
+    connector = _RecordingConnector()
+    memory = _stored_memory(connector, refresh=am.CountRefresh(every=3))
+
+    memory.add({"value": 1})
+    memory.add({"value": 2})
+
+    assert connector.commits == []
+
+    memory.add({"value": 3})
+
+    assert len(connector.commits) == 1
+    _statement, inserted, retracted = connector.commits[0][0]
+    assert inserted.to_dict("records") == [
+        {"value": 1},
+        {"value": 2},
+        {"value": 3},
+    ]
+    assert retracted.empty
+    assert connector.markers["test"].source_row_count == 3
+
+
+def test_count_refresh_storage_failure_keeps_the_whole_pending_batch() -> None:
+    connector = _RecordingConnector(fail_writes=True)
+    memory = _stored_memory(connector, refresh=am.CountRefresh(every=2))
+
+    memory.add({"value": 1})
+    with pytest.raises(RuntimeError, match="storage write failed"):
+        memory.add({"value": 2})
+
+    assert connector.commits == []
+    assert connector.rollbacks == 1
+    assert memory.pending_count == 2
+    assert memory._runtime._state == {}
 
 
 def test_storage_receives_retractions_when_a_sink_row_is_replaced() -> None:
