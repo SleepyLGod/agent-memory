@@ -141,17 +141,16 @@ def test_policy_compiler_fuses_semantic_grouped_aggregate_pattern() -> None:
     assert not any(node.query.op == "sem_groupby" for node in plan.nodes.values())
 
 
-def test_policy_compiler_rejects_view_time_semantic_join() -> None:
-    class UnsupportedMemory(am.Memory):
+def test_policy_compiler_supports_append_only_inner_semantic_join() -> None:
+    class SemanticJoinMemory(am.Memory):
         log = am.Log({"message": "Message."})
         joined = log.sem_join(log, instruction="{message:left} matches {message:right}.")
 
-    try:
-        UnsupportedMemory.differentiate_policy()
-    except NotImplementedError as error:
-        assert "view-time sem_join" in str(error)
-    else:
-        raise AssertionError("view-time sem_join should be rejected")
+    plan = SemanticJoinMemory.differentiate_policy()
+    node = next(node for node in plan.nodes.values() if node.query.op == "sem_join")
+
+    assert node.execution_kind == "semantic_binary_state"
+    assert node.maintenance_query is not None
 
 
 def test_policy_compiler_rejects_view_time_semantic_topk() -> None:

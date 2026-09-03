@@ -996,8 +996,15 @@ The canonical documentation form is
 logical join condition, deterministic keys, and match cardinality in one
 DataFrame operator.
 
-`on` is an optional exact equality condition evaluated before the semantic
-predicate:
+`on` is an optional deterministic candidate condition evaluated before the
+semantic predicate. It accepts the same `JoinOn` forms as ordinary `join(...)`:
+
+- one same-named key column;
+- a sequence of same-named key columns;
+- one relation-bound boolean expression;
+- a sequence of relation-bound boolean expressions, interpreted as conjunction.
+
+Exact-key example:
 
 ```python
 changed_facts.sem_join(
@@ -1011,6 +1018,30 @@ changed_facts.sem_join(
 Only rows with equal `source_entity_id` and `target_entity_id` values are
 eligible for semantic comparison. The columns named by `on` are ordinary
 relational keys. They are not embedded and are not interpreted by the LLM.
+
+General deterministic-predicate example:
+
+```python
+left = facts.alias("left")
+right = facts.alias("right")
+
+pairs = left.sem_join(
+    right,
+    on=[
+        left.col("tenant_id") == right.col("tenant_id"),
+        left.col("valid_at") < right.col("valid_at"),
+    ],
+    instruction="{fact:left} and {fact:right} describe the same fact.",
+    how="inner",
+)
+```
+
+Here, the adapter first keeps pairs from the same tenant whose left timestamp is
+earlier. Only those pairs reach embedding-based candidate generation or LLM
+verification. `on=None` means that no deterministic restriction is applied, so
+the semantic predicate starts from the full left-by-right pair domain. Key
+column names and predicate expressions cannot be mixed in the same `on`
+sequence.
 
 `k` optionally limits the number of matched right rows for each left row:
 
@@ -1281,17 +1312,41 @@ declared, `k` is omitted and the legacy all-matches join-map contract is
 preserved. See `groupby_agg.md` for the complete paper-wise and
 implementation-wise formulas.
 
-Join follows the usual relational delta shape:
+Direct append-only semantic inner join follows the usual bag-preserving
+relational delta shape. Let `L0`, `R0`, and `J0` be the committed left, right,
+and join states before one update, and let `delta_L` and `delta_R` be the newly
+inserted rows:
 
 ```python
-V = L.sem_join(R, instruction=instruction, how="inner")
+J = L.sem_join(R, instruction=instruction, how="inner")
 
-V_prime = (
-    delta_L.sem_join(R, instruction=instruction, how="inner")
-    .union(L.sem_join(delta_R, instruction=instruction, how="inner"))
-    .union(delta_L.sem_join(delta_R, instruction=instruction, how="inner"))
+delta_J = (
+    delta_L.sem_join(R0, instruction=instruction, how="inner")
+    .concat(L0.sem_join(delta_R, instruction=instruction, how="inner"))
+    .concat(delta_L.sem_join(delta_R, instruction=instruction, how="inner"))
 )
+
+J1 = J0.concat(delta_J)
 ```
+
+The same `instruction`, `on`, and semantic execution profile are used in all
+three terms. Their pair domains do not overlap, so pairs between `delta_L` and
+`delta_R` are evaluated exactly once. `concat` is intentional: join output is a
+bag, and exact duplicate rows must retain their multiplicity.
+
+The current direct `sem_join` differential implementation is deliberately
+narrow:
+
+```text
+supported:     append-only parent changes, how="inner", k=None
+not supported: parent retractions, left/right/outer maintenance, k joins
+```
+
+An unsupported `how` or `k` is rejected while compiling the differential plan.
+A parent retraction is rejected before applying the append-only maintenance
+formula. These limits apply only to differential maintenance; static
+`sem_join(...)` execution continues to support the documented join types and
+`k` values.
 
 For updates, the exact output can be expressed with ordinary set operations:
 

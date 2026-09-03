@@ -155,8 +155,11 @@ class PolicyExecutor:
 
             if node.execution_kind == "deterministic":
                 next_state = self._execute_deterministic(node_id, staged_node_state)
-            elif node.execution_kind == "relational_state":
-                next_state = self._execute_relational_state(
+            elif node.execution_kind in {
+                "relational_state",
+                "semantic_binary_state",
+            }:
+                next_state = self._execute_binary_state(
                     node_id,
                     old_state=old_state,
                     parent_updates=parent_updates,
@@ -608,7 +611,7 @@ class PolicyExecutor:
         }
         return self.adapter.execute(node.query, inputs)
 
-    def _execute_relational_state(
+    def _execute_binary_state(
         self,
         node_id: str,
         *,
@@ -616,15 +619,19 @@ class PolicyExecutor:
         parent_updates: tuple[NodeOutputUpdate, ...],
         staged_node_state: Mapping[str, pd.DataFrame],
     ) -> pd.DataFrame:
-        """Incrementally maintain an inner join or fully recompute on retractions."""
+        """Incrementally maintain a binary inner join from old and inserted rows."""
 
         node = self.policy.nodes[node_id]
         if len(node.input_node_ids) != 2 or len(parent_updates) != 2:
-            raise RuntimeError("Relational state nodes require exactly two inputs")
+            raise RuntimeError("Binary state nodes require exactly two inputs")
         if any(not update.retracted_rows.empty for update in parent_updates):
+            if node.execution_kind == "semantic_binary_state":
+                raise NotImplementedError(
+                    "Semantic binary state maintenance requires append-only input changes"
+                )
             return self._execute_deterministic(node_id, staged_node_state)
         if node.maintenance_query is None:
-            raise RuntimeError(f"Relational state node {node_id} has no maintenance query")
+            raise RuntimeError(f"Binary state node {node_id} has no maintenance query")
 
         inputs: dict[str, pd.DataFrame] = {node_id: old_state}
         for parent_id, update in zip(

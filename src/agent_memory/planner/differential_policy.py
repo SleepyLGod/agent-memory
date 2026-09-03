@@ -201,10 +201,6 @@ class _DifferentialPolicyBuilder:
             self._query_nodes[query] = node_id
             return node_id
 
-        if query.op == "sem_join":
-            raise NotImplementedError(
-                "Direct view-time sem_join is not supported by policy differentiation"
-            )
         if query.op == "sem_topk":
             raise NotImplementedError(
                 "View-time sem_topk is not supported by policy differentiation"
@@ -246,10 +242,28 @@ class _DifferentialPolicyBuilder:
         maintenance_query: QueryExpr | None = None
         if query.op == "join" and str(query.params.get("how", "inner")) == "inner":
             execution_kind = "relational_state"
-            maintenance_query = self._relational_inner_join_maintenance_query(
+            maintenance_query = self._append_inner_join_maintenance_query(
                 local_query,
                 input_node_ids,
                 current_node_id=self._node_id(query),
+                operator="join",
+            )
+        elif query.op == "sem_join":
+            how = str(query.params.get("how", "inner")).lower()
+            if how != "inner":
+                raise NotImplementedError(
+                    "Direct sem_join differential currently supports only how='inner'"
+                )
+            if query.params.get("k") is not None:
+                raise NotImplementedError(
+                    "Direct sem_join differential currently requires k=None"
+                )
+            execution_kind = "semantic_binary_state"
+            maintenance_query = self._append_inner_join_maintenance_query(
+                local_query,
+                input_node_ids,
+                current_node_id=self._node_id(query),
+                operator="sem_join",
             )
         elif query.op == "sem_agg":
             execution_kind = "semantic_state"
@@ -396,19 +410,22 @@ class _DifferentialPolicyBuilder:
             source_input=changed_source,
         )
 
-    def _relational_inner_join_maintenance_query(
+    def _append_inner_join_maintenance_query(
         self,
         local_query: QueryExpr,
         input_node_ids: tuple[str, ...],
         *,
         current_node_id: str,
+        operator: str,
     ) -> QueryExpr:
-        """Build bag-preserving append maintenance for one relational inner join."""
+        """Build bag-preserving append maintenance for one inner join node."""
 
-        if local_query.op != "join" or str(local_query.params.get("how", "inner")) != "inner":
-            raise ValueError("Relational join maintenance requires how='inner'")
+        if local_query.op != operator:
+            raise ValueError(f"{operator} maintenance requires a {operator} query")
+        if str(local_query.params.get("how", "inner")).lower() != "inner":
+            raise ValueError(f"{operator} maintenance requires how='inner'")
         if len(input_node_ids) != 2 or len(local_query.inputs) != 2:
-            raise ValueError("Relational inner join requires exactly two inputs")
+            raise ValueError(f"{operator} inner join requires exactly two inputs")
 
         left_node_id, right_node_id = input_node_ids
         left_old = self._node_leaf(left_node_id)
@@ -418,7 +435,7 @@ class _DifferentialPolicyBuilder:
 
         def join(left: QueryExpr, right: QueryExpr) -> QueryExpr:
             return QueryExpr(
-                op="join",
+                op=operator,
                 inputs=(
                     self._preserve_input_alias(local_query.inputs[0], left),
                     self._preserve_input_alias(local_query.inputs[1], right),

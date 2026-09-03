@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Callable, Mapping, Sequence
-from typing import Any
+from typing import Any, cast
 
 import pandas as pd
 
@@ -39,14 +39,16 @@ def execute_sem_join(
     digest = query_digest(query)
     profile = context.config.semantic_pair_profiles.get(digest)
     id_columns = _join_id_columns(query.params.get("id_columns"))
+    on = tuple(cast(Sequence[Any], query.params.get("on", ())))
     if query.params.get("k") is not None and context.config.sem_join_cascade_args is not None:
         raise ValueError("top-k sem_join cannot be combined with LOTUS sem_join cascade")
-    if query.params.get("on") and context.config.sem_join_cascade_args is not None:
+    if on and context.config.sem_join_cascade_args is not None:
         # LOTUS 1.1.4 cascades rebuild the full Cartesian product and cannot
-        # consume exact-key candidate pairs. Keep that backend boundary explicit
+        # consume deterministically restricted pairs. Keep that boundary explicit
         # rather than silently dropping `on` semantics or forking LOTUS here.
+        restriction = "exact-key" if all(isinstance(item, str) for item in on) else "predicate"
         raise ValueError(
-            "exact-key sem_join cannot be combined with LOTUS sem_join cascade"
+            f"{restriction} sem_join cannot be combined with LOTUS sem_join cascade"
         )
     if profile is not None and profile.mode in {"search-filter", "proxy-only"}:
         if context.config.sem_join_cascade_args is not None:
@@ -98,7 +100,7 @@ def execute_sem_join(
             context,
             profile=profile,
         )
-    elif query.params.get("on"):
+    elif on:
         left_series, right_series, left_label, right_label, instruction = join_series(
             left,
             right,
@@ -109,7 +111,8 @@ def execute_sem_join(
             right_series,
             left_frame=left,
             right_frame=right,
-            on=tuple(str(column) for column in query.params["on"]),
+            on=on,
+            query=query,
         )
         if profile is not None and profile.mode in {"search-filter", "proxy-only"}:
             assert context.pair_embedding_provider is not None
@@ -412,16 +415,37 @@ def semantic_join_pair_candidates(
     *,
     left_frame: pd.DataFrame | None = None,
     right_frame: pd.DataFrame | None = None,
-    on: Sequence[str] = (),
+    on: Sequence[Any] = (),
+    query: QueryExpr | None = None,
 ) -> pd.DataFrame:
-    """Return semantic join pairs after optional exact-key restriction."""
+    """Return semantic join pairs after optional deterministic restriction."""
 
     if on and (left_frame is None or right_frame is None):
-        raise ValueError("exact-key semantic join candidates require both input frames")
+        raise ValueError("restricted semantic join candidates require both input frames")
+
+    exact_keys = tuple(str(item) for item in on if isinstance(item, str))
+    predicate_on = tuple(item for item in on if isinstance(item, Mapping))
+    if len(exact_keys) + len(predicate_on) != len(on) or (
+        exact_keys and predicate_on
+    ):
+        raise ValueError("sem_join on must contain exact keys or predicate expressions")
+    if predicate_on:
+        if query is None or left_frame is None or right_frame is None:
+            raise ValueError("predicate semantic join candidates require the join query")
+        from agent_memory.adapters.lotus.relational import predicate_join_row_ids
+
+        restricted_pair_ids = predicate_join_row_ids(
+            query,
+            left_frame,
+            right_frame,
+            on=predicate_on,
+        )
+        return _semantic_join_pair_frame(left, right, restricted_pair_ids)
+
     missing = (
         sorted(
-            set(on).difference(left_frame.columns).union(
-                set(on).difference(right_frame.columns)
+            set(exact_keys).difference(left_frame.columns).union(
+                set(exact_keys).difference(right_frame.columns)
             )
         )
         if left_frame is not None and right_frame is not None
@@ -431,32 +455,42 @@ def semantic_join_pair_candidates(
         raise ValueError(f"sem_join on columns not found on both sides: {missing}")
 
     right_by_key: dict[tuple[object, ...], list[Any]] = defaultdict(list)
-    if on:
+    if exact_keys:
         assert right_frame is not None
         for right_id in right.index:
-            right_by_key[_semantic_join_key(right_frame.loc[right_id], on)].append(
-                right_id
-            )
+            key = _semantic_join_key(right_frame.loc[right_id], exact_keys)
+            right_by_key[key].append(right_id)
 
-    rows: list[dict[str, Any]] = []
-    for left_id, left_value in left.items():
-        if on:
+    pair_ids: list[tuple[Any, Any]] = []
+    for left_id in left.index:
+        if exact_keys:
             assert left_frame is not None
             right_ids: Sequence[Any] = right_by_key.get(
-                _semantic_join_key(left_frame.loc[left_id], on),
+                _semantic_join_key(left_frame.loc[left_id], exact_keys),
                 (),
             )
         else:
-            right_ids = right.index
-        rows.extend(
-            {
-                PAIR_LEFT_ID_COLUMN: left_id,
-                PAIR_RIGHT_ID_COLUMN: right_id,
-                PAIR_LEFT_TEXT_COLUMN: left_value,
-                PAIR_RIGHT_TEXT_COLUMN: right.loc[right_id],
-            }
-            for right_id in right_ids
-        )
+            right_ids = tuple(right.index)
+        pair_ids.extend((left_id, right_id) for right_id in right_ids)
+    return _semantic_join_pair_frame(left, right, pair_ids)
+
+
+def _semantic_join_pair_frame(
+    left: pd.Series,
+    right: pd.Series,
+    pair_ids: Sequence[tuple[Any, Any]],
+) -> pd.DataFrame:
+    """Materialize canonical semantic-pair rows from stable input IDs."""
+
+    rows = [
+        {
+            PAIR_LEFT_ID_COLUMN: left_id,
+            PAIR_RIGHT_ID_COLUMN: right_id,
+            PAIR_LEFT_TEXT_COLUMN: left.loc[left_id],
+            PAIR_RIGHT_TEXT_COLUMN: right.loc[right_id],
+        }
+        for left_id, right_id in pair_ids
+    ]
     return pd.DataFrame(
         rows,
         columns=pd.Index(

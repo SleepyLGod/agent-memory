@@ -489,11 +489,41 @@ JoinGroups(GΔ, V, Kr, θg, M) =
 
 `group_match(θg)`是compiler从原`sem_groupby` instruction改写出的“changed group
 和current group是否属于同一组”谓词。`Ks`只是这个semantic predicate读取的内容，
-绝不能写成`on=Ks`：`on`只接受必须精确相等的`partition_by` keys `Kr`。
+绝不能写成`on=Ks`。`sem_join.on`本身支持general deterministic `JoinOn`；但在这条
+grouped-aggregate rule里，`on=Kr`有一个更窄、更明确的职责：只用必须精确相等的
+`partition_by` keys排除跨partition candidates。
 
 `MergeByTarget`表示：matched rows按选中的current target合并；没有target的changed
 group形成新row；未被触及的current row原样保留。如果多个changed groups命中同一个
 target，只生成一次合并后的target row。
+
+### 可复用的 direct `sem_join` 增量规则
+
+`rule-join-map`会在自己的maintenance query内部调用`sem_join`，但direct
+`sem_join` view的增量维护是一个独立、可复用的binary-state能力。对：
+
+```text
+J = L.sem_join(R, on=φ, instruction=θ, how="inner", k=None)
+```
+
+append-only rule是：
+
+```text
+ΔJ = SemJoin(ΔL, R0, φ, θ)
+     bag-union SemJoin(L0, ΔR, φ, θ)
+     bag-union SemJoin(ΔL, ΔR, φ, θ)
+
+J1 = J0 bag-union ΔJ
+```
+
+这里`φ`可以是`on=None`、同名exact keys或general deterministic `JoinOn`。每一项都
+先用`φ`缩小candidate pairs，再执行原semantic predicate `θ`；`ΔL × ΔR`只在第三项
+计算一次。实现使用保留重复行的`concat`，不是会去重的`union`。
+
+当前direct differential只支持append-only、`how="inner"`和`k=None`。这不限制
+静态`sem_join`，也不改变本章的grouped-aggregate rules：`rule-join-map`仍然可以在
+其自身state-merge lowering内部使用outer或top-k semantic join；它不是把该内部
+join再次编译成一个独立的direct differential node。
 
 ### 2.1 `sem_groupby(...).sem_agg(...)`
 
