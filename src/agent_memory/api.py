@@ -74,6 +74,19 @@ class Message:
 MessageInput = str | Message | Mapping[str, Any]
 
 
+@dataclass(frozen=True)
+class CountRefresh:
+    """Refresh memory after accepting a fixed number of source rows."""
+
+    every: int
+
+    def __post_init__(self) -> None:
+        if isinstance(self.every, bool) or not isinstance(self.every, int):
+            raise TypeError("CountRefresh.every must be an integer")
+        if self.every < 1:
+            raise ValueError("CountRefresh.every must be at least 1")
+
+
 class Memory:
     """Base class for declarative memory policies."""
 
@@ -95,6 +108,7 @@ class Memory:
         *,
         adapter: Any | None = None,
         storage: StorageDeployment | None = None,
+        refresh: CountRefresh | None = None,
     ) -> None:
         from .runtime import MemoryRuntime
 
@@ -110,6 +124,7 @@ class Memory:
             policy,
             adapter=adapter,
             storage=storage,
+            refresh=refresh,
         )
 
     def add(self, message: MessageInput) -> None:
@@ -126,6 +141,17 @@ class Memory:
         """Run the default policy-defined retrieval query."""
 
         return self._runtime.execute_retrieval_query("default", text)
+
+    @property
+    def pending_count(self) -> int:
+        """Return the number of accepted rows awaiting maintenance."""
+
+        return self._runtime.pending_count
+
+    def flush(self) -> None:
+        """Apply all pending rows as one atomic relation-valued delta."""
+
+        self._runtime.flush()
 
     @classmethod
     def spec(cls) -> MemorySpec:
