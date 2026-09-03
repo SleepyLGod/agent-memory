@@ -19,6 +19,7 @@ from agent_memory.adapters.lotus.pair_execution import (
     write_semantic_pair_execution_trace,
 )
 from agent_memory.adapters.lotus.sem_join import row_text_series
+from agent_memory.adapters.lotus.prompt_batching import PromptBatching
 from agent_memory.adapters.lotus.structured import StructuredLMExecutor
 from agent_memory.policy.logical import ColumnSpec, QueryExpr
 from agent_memory.storage.embedding import EmbeddingProvider
@@ -85,6 +86,9 @@ def execute_sem_groupby(
             query_digest_value=digest,
             profile=profile,
             embedding_provider=context.pair_embedding_provider,
+            prompt_batching=context.config.prompt_batching,
+            structured_parse_retries=context.config.structured_parse_retries,
+            structured_max_tokens=context.config.structured_max_tokens,
         )
     if labels:
         return assign_declared_labels(
@@ -93,6 +97,7 @@ def execute_sem_groupby(
             labels=labels,
             label_col=str(query.params.get("label_col", "_label")),
             instruction=str(query.params["instruction"]),
+            prompt_batching=context.config.prompt_batching,
         )
 
     unique_rows, row_to_unique = exact_unique_key_rows(source, input_cols)
@@ -107,6 +112,9 @@ def execute_sem_groupby(
         query_digest_value=digest,
         profile=profile,
         embedding_provider=context.pair_embedding_provider,
+        prompt_batching=context.config.prompt_batching,
+        structured_parse_retries=context.config.structured_parse_retries,
+        structured_max_tokens=context.config.structured_max_tokens,
     )
     result = assign_semantic_group_ids(
         source,
@@ -145,6 +153,9 @@ def execute_partitioned_sem_groupby(
     query_digest_value: str,
     profile: SemanticPairExecutionProfile | None,
     embedding_provider: EmbeddingProvider | None,
+    prompt_batching: PromptBatching | None,
+    structured_parse_retries: int,
+    structured_max_tokens: int,
 ) -> pd.DataFrame:
     """Assign semantic group ids independently within deterministic partitions."""
 
@@ -168,6 +179,7 @@ def execute_partitioned_sem_groupby(
                 labels=labels,
                 label_col=label_col,
                 instruction=instruction,
+                prompt_batching=prompt_batching,
             )
         else:
             unique_rows, row_to_unique = exact_unique_key_rows(partition, input_cols)
@@ -182,6 +194,9 @@ def execute_partitioned_sem_groupby(
                 query_digest_value=query_digest_value,
                 profile=profile,
                 embedding_provider=embedding_provider,
+                prompt_batching=prompt_batching,
+                structured_parse_retries=structured_parse_retries,
+                structured_max_tokens=structured_max_tokens,
             )
             result = assign_semantic_group_ids(
                 partition,
@@ -222,6 +237,7 @@ def assign_declared_labels(
     labels: Sequence[ColumnSpec],
     label_col: str,
     instruction: str,
+    prompt_batching: PromptBatching | None = None,
 ) -> pd.DataFrame:
     """Assign rows to declared closed-world labels with LOTUS structured output."""
 
@@ -256,6 +272,7 @@ def assign_declared_labels(
         progress_bar_desc="Grouping labels",
         model_kwargs={},
         operator="sem_groupby",
+        prompt_batching=prompt_batching,
     )
 
     label_to_group = {name: index for index, name in enumerate(label_names)}
@@ -389,6 +406,9 @@ def evaluate_group_matches(
     query_digest_value: str = "",
     profile: SemanticPairExecutionProfile | None = None,
     embedding_provider: EmbeddingProvider | None = None,
+    prompt_batching: PromptBatching | None = None,
+    structured_parse_retries: int = 0,
+    structured_max_tokens: int = 8192,
 ) -> list[tuple[int, int]]:
     """Evaluate candidate row pairs with LOTUS sem_filter."""
 
@@ -442,34 +462,61 @@ def evaluate_group_matches(
         "{left} and {right} satisfy this semantic grouping condition: "
         f"{lowered_instruction}"
     )
-    batch_size = pair_batch_size or len(pairs)
-    parsed_outputs: list[bool] = []
-    raw_outputs: list[Any] = []
-    explanations: list[Any] = []
-    for start in range(0, len(pairs), batch_size):
-        pair_batch = pairs.iloc[start : start + batch_size].reset_index(drop=True)
-        docs = task_instructions.df2multimodal_info(pair_batch, ["left", "right"])
-        output = evaluate_group_match_batch(
-            sem_filter,
-            docs=docs,
-            lm=lotus.settings.lm,
-            instruction=user_instruction,
-            default=default,
-            retries=pair_batch_retries,
-        )
-        batch_outputs = list(output.outputs)
-        if len(batch_outputs) != len(pair_batch):
+    if prompt_batching is not None:
+        if default:
             raise ValueError(
-                "sem_groupby pair batch returned an unexpected number of outputs: "
-                f"expected {len(pair_batch)}, got {len(batch_outputs)}"
+                "prompt-batched sem_groupby does not support default=True"
             )
-        parsed_outputs.extend(bool(value) for value in batch_outputs)
-        raw_outputs.extend(
-            aligned_batch_values(output, "raw_outputs", len(pair_batch), "")
+        if pair_batch_size is not None:
+            raise ValueError(
+                "prompt_batching cannot be combined with sem_groupby_pair_batch_size"
+            )
+        from agent_memory.adapters.lotus.sem_filter_batch_prompting import (
+            execute_batch_prompted_predicate,
         )
-        explanations.extend(
-            aligned_batch_values(output, "explanations", len(pair_batch), "")
+
+        prompted = execute_batch_prompted_predicate(
+            pairs.loc[:, ["left", "right"]],
+            instruction=user_instruction,
+            prompt_batching=prompt_batching,
+            structured_parse_retries=structured_parse_retries,
+            structured_max_tokens=structured_max_tokens,
+            progress_bar_desc="Grouping comparisons",
+            trace_dir=trace_dir,
+            operator="sem_groupby",
         )
+        parsed_outputs = list(prompted.decisions)
+        raw_outputs = [attempts[-1] for attempts in prompted.raw_output_attempts]
+        explanations: list[Any] = [""] * len(parsed_outputs)
+    else:
+        batch_size = pair_batch_size or len(pairs)
+        parsed_outputs = []
+        raw_outputs = []
+        explanations = []
+        for start in range(0, len(pairs), batch_size):
+            pair_batch = pairs.iloc[start : start + batch_size].reset_index(drop=True)
+            docs = task_instructions.df2multimodal_info(pair_batch, ["left", "right"])
+            output = evaluate_group_match_batch(
+                sem_filter,
+                docs=docs,
+                lm=lotus.settings.lm,
+                instruction=user_instruction,
+                default=default,
+                retries=pair_batch_retries,
+            )
+            batch_outputs = list(output.outputs)
+            if len(batch_outputs) != len(pair_batch):
+                raise ValueError(
+                    "sem_groupby pair batch returned an unexpected number of outputs: "
+                    f"expected {len(pair_batch)}, got {len(batch_outputs)}"
+                )
+            parsed_outputs.extend(bool(value) for value in batch_outputs)
+            raw_outputs.extend(
+                aligned_batch_values(output, "raw_outputs", len(pair_batch), "")
+            )
+            explanations.extend(
+                aligned_batch_values(output, "explanations", len(pair_batch), "")
+            )
 
     write_groupby_pair_trace(
         trace_dir,

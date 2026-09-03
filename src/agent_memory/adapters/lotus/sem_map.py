@@ -31,7 +31,7 @@ def execute_sem_map(
     context.configure()
     source = execute(query.inputs[0], inputs)
     output_cols = output_columns(query)
-    if len(output_cols) == 1:
+    if len(output_cols) == 1 and context.config.prompt_batching is None:
         return execute_native_sem_map(query, source, output_cols[0], context.config)
     return execute_structured_sem_map(query, source, output_cols, context.config)
 
@@ -95,6 +95,7 @@ def execute_structured_sem_map(
         structured_max_tokens=config.structured_max_tokens,
         structured_parse_retries=config.structured_parse_retries,
         semantic_trace_dir=config.trace_dir(),
+        prompt_batching=config.prompt_batching,
     )
     return apply_structured_map_outputs(
         source,

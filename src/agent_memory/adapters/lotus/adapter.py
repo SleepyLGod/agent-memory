@@ -87,6 +87,26 @@ class LotusAdapter:
         pair_fingerprint = semantic_pair_profiles_fingerprint(
             self.config.semantic_pair_profiles
         )
+        sem_agg_configured = self.config.sem_agg_dispatch != "sequential"
+        if sem_agg_configured or self.config.prompt_batching is not None:
+            base_fingerprint = self._base_maintenance_execution_fingerprint(
+                pair_fingerprint
+            )
+            parts = [f"base_execution_fingerprint={base_fingerprint}"]
+            if sem_agg_configured:
+                parts.append(f"sem_agg_dispatch={self.config.sem_agg_dispatch}")
+            if self.config.prompt_batching is not None:
+                parts.append(
+                    "prompt_batching="
+                    f"{self.config.prompt_batching.fingerprint}"
+                )
+            payload = "\n".join(parts)
+            return sha256(payload.encode("utf-8")).hexdigest()
+        return self._base_maintenance_execution_fingerprint(pair_fingerprint)
+
+    def _base_maintenance_execution_fingerprint(self, pair_fingerprint: str) -> str:
+        """Preserve the pre-prompting physical fingerprint contract."""
+
         if self.config.sem_join_topk_method == "listwise":
             return pair_fingerprint
         payload = (

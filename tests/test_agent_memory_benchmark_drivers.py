@@ -16,6 +16,7 @@ from agent_memory.adapters.lotus.pair_execution import (
     PAIR_RIGHT_TEXT_COLUMN,
     SemanticPairExecutionProfile,
 )
+from agent_memory.adapters.lotus.prompt_batching import PromptBatching
 from agent_memory.evaluation.agent_memory_drivers import (
     ClaudeMemoryDriverFactory,
     ClaudeMemoryDriver,
@@ -655,6 +656,139 @@ def test_zep_run_configures_existing_factory_and_checkpoint_flow(
         == maintenance_dir
     )
     assert captured["closed"] is True
+
+
+def test_run_records_and_propagates_count_refresh_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import agent_memory.evaluation.run as run_module
+
+    captured: dict[str, Any] = {}
+
+    class FakeFactory:
+        def __init__(self, **kwargs: Any) -> None:
+            captured["factory"] = kwargs
+
+    class FakeRunner:
+        def __init__(self, **kwargs: Any) -> None:
+            captured["runner"] = kwargs
+
+        def run(self, bundle: BenchmarkBundle) -> None:
+            captured["bundle"] = bundle
+
+    monkeypatch.setattr(run_module, "_require_environment", lambda _system: None)
+    monkeypatch.setattr(
+        run_module,
+        "collect_runtime_provenance",
+        lambda *args, **kwargs: {"source": {}, "runtime": {}},
+    )
+    monkeypatch.setattr(
+        run_module,
+        "validate_run_provenance",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(run_module, "ClaudeMemoryDriverFactory", FakeFactory)
+    monkeypatch.setattr(run_module, "BenchmarkRunner", FakeRunner)
+    bundle = BenchmarkBundle(
+        "locomo",
+        "revision",
+        "sha256",
+        (
+            BenchmarkCase(
+                case_id="case-1",
+                task_id="locomo",
+                events=(_event(),),
+                questions=(BenchmarkQuestion("q1", "case-1", "?", "a", ()),),
+            ),
+        ),
+        {"run_mode": "integration-smoke"},
+    )
+
+    run_agent_memory_bundle(
+        bundle=bundle,
+        contracts={},
+        system_id="claude-memory",
+        output_dir=tmp_path / "output",
+        refresh_every=4,
+        memory_thinking_enabled=False,
+    )
+
+    assert captured["factory"]["refresh_every"] == 4
+    assert captured["runner"]["system_contract"].maintenance_execution_id == (
+        "refresh:count:4"
+    )
+    assert captured["runner"]["runtime_provenance"]["runtime"]["refresh"] == {
+        "type": "count",
+        "every": 4,
+    }
+
+
+def test_run_records_and_propagates_prompt_batching_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import agent_memory.evaluation.run as run_module
+
+    captured: dict[str, Any] = {}
+
+    class FakeFactory:
+        def __init__(self, **kwargs: Any) -> None:
+            captured["factory"] = kwargs
+
+    class FakeRunner:
+        def __init__(self, **kwargs: Any) -> None:
+            captured["runner"] = kwargs
+
+        def run(self, bundle: BenchmarkBundle) -> None:
+            captured["bundle"] = bundle
+
+    monkeypatch.setattr(run_module, "_require_environment", lambda _system: None)
+    monkeypatch.setattr(
+        run_module,
+        "collect_runtime_provenance",
+        lambda *args, **kwargs: {"source": {}, "runtime": {}},
+    )
+    monkeypatch.setattr(
+        run_module,
+        "validate_run_provenance",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(run_module, "ClaudeMemoryDriverFactory", FakeFactory)
+    monkeypatch.setattr(run_module, "BenchmarkRunner", FakeRunner)
+    bundle = BenchmarkBundle(
+        "locomo",
+        "revision",
+        "sha256",
+        (
+            BenchmarkCase(
+                case_id="case-1",
+                task_id="locomo",
+                events=(_event(),),
+                questions=(BenchmarkQuestion("q1", "case-1", "?", "a", ()),),
+            ),
+        ),
+        {"run_mode": "integration-smoke"},
+    )
+    prompt_batching = PromptBatching(max_tasks=8)
+
+    run_agent_memory_bundle(
+        bundle=bundle,
+        contracts={},
+        system_id="claude-memory",
+        output_dir=tmp_path / "output",
+        prompt_batching=prompt_batching,
+        memory_thinking_enabled=False,
+    )
+
+    assert captured["factory"]["prompt_batching"] == prompt_batching
+    contract = captured["runner"]["system_contract"]
+    assert contract.maintenance_execution_id == (
+        f"prompt-batching:{prompt_batching.fingerprint}"
+    )
+    assert captured["runner"]["runtime_provenance"]["runtime"][
+        "lotus_execution"
+    ]["prompt_batching"] == {"max_tasks": 8}
 
 
 def test_zep_run_closes_factory_when_storage_provenance_fails(

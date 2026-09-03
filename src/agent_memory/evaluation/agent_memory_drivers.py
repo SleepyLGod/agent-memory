@@ -20,6 +20,7 @@ from agent_memory.adapters.lotus.pair_execution import (
     semantic_pair_site_id,
     semantic_pair_site_physical_contract,
 )
+from agent_memory.adapters.lotus.prompt_batching import PromptBatching
 from agent_memory.evaluation.claude_memory.bindings import event_to_claude_log_row
 from agent_memory.evaluation.embedding_trace import TracingEmbeddingProvider
 from agent_memory.evaluation.harness import RetrievalOutput
@@ -247,6 +248,11 @@ def _validate_lotus_cache_mode(mode: str) -> None:
         )
 
 
+def _validate_refresh_every(every: int) -> None:
+    if isinstance(every, bool) or not isinstance(every, int) or every < 1:
+        raise ValueError("refresh_every must be a positive integer")
+
+
 def build_mem0_semantic_pair_profiles(
     memory_type: type[Any],
     *,
@@ -442,6 +448,12 @@ class ClaudeMemoryDriver:
         del session_id
         return {}
 
+    def flush(self) -> dict[str, int]:
+        """Publish any pending source rows before the final checkpoint."""
+
+        self._memory.flush()
+        return _claude_memory_shape(self._memory)
+
     def retrieve(self, request: RetrievalRequest) -> RetrievalOutput:
         """Run ClaudeMemory's declared semantic top-k retrieval unchanged."""
 
@@ -497,6 +509,12 @@ class ZepMemoryDriver:
 
         del session_id
         return {}
+
+    def flush(self) -> dict[str, int]:
+        """Publish any pending source rows before the final checkpoint."""
+
+        self._memory.flush()
+        return _view_counts(self._memory)
 
     def retrieve(self, request: RetrievalRequest) -> RetrievalOutput:
         """Run the declared entity/fact retrieval DAG without an answer model."""
@@ -557,6 +575,12 @@ class Mem0MemoryDriver:
 
         del session_id
         return {}
+
+    def flush(self) -> dict[str, int]:
+        """Publish any pending source rows before the final checkpoint."""
+
+        self._memory.flush()
+        return _view_counts(self._memory)
 
     def retrieve(self, request: RetrievalRequest) -> RetrievalOutput:
         """Run indexed cosine retrieval without a generative model call."""
@@ -643,8 +667,11 @@ class ClaudeMemoryDriverFactory:
         sem_groupby_pair_batch_size: int | None = None,
         sem_groupby_pair_batch_retries: int = 0,
         semantic_pair_profiles: dict[str, SemanticPairExecutionProfile] | None = None,
+        prompt_batching: PromptBatching | None = None,
+        sem_agg_dispatch: str = "sequential",
         semantic_trace_snapshot_mode: str = "compact",
         lotus_cache_mode: str = "disabled",
+        refresh_every: int = 1,
         thinking_enabled: bool = True,
     ) -> None:
         from agent_memory.adapters.lotus.context import SEM_TOPK_METHODS
@@ -664,10 +691,14 @@ class ClaudeMemoryDriverFactory:
         self.sem_groupby_pair_batch_size = sem_groupby_pair_batch_size
         self.sem_groupby_pair_batch_retries = sem_groupby_pair_batch_retries
         self.semantic_pair_profiles = dict(semantic_pair_profiles or {})
+        self.prompt_batching = prompt_batching
+        self.sem_agg_dispatch = sem_agg_dispatch
         _semantic_pair_embedding_contract(self.semantic_pair_profiles)
         self.semantic_trace_snapshot_mode = semantic_trace_snapshot_mode
         _validate_lotus_cache_mode(lotus_cache_mode)
         self.lotus_cache_mode = lotus_cache_mode
+        _validate_refresh_every(refresh_every)
+        self.refresh_every = refresh_every
         self.thinking_enabled = thinking_enabled
 
     def __call__(
@@ -718,6 +749,8 @@ class ClaudeMemoryDriverFactory:
                 sem_groupby_pair_batch_size=self.sem_groupby_pair_batch_size,
                 sem_groupby_pair_batch_retries=self.sem_groupby_pair_batch_retries,
                 semantic_pair_profiles=self.semantic_pair_profiles,
+                prompt_batching=self.prompt_batching,
+                sem_agg_dispatch=self.sem_agg_dispatch,
                 semantic_trace_snapshot_mode=self.semantic_trace_snapshot_mode,
             ),
             pair_embedding_provider=pair_embedding_provider,
@@ -726,7 +759,14 @@ class ClaudeMemoryDriverFactory:
         policy = PolicyDifferentiator(
             rules=DifferentialRules(grouped_agg_rule=self.grouped_agg_rule)
         ).differentiate(am.ClaudeMemory.spec())
-        memory._runtime = MemoryRuntime(policy, adapter=adapter)
+        if self.refresh_every > 1:
+            memory._runtime = MemoryRuntime(
+                policy,
+                adapter=adapter,
+                refresh=am.CountRefresh(every=self.refresh_every),
+            )
+        else:
+            memory._runtime = MemoryRuntime(policy, adapter=adapter)
         return ClaudeMemoryDriver(memory)
 
 
@@ -744,9 +784,12 @@ class ZepMemoryDriverFactory:
         sem_groupby_pair_batch_size: int | None = None,
         sem_groupby_pair_batch_retries: int = 0,
         semantic_pair_profiles: dict[str, SemanticPairExecutionProfile] | None = None,
+        prompt_batching: PromptBatching | None = None,
+        sem_agg_dispatch: str = "sequential",
         embedding_device: str = "cpu",
         semantic_trace_snapshot_mode: str = "compact",
         lotus_cache_mode: str = "disabled",
+        refresh_every: int = 1,
         thinking_enabled: bool = True,
         neo4j_image: str,
         neo4j_image_digest: str,
@@ -767,6 +810,8 @@ class ZepMemoryDriverFactory:
         self.sem_groupby_pair_batch_size = sem_groupby_pair_batch_size
         self.sem_groupby_pair_batch_retries = sem_groupby_pair_batch_retries
         self.semantic_pair_profiles = dict(semantic_pair_profiles or {})
+        self.prompt_batching = prompt_batching
+        self.sem_agg_dispatch = sem_agg_dispatch
         embedding_contract = _semantic_pair_embedding_contract(
             self.semantic_pair_profiles
         )
@@ -788,6 +833,8 @@ class ZepMemoryDriverFactory:
         self.semantic_trace_snapshot_mode = semantic_trace_snapshot_mode
         _validate_lotus_cache_mode(lotus_cache_mode)
         self.lotus_cache_mode = lotus_cache_mode
+        _validate_refresh_every(refresh_every)
+        self.refresh_every = refresh_every
         self.thinking_enabled = thinking_enabled
         self.neo4j_image = neo4j_image
         self.neo4j_image_digest = neo4j_image_digest
@@ -804,9 +851,12 @@ class ZepMemoryDriverFactory:
         sem_groupby_pair_batch_size: int | None = None,
         sem_groupby_pair_batch_retries: int = 0,
         semantic_pair_profiles: dict[str, SemanticPairExecutionProfile] | None = None,
+        prompt_batching: PromptBatching | None = None,
+        sem_agg_dispatch: str = "sequential",
         embedding_device: str = "cpu",
         semantic_trace_snapshot_mode: str = "compact",
         lotus_cache_mode: str = "disabled",
+        refresh_every: int = 1,
         thinking_enabled: bool = True,
     ) -> ZepMemoryDriverFactory:
         """Create the pinned Graphiti-compatible deployment connector."""
@@ -852,9 +902,12 @@ class ZepMemoryDriverFactory:
             sem_groupby_pair_batch_size=sem_groupby_pair_batch_size,
             sem_groupby_pair_batch_retries=sem_groupby_pair_batch_retries,
             semantic_pair_profiles=semantic_pair_profiles,
+            prompt_batching=prompt_batching,
+            sem_agg_dispatch=sem_agg_dispatch,
             embedding_device=embedding_device,
             semantic_trace_snapshot_mode=semantic_trace_snapshot_mode,
             lotus_cache_mode=lotus_cache_mode,
+            refresh_every=refresh_every,
             thinking_enabled=thinking_enabled,
             neo4j_image=neo4j_image,
             neo4j_image_digest=neo4j_image_digest,
@@ -921,6 +974,8 @@ class ZepMemoryDriverFactory:
                 sem_groupby_pair_batch_size=self.sem_groupby_pair_batch_size,
                 sem_groupby_pair_batch_retries=self.sem_groupby_pair_batch_retries,
                 semantic_pair_profiles=self.semantic_pair_profiles,
+                prompt_batching=self.prompt_batching,
+                sem_agg_dispatch=self.sem_agg_dispatch,
                 semantic_trace_snapshot_mode=self.semantic_trace_snapshot_mode,
             ),
             pair_embedding_provider=(
@@ -934,11 +989,19 @@ class ZepMemoryDriverFactory:
             statements=storage.statements,
         )
         memory = am.ZepMemory(adapter=adapter)
-        memory._runtime = MemoryRuntime(
-            policy,
-            adapter=adapter,
-            storage=storage,
-        )
+        if self.refresh_every > 1:
+            memory._runtime = MemoryRuntime(
+                policy,
+                adapter=adapter,
+                storage=storage,
+                refresh=am.CountRefresh(every=self.refresh_every),
+            )
+        else:
+            memory._runtime = MemoryRuntime(
+                policy,
+                adapter=adapter,
+                storage=storage,
+            )
         return ZepMemoryDriver(
             memory,
             trace_dir=trace_dir,
@@ -967,9 +1030,12 @@ class Mem0MemoryDriverFactory:
         sem_groupby_pair_batch_size: int | None = None,
         sem_groupby_pair_batch_retries: int = 0,
         semantic_pair_profiles: dict[str, SemanticPairExecutionProfile] | None = None,
+        prompt_batching: PromptBatching | None = None,
+        sem_agg_dispatch: str = "sequential",
         embedding_device: str = "cpu",
         semantic_trace_snapshot_mode: str = "compact",
         lotus_cache_mode: str = "disabled",
+        refresh_every: int = 1,
         thinking_enabled: bool = False,
     ) -> None:
         if not base_namespace:
@@ -979,12 +1045,16 @@ class Mem0MemoryDriverFactory:
         self.sem_groupby_pair_batch_size = sem_groupby_pair_batch_size
         self.sem_groupby_pair_batch_retries = sem_groupby_pair_batch_retries
         self.semantic_pair_profiles = dict(semantic_pair_profiles or {})
+        self.prompt_batching = prompt_batching
+        self.sem_agg_dispatch = sem_agg_dispatch
         if embedding_device not in {"cpu", "cuda"}:
             raise ValueError("Mem0 embedding_device must be 'cpu' or 'cuda'")
         self.embedding_device = embedding_device
         self.semantic_trace_snapshot_mode = semantic_trace_snapshot_mode
         _validate_lotus_cache_mode(lotus_cache_mode)
         self.lotus_cache_mode = lotus_cache_mode
+        _validate_refresh_every(refresh_every)
+        self.refresh_every = refresh_every
         self.thinking_enabled = thinking_enabled
         self.sem_topk_method = "pairwise-naive"
 
@@ -1074,6 +1144,8 @@ class Mem0MemoryDriverFactory:
                     sem_groupby_pair_batch_size=self.sem_groupby_pair_batch_size,
                     sem_groupby_pair_batch_retries=self.sem_groupby_pair_batch_retries,
                     semantic_pair_profiles=self.semantic_pair_profiles,
+                    prompt_batching=self.prompt_batching,
+                    sem_agg_dispatch=self.sem_agg_dispatch,
                     semantic_trace_snapshot_mode=self.semantic_trace_snapshot_mode,
                 ),
                 pair_embedding_provider=embedding_provider,
@@ -1083,11 +1155,19 @@ class Mem0MemoryDriverFactory:
                 statements=storage.statements,
             )
             memory = memory_type(adapter=adapter)
-            memory._runtime = MemoryRuntime(
-                policy,
-                adapter=adapter,
-                storage=storage,
-            )
+            if self.refresh_every > 1:
+                memory._runtime = MemoryRuntime(
+                    policy,
+                    adapter=adapter,
+                    storage=storage,
+                    refresh=am.CountRefresh(every=self.refresh_every),
+                )
+            else:
+                memory._runtime = MemoryRuntime(
+                    policy,
+                    adapter=adapter,
+                    storage=storage,
+                )
         except BaseException:
             connector.close()
             raise
@@ -1114,9 +1194,12 @@ class Mem0MemoryEnhancedDriverFactory(Mem0MemoryDriverFactory):
         sem_groupby_pair_batch_size: int | None = None,
         sem_groupby_pair_batch_retries: int = 0,
         semantic_pair_profiles: dict[str, SemanticPairExecutionProfile] | None = None,
+        prompt_batching: PromptBatching | None = None,
+        sem_agg_dispatch: str = "sequential",
         embedding_device: str = "cpu",
         semantic_trace_snapshot_mode: str = "compact",
         lotus_cache_mode: str = "disabled",
+        refresh_every: int = 1,
         thinking_enabled: bool = False,
     ) -> None:
         from agent_memory.adapters.lotus.context import SEM_TOPK_METHODS
@@ -1131,9 +1214,12 @@ class Mem0MemoryEnhancedDriverFactory(Mem0MemoryDriverFactory):
             sem_groupby_pair_batch_size=sem_groupby_pair_batch_size,
             sem_groupby_pair_batch_retries=sem_groupby_pair_batch_retries,
             semantic_pair_profiles=semantic_pair_profiles,
+            prompt_batching=prompt_batching,
+            sem_agg_dispatch=sem_agg_dispatch,
             embedding_device=embedding_device,
             semantic_trace_snapshot_mode=semantic_trace_snapshot_mode,
             lotus_cache_mode=lotus_cache_mode,
+            refresh_every=refresh_every,
             thinking_enabled=thinking_enabled,
         )
         self.sem_topk_method = sem_topk_method

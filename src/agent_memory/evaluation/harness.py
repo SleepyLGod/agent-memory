@@ -210,6 +210,11 @@ class MemorySystemDriver(Protocol):
 
         ...
 
+    def flush(self) -> Mapping[str, Any]:
+        """Publish any case-final pending source rows."""
+
+        ...
+
     def save_state(self, directory: Path) -> Mapping[str, Any]:
         """Write opaque driver state into a new checkpoint directory."""
 
@@ -657,7 +662,9 @@ class BenchmarkRunner:
                             execution_attempt=attempt,
                             unit_attempt=unit_attempt,
                         ):
-                            metrics = driver.add(event)
+                            metrics = dict(driver.add(event))
+                            if event_index + 1 == len(case.events):
+                                metrics.update(driver.flush())
                     trace_io_latency_ms = round(trace_io.latency_ms, 3)
                     trace_bytes_written = trace_io.bytes_written
                     insertion_latency_ms = round(

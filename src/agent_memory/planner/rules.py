@@ -10,6 +10,7 @@ from agent_memory.policy.aggregates import (
     CollectListAggregateSpec,
     MinAggregateSpec,
     SemanticAggregateSpec,
+    aggregate_output_names,
 )
 from agent_memory.policy.expressions import ColumnExpr, least
 from agent_memory.policy.logical import ColumnSpec, QueryExpr
@@ -662,7 +663,6 @@ class DifferentialRules:
         merged = self._build_aggregate_remerge(
             grouped=regrouped,
             aggregate=aggregate,
-            state_cols=final_columns,
             instruction_rewriter=instruction_rewriter,
         )
         return self._select_after_array_remerge_flatten(merged, aggregate, final_columns)
@@ -672,7 +672,6 @@ class DifferentialRules:
         *,
         grouped: QueryExpr,
         aggregate: QueryExpr,
-        state_cols: Sequence[str],
         instruction_rewriter: DifferentialInstructionRewriter,
     ) -> QueryExpr:
         """Build grouped aggregate remerge using ordinary aggregate specs."""
@@ -683,7 +682,6 @@ class DifferentialRules:
             params={
                 "aggregates": self._remerge_aggregate_specs(
                     aggregate,
-                    state_cols=state_cols,
                     instruction_rewriter=instruction_rewriter,
                 )
             },
@@ -693,7 +691,6 @@ class DifferentialRules:
         self,
         aggregate: QueryExpr,
         *,
-        state_cols: Sequence[str],
         instruction_rewriter: DifferentialInstructionRewriter,
     ) -> tuple[object, ...]:
         """Return aggregate specs for remerging grouped aggregate rows."""
@@ -701,9 +698,10 @@ class DifferentialRules:
         specs: list[object] = []
         for spec in aggregate.params.get("aggregates", ()):
             if isinstance(spec, SemanticAggregateSpec):
+                state_cols = aggregate_output_names(spec)
                 specs.append(
                     SemanticAggregateSpec(
-                        input_cols=None,
+                        input_cols=state_cols,
                         output_cols=spec.output_cols,
                         instruction=instruction_rewriter.state_reaggregation(
                             spec.instruction,
@@ -1063,7 +1061,6 @@ class DifferentialRules:
             merged = self._build_aggregate_remerge(
                 grouped=grouped_states,
                 aggregate=aggregate,
-                state_cols=final_columns,
                 instruction_rewriter=instruction_rewriter,
             )
             return self._select_after_array_remerge_flatten(
@@ -1075,10 +1072,11 @@ class DifferentialRules:
             raise TypeError(f"Unsupported join-map aggregate: {aggregate.op}")
 
         reaggregate_params = dict(aggregate.params)
-        reaggregate_params["input_cols"] = None
+        state_cols = self._output_column_names(aggregate.params.get("output_cols"))
+        reaggregate_params["input_cols"] = state_cols
         reaggregate_params["instruction"] = instruction_rewriter.state_reaggregation(
             str(aggregate.params["instruction"]),
-            state_cols=final_columns,
+            state_cols=state_cols,
             raw_input_cols=tuple(
                 str(column) for column in (aggregate.params.get("input_cols") or ())
             ),
@@ -1217,10 +1215,11 @@ class DifferentialRules:
             params=groupby.params,
         )
         reaggregate_params = dict(aggregate.params)
-        reaggregate_params["input_cols"] = None
+        state_cols = self._output_column_names(aggregate.params.get("output_cols"))
+        reaggregate_params["input_cols"] = state_cols
         reaggregate_params["instruction"] = instruction_rewriter.state_reaggregation(
             str(aggregate.params["instruction"]),
-            state_cols=final_columns,
+            state_cols=state_cols,
             raw_input_cols=tuple(
                 str(column) for column in (aggregate.params.get("input_cols") or ())
             ),

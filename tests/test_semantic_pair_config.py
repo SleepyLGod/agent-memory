@@ -46,6 +46,32 @@ def test_load_semantic_pair_profile_config_is_strict_and_canonical(
         "sem_groupby:fact",
     ]
     assert config.to_dict()["source_sha256"] == config.source_sha256
+    assert config.schema_version == 1
+
+
+def test_load_semantic_pair_profile_config_rejects_unknown_schema(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "profiles.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "bindings": [
+                    {
+                        "site_id": "sem_groupby:entity",
+                        "mode": "search-filter",
+                        "top_k": 15,
+                        "min_similarity": 0.6,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="schema_version must be 1"):
+        load_semantic_pair_profile_config(path)
 
 
 @pytest.mark.parametrize(

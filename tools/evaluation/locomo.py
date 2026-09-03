@@ -20,9 +20,13 @@ from agent_memory.evaluation.locomo_contracts import locomo_task_contract  # noq
 from agent_memory.evaluation.run import (  # noqa: E402
     AGENT_MEMORY_SYSTEMS,
     DEFAULT_PROVIDER_MODEL_ID,
+    SEM_AGG_DISPATCH_METHODS,
     SEMANTIC_PAIR_PROFILES,
     SEM_JOIN_TOPK_METHODS,
     run_agent_memory_bundle,
+)
+from agent_memory.adapters.lotus.prompt_batching import (  # noqa: E402
+    parse_prompt_batch_size,
 )
 from agent_memory.planner import GROUPED_AGG_RULES  # noqa: E402
 
@@ -64,6 +68,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     run.add_argument("--condition-id")
     run.add_argument("--maintenance-checkpoint-output-dir", type=Path)
     run.add_argument("--maintenance-only", action="store_true")
+    run.add_argument("--refresh-every", type=int, default=1)
     run.add_argument(
         "--grouped-agg-rule",
         choices=GROUPED_AGG_RULES,
@@ -80,6 +85,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     run.add_argument("--sem-groupby-pair-batch-size", type=int)
     run.add_argument("--sem-groupby-pair-batch-retries", type=int, default=0)
+    run.add_argument(
+        "--sem-agg-dispatch",
+        choices=SEM_AGG_DISPATCH_METHODS,
+        default="sequential",
+    )
+    run.add_argument("--prompt-batch-size", type=parse_prompt_batch_size)
     run.add_argument(
         "--semantic-pair-profile",
         choices=SEMANTIC_PAIR_PROFILES,
@@ -208,6 +219,8 @@ def main(argv: Sequence[str] | None = None) -> Path:
         sem_join_topk_method=args.sem_join_topk_method,
         sem_groupby_pair_batch_size=args.sem_groupby_pair_batch_size,
         sem_groupby_pair_batch_retries=args.sem_groupby_pair_batch_retries,
+        sem_agg_dispatch=args.sem_agg_dispatch,
+        prompt_batching=args.prompt_batch_size,
         semantic_pair_profile=args.semantic_pair_profile,
         semantic_pair_top_k=args.semantic_pair_top_k,
         semantic_pair_min_similarity=args.semantic_pair_min_similarity,
@@ -215,6 +228,7 @@ def main(argv: Sequence[str] | None = None) -> Path:
         lotus_cache_mode=args.lotus_cache_mode,
         embedding_device=args.embedding_device,
         semantic_trace_snapshot_mode=args.semantic_trace_snapshot_mode,
+        refresh_every=args.refresh_every,
         memory_thinking_enabled=False,
         condition_id=args.condition_id or "",
         maintenance_only=args.maintenance_only,

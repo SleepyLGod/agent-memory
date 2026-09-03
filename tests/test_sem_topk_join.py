@@ -16,6 +16,7 @@ from agent_memory.adapters.lotus.sem_topk_join import (
     _pairwise_topk,
     _parse_listwise_ids,
 )
+from agent_memory.adapters.lotus.prompt_batching import PromptBatching
 from agent_memory.policy.logical import QueryExpr
 
 
@@ -29,6 +30,10 @@ class _StaticJoinContext:
 
 
 class _BatchListwiseLM:
+    max_ctx_len = 100_000
+    max_tokens = 1024
+    cache = None
+
     def __init__(self, outputs: list[str]) -> None:
         self.outputs = outputs
         self.calls: list[tuple[Any, dict[str, Any]]] = []
@@ -36,6 +41,9 @@ class _BatchListwiseLM:
     def __call__(self, messages: Any, **kwargs: Any) -> Any:
         self.calls.append((messages, kwargs))
         return SimpleNamespace(outputs=self.outputs)
+
+    def count_tokens(self, messages: Any) -> int:
+        return len(str(messages))
 
 
 def _query(*, k: int, how: str = "inner", on: tuple[str, ...] = ()) -> QueryExpr:
@@ -122,6 +130,44 @@ def test_listwise_topk_join_can_select_multiple_matches_up_to_k(
     )
 
     assert result["name:right"].tolist() == ["Mel", "Melanie"]
+
+
+def test_prompt_batching_packs_multiple_listwise_join_anchors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import lotus
+
+    left = pd.DataFrame({"name": ["Melanie", "Poppy"]}, index=[10, 20])
+    right = pd.DataFrame({"name": ["Mel", "Poppy"]}, index=[100, 200])
+    lm = _BatchListwiseLM(
+        [
+            '{"results":['
+            '{"task_id":"task_1","selected_ids":["candidate_3"]},'
+            '{"task_id":"task_0","selected_ids":["candidate_0"]}]}'
+        ]
+    )
+    monkeypatch.setattr(lotus.settings, "lm", lm)
+
+    result = execute_sem_join(
+        _query(k=1),
+        {},
+        lambda query, _inputs: left if query.params["name"] == "left" else right,
+        _StaticJoinContext(
+            LotusExecutionConfig(
+                sem_join_topk_method="listwise",
+                prompt_batching=PromptBatching(),
+            )
+        ),
+    )
+
+    assert list(zip(result["name:left"], result["name:right"], strict=True)) == [
+        ("Melanie", "Mel"),
+        ("Poppy", "Poppy"),
+    ]
+    assert len(lm.calls) == 1
+    assert len(lm.calls[0][0]) == 1
+    assert "task_0" in str(lm.calls[0][0][0])
+    assert "task_1" in str(lm.calls[0][0][0])
 
 
 def test_pairwise_topk_join_reuses_lotus_ranking_after_predicate_verification(

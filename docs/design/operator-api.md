@@ -132,6 +132,71 @@ rows. The first implementation is synchronous and count-triggered only; it
 does not provide a timer, background worker, query-triggered refresh, or a
 crash-durable pending log.
 
+### Prompt batching
+
+Prompt batching is an opt-in LOTUS execution setting. It does not decide when
+source rows enter the dataflow; it decides how one semantic operator sends the
+independent tasks that are ready in its current invocation:
+
+```python
+from agent_memory.adapters.lotus import LotusAdapter, PromptBatching
+from agent_memory.adapters.lotus.context import LotusExecutionConfig
+
+adapter = LotusAdapter(
+    config=LotusExecutionConfig(
+        prompt_batching=PromptBatching(),
+    )
+)
+memory = MyMemory(adapter=adapter, refresh=am.CountRefresh(every=32))
+```
+
+The two settings are deliberately separate:
+
+```text
+CountRefresh(every=32)
+  -> up to 32 source rows enter the maintenance DAG as one relation-valued delta
+
+PromptBatching()
+  -> each semantic operator puts all of its currently ready independent tasks
+     into one prompt when the model context permits
+```
+
+`PromptBatching(max_tasks=M)` caps a prompt at `M` tasks. `max_tasks=None`
+means no artificial task-count cap, not one task per prompt. The runner still
+splits deterministically when a complete prompt would exceed the model context;
+it never truncates a task to make it fit.
+
+The shared setting applies to the task shapes exposed by `sem_filter`,
+`sem_map`, `sem_flat_map`, pairwise `sem_join`, multi-anchor top-k `sem_join`,
+pairwise `sem_groupby`, and `sem_agg`. Direct listwise `sem_topk` already asks
+one ranking question over its input; delegated LOTUS pairwise ranking keeps its
+algorithm-specific comparison schedule. Search-Filter remains an earlier
+candidate-generation step, so only selected pairs are prompt-batched.
+
+Prompt batching is not provider request batching. A packed prompt asks one
+model request to return several task results. Provider batching sends several
+separate prompts together while preserving each prompt byte-for-byte. The
+existing `sem_agg_dispatch="provider-batched"` path is therefore mutually
+exclusive with `prompt_batching`.
+
+Every packed output must contain every stable task ID exactly once and satisfy
+the operator's normal output schema. The parser may repair recorded,
+syntax-only JSON mistakes, but it rejects missing, duplicate, unknown, or
+semantically invalid results. Enabling prompt batching changes the physical
+execution and checkpoint fingerprint; omitting it preserves the existing
+prompts and behavior.
+
+Prompt batching is not a semantics-preserving transport optimization. Putting
+the same tasks together changes the context seen by the model, so valid
+structured output can still contain different semantic decisions. A
+32-event Claude/Mem0/Zep smoke completed all tested batch sizes but produced
+different materialized states; larger Claude batches omitted durable topics,
+and the largest Zep batch made an incorrect entity merge. There is therefore
+no empirically supported system-wide `max_tasks` value from this smoke. Keep
+this setting opt-in and validate it against each policy's state and end-to-end
+quality before using it as a production default. The evidence is summarized in
+`next-plan-sem-join-and-count-refresh.zh.md`.
+
 ### `select`
 
 Projection over columns.

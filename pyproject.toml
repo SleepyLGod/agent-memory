@@ -9,6 +9,7 @@ authors = [
 requires-python = ">=3.12"
 dependencies = [
     "dspy>=3.2.0",
+    "json5>=0.14.0",
     "lotus-ai==1.1.4",
     "nltk>=3.9.1",
     "pandas>=2.3.3",

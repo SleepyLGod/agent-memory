@@ -100,7 +100,7 @@ the same `sem_join(k=1)` expression; this flag changes only how the adapter
 resolves that join.
 
 `--semantic-pair-profile-config` binds Search-Filter or Proxy-Only profiles to
-stable semantic predicate site IDs. A config has this strict shape:
+stable semantic predicate site IDs:
 
 ```json
 {
@@ -134,6 +134,58 @@ duplicate, or drifted sites fail before model and storage initialization.
 Site-level config is mutually exclusive with the global
 `--semantic-pair-profile`, `--semantic-pair-top-k`, and
 `--semantic-pair-min-similarity` options.
+
+Prompt construction is a separate physical layer from candidate selection.
+Enable it for the whole LOTUS execution path with one option:
+
+```bash
+--prompt-batch-size all
+--prompt-batch-size 8
+```
+
+Omitting the option preserves the existing LOTUS prompts. `all` places all
+currently ready, independent tasks from one operator invocation into one
+prompt, unless the model context requires deterministic chunks. A positive
+integer caps each prompt at that many tasks. Search-Filter still runs first, so
+only selected candidates enter a prompt. The setting covers semantic filters,
+maps, flat maps, pairwise joins, pairwise group comparisons, multi-anchor
+top-k joins, and semantic aggregate groups. A direct listwise `sem_topk` is
+already one ranking task; delegated LOTUS pairwise ranking keeps its own
+algorithm-specific comparison schedule.
+
+This option changes prompt construction, so it is explicit opt-in and enters
+the maintenance/checkpoint identity. Operators validate every returned task ID
+and output schema. Syntax-only JSON repairs are recorded; missing, duplicate,
+unknown, or malformed task results fail instead of being guessed.
+
+Structural validation does not make prompt batching semantics-preserving. A
+packed request can return valid JSON while making different semantic decisions
+from the same tasks sent in smaller prompts. The current Claude/Mem0/Zep smoke
+did not establish a universal best batch size, and larger tested batches caused
+material quality loss in at least one policy. Treat every
+`--prompt-batch-size` value as a separate experiment condition; do not use
+`all` as a general default.
+
+Semantic aggregate provider dispatch remains a separate control:
+
+- `--sem-agg-dispatch provider-batched` keeps every per-group prompt unchanged
+  but submits ready prompts together through the LOTUS LM batch interface.
+
+`--sem-agg-dispatch provider-batched` and `--prompt-batch-size` are mutually
+exclusive. The former sends several unchanged prompts in one provider call;
+the latter puts several tasks inside one prompt. Both are disabled by default.
+
+`--refresh-every N` controls when source rows enter the maintenance DAG. Its
+default is `1`, which preserves one eager refresh per event. A value greater
+than one buffers normalized rows and publishes each full batch as one atomic
+delta; the benchmark flushes the final partial batch after the last event and
+before retrieval. That final flush remains inside the last event's insertion
+timing, so it is not hidden as unreported cleanup work.
+
+Count refresh is independent of prompt batching and provider request batching.
+It changes the physical execution identity and checkpoint contract. Resume
+must use the same `--refresh-every` value; intermediate dataset session
+boundaries do not force an early refresh.
 
 The remaining flags belong to separate physical layers:
 

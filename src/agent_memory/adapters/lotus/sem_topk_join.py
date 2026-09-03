@@ -10,6 +10,12 @@ from typing import Any, cast
 import pandas as pd
 
 from agent_memory.adapters.lotus.context import LotusExecutionContext
+from agent_memory.adapters.lotus.prompt_batching import (
+    ParsedPromptBatch,
+    PromptBatchItem,
+    PromptBatchRequest,
+    run_prompt_batches,
+)
 from agent_memory.adapters.lotus.pair_execution import (
     PAIR_LEFT_ID_COLUMN,
     PAIR_LEFT_TEXT_COLUMN,
@@ -21,6 +27,9 @@ from agent_memory.adapters.lotus.pair_execution import (
 )
 from agent_memory.adapters.lotus.sem_topk import LOTUS_PAIRWISE_METHODS
 from agent_memory.adapters.lotus.structured import normalize_strategy
+from agent_memory.adapters.lotus.structured import (
+    load_structured_json_with_syntax_repair,
+)
 from agent_memory.policy.logical import QueryExpr
 from agent_memory.tracing.semantic import query_digest, write_pair_trace
 
@@ -33,10 +42,18 @@ LISTWISE_JOIN_SYSTEM_PROMPT = (
     "match. If too many candidates match, select the strongest matches. Return an "
     "empty selected_ids array when none match. Return only a JSON object."
 )
+LISTWISE_JOIN_BATCH_SYSTEM_PROMPT = (
+    "The user will provide several independent semantic join tasks. Resolve each "
+    "task independently using its join condition, left row, candidate rows, and "
+    "max_matches. Do not use one task as evidence for another. Return every "
+    "supplied task_id exactly once with its selected_ids. Do not change or invent "
+    "IDs. Return only the requested JSON object."
+)
 
 
 @dataclass(frozen=True)
 class _ListwiseTask:
+    task_id: str
     left_id: Any
     prompt: list[dict[str, Any]]
     candidate_positions: Mapping[str, int]
@@ -66,7 +83,8 @@ def evaluate_sem_topk_join(
         right_series,
         left_frame=left,
         right_frame=right,
-        on=tuple(str(column) for column in query.params.get("on", ())),
+        on=tuple(query.params.get("on", ())),
+        query=query,
     )
     candidates, scores = _apply_pair_profile(
         query,
@@ -172,11 +190,89 @@ def _listwise_topk(
         right_label=right_label,
         k=k,
     )
+    if context.config.prompt_batching is not None:
+        task_by_id = {task.task_id: task for task in tasks}
+        execution = run_prompt_batches(
+            tasks,
+            task_id=lambda task: task.task_id,
+            build_request=_build_listwise_batch_request,
+            parse_results=lambda raw_output: _parse_listwise_prompt_batch(
+                raw_output,
+                tasks=task_by_id,
+                k=k,
+            ),
+            model=lm,
+            config=context.config.prompt_batching,
+            max_retries=context.config.structured_parse_retries,
+            progress_bar_desc="Listwise join resolution",
+            operator="sem_join",
+            trace_dir=context.config.trace_dir(),
+        )
+        selected_by_left = {
+            task.left_id: tuple(
+                task.candidate_positions[candidate_id]
+                for candidate_id in selected_ids
+            )
+            for task, selected_ids in zip(tasks, execution.outputs, strict=True)
+        }
+        retry_count = execution.retry_count
+    else:
+        selected_by_left, retry_count = _execute_listwise_tasks(
+            tasks,
+            lm=lm,
+            k=k,
+            max_retries=context.config.structured_parse_retries,
+        )
+
+    selected_positions = {
+        position
+        for positions in selected_by_left.values()
+        for position in positions
+    }
+    rows = []
+    results: list[tuple[Any, Any, str | None]] = []
+    for position, row in candidates.iterrows():
+        matched = position in selected_positions
+        rows.append(
+            {
+                "operator": "sem_join",
+                "instruction": instruction,
+                "decision_source": "listwise",
+                "left_id": row[PAIR_LEFT_ID_COLUMN],
+                "right_id": row[PAIR_RIGHT_ID_COLUMN],
+                "left": row[PAIR_LEFT_TEXT_COLUMN],
+                "right": row[PAIR_RIGHT_TEXT_COLUMN],
+                "parsed_output": matched,
+            }
+        )
+        if matched:
+            results.append(
+                (
+                    row[PAIR_LEFT_ID_COLUMN],
+                    row[PAIR_RIGHT_ID_COLUMN],
+                    None,
+                )
+            )
+    write_pair_trace(
+        context.config.trace_dir(),
+        operator="sem_join",
+        rows=rows,
+    )
+    return results, retry_count
+
+
+def _execute_listwise_tasks(
+    tasks: Sequence[_ListwiseTask],
+    *,
+    lm: Any,
+    k: int,
+    max_retries: int,
+) -> tuple[dict[Any, tuple[int, ...]], int]:
     pending = list(tasks)
     selected_by_left: dict[Any, tuple[int, ...]] = {}
     retry_count = 0
     last_error: ValueError | None = None
-    for attempt in range(context.config.structured_parse_retries + 1):
+    for _attempt in range(max_retries + 1):
         if not pending:
             break
         lm_call: Any = lm
@@ -216,44 +312,10 @@ def _listwise_topk(
         assert last_error is not None
         raise ValueError(
             "listwise top-k sem_join returned invalid structured output after "
-            f"{context.config.structured_parse_retries + 1} attempt(s): {last_error}"
+            f"{max_retries + 1} attempt(s): {last_error}"
         ) from last_error
 
-    selected_positions = {
-        position
-        for positions in selected_by_left.values()
-        for position in positions
-    }
-    rows = []
-    results: list[tuple[Any, Any, str | None]] = []
-    for position, row in candidates.iterrows():
-        matched = position in selected_positions
-        rows.append(
-            {
-                "operator": "sem_join",
-                "instruction": instruction,
-                "decision_source": "listwise",
-                "left_id": row[PAIR_LEFT_ID_COLUMN],
-                "right_id": row[PAIR_RIGHT_ID_COLUMN],
-                "left": row[PAIR_LEFT_TEXT_COLUMN],
-                "right": row[PAIR_RIGHT_TEXT_COLUMN],
-                "parsed_output": matched,
-            }
-        )
-        if matched:
-            results.append(
-                (
-                    row[PAIR_LEFT_ID_COLUMN],
-                    row[PAIR_RIGHT_ID_COLUMN],
-                    None,
-                )
-            )
-    write_pair_trace(
-        context.config.trace_dir(),
-        operator="sem_join",
-        rows=rows,
-    )
-    return results, retry_count
+    return selected_by_left, retry_count
 
 
 def _listwise_tasks(
@@ -265,7 +327,9 @@ def _listwise_tasks(
     k: int,
 ) -> list[_ListwiseTask]:
     tasks: list[_ListwiseTask] = []
-    for left_id, group in candidates.groupby(PAIR_LEFT_ID_COLUMN, sort=False):
+    for task_index, (left_id, group) in enumerate(
+        candidates.groupby(PAIR_LEFT_ID_COLUMN, sort=False)
+    ):
         candidate_positions = {
             f"candidate_{position}": int(position) for position in group.index
         }
@@ -285,6 +349,7 @@ def _listwise_tasks(
         }
         tasks.append(
             _ListwiseTask(
+                task_id=f"task_{task_index}",
                 left_id=left_id,
                 prompt=[
                     {"role": "system", "content": LISTWISE_JOIN_SYSTEM_PROMPT},
@@ -297,6 +362,84 @@ def _listwise_tasks(
             )
         )
     return tasks
+
+
+def _build_listwise_batch_request(
+    tasks: tuple[_ListwiseTask, ...],
+) -> PromptBatchRequest:
+    payload = {
+        "tasks": [
+            {"task_id": task.task_id, "messages": task.prompt} for task in tasks
+        ],
+        "output_schema": {
+            "results": [
+                {"task_id": "task_id", "selected_ids": ["candidate_id"]}
+            ]
+        },
+    }
+    return PromptBatchRequest(
+        task_ids=tuple(task.task_id for task in tasks),
+        prompt=[
+            {"role": "system", "content": LISTWISE_JOIN_BATCH_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": json.dumps(payload, ensure_ascii=False, default=str),
+            },
+        ],
+        max_tokens=LISTWISE_JOIN_MAX_TOKENS,
+    )
+
+
+def _parse_listwise_prompt_batch(
+    raw_output: str,
+    *,
+    tasks: Mapping[str, _ListwiseTask],
+    k: int,
+) -> ParsedPromptBatch[tuple[str, ...]]:
+    decoded = load_structured_json_with_syntax_repair(
+        raw_output,
+        operator="prompt-batched listwise sem_join",
+        expected_shape='JSON object with a "results" array',
+    )
+    payload = decoded.value
+    if not isinstance(payload, Mapping) or set(payload) != {"results"}:
+        raise ValueError(
+            "prompt-batched listwise sem_join output must contain only results"
+        )
+    results = payload["results"]
+    if not isinstance(results, list):
+        raise ValueError("prompt-batched listwise sem_join results must be a list")
+    items: list[PromptBatchItem[tuple[str, ...]]] = []
+    for result in results:
+        if not isinstance(result, Mapping) or set(result) != {
+            "task_id",
+            "selected_ids",
+        }:
+            raise ValueError(
+                "prompt-batched listwise sem_join results require task_id and "
+                "selected_ids"
+            )
+        identifier = result["task_id"]
+        if not isinstance(identifier, str):
+            raise ValueError(
+                "prompt-batched listwise sem_join task_id must be a string"
+            )
+        task = tasks.get(identifier)
+        if task is None:
+            selected = tuple(
+                value for value in result["selected_ids"] if isinstance(value, str)
+            ) if isinstance(result["selected_ids"], list) else ()
+        else:
+            selected = _parse_listwise_ids(
+                json.dumps({"selected_ids": result["selected_ids"]}),
+                valid_ids=set(task.candidate_positions),
+                k=k,
+            )
+        items.append(PromptBatchItem(identifier, selected))
+    return ParsedPromptBatch(
+        items=tuple(items),
+        repair_method=decoded.repair_method,
+    )
 
 
 def _parse_listwise_ids(

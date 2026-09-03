@@ -5,6 +5,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from agent_memory.adapters.lotus.prompt_batching import PromptBatching
+
 from agent_memory.planner.rules import GROUPED_AGG_RULES
 from tools.evaluation import locomo, longmemeval, memory_agent_bench
 
@@ -78,6 +80,50 @@ def test_agent_benchmark_clis_share_sem_groupby_execution_options(
     assert args.sem_groupby_pair_batch_size == 12
     assert args.sem_groupby_pair_batch_retries == 2
     assert args.semantic_trace_snapshot_mode == "compact"
+
+
+@pytest.mark.parametrize("module", (locomo, longmemeval, memory_agent_bench))
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    (("all", PromptBatching()), ("4", PromptBatching(max_tasks=4))),
+)
+def test_agent_benchmark_clis_share_prompt_batching_option(
+    module, value, expected, tmp_path
+) -> None:
+    args = module.parse_args(
+        [
+            "run",
+            "--bundle-dir",
+            str(tmp_path / "bundle"),
+            "--output-dir",
+            str(tmp_path / "output"),
+            "--system",
+            "zep-memory",
+            "--prompt-batch-size",
+            value,
+        ]
+    )
+
+    assert args.prompt_batch_size == expected
+
+
+@pytest.mark.parametrize("module", (locomo, longmemeval, memory_agent_bench))
+def test_agent_benchmark_clis_disable_prompt_batching_by_default(
+    module, tmp_path
+) -> None:
+    args = module.parse_args(
+        [
+            "run",
+            "--bundle-dir",
+            str(tmp_path / "bundle"),
+            "--output-dir",
+            str(tmp_path / "output"),
+            "--system",
+            "zep-memory",
+        ]
+    )
+
+    assert args.prompt_batch_size is None
 
 
 @pytest.mark.parametrize("module", (locomo, longmemeval, memory_agent_bench))
@@ -155,6 +201,25 @@ def test_agent_benchmark_clis_share_site_profiles_and_cache_mode(
 
     assert args.semantic_pair_profile_config == profile_path
     assert args.lotus_cache_mode == "memory"
+
+
+@pytest.mark.parametrize("module", (locomo, longmemeval, memory_agent_bench))
+def test_agent_benchmark_clis_share_count_refresh_option(module, tmp_path) -> None:
+    args = module.parse_args(
+        [
+            "run",
+            "--bundle-dir",
+            str(tmp_path / "bundle"),
+            "--output-dir",
+            str(tmp_path / "output"),
+            "--system",
+            "zep-memory",
+            "--refresh-every",
+            "4",
+        ]
+    )
+
+    assert args.refresh_every == 4
 
 
 @pytest.mark.parametrize("module", (locomo, longmemeval, memory_agent_bench))

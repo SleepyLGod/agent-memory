@@ -23,6 +23,7 @@ from agent_memory.adapters.lotus.pair_execution import (
 )
 from agent_memory.evaluation.harness import MemorySystemContract
 from agent_memory.adapters.lotus.context import LotusExecutionConfig
+from agent_memory.adapters.lotus.prompt_batching import PromptBatching
 from agent_memory.adapters.lotus.sem_filter import execute_sem_filter
 from agent_memory.adapters.lotus.sem_groupby import execute_sem_groupby
 from agent_memory.adapters.lotus.sem_join import (
@@ -534,6 +535,110 @@ def test_sem_filter_search_filter_sends_only_candidates_to_oracle(tmp_path) -> N
     assert "pairs_snapshot_path" not in decisions[0]
 
 
+def test_sem_filter_search_filter_batch_prompting_verifies_only_candidates(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import lotus
+
+    class FakeLM:
+        max_tokens = 512
+        cache = None
+
+        def __init__(self) -> None:
+            self.calls: list[tuple[object, dict[str, object]]] = []
+
+        def __call__(self, messages: object, **kwargs: object) -> object:
+            self.calls.append((messages, kwargs))
+            return type(
+                "Output",
+                (),
+                {
+                    "outputs": [
+                        '{"decisions":[{"row_id":"row_0","keep":true}]}'
+                    ]
+                },
+            )()
+
+    query = _filter_query()
+    source = _filter_source()
+    provider = FakeEmbeddingProvider(
+        {
+            "memory: old alpha": [1.0, 0.0],
+            "memory: old beta": [0.0, 1.0],
+            "memory: new alpha": [0.8, 0.6],
+        }
+    )
+    digest = query_digest(query)
+    lm = FakeLM()
+    monkeypatch.setattr(lotus.settings, "lm", lm)
+    monkeypatch.setattr(lotus.settings, "enable_cache", False)
+    config = LotusExecutionConfig(
+        semantic_trace_dir=tmp_path,
+        semantic_pair_profiles={digest: _filter_profile(0.75)},
+        prompt_batching=PromptBatching(max_tasks=4),
+    )
+    FakeFilterFrame.oracle_batches = []
+
+    result = execute_sem_filter(
+        query,
+        {},
+        lambda _query, _inputs: source,
+        FakeContext(config, provider),
+    )
+
+    assert list(result["memory:earlier"]) == ["old alpha"]
+    assert FakeFilterFrame.oracle_batches == []
+    assert len(lm.calls) == 1
+    prompt_text = json.dumps(lm.calls[0][0], ensure_ascii=False)
+    assert "old alpha" in prompt_text
+    assert "old beta" not in prompt_text
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "events.jsonl").read_text().splitlines()
+    ]
+    operator_result = next(
+        event
+        for event in events
+        if event["event_type"] == "operator_result"
+    )
+    assert operator_result["prompt_batching"] == {"max_tasks": 4}
+    assert operator_result["verification_prompt_count"] == 1
+    assert operator_result["verification_retry_count"] == 0
+    assert operator_result["verified_tuple_count"] == 1
+
+
+def test_sem_filter_batch_prompting_rejects_lotus_cascade_before_input() -> None:
+    query = _filter_query()
+    config = LotusExecutionConfig(
+        sem_filter_cascade_args={"sampling_percentage": 0.1},
+        prompt_batching=PromptBatching(max_tasks=4),
+    )
+
+    with pytest.raises(ValueError, match="does not support LOTUS options: cascade_args"):
+        execute_sem_filter(
+            query,
+            {},
+            lambda _query, _inputs: (_ for _ in ()).throw(
+                AssertionError("input execution must not run before validation")
+            ),
+            FakeContext(config),
+        )
+
+
+def test_sem_filter_batch_prompting_changes_only_physical_fingerprint() -> None:
+    baseline = LotusAdapter().maintenance_execution_fingerprint
+    prompted = LotusAdapter(
+        config=LotusExecutionConfig(
+            prompt_batching=PromptBatching(max_tasks=4),
+        )
+    ).maintenance_execution_fingerprint
+
+    assert baseline == ""
+    assert prompted
+    assert prompted != baseline
+
+
 def test_sem_filter_without_matching_profile_keeps_oracle_path() -> None:
     query = _filter_query()
     source = _filter_source()
@@ -768,6 +873,99 @@ def test_sem_join_search_filter_verifies_only_candidates_and_preserves_outer_joi
     assert "pairs" not in candidate
 
 
+def test_sem_join_prompt_batching_verifies_ready_pairs_in_one_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import lotus
+
+    class FakeLM:
+        max_tokens = 512
+        cache = None
+
+        def __init__(self) -> None:
+            self.calls: list[object] = []
+
+        def __call__(self, messages: object, **_kwargs: object) -> object:
+            self.calls.append(messages)
+            return type(
+                "Output",
+                (),
+                {
+                    "outputs": [
+                        '{"decisions":['
+                        '{"row_id":"row_0","keep":true},'
+                        '{"row_id":"row_1","keep":false},'
+                        '{"row_id":"row_2","keep":false},'
+                        '{"row_id":"row_3","keep":true}]}'
+                    ]
+                },
+            )()
+
+    lm = FakeLM()
+    monkeypatch.setattr(lotus.settings, "lm", lm)
+    monkeypatch.setattr(lotus.settings, "enable_cache", False)
+    left = pd.DataFrame(
+        {
+            "topic": ["alpha", "tea"],
+            "description": ["software project", "hot drink"],
+        }
+    )
+    right = pd.DataFrame(
+        {
+            "topic": ["alpha project", "tea preference"],
+            "description": ["software initiative", "preferred hot drink"],
+        }
+    )
+    query = QueryExpr(
+        op="sem_join",
+        inputs=(
+            QueryExpr(op="materialized_view", params={"name": "left"}),
+            QueryExpr(op="materialized_view", params={"name": "right"}),
+        ),
+        params={
+            "instruction": (
+                "{topic:left} and {topic:right} are the same topic when "
+                "{description:left} and {description:right} agree."
+            ),
+            "how": "inner",
+        },
+    )
+
+    result = execute_sem_join(
+        query,
+        {"left": left, "right": right},
+        lambda expression, inputs: inputs[str(expression.params["name"])],
+        FakeContext(
+            LotusExecutionConfig(prompt_batching=PromptBatching()),
+        ),
+    )
+
+    assert result.to_dict(orient="records") == [
+        {
+            "topic:left": "alpha",
+            "description:left": "software project",
+            "topic:right": "alpha project",
+            "description:right": "software initiative",
+        },
+        {
+            "topic:left": "tea",
+            "description:left": "hot drink",
+            "topic:right": "tea preference",
+            "description:right": "preferred hot drink",
+        },
+    ]
+    assert len(lm.calls) == 1
+    assert len(lm.calls[0]) == 1
+    prompt = str(lm.calls[0])
+    assert "topic: alpha" in prompt
+    assert "description: software project" in prompt
+    assert "left row" in prompt
+    assert "topic field" in prompt
+    assert "right row" in prompt
+    assert "description field" in prompt
+    assert "{topic:left}" not in prompt
+
+
 def test_sem_groupby_search_filter_verifies_only_candidate_edges(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -839,6 +1037,62 @@ def test_sem_groupby_search_filter_verifies_only_candidate_edges(
     assert candidate["candidate_pair_count"] == 1
     assert "vectors" not in candidate
     assert "pairs" not in candidate
+
+
+def test_sem_groupby_prompt_batching_verifies_ready_pairs_in_one_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import lotus
+
+    class FakeLM:
+        max_tokens = 512
+        cache = None
+
+        def __init__(self) -> None:
+            self.calls: list[object] = []
+
+        def __call__(self, messages: object, **_kwargs: object) -> object:
+            self.calls.append(messages)
+            return type(
+                "Output",
+                (),
+                {
+                    "outputs": [
+                        '{"decisions":['
+                        '{"row_id":"row_0","keep":true},'
+                        '{"row_id":"row_1","keep":false},'
+                        '{"row_id":"row_2","keep":false}]}'
+                    ]
+                },
+            )()
+
+    lm = FakeLM()
+    monkeypatch.setattr(lotus.settings, "lm", lm)
+    monkeypatch.setattr(lotus.settings, "enable_cache", False)
+    source = pd.DataFrame(
+        {"topic": ["alpha", "alpha project", "tea preference"]}
+    )
+    query = QueryExpr(
+        op="sem_groupby",
+        inputs=(QueryExpr(op="materialized_view", params={"name": "rows"}),),
+        params={
+            "input_cols": ("topic",),
+            "instruction": "Group rows that describe the same topic: {topic}.",
+        },
+    )
+
+    result = execute_sem_groupby(
+        query,
+        {"rows": source},
+        lambda expression, inputs: inputs[str(expression.params["name"])],
+        FakeContext(
+            LotusExecutionConfig(prompt_batching=PromptBatching()),
+        ),
+    )
+
+    assert list(result["_agent_memory_group_id"]) == [0, 0, 1]
+    assert len(lm.calls) == 1
+    assert len(lm.calls[0]) == 1
 
 
 def test_sem_join_proxy_only_assembles_selected_pairs_without_oracle(
@@ -1070,6 +1324,36 @@ def test_exact_key_sem_join_rejects_lotus_cascade_before_input_execution() -> No
             {
                 "left": pd.DataFrame({"tenant_id": ["a"], "topic": ["alpha"]}),
                 "right": pd.DataFrame({"tenant_id": ["a"], "topic": ["alpha"]}),
+            },
+            lambda _expression, _inputs: (_ for _ in ()).throw(
+                AssertionError("input execution must not run before validation")
+            ),
+            context,
+        )
+
+
+def test_prompt_batched_sem_join_rejects_lotus_cascade_before_input_execution() -> None:
+    query = QueryExpr(
+        op="sem_join",
+        inputs=(
+            QueryExpr(op="materialized_view", params={"name": "left"}),
+            QueryExpr(op="materialized_view", params={"name": "right"}),
+        ),
+        params={"instruction": "Rows match.", "how": "inner"},
+    )
+    context = FakeContext(
+        LotusExecutionConfig(
+            prompt_batching=PromptBatching(),
+            sem_join_cascade_args={"sampling_percentage": 0.1},
+        )
+    )
+
+    with pytest.raises(ValueError, match="cannot be combined with LOTUS sem_join cascade"):
+        execute_sem_join(
+            query,
+            {
+                "left": pd.DataFrame({"topic": ["alpha"]}),
+                "right": pd.DataFrame({"topic": ["alpha"]}),
             },
             lambda _expression, _inputs: (_ for _ in ()).throw(
                 AssertionError("input execution must not run before validation")
