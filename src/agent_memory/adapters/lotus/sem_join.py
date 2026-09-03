@@ -42,6 +42,13 @@ def execute_sem_join(
     on = tuple(cast(Sequence[Any], query.params.get("on", ())))
     if query.params.get("k") is not None and context.config.sem_join_cascade_args is not None:
         raise ValueError("top-k sem_join cannot be combined with LOTUS sem_join cascade")
+    if (
+        context.config.prompt_batching is not None
+        and context.config.sem_join_cascade_args is not None
+    ):
+        raise ValueError(
+            "prompt-batched sem_join cannot be combined with LOTUS sem_join cascade"
+        )
     if on and context.config.sem_join_cascade_args is not None:
         # LOTUS 1.1.4 cascades rebuild the full Cartesian product and cannot
         # consume deterministically restricted pairs. Keep that boundary explicit
@@ -142,6 +149,19 @@ def execute_sem_join(
             context.config,
             profile=profile,
             embedding_provider=context.pair_embedding_provider,
+        )
+    elif context.config.prompt_batching is not None:
+        left_series, right_series, left_label, right_label, instruction = join_series(
+            left,
+            right,
+            str(query.params["instruction"]),
+        )
+        join_results = verify_semantic_join_candidates(
+            semantic_join_pair_candidates(left_series, right_series),
+            left_label=left_label,
+            right_label=right_label,
+            instruction=instruction,
+            config=context.config,
         )
     else:
         join_results = evaluate_semantic_join(query, left, right, context.config)
@@ -346,8 +366,6 @@ def verify_semantic_join_candidates(
     if candidates.empty:
         return []
 
-    import lotus
-    from lotus.sem_ops.sem_filter import sem_filter
     from lotus.templates import task_instructions
 
     oracle_frame = pd.DataFrame(
@@ -356,39 +374,65 @@ def verify_semantic_join_candidates(
             right_label: candidates[PAIR_RIGHT_TEXT_COLUMN],
         }
     )
-    docs = task_instructions.df2multimodal_info(
-        oracle_frame,
-        [left_label, right_label],
-    )
-    output = sem_filter(
-        docs,
-        lotus.settings.lm,
-        instruction,
-        examples_multimodal_data=examples_multimodal_data(
-            config.sem_join_examples,
-            left_label=left_label,
-            right_label=right_label,
-        ),
-        examples_answers=example_answers(config.sem_join_examples),
-        cot_reasoning=example_reasoning(config.sem_join_examples),
-        default=config.sem_join_default,
-        strategy=normalize_strategy(config.sem_join_strategy),
-        safe_mode=config.sem_join_safe_mode,
-        progress_bar_desc=config.sem_join_progress_bar_desc,
-    )
-    outputs = list(output.outputs)
+    if config.prompt_batching is not None:
+        _validate_prompt_batched_sem_join_config(config)
+        from agent_memory.adapters.lotus.sem_filter_batch_prompting import (
+            execute_batch_prompted_predicate,
+        )
+
+        prompted = execute_batch_prompted_predicate(
+            oracle_frame,
+            instruction=_batch_prompt_join_instruction(
+                instruction,
+                columns=(left_label, right_label),
+            ),
+            prompt_batching=config.prompt_batching,
+            structured_parse_retries=config.structured_parse_retries,
+            structured_max_tokens=config.structured_max_tokens,
+            progress_bar_desc=config.sem_join_progress_bar_desc,
+            trace_dir=config.trace_dir(),
+            operator="sem_join",
+        )
+        outputs = list(prompted.decisions)
+        raw_outputs = [attempts[-1] for attempts in prompted.raw_output_attempts]
+        explanations: list[str | None] = [None] * len(outputs)
+    else:
+        import lotus
+        from lotus.sem_ops.sem_filter import sem_filter
+
+        docs = task_instructions.df2multimodal_info(
+            oracle_frame,
+            [left_label, right_label],
+        )
+        output = sem_filter(
+            docs,
+            lotus.settings.lm,
+            instruction,
+            examples_multimodal_data=examples_multimodal_data(
+                config.sem_join_examples,
+                left_label=left_label,
+                right_label=right_label,
+            ),
+            examples_answers=example_answers(config.sem_join_examples),
+            cot_reasoning=example_reasoning(config.sem_join_examples),
+            default=config.sem_join_default,
+            strategy=normalize_strategy(config.sem_join_strategy),
+            safe_mode=config.sem_join_safe_mode,
+            progress_bar_desc=config.sem_join_progress_bar_desc,
+        )
+        outputs = list(output.outputs)
+        raw_outputs = aligned_join_values(output, "raw_outputs", len(candidates), "")
+        explanations = aligned_join_values(
+            output,
+            "explanations",
+            len(candidates),
+            None,
+        )
     if len(outputs) != len(candidates):
         raise ValueError(
             "sem_join candidate verification returned an unexpected number of "
             f"outputs: expected {len(candidates)}, got {len(outputs)}"
         )
-    raw_outputs = aligned_join_values(output, "raw_outputs", len(candidates), "")
-    explanations = aligned_join_values(
-        output,
-        "explanations",
-        len(candidates),
-        None,
-    )
     write_selected_join_pair_trace(
         config.trace_dir(),
         candidates,
@@ -407,6 +451,47 @@ def verify_semantic_join_candidates(
         for index, (_row_index, row) in enumerate(candidates.iterrows())
         if bool(outputs[index])
     ]
+
+
+def _batch_prompt_join_instruction(
+    instruction: str,
+    *,
+    columns: Sequence[str],
+) -> str:
+    """Describe join fields already embedded in collapsed left/right records."""
+
+    from lotus.nl_expression import parse_cols
+
+    available = set(columns)
+    rendered = instruction
+    for column in parse_cols(instruction):
+        if column in available:
+            continue
+        if column.endswith(":left"):
+            description = f"the left row's {column[:-5]} field"
+        elif column.endswith(":right"):
+            description = f"the right row's {column[:-6]} field"
+        else:
+            continue
+        rendered = rendered.replace(f"{{{column}}}", description)
+    return rendered
+
+
+def _validate_prompt_batched_sem_join_config(config: LotusExecutionConfig) -> None:
+    unsupported: list[str] = []
+    if config.sem_join_examples is not None:
+        unsupported.append("examples")
+    if config.sem_join_strategy is not None:
+        unsupported.append("strategy")
+    if config.sem_join_default:
+        unsupported.append("default=True")
+    if config.sem_join_safe_mode:
+        unsupported.append("safe_mode")
+    if unsupported:
+        raise ValueError(
+            "prompt-batched sem_join does not support LOTUS options: "
+            + ", ".join(unsupported)
+        )
 
 
 def semantic_join_pair_candidates(

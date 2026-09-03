@@ -12,8 +12,6 @@ from typing import Any
 from agent_memory.adapters.lotus.pair_execution import (
     SEMANTIC_PAIR_EXECUTION_MODES,
 )
-
-
 @dataclass(frozen=True)
 class SemanticPairSiteBinding:
     """One user-selected physical profile for a semantic predicate site."""
@@ -55,7 +53,6 @@ class SemanticPairSiteBinding:
             raise ValueError("search-filter site bindings require a candidate bound")
         if self.mode == "proxy-only" and self.min_similarity is None:
             raise ValueError("proxy-only site bindings require min_similarity")
-
     def to_dict(self) -> dict[str, object]:
         """Return the canonical manifest representation."""
 
@@ -73,12 +70,13 @@ class SemanticPairProfileConfig:
 
     bindings: tuple[SemanticPairSiteBinding, ...]
     source_sha256: str
+    schema_version: int = 1
 
     def to_dict(self) -> dict[str, object]:
         """Return normalized provenance without the machine-local path."""
 
         return {
-            "schema_version": 1,
+            "schema_version": self.schema_version,
             "source_sha256": self.source_sha256,
             "bindings": [binding.to_dict() for binding in self.bindings],
         }
@@ -100,7 +98,8 @@ def load_semantic_pair_profile_config(path: Path) -> SemanticPairProfileConfig:
     if not isinstance(payload, dict):
         raise TypeError("semantic pair profile config must be a JSON object")
     _require_exact_keys(payload, {"schema_version", "bindings"}, "config")
-    if payload["schema_version"] != 1:
+    schema_version = payload["schema_version"]
+    if schema_version != 1:
         raise ValueError("semantic pair profile config schema_version must be 1")
     raw_bindings = payload["bindings"]
     if not isinstance(raw_bindings, list) or not raw_bindings:
@@ -111,11 +110,8 @@ def load_semantic_pair_profile_config(path: Path) -> SemanticPairProfileConfig:
     for index, item in enumerate(raw_bindings):
         if not isinstance(item, dict):
             raise TypeError(f"semantic pair binding {index} must be an object")
-        _require_exact_keys(
-            item,
-            {"site_id", "mode", "top_k", "min_similarity"},
-            f"binding {index}",
-        )
+        expected_keys = {"site_id", "mode", "top_k", "min_similarity"}
+        _require_exact_keys(item, expected_keys, f"binding {index}")
         site_id = item["site_id"]
         mode = item["mode"]
         if not isinstance(site_id, str) or not isinstance(mode, str):
@@ -134,6 +130,7 @@ def load_semantic_pair_profile_config(path: Path) -> SemanticPairProfileConfig:
     return SemanticPairProfileConfig(
         bindings=tuple(bindings),
         source_sha256=sha256(content).hexdigest(),
+        schema_version=schema_version,
     )
 
 

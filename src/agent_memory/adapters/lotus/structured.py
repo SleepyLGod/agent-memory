@@ -11,12 +11,20 @@ from pathlib import Path
 from typing import Any, Literal, TypeAlias
 from uuid import uuid4
 
+import json5
 import pandas as pd
 from lotus.cache import operator_cache
 
 from agent_memory.adapters.lotus.context import (
     DEFAULT_STRUCTURED_MAX_TOKENS,
     DEFAULT_STRUCTURED_PARSE_RETRIES,
+)
+from agent_memory.adapters.lotus.prompt_batching import (
+    ParsedPromptBatch,
+    PromptBatchItem,
+    PromptBatchRequest,
+    PromptBatching,
+    run_prompt_batches,
 )
 from agent_memory.tracing.semantic import write_structured_generation_trace
 from agent_memory.policy.logical import ColumnSpec, QueryExpr
@@ -26,6 +34,13 @@ FLAT_MAP_ROWS_FIELD = "rows"
 STRUCTURED_RESERVED_MODEL_KWARGS = {"progress_bar_desc", "response_format"}
 RAW_OUTPUT_PREVIEW_CHARS = 240
 STRUCTURED_FAILURE_DIR = Path(".memory-test") / "structured-failures" / "latest"
+STRUCTURED_BATCH_SYSTEM_PROMPT = (
+    "The user will provide several independent semantic operator tasks. Follow "
+    "each task's messages independently. Do not use one task as evidence for "
+    "another. Return every supplied task_id exactly once without changing or "
+    "inventing IDs. Put each task's requested JSON result in its output field. "
+    "Return only the requested JSON object."
+)
 PLACEHOLDER_PATTERN = re.compile(
     r"(?<!\{)\{([A-Za-z_][A-Za-z0-9_]*)(?::(left|right))?\}(?!\})"
 )
@@ -80,6 +95,20 @@ class StructuredLMRetryResult:
     raw_output_attempts: Sequence[Sequence[str]]
     invalid_indices: Sequence[int]
     failure_artifact_paths: Sequence[Path]
+
+
+@dataclass(frozen=True)
+class StructuredJsonResult:
+    """One decoded JSON value plus any safe syntax repair that was applied."""
+
+    value: Any
+    repair_method: str | None = None
+
+
+@dataclass(frozen=True)
+class _StructuredPromptTask:
+    task_id: str
+    prompt: list[dict[str, str]]
 
 
 def normalize_strategy(strategy: Any) -> Any:
@@ -386,6 +415,78 @@ def _load_structured_json(raw_output: str, *, operator: str, expected_shape: str
         ) from error
 
 
+def load_structured_json_with_syntax_repair(
+    raw_output: str,
+    *,
+    operator: str,
+    expected_shape: str,
+) -> StructuredJsonResult:
+    """Parse structured output while tolerating only complete JSON5 syntax."""
+
+    text = raw_output.strip()
+    try:
+        return StructuredJsonResult(_load_json_without_duplicate_keys(text))
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    candidate, fenced = _strip_json_code_fence(text)
+    try:
+        value = _load_json5_without_duplicate_keys(candidate)
+        method = "json5-code-fence" if fenced else "json5"
+        return StructuredJsonResult(value, method)
+    except ValueError as tolerant_error:
+        if candidate.endswith("}"):
+            try:
+                value = _load_json5_without_duplicate_keys(candidate[:-1])
+                method = "json5-extra-closing-brace"
+                if fenced:
+                    method += "-code-fence"
+                return StructuredJsonResult(value, method)
+            except ValueError:
+                pass
+        raise ValueError(
+            f"{operator} returned invalid JSON; expected {expected_shape}; "
+            f"raw_output={_preview_raw_output(raw_output)!r}"
+        ) from tolerant_error
+
+
+def _load_json_without_duplicate_keys(value: str) -> Any:
+    return json.loads(
+        value,
+        object_pairs_hook=_unique_json_object,
+        parse_constant=_reject_nonfinite_json_constant,
+    )
+
+
+def _load_json5_without_duplicate_keys(value: str) -> Any:
+    return json5.loads(
+        value,
+        allow_duplicate_keys=False,
+        consume_trailing=True,
+        parse_constant=_reject_nonfinite_json_constant,
+    )
+
+
+def _unique_json_object(pairs: Sequence[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON object key: {key!r}")
+        result[key] = value
+    return result
+
+
+def _reject_nonfinite_json_constant(value: str) -> Any:
+    raise ValueError(f"non-finite JSON value is not supported: {value}")
+
+
+def _strip_json_code_fence(value: str) -> tuple[str, bool]:
+    match = re.fullmatch(r"```(?:json)?[ \t]*\n(.*)\n```", value, flags=re.DOTALL)
+    if match is None:
+        return value, False
+    return match.group(1).strip(), True
+
+
 def _preview_raw_output(raw_output: str) -> str:
     """Return a bounded raw output preview for errors."""
 
@@ -457,6 +558,7 @@ class StructuredLMExecutor:
         structured_parse_retries: int = DEFAULT_STRUCTURED_PARSE_RETRIES,
         semantic_trace_dir: Any = None,
         operator: str = "sem_map",
+        prompt_batching: PromptBatching | None = None,
     ) -> StructuredGenerationResult:
         """Run a structured LOTUS-backed LM batch and parse JSON outputs."""
 
@@ -531,9 +633,60 @@ class StructuredLMExecutor:
             show_safe_mode(estimated_cost, len(prompts))
 
         current_max_tokens = int(getattr(lotus.settings.lm, "max_tokens", 512) or 512)
+        max_tokens = max(current_max_tokens, structured_max_tokens)
+        if prompt_batching is not None:
+            execution = _execute_structured_prompt_batches(
+                prompts,
+                model=lotus.settings.lm,
+                prompt_batching=prompt_batching,
+                output_cols=output_cols,
+                shape=shape,
+                require_explanation=require_explanation and shape == "object",
+                operator=operator,
+                max_tokens=max_tokens,
+                max_retries=structured_parse_retries,
+                progress_bar_desc=progress_bar_desc,
+                model_kwargs=model_kwargs,
+                trace_dir=semantic_trace_dir,
+            )
+            parsed_outputs = [output[0] for output in execution.outputs]
+            explanations = [output[1] for output in execution.outputs]
+            raw_outputs = [attempts[-1] for attempts in execution.raw_output_attempts]
+            audit_rows = structured_generation_audit_rows(
+                source=self._obj,
+                input_cols=input_cols,
+                output_cols=output_cols,
+                instruction=instruction,
+                formatted_instruction=formatted_instruction,
+                final_instruction=user_instruction,
+                raw_outputs=raw_outputs,
+                raw_output_attempts=execution.raw_output_attempts,
+                shape=shape,
+                require_explanation=require_explanation and shape == "object",
+                invalid_indices=(),
+                failure_artifact_paths=(),
+                operator=operator,
+                parsed_outputs_override=parsed_outputs,
+                syntax_repair_methods=execution.repair_methods,
+            )
+            write_structured_generation_trace(
+                semantic_trace_dir,
+                operator=operator,
+                rows=audit_rows,
+                snapshots={"input": self._obj.loc[:, list(input_cols)].copy()},
+            )
+            if safe_mode:
+                lotus.settings.lm.print_total_usage()
+            return StructuredGenerationResult(
+                parsed_outputs=tuple(parsed_outputs),
+                raw_outputs=tuple(raw_outputs),
+                explanations=tuple(explanations),
+                raw_output_attempts=execution.raw_output_attempts,
+            )
+
         lm_kwargs: dict[str, Any] = {
             "progress_bar_desc": progress_bar_desc,
-            "max_tokens": max(current_max_tokens, structured_max_tokens),
+            "max_tokens": max_tokens,
             **dict(model_kwargs),
             "response_format": {"type": "json_object"},
         }
@@ -595,6 +748,148 @@ class StructuredLMExecutor:
             explanations=explanations,
             raw_output_attempts=retry_result.raw_output_attempts,
         )
+
+
+def _execute_structured_prompt_batches(
+    prompts: Sequence[Any],
+    *,
+    model: Any,
+    prompt_batching: PromptBatching,
+    output_cols: Sequence[ColumnSpec],
+    shape: Literal["object", "array"],
+    require_explanation: bool,
+    operator: str,
+    max_tokens: int,
+    max_retries: int,
+    progress_bar_desc: str,
+    model_kwargs: Mapping[str, Any],
+    trace_dir: Any,
+) -> Any:
+    tasks = tuple(
+        _StructuredPromptTask(
+            task_id=f"task_{index}",
+            prompt=_text_prompt(prompt, operator=operator),
+        )
+        for index, prompt in enumerate(prompts)
+    )
+    return run_prompt_batches(
+        tasks,
+        task_id=lambda task: task.task_id,
+        build_request=lambda batch: _build_structured_prompt_batch_request(
+            batch,
+            max_tokens=max_tokens,
+        ),
+        parse_results=lambda raw_output: _parse_structured_prompt_batch(
+            raw_output,
+            output_cols=output_cols,
+            shape=shape,
+            require_explanation=require_explanation,
+            operator=operator,
+        ),
+        model=model,
+        config=prompt_batching,
+        max_retries=max_retries,
+        progress_bar_desc=progress_bar_desc,
+        operator=operator,
+        trace_dir=trace_dir,
+        model_kwargs=model_kwargs,
+    )
+
+
+def _text_prompt(prompt: Any, *, operator: str) -> list[dict[str, str]]:
+    if not isinstance(prompt, list) or any(
+        not isinstance(message, Mapping)
+        or not isinstance(message.get("role"), str)
+        or not isinstance(message.get("content"), str)
+        for message in prompt
+    ):
+        raise NotImplementedError(
+            f"prompt-batched {operator} currently supports text prompts only"
+        )
+    return [
+        {"role": str(message["role"]), "content": str(message["content"])}
+        for message in prompt
+    ]
+
+
+def _build_structured_prompt_batch_request(
+    tasks: tuple[_StructuredPromptTask, ...],
+    *,
+    max_tokens: int,
+) -> PromptBatchRequest:
+    payload = {
+        "tasks": [
+            {"task_id": task.task_id, "messages": task.prompt} for task in tasks
+        ],
+        "output_schema": {
+            "results": [{"task_id": "task_id", "output": {}}]
+        },
+    }
+    return PromptBatchRequest(
+        task_ids=tuple(task.task_id for task in tasks),
+        prompt=[
+            {"role": "system", "content": STRUCTURED_BATCH_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": json.dumps(payload, ensure_ascii=False),
+            },
+        ],
+        max_tokens=max_tokens,
+    )
+
+
+def _parse_structured_prompt_batch(
+    raw_output: str,
+    *,
+    output_cols: Sequence[ColumnSpec],
+    shape: Literal["object", "array"],
+    require_explanation: bool,
+    operator: str,
+) -> ParsedPromptBatch[tuple[Any, str | None]]:
+    decoded = load_structured_json_with_syntax_repair(
+        raw_output,
+        operator=f"prompt-batched {operator}",
+        expected_shape='JSON object with a "results" array',
+    )
+    payload = decoded.value
+    if not isinstance(payload, Mapping) or set(payload) != {"results"}:
+        raise ValueError(f"prompt-batched {operator} output must contain only results")
+    results = payload["results"]
+    if not isinstance(results, list):
+        raise ValueError(f"prompt-batched {operator} results must be a list")
+
+    items: list[PromptBatchItem[tuple[Any, str | None]]] = []
+    for result in results:
+        if not isinstance(result, Mapping) or set(result) != {"task_id", "output"}:
+            raise ValueError(
+                f"prompt-batched {operator} results require task_id and output"
+            )
+        identifier = result["task_id"]
+        output = result["output"]
+        if not isinstance(identifier, str):
+            raise ValueError(f"prompt-batched {operator} task_id must be a string")
+        if not isinstance(output, Mapping):
+            raise ValueError(f"prompt-batched {operator} output must be an object")
+        serialized = json.dumps(output, ensure_ascii=False)
+        if shape == "object":
+            parsed, explanation = parse_structured_object_json(
+                serialized,
+                output_cols,
+                require_explanation=require_explanation,
+                operator=operator,
+            )
+        else:
+            parsed = parse_structured_array_json(
+                serialized,
+                output_cols,
+                operator=operator,
+            )
+            explanation = None
+        items.append(PromptBatchItem(identifier, (parsed, explanation)))
+    return ParsedPromptBatch(
+        items=tuple(items),
+        repair_method=decoded.repair_method,
+    )
 
 
 def execute_structured_lm_with_retries(
@@ -743,6 +1038,8 @@ def structured_generation_audit_rows(
     invalid_indices: Sequence[int],
     failure_artifact_paths: Sequence[Path],
     operator: str,
+    parsed_outputs_override: Sequence[Any] | None = None,
+    syntax_repair_methods: Sequence[str | None] | None = None,
 ) -> list[dict[str, Any]]:
     """Build structured generation audit rows without mutating source data."""
 
@@ -764,6 +1061,8 @@ def structured_generation_audit_rows(
                 require_explanation=require_explanation,
                 operator=operator,
             )
+        elif parsed_outputs_override is not None:
+            parsed_output = parsed_outputs_override[index]
         else:
             parsed, _explanations = parse_structured_outputs(
                 [raw_output],
@@ -799,6 +1098,16 @@ def structured_generation_audit_rows(
                 "parsed_output": parsed_output,
                 "parse_error": parse_error,
                 "failure_artifact": artifact_by_index.get(index, ""),
+                "structured_output_repaired": bool(
+                    syntax_repair_methods
+                    and index < len(syntax_repair_methods)
+                    and syntax_repair_methods[index]
+                ),
+                "structured_output_repair_method": (
+                    syntax_repair_methods[index]
+                    if syntax_repair_methods and index < len(syntax_repair_methods)
+                    else None
+                ),
             }
         )
     return rows

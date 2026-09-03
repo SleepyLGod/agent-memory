@@ -8,6 +8,7 @@ import math
 import os
 from pathlib import Path
 import re
+from typing import Any
 
 from .agent_memory_drivers import (
     ClaudeMemoryDriverFactory,
@@ -27,8 +28,10 @@ from agent_memory.adapters.lotus.pair_execution import (
 from agent_memory.adapters.lotus.context import (
     LOTUS_MEMORY_CACHE_ID,
     LOTUS_MEMORY_CACHE_MAX_SIZE,
+    SEM_AGG_DISPATCH_METHODS,
     SEM_JOIN_TOPK_METHODS,
 )
+from agent_memory.adapters.lotus.prompt_batching import PromptBatching
 from .artifacts import BenchmarkArtifactStore
 from .bundle import BenchmarkBundle
 from .harness import BenchmarkRunner, MemorySystemContract, TaskContract
@@ -103,6 +106,8 @@ def run_agent_memory_bundle(
     sem_join_topk_method: str | None = None,
     sem_groupby_pair_batch_size: int | None = None,
     sem_groupby_pair_batch_retries: int = 0,
+    sem_agg_dispatch: str = "sequential",
+    prompt_batching: PromptBatching | None = None,
     semantic_pair_profile: str = "oracle-only",
     semantic_pair_top_k: int | None = None,
     semantic_pair_min_similarity: float | None = None,
@@ -110,6 +115,7 @@ def run_agent_memory_bundle(
     lotus_cache_mode: str = "disabled",
     embedding_device: str = "cpu",
     semantic_trace_snapshot_mode: str = "compact",
+    refresh_every: int = 1,
     memory_thinking_enabled: bool = True,
     condition_id: str = "",
     maintenance_only: bool = False,
@@ -120,10 +126,34 @@ def run_agent_memory_bundle(
 
     if system_id not in AGENT_MEMORY_SYSTEMS:
         raise ValueError(f"unsupported agent-memory benchmark system {system_id!r}")
+    if (
+        isinstance(refresh_every, bool)
+        or not isinstance(refresh_every, int)
+        or refresh_every < 1
+    ):
+        raise ValueError("refresh_every must be a positive integer")
     if sem_groupby_pair_batch_size is not None and sem_groupby_pair_batch_size < 1:
         raise ValueError("sem_groupby_pair_batch_size must be positive")
     if sem_groupby_pair_batch_retries < 0:
         raise ValueError("sem_groupby_pair_batch_retries cannot be negative")
+    if sem_agg_dispatch not in SEM_AGG_DISPATCH_METHODS:
+        raise ValueError(
+            "sem_agg_dispatch must be one of: "
+            + ", ".join(SEM_AGG_DISPATCH_METHODS)
+        )
+    if prompt_batching is not None and not isinstance(
+        prompt_batching, PromptBatching
+    ):
+        raise TypeError("prompt_batching must be PromptBatching or None")
+    if prompt_batching is not None and sem_agg_dispatch != "sequential":
+        raise ValueError(
+            "prompt_batching cannot be combined with sem_agg_dispatch"
+        )
+    if prompt_batching is not None and sem_groupby_pair_batch_size is not None:
+        raise ValueError(
+            "prompt_batching cannot be combined with "
+            "sem_groupby_pair_batch_size"
+        )
     if (
         sem_join_topk_method is not None
         and sem_join_topk_method not in SEM_JOIN_TOPK_METHODS
@@ -325,6 +355,17 @@ def run_agent_memory_bundle(
                 if uses_sem_join_topk
                 else ""
             ),
+            (
+                f"sem-agg-dispatch:{sem_agg_dispatch}"
+                if sem_agg_dispatch != "sequential"
+                else ""
+            ),
+            (
+                f"prompt-batching:{prompt_batching.fingerprint}"
+                if prompt_batching is not None
+                else ""
+            ),
+            f"refresh:count:{refresh_every}" if refresh_every > 1 else "",
             f"lotus-cache:{LOTUS_MEMORY_CACHE_ID}"
             if lotus_cache_mode == "memory"
             else "",
@@ -367,6 +408,11 @@ def run_agent_memory_bundle(
             ),
         ),
     )
+    if refresh_every > 1:
+        runtime_provenance["runtime"]["refresh"] = {
+            "type": "count",
+            "every": refresh_every,
+        }
     lotus_execution_provenance = {
         "sem_groupby_pair_batch_size": sem_groupby_pair_batch_size,
         "sem_groupby_pair_batch_retries": sem_groupby_pair_batch_retries,
@@ -386,6 +432,16 @@ def run_agent_memory_bundle(
             for digest, profile in sorted(semantic_pair_profiles.items())
         },
     }
+    if sem_agg_dispatch != "sequential":
+        lotus_execution_provenance.update(
+            {
+                "sem_agg_dispatch": sem_agg_dispatch,
+            }
+        )
+    if prompt_batching is not None:
+        lotus_execution_provenance["prompt_batching"] = (
+            prompt_batching.to_dict()
+        )
     if site_profile_config is not None:
         lotus_execution_provenance.update(
             {
@@ -458,6 +514,21 @@ def run_agent_memory_bundle(
         framework_cache_mode=framework_cache_mode,
         checkpoint_enabled=True,
     )
+    sem_agg_execution_options = (
+        {
+            "sem_agg_dispatch": sem_agg_dispatch,
+        }
+        if sem_agg_dispatch != "sequential"
+        else {}
+    )
+    prompt_batching_options = (
+        {"prompt_batching": prompt_batching}
+        if prompt_batching is not None
+        else {}
+    )
+    refresh_execution_options: dict[str, Any] = {}
+    if refresh_every > 1:
+        refresh_execution_options["refresh_every"] = refresh_every
     if system_id == "claude-memory":
         driver_factory = ClaudeMemoryDriverFactory(
             model_id=memory_provider_model_id,
@@ -469,6 +540,9 @@ def run_agent_memory_bundle(
             semantic_trace_snapshot_mode=semantic_trace_snapshot_mode,
             lotus_cache_mode=lotus_cache_mode,
             thinking_enabled=memory_thinking_enabled,
+            **sem_agg_execution_options,
+            **prompt_batching_options,
+            **refresh_execution_options,
         )
     elif system_id == "zep-memory":
         driver_factory = ZepMemoryDriverFactory.from_environment(
@@ -483,6 +557,9 @@ def run_agent_memory_bundle(
             semantic_trace_snapshot_mode=semantic_trace_snapshot_mode,
             lotus_cache_mode=lotus_cache_mode,
             thinking_enabled=memory_thinking_enabled,
+            **sem_agg_execution_options,
+            **prompt_batching_options,
+            **refresh_execution_options,
         )
     elif system_id == "mem0-memory":
         driver_factory = Mem0MemoryDriverFactory(
@@ -495,6 +572,9 @@ def run_agent_memory_bundle(
             semantic_trace_snapshot_mode=semantic_trace_snapshot_mode,
             lotus_cache_mode=lotus_cache_mode,
             thinking_enabled=memory_thinking_enabled,
+            **sem_agg_execution_options,
+            **prompt_batching_options,
+            **refresh_execution_options,
         )
     else:
         driver_factory = Mem0MemoryEnhancedDriverFactory(
@@ -508,6 +588,9 @@ def run_agent_memory_bundle(
             semantic_trace_snapshot_mode=semantic_trace_snapshot_mode,
             lotus_cache_mode=lotus_cache_mode,
             thinking_enabled=memory_thinking_enabled,
+            **sem_agg_execution_options,
+            **prompt_batching_options,
+            **refresh_execution_options,
         )
     try:
         storage_provenance = (

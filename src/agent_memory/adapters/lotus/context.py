@@ -10,6 +10,7 @@ from typing import Any
 from agent_memory.adapters.lotus.pair_execution import (
     SemanticPairExecutionProfile,
 )
+from agent_memory.adapters.lotus.prompt_batching import PromptBatching
 from agent_memory.adapters.lotus.provider_usage_lm import provider_usage_tracing_lm_class
 from agent_memory.adapters.lotus.traced_lm import TracedLM
 from agent_memory.storage.embedding import EmbeddingProvider
@@ -25,6 +26,7 @@ SEM_TOPK_METHODS = (
     "listwise",
 )
 SEM_JOIN_TOPK_METHODS = SEM_TOPK_METHODS
+SEM_AGG_DISPATCH_METHODS = ("sequential", "provider-batched")
 _LM_OWNED_KWARGS = {
     "cache",
     "max_batch_size",
@@ -52,6 +54,7 @@ class LotusExecutionConfig:
     semantic_pair_profiles: Mapping[str, SemanticPairExecutionProfile] = field(
         default_factory=dict
     )
+    prompt_batching: PromptBatching | None = None
 
     sem_filter_examples: Sequence[Mapping[str, Any]] | None = None
     sem_filter_helper_examples: Sequence[Mapping[str, Any]] | None = None
@@ -91,9 +94,30 @@ class LotusExecutionConfig:
     sem_agg_safe_mode: bool = False
     sem_agg_progress_bar_desc: str = "Aggregating"
     sem_agg_model_kwargs: Mapping[str, Any] = field(default_factory=dict)
+    sem_agg_dispatch: str = "sequential"
 
     def __post_init__(self) -> None:
         """Validate bounded semantic execution settings."""
+
+        if self.prompt_batching is not None and not isinstance(
+            self.prompt_batching, PromptBatching
+        ):
+            raise TypeError("prompt_batching must be PromptBatching or None")
+        if (
+            self.prompt_batching is not None
+            and self.sem_agg_dispatch != "sequential"
+        ):
+            raise ValueError(
+                "prompt_batching cannot be combined with sem_agg_dispatch"
+            )
+        if (
+            self.prompt_batching is not None
+            and self.sem_groupby_pair_batch_size is not None
+        ):
+            raise ValueError(
+                "prompt_batching cannot be combined with "
+                "sem_groupby_pair_batch_size"
+            )
 
         if (
             self.sem_groupby_pair_batch_size is not None
@@ -110,6 +134,11 @@ class LotusExecutionConfig:
             raise ValueError(
                 "sem_join_topk_method must be one of: "
                 + ", ".join(SEM_JOIN_TOPK_METHODS)
+            )
+        if self.sem_agg_dispatch not in SEM_AGG_DISPATCH_METHODS:
+            raise ValueError(
+                "sem_agg_dispatch must be one of: "
+                + ", ".join(SEM_AGG_DISPATCH_METHODS)
             )
         for query_digest, profile in self.semantic_pair_profiles.items():
             if not isinstance(query_digest, str) or not query_digest:

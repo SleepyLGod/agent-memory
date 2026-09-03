@@ -1831,7 +1831,7 @@ def test_differential_query_planner_supports_group_by_sem_agg_re_group_rule() ->
     assert differentiated.params["columns"] == ("topic", "summary")
     final_aggregate = differentiated.inputs[0]
     assert final_aggregate.op == "sem_agg"
-    assert final_aggregate.params["input_cols"] is None
+    assert final_aggregate.params["input_cols"] == ("summary",)
     assert final_aggregate.inputs[0].op == "group_by"
     combined = final_aggregate.inputs[0].inputs[0]
     assert combined.op == "union_by_name"
@@ -1876,7 +1876,7 @@ def test_differential_query_planner_supports_group_by_mixed_agg_re_group_rule() 
     final_aggregate = flattened.inputs[0]
     assert final_aggregate.op == "agg"
     semantic_spec, collect_spec, min_spec = final_aggregate.params["aggregates"]
-    assert semantic_spec.input_cols is None
+    assert semantic_spec.input_cols == ("summary",)
     assert semantic_spec.instruction == "Summarize body."
     assert collect_spec.column == "evidence"
     assert collect_spec.output_col == "evidence"
@@ -1887,6 +1887,34 @@ def test_differential_query_planner_supports_group_by_mixed_agg_re_group_rule() 
     combined = final_aggregate.inputs[0].inputs[0]
     assert combined.op == "concat"
     assert combined.inputs[1].op == "agg"
+
+
+def test_re_group_reaggregates_each_semantic_state_from_its_own_outputs() -> None:
+    class TopicStateMemory(am.Memory):
+        log = am.Log({"topic": "Topic.", "body": "Evidence body."})
+        summaries = log.group_by("topic").agg(
+            am.sem_agg(
+                input_cols=["body"],
+                output_cols={"summary": "Topic summary."},
+                instruction="Summarize {body} as {summary}.",
+            ),
+            am.sem_agg(
+                input_cols=["body"],
+                output_cols={"keywords": "Topic keywords."},
+                instruction="Extract keywords from {body} as {keywords}.",
+            ),
+        )
+
+    differentiated = QueryDifferentiator(
+        rules=DifferentialRules(grouped_agg_rule="rule-re-group"),
+    ).differentiate(TopicStateMemory.spec().views["summaries"])
+
+    final_aggregate = differentiated.inputs[0]
+    summary_spec, keyword_spec = final_aggregate.params["aggregates"]
+    assert summary_spec.input_cols == ("summary",)
+    assert summary_spec.instruction == "Summarize body as {summary}."
+    assert keyword_spec.input_cols == ("keywords",)
+    assert keyword_spec.instruction == "Extract keywords from body as {keywords}."
 
 
 def test_differential_query_planner_supports_group_by_mixed_agg_join_map_rule() -> None:

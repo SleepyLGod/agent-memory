@@ -12,6 +12,7 @@ version = "0.0.1"
 source = { editable = "." }
 dependencies = [
     { name = "dspy" },
+    { name = "json5" },
     { name = "lotus-ai" },
     { name = "nltk" },
     { name = "pandas" },
@@ -48,6 +49,7 @@ dev = [
 requires-dist = [
     { name = "dspy", specifier = ">=3.2.0" },
     { name = "editdistance", marker = "extra == 'benchmarks'", specifier = ">=0.8.1" },
+    { name = "json5", specifier = ">=0.14.0" },
     { name = "lotus-ai", specifier = "==1.1.4" },
     { name = "neo4j", marker = "extra == 'zep'", specifier = "==6.1.0" },
     { name = "nltk", specifier = ">=3.9.1" },

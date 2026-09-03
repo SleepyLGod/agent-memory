@@ -194,6 +194,7 @@ class _Driver:
     fail_event_id: str | None = None
     fail_finish: bool = False
     restored_event_ids: tuple[str, ...] = ()
+    flush_count: int = 0
 
     def __post_init__(self) -> None:
         self.events = []
@@ -222,6 +223,10 @@ class _Driver:
         if self.fail_finish:
             raise RuntimeError("consolidation failed")
         return {"session_id": session_id}
+
+    def flush(self) -> dict[str, int]:
+        self.flush_count += 1
+        return {"flushed": self.flush_count}
 
     def close(self) -> None:
         self.closed = True
@@ -1426,6 +1431,55 @@ def _session_bundle() -> BenchmarkBundle:
         questions=(BenchmarkQuestion("q1", "case-1", "first?", "one", ()),),
     )
     return BenchmarkBundle("benchmark", "revision", "sha", (case,))
+
+
+def test_runner_flushes_once_after_the_last_event_before_final_checkpoint(
+    tmp_path: Path,
+) -> None:
+    operations: list[str] = []
+
+    class RecordingDriver(_Driver):
+        def add(self, event: BenchmarkEvent) -> dict[str, int]:
+            operations.append(f"add:{event.event_id}")
+            return super().add(event)
+
+        def finish_session(self, session_id: str) -> dict[str, str]:
+            operations.append(f"finish:{session_id}")
+            return super().finish_session(session_id)
+
+        def flush(self) -> dict[str, int]:
+            operations.append("flush")
+            return super().flush()
+
+        def save_state(self, directory: Path) -> dict[str, Any]:
+            operations.append("checkpoint")
+            return super().save_state(directory)
+
+    drivers: list[RecordingDriver] = []
+    runner = BenchmarkRunner(
+        system_contract=_system_contract(),
+        contracts={"task-1": _contract()},
+        driver_factory=lambda case_id, state_dir, trace_dir: drivers.append(
+            RecordingDriver(state_dir)
+        )
+        or drivers[-1],
+        answer_model=_Model(),
+        judge_model=_Model(),
+        artifacts=BenchmarkArtifactStore(tmp_path),
+        maintenance_only=True,
+    )
+
+    runner.run(_session_bundle())
+
+    assert drivers[0].flush_count == 1
+    assert operations.count("flush") == 1
+    assert operations.index("finish:session-1") < operations.index("flush")
+    assert operations.index("add:event-4") < operations.index("flush")
+    assert operations.index("flush") < len(operations) - 1
+    assert operations[operations.index("flush") + 1 :] == [
+        "finish:session-2",
+        "checkpoint",
+    ]
 
 
 def test_session_checkpoint_resumes_without_readding_completed_session(

@@ -19,7 +19,9 @@ from agent_memory.adapters.lotus.sem_agg import (
     aggregate_groups_with_keys,
     aggregate_input_columns,
     execute_native_sem_agg_group,
+    execute_native_sem_agg_groups,
     execute_structured_sem_agg_group,
+    execute_structured_sem_agg_groups,
 )
 from agent_memory.policy.expressions import (
     ArrayCatExpr,
@@ -129,8 +131,12 @@ def execute_union_by_name(
     if not isinstance(allow_missing, bool):
         raise TypeError("union_by_name allow_missing_columns must be a bool")
     columns = _union_by_name_columns(left, right, allow_missing_columns=allow_missing)
-    left_aligned = _align_columns_by_name(left, columns, allow_missing_columns=allow_missing)
-    right_aligned = _align_columns_by_name(right, columns, allow_missing_columns=allow_missing)
+    left_aligned = _align_columns_by_name(
+        left, columns, allow_missing_columns=allow_missing
+    )
+    right_aligned = _align_columns_by_name(
+        right, columns, allow_missing_columns=allow_missing
+    )
     concatenated = _concat_rows(left_aligned, right_aligned)
     return concatenated.drop_duplicates(ignore_index=True)
 
@@ -328,7 +334,9 @@ def execute_array_agg(
         raise ValueError(f"array_agg input columns not found in DataFrame: {missing}")
 
     records = _strict_json_records(source, columns)
-    value = json.dumps(records, ensure_ascii=False, default=_json_default, allow_nan=False)
+    value = json.dumps(
+        records, ensure_ascii=False, default=_json_default, allow_nan=False
+    )
     return pd.DataFrame([{output_col: value}], columns=[output_col])
 
 
@@ -345,13 +353,17 @@ def execute_grouped_array_agg(
     output_col = str(query.params["output_col"])
     missing = [column for column in columns if column not in source.columns]
     if missing:
-        raise ValueError(f"grouped array_agg input columns not found in DataFrame: {missing}")
+        raise ValueError(
+            f"grouped array_agg input columns not found in DataFrame: {missing}"
+        )
 
     if group_query.op == "group_by":
         group_keys = tuple(str(key) for key in group_query.params["keys"])
         missing_keys = [key for key in group_keys if key not in source.columns]
         if missing_keys:
-            raise ValueError(f"group_by key columns not found in DataFrame: {missing_keys}")
+            raise ValueError(
+                f"group_by key columns not found in DataFrame: {missing_keys}"
+            )
         return _array_agg_by_keys(
             source,
             group_keys=group_keys,
@@ -381,9 +393,7 @@ def execute_min(
     missing = [column for column in columns if column not in source.columns]
     if missing:
         if len(missing) == 1:
-            raise ValueError(
-                f"min input column not found in DataFrame: {missing[0]!r}"
-            )
+            raise ValueError(f"min input column not found in DataFrame: {missing[0]!r}")
         raise ValueError(f"min input columns not found in DataFrame: {missing}")
 
     if source_query.op == "group_by":
@@ -424,15 +434,29 @@ def execute_agg(
         raise ValueError("agg expects group_by or sem_groupby input")
     if source.empty:
         return pd.DataFrame(columns=list(output_columns(query)))
+    if (
+        context.config.sem_agg_dispatch != "sequential"
+        or context.config.prompt_batching is not None
+    ):
+        return _execute_agg_with_group_batching(
+            query,
+            source,
+            aggregates,
+            context=context,
+        )
 
     rows: list[dict[str, Any]] = []
-    for group_index, (key_values, group) in enumerate(aggregate_groups_with_keys(source)):
+    for group_index, (key_values, group) in enumerate(
+        aggregate_groups_with_keys(source)
+    ):
         row: dict[str, Any] = dict(key_values)
         for aggregate in aggregates:
             if isinstance(aggregate, ArrayAggregateSpec):
                 if aggregate.output_col in row:
                     continue
-                row[aggregate.output_col] = _array_records_json(group, aggregate.columns)
+                row[aggregate.output_col] = _array_records_json(
+                    group, aggregate.columns
+                )
                 continue
             if isinstance(aggregate, CollectListAggregateSpec):
                 if aggregate.output_col in row:
@@ -449,8 +473,7 @@ def execute_agg(
                 ]
                 if missing:
                     raise ValueError(
-                        "min input columns not found in aggregate group: "
-                        f"{missing}"
+                        f"min input columns not found in aggregate group: {missing}"
                     )
                 row[aggregate.output_col] = _minimum_value(group, aggregate.columns)
                 continue
@@ -475,6 +498,111 @@ def execute_agg(
                 dtype=object,
             )
     return result
+
+
+def _execute_agg_with_group_batching(
+    query: QueryExpr,
+    source: pd.DataFrame,
+    aggregates: Sequence[object],
+    *,
+    context: Any,
+) -> pd.DataFrame:
+    """Execute semantic aggregate specs across independent groups in batches."""
+
+    grouped = aggregate_groups_with_keys(source)
+    groups = [group for _key_values, group in grouped]
+    rows = [dict(key_values) for key_values, _group in grouped]
+    for aggregate in aggregates:
+        if isinstance(aggregate, SemanticAggregateSpec):
+            semantic_values = _execute_grouped_semantic_aggregate_spec_many(
+                aggregate,
+                groups,
+                context=context,
+            )
+            for row, values in zip(rows, semantic_values, strict=True):
+                for column, value in values.items():
+                    if column not in row:
+                        row[column] = value
+            continue
+        for row, group in zip(rows, groups, strict=True):
+            _apply_deterministic_aggregate(aggregate, group, row)
+
+    result = pd.DataFrame(rows, columns=list(output_columns(query)))
+    for aggregate in aggregates:
+        if isinstance(aggregate, MinAggregateSpec):
+            result[aggregate.output_col] = pd.Series(
+                [row.get(aggregate.output_col) for row in rows],
+                dtype=object,
+            )
+    return result
+
+
+def _apply_deterministic_aggregate(
+    aggregate: object,
+    group: pd.DataFrame,
+    row: dict[str, Any],
+) -> None:
+    """Apply one non-semantic aggregate spec to one grouped frame."""
+
+    if isinstance(aggregate, ArrayAggregateSpec):
+        if aggregate.output_col not in row:
+            row[aggregate.output_col] = _array_records_json(group, aggregate.columns)
+        return
+    if isinstance(aggregate, CollectListAggregateSpec):
+        if aggregate.output_col not in row:
+            row[aggregate.output_col] = _collect_list_json(group, aggregate.column)
+        return
+    if isinstance(aggregate, MinAggregateSpec):
+        if aggregate.output_col in row:
+            return
+        missing = [
+            column for column in aggregate.columns if column not in group.columns
+        ]
+        if missing:
+            raise ValueError(
+                f"min input columns not found in aggregate group: {missing}"
+            )
+        row[aggregate.output_col] = _minimum_value(group, aggregate.columns)
+        return
+    raise TypeError(f"Unsupported aggregate spec: {type(aggregate).__name__}")
+
+
+def _execute_grouped_semantic_aggregate_spec_many(
+    aggregate: SemanticAggregateSpec,
+    groups: Sequence[pd.DataFrame],
+    *,
+    context: Any,
+) -> list[dict[str, Any]]:
+    """Execute one semantic aggregate spec over independent grouped frames."""
+
+    if not groups:
+        return []
+    query = QueryExpr(
+        op="sem_agg",
+        params={
+            "input_cols": aggregate.input_cols,
+            "output_cols": aggregate.output_cols,
+            "instruction": aggregate.instruction,
+        },
+    )
+    input_cols = aggregate_input_columns(groups[0], query.params.get("input_cols"))
+    if len(aggregate.output_cols) == 1:
+        output_col = aggregate.output_cols[0]
+        values = execute_native_sem_agg_groups(
+            query,
+            groups,
+            input_cols,
+            context.config,
+        )
+        return [{output_col.name: value} for value in values]
+    parsed = execute_structured_sem_agg_groups(
+        query,
+        groups,
+        input_cols,
+        aggregate.output_cols,
+        context.config,
+    )
+    return [dict(values) for values in parsed]
 
 
 def _execute_grouped_semantic_aggregate_spec(
@@ -527,13 +655,21 @@ def execute_over_array_agg(
     )
     columns = tuple(str(column) for column in query.params["columns"])
     output_col = str(query.params["output_col"])
-    emit_columns = tuple(output_columns(over_query.inputs[0])) or tuple(emit_source.columns)
+    emit_columns = tuple(output_columns(over_query.inputs[0])) or tuple(
+        emit_source.columns
+    )
     missing = [column for column in columns if column not in frame_source.columns]
     if missing:
-        raise ValueError(f"over array_agg input columns not found in DataFrame: {missing}")
-    missing_emit = [column for column in emit_columns if column not in emit_source.columns]
+        raise ValueError(
+            f"over array_agg input columns not found in DataFrame: {missing}"
+        )
+    missing_emit = [
+        column for column in emit_columns if column not in emit_source.columns
+    ]
     if missing_emit:
-        raise ValueError(f"over array_agg emit columns not found in DataFrame: {missing_emit}")
+        raise ValueError(
+            f"over array_agg emit columns not found in DataFrame: {missing_emit}"
+        )
 
     rows: list[dict[str, Any]] = []
     for frame in over_frames(emit_source, frame_source, over_query.params):
@@ -640,7 +776,9 @@ def execute_unnest(
     expected_columns = list(output_columns(query))
     source = execute(query.inputs[0], inputs).copy()
     column = str(query.params["column"])
-    fields = tuple((str(field), str(output)) for field, output in query.params["fields"])
+    fields = tuple(
+        (str(field), str(output)) for field, output in query.params["fields"]
+    )
     if column not in source.columns:
         raise ValueError(f"unnest input column not found in DataFrame: {column!r}")
 
@@ -648,7 +786,9 @@ def execute_unnest(
     output_names = [output for _, output in fields]
     conflicts = sorted(set(parent_columns).intersection(output_names))
     if conflicts:
-        raise ValueError(f"unnest output columns conflict with existing columns: {conflicts}")
+        raise ValueError(
+            f"unnest output columns conflict with existing columns: {conflicts}"
+        )
 
     output_rows: list[dict[str, Any]] = []
     for _, row in source.iterrows():
@@ -750,7 +890,9 @@ def _require_supported_join_how(how: str) -> None:
     """Require a pandas relational join mode supported by the public API."""
 
     if how not in {"inner", "left", "right", "outer", "left_anti"}:
-        raise ValueError("join how must be one of: inner, left, right, outer, left_anti")
+        raise ValueError(
+            "join how must be one of: inner, left, right, outer, left_anti"
+        )
 
 
 def _is_predicate_join(on: tuple[Any, ...]) -> bool:
@@ -1055,8 +1197,7 @@ def _evaluate_least(expr: LeastExpr, frame: Any) -> pd.Series:
             values.append(min(candidates))
         except TypeError as exc:
             raise TypeError(
-                "least operands are not mutually comparable at row position "
-                f"{position}"
+                f"least operands are not mutually comparable at row position {position}"
             ) from exc
     return pd.Series(values, index=frame.index)
 
@@ -1107,7 +1248,9 @@ def _array_agg_by_keys(
         )
     output_rows: list[dict[str, Any]] = []
     if source.empty:
-        return pd.DataFrame(columns=[*group_keys, output_col] if include_keys else [output_col])
+        return pd.DataFrame(
+            columns=[*group_keys, output_col] if include_keys else [output_col]
+        )
 
     grouped = source.groupby(list(group_keys), sort=False, dropna=False)
     for key, group in grouped:
@@ -1193,7 +1336,9 @@ def _load_json_array(value: Any, *, op: str, column: str) -> list[Any]:
     try:
         parsed = json.loads(value)
     except (TypeError, json.JSONDecodeError) as error:
-        raise ValueError(f"{op} value in column {column!r} must be a JSON array") from error
+        raise ValueError(
+            f"{op} value in column {column!r} must be a JSON array"
+        ) from error
     if not isinstance(parsed, list):
         raise ValueError(f"{op} value in column {column!r} must be a JSON array")
     return parsed
@@ -1215,7 +1360,9 @@ def _load_json_object(value: Any, *, op: str, column: str) -> dict[str, Any]:
     try:
         parsed = json.loads(value)
     except (TypeError, json.JSONDecodeError) as error:
-        raise ValueError(f"{op} value in column {column!r} must be a JSON object") from error
+        raise ValueError(
+            f"{op} value in column {column!r} must be a JSON object"
+        ) from error
     if not isinstance(parsed, dict):
         raise ValueError(f"{op} value in column {column!r} must be a JSON object")
     return parsed
@@ -1232,10 +1379,14 @@ def _require_join_keys(left: Any, right: Any, keys: tuple[str, ...]) -> None:
             details.append(f"left missing {missing_left}")
         if missing_right:
             details.append(f"right missing {missing_right}")
-        raise ValueError(f"join key columns must exist on both sides: {', '.join(details)}")
+        raise ValueError(
+            f"join key columns must exist on both sides: {', '.join(details)}"
+        )
 
 
-def _require_non_null_join_keys(frame: Any, keys: tuple[str, ...], *, side: str) -> None:
+def _require_non_null_join_keys(
+    frame: Any, keys: tuple[str, ...], *, side: str
+) -> None:
     """Reject null join keys to avoid pandas null-null matching surprises."""
 
     if frame.loc[:, list(keys)].isna().any().any():

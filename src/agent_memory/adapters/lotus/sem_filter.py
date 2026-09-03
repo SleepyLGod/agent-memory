@@ -16,6 +16,10 @@ from agent_memory.adapters.lotus.pair_execution import (
     select_semantic_pair_candidates,
     write_semantic_pair_execution_trace,
 )
+from agent_memory.adapters.lotus.sem_filter_batch_prompting import (
+    execute_batch_prompted_sem_filter,
+    validate_batch_prompting_sem_filter_config,
+)
 from agent_memory.tracing.semantic import (
     query_digest,
     semantic_trace_scope,
@@ -40,6 +44,10 @@ def execute_sem_filter(
 
     digest = query_digest(query)
     profile = context.config.semantic_pair_profiles.get(digest)
+    prompt_batching = context.config.prompt_batching
+    batch_prompting = prompt_batching is not None
+    if batch_prompting:
+        validate_batch_prompting_sem_filter_config(context.config)
     if profile is not None and profile.mode in {"search-filter", "proxy-only"}:
         if (
             profile.mode == "proxy-only"
@@ -75,10 +83,28 @@ def execute_sem_filter(
         oracle_source,
         str(query.params["instruction"]),
     )
+    prompt_count: int | None = 0 if batch_prompting else None
+    prompt_retry_count: int | None = (
+        0 if batch_prompting else None
+    )
+    verified_tuple_count: int | None = (
+        len(lotus_source) if batch_prompting else None
+    )
     if profile is not None and profile.mode == "proxy-only":
         result = lotus_source.copy()
     elif selection is not None and lotus_source.empty:
         result = lotus_source.copy()
+    elif batch_prompting:
+        assert prompt_batching is not None
+        prompted = execute_batch_prompted_sem_filter(
+            lotus_source,
+            instruction=instruction,
+            context=context,
+            prompt_batching=prompt_batching,
+        )
+        result = prompted.frame
+        prompt_count = prompted.prompt_count
+        prompt_retry_count = prompted.retry_count
     else:
         result = lotus_source.sem_filter(
             instruction,
@@ -96,25 +122,36 @@ def execute_sem_filter(
             instruction=str(query.params["instruction"]),
             profile=profile,
         )
+        trace_payload: dict[str, Any] = {
+            "instruction": str(query.params["instruction"]),
+            "lowered_instruction": instruction,
+            "semantic_pair_profile": (
+                "oracle-only" if profile is None else profile.mode
+            ),
+            "semantic_pair_profile_fingerprint": (
+                None if profile is None else profile.fingerprint
+            ),
+            "candidate_pair_count": (
+                None if selection is None else selection.candidate_pair_count
+            ),
+        }
+        if prompt_batching is not None:
+            trace_payload.update(
+                {
+                    "prompt_batching": prompt_batching.to_dict(),
+                    "prompt_batching_fingerprint": prompt_batching.fingerprint,
+                    "verification_prompt_count": prompt_count,
+                    "verification_retry_count": prompt_retry_count,
+                    "verified_tuple_count": verified_tuple_count,
+                }
+            )
         write_compact_operator_trace(
             context.config.trace_dir(),
             operator="sem_filter",
             event_type="operator_result",
             input_frame=source,
             output_frame=result,
-            payload={
-                "instruction": str(query.params["instruction"]),
-                "lowered_instruction": instruction,
-                "semantic_pair_profile": (
-                    "oracle-only" if profile is None else profile.mode
-                ),
-                "semantic_pair_profile_fingerprint": (
-                    None if profile is None else profile.fingerprint
-                ),
-                "candidate_pair_count": (
-                    None if selection is None else selection.candidate_pair_count
-                ),
-            },
+            payload=trace_payload,
         )
     return result
 

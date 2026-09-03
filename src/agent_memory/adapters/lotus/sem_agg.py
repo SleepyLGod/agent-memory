@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 import json
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,10 @@ from agent_memory.adapters.lotus.context import (
 )
 from agent_memory.tracing.semantic import write_structured_generation_trace
 from agent_memory.adapters.lotus.sem_groupby import GROUP_ID_COLUMN
+from agent_memory.adapters.lotus.sem_agg_batch_prompting import (
+    execute_batch_prompted_sem_agg,
+)
+from agent_memory.adapters.lotus.prompt_batching import PromptBatching
 from agent_memory.adapters.lotus.structured import (
     StructuredLMRetryResult,
     escape_structured_formatter_placeholders,
@@ -29,6 +34,24 @@ from agent_memory.policy.schema import output_columns
 from agent_memory.runtime.window import over_frames
 
 JSON_OBJECT_RESPONSE_FORMAT = {"type": "json_object"}
+
+
+@dataclass(frozen=True)
+class _SemAggExecution:
+    """Final output and structured retry metadata for one aggregate group."""
+
+    raw_output: str
+    retry_result: StructuredLMRetryResult | None = None
+
+
+@dataclass
+class _SemAggGroupState:
+    """Mutable hierarchical state for one independent aggregate group."""
+
+    group_index: int
+    documents: list[str]
+    tree_level: int = 0
+    execution: _SemAggExecution | None = None
 
 
 def execute_sem_agg(
@@ -77,10 +100,16 @@ def execute_over_sem_agg(
         raise ValueError("over sem_agg requires explicit output_cols")
     output_cols = tuple(declared_output_cols)
     emit_source = execute(over_query.inputs[0], inputs)
-    emit_columns = tuple(output_columns(over_query.inputs[0])) or tuple(emit_source.columns)
-    missing_emit = [column for column in emit_columns if column not in emit_source.columns]
+    emit_columns = tuple(output_columns(over_query.inputs[0])) or tuple(
+        emit_source.columns
+    )
+    missing_emit = [
+        column for column in emit_columns if column not in emit_source.columns
+    ]
     if missing_emit:
-        raise ValueError(f"over sem_agg emit columns not found in DataFrame: {missing_emit}")
+        raise ValueError(
+            f"over sem_agg emit columns not found in DataFrame: {missing_emit}"
+        )
     frame_source_query = over_query.params.get("frame_source")
     frame_source = (
         execute(frame_source_query, inputs)
@@ -96,7 +125,9 @@ def execute_over_sem_agg(
             rows.append(row)
             continue
 
-        input_cols = aggregate_input_columns(frame.frame, query.params.get("input_cols"))
+        input_cols = aggregate_input_columns(
+            frame.frame, query.params.get("input_cols")
+        )
         if len(output_cols) == 1:
             result = execute_native_sem_agg(
                 query,
@@ -136,24 +167,104 @@ def execute_native_sem_agg(
         return pd.DataFrame(columns=list(output_columns(query)))
 
     config = config or LotusExecutionConfig()
+    grouped = aggregate_groups_with_keys(source)
+    raw_outputs = execute_native_sem_agg_groups(
+        query,
+        [group for _key_values, group in grouped],
+        input_cols,
+        config,
+    )
     rows: list[dict[str, Any]] = []
-    for group_index, (key_values, group) in enumerate(aggregate_groups_with_keys(source)):
-        raw_output = execute_native_sem_agg_group(query, group, input_cols, config)
+    for group_index, ((key_values, group), raw_output) in enumerate(
+        zip(grouped, raw_outputs, strict=True)
+    ):
         row = dict(key_values)
         if output_col.name not in row:
             row[output_col.name] = raw_output
         rows.append(row)
-        write_sem_agg_audit(
-            config,
-            query=query,
-            group=group,
-            input_cols=input_cols,
-            output_cols=(output_col,),
-            group_index=group_index,
-            raw_output=raw_output,
-            parsed_output={output_col.name: raw_output},
-        )
+        if _prompt_batching(config) is None:
+            write_sem_agg_audit(
+                config,
+                query=query,
+                group=group,
+                input_cols=input_cols,
+                output_cols=(output_col,),
+                group_index=group_index,
+                raw_output=raw_output,
+                parsed_output={output_col.name: raw_output},
+            )
     return pd.DataFrame(rows, columns=list(output_columns(query)))
+
+
+def _prompt_batching(config: LotusExecutionConfig) -> PromptBatching | None:
+    """Return the shared prompt batching contract."""
+
+    return config.prompt_batching
+
+
+def execute_native_sem_agg_groups(
+    query: QueryExpr,
+    groups: Sequence[pd.DataFrame],
+    input_cols: Sequence[str],
+    config: LotusExecutionConfig,
+) -> list[str]:
+    """Aggregate independent groups with the configured physical dispatch."""
+
+    prompt_batching = _prompt_batching(config)
+    if prompt_batching is not None:
+        import lotus
+
+        output_col = aggregate_output_columns(query, input_cols)[0]
+        result = execute_batch_prompted_sem_agg(
+            [aggregate_group_text(group, input_cols) for group in groups],
+            instruction=aggregate_instruction(query, input_cols),
+            output_cols=(output_col,),
+            model=lotus.settings.lm,
+            prompt_batching=prompt_batching,
+            max_retries=config.structured_parse_retries,
+            model_kwargs=structured_sem_agg_model_kwargs(config),
+            progress_bar_desc=config.sem_agg_progress_bar_desc,
+            trace_dir=config.trace_dir(),
+        )
+        outputs = [str(values[output_col.name]) for values in result.outputs]
+        for group_index, (group, output, raw_output_attempts, repair_method) in enumerate(
+            zip(
+                groups,
+                outputs,
+                result.raw_output_attempts,
+                result.repair_methods,
+                strict=True,
+            )
+        ):
+            write_sem_agg_audit(
+                config,
+                query=query,
+                group=group,
+                input_cols=input_cols,
+                output_cols=(output_col,),
+                group_index=group_index,
+                raw_output=raw_output_attempts[-1],
+                raw_output_attempts=raw_output_attempts,
+                parsed_output={output_col.name: output},
+                syntax_repair_method=repair_method,
+            )
+        return outputs
+    if config.sem_agg_dispatch == "sequential" or len(groups) < 2:
+        return [
+            execute_native_sem_agg_group(query, group, input_cols, config)
+            for group in groups
+        ]
+
+    import lotus
+
+    instruction = aggregate_instruction(query, input_cols)
+    executions = _execute_independent_sem_agg_groups(
+        [aggregate_group_text(group, input_cols) for group in groups],
+        lotus.settings.lm,
+        instruction,
+        config=config,
+    )
+    return [execution.raw_output for execution in executions]
 
 
 def execute_native_sem_agg_group(
@@ -199,22 +310,122 @@ def execute_structured_sem_agg(
         return pd.DataFrame(columns=list(output_columns(query)))
 
     config = config or LotusExecutionConfig()
+    grouped = aggregate_groups_with_keys(source)
+    parsed_outputs = execute_structured_sem_agg_groups(
+        query,
+        [group for _key_values, group in grouped],
+        input_cols,
+        output_cols,
+        config,
+    )
     rows: list[dict[str, Any]] = []
-    for group_index, (key_values, group) in enumerate(aggregate_groups_with_keys(source)):
-        parsed = execute_structured_sem_agg_group(
-            query,
-            group,
-            input_cols,
-            output_cols,
-            config,
-            group_index=group_index,
-        )
+    for (key_values, _group), parsed in zip(
+        grouped,
+        parsed_outputs,
+        strict=True,
+    ):
         row = dict(key_values)
         for column in output_cols:
             if column.name not in row:
                 row[column.name] = parsed[column.name]
         rows.append(row)
     return pd.DataFrame(rows, columns=list(output_columns(query)))
+
+
+def execute_structured_sem_agg_groups(
+    query: QueryExpr,
+    groups: Sequence[pd.DataFrame],
+    input_cols: Sequence[str],
+    output_cols: Sequence[ColumnSpec],
+    config: LotusExecutionConfig,
+) -> list[Mapping[str, Any]]:
+    """Aggregate independent groups into declared structured fields."""
+
+    prompt_batching = _prompt_batching(config)
+    if prompt_batching is not None:
+        import lotus
+
+        instruction = aggregate_instruction(query, input_cols)
+        result = execute_batch_prompted_sem_agg(
+            [aggregate_group_text(group, input_cols) for group in groups],
+            instruction=instruction,
+            output_cols=output_cols,
+            model=lotus.settings.lm,
+            prompt_batching=prompt_batching,
+            max_retries=config.structured_parse_retries,
+            model_kwargs=structured_sem_agg_model_kwargs(config),
+            progress_bar_desc=config.sem_agg_progress_bar_desc,
+            trace_dir=config.trace_dir(),
+        )
+        parsed_outputs: list[Mapping[str, Any]] = [
+            dict(values) for values in result.outputs
+        ]
+        for group_index, (group, parsed, repair_method) in enumerate(
+            zip(groups, parsed_outputs, result.repair_methods, strict=True)
+        ):
+            raw_output_attempts = result.raw_output_attempts[group_index]
+            raw_output = raw_output_attempts[-1]
+            write_sem_agg_audit(
+                config,
+                query=query,
+                group=group,
+                input_cols=input_cols,
+                output_cols=output_cols,
+                group_index=group_index,
+                raw_output=raw_output,
+                raw_output_attempts=raw_output_attempts,
+                parsed_output=parsed,
+                syntax_repair_method=repair_method,
+            )
+        return parsed_outputs
+    if config.sem_agg_dispatch == "sequential" or len(groups) < 2:
+        return [
+            execute_structured_sem_agg_group(
+                query,
+                group,
+                input_cols,
+                output_cols,
+                config,
+                group_index=group_index,
+            )
+            for group_index, group in enumerate(groups)
+        ]
+
+    import lotus
+
+    instruction = structured_aggregate_instruction(query, input_cols, output_cols)
+    executions = _execute_independent_sem_agg_groups(
+        [aggregate_group_text(group, input_cols) for group in groups],
+        lotus.settings.lm,
+        instruction,
+        config=config,
+        output_cols=output_cols,
+        failure_extra_by_group=[
+            {
+                "group_index": group_index,
+                "final_instruction": instruction,
+                "group_row_preview": group.head(5)
+                .astype(str)
+                .to_dict(orient="records"),
+            }
+            for group_index, group in enumerate(groups)
+        ],
+    )
+    return [
+        _parse_structured_sem_agg_execution(
+            execution,
+            query=query,
+            group=group,
+            input_cols=input_cols,
+            output_cols=output_cols,
+            config=config,
+            group_index=group_index,
+            instruction=instruction,
+        )
+        for group_index, (group, execution) in enumerate(
+            zip(groups, executions, strict=True)
+        )
+    ]
 
 
 def execute_structured_sem_agg_group(
@@ -237,8 +448,42 @@ def execute_structured_sem_agg_group(
         config,
         group_index=group_index,
     )
-    raw_output = str(retry_result.raw_outputs[0])
-    raw_output_attempts = tuple(str(value) for value in retry_result.raw_output_attempts[0])
+    execution = _SemAggExecution(
+        raw_output=str(retry_result.raw_outputs[0]),
+        retry_result=retry_result,
+    )
+    return _parse_structured_sem_agg_execution(
+        execution,
+        query=query,
+        group=group,
+        input_cols=input_cols,
+        output_cols=output_cols,
+        config=config,
+        group_index=group_index,
+        instruction=instruction,
+    )
+
+
+def _parse_structured_sem_agg_execution(
+    execution: _SemAggExecution,
+    *,
+    query: QueryExpr,
+    group: pd.DataFrame,
+    input_cols: Sequence[str],
+    output_cols: Sequence[ColumnSpec],
+    config: LotusExecutionConfig,
+    group_index: int,
+    instruction: str,
+) -> Mapping[str, Any]:
+    """Parse, audit, and return one structured aggregate execution."""
+
+    retry_result = execution.retry_result
+    if retry_result is None:
+        raise ValueError("structured sem_agg execution is missing retry metadata")
+    raw_output = execution.raw_output
+    raw_output_attempts = tuple(
+        str(value) for value in retry_result.raw_output_attempts[0]
+    )
     if retry_result.invalid_indices:
         parse_error = structured_parse_error(
             raw_output,
@@ -317,7 +562,9 @@ def execute_lotus_style_structured_sem_agg_group(
             0: {
                 "group_index": group_index,
                 "final_instruction": instruction,
-                "group_row_preview": group.head(5).astype(str).to_dict(orient="records"),
+                "group_row_preview": group.head(5)
+                .astype(str)
+                .to_dict(orient="records"),
             }
         },
     )
@@ -332,8 +579,7 @@ def structured_aggregate_instruction(
 
     instruction = aggregate_instruction(query, input_cols)
     field_lines = "\n".join(
-        f"- {column.name}: {column.description or 'string'}"
-        for column in output_cols
+        f"- {column.name}: {column.description or 'string'}" for column in output_cols
     )
     shape = json.dumps(
         {column.name: "string" for column in output_cols},
@@ -378,6 +624,7 @@ def write_sem_agg_audit(
     raw_output_attempts: Sequence[str] | None = None,
     parse_error: str = "",
     failure_artifact: Path | str | None = None,
+    syntax_repair_method: str | None = None,
 ) -> None:
     """Write a structured audit row for one semantic aggregate group."""
 
@@ -388,8 +635,8 @@ def write_sem_agg_audit(
         if len(output_cols) > 1
         else formatted_instruction
     )
-    input_preview = group.loc[:, list(input_cols)].head(20).astype(str).to_dict(
-        orient="records"
+    input_preview = (
+        group.loc[:, list(input_cols)].head(20).astype(str).to_dict(orient="records")
     )
     attempts = [str(value) for value in (raw_output_attempts or (raw_output,))]
     audit_row = {
@@ -412,12 +659,224 @@ def write_sem_agg_audit(
         "parse_error": parse_error,
         "failure_artifact": "" if failure_artifact is None else str(failure_artifact),
     }
+    if (
+        config.sem_agg_dispatch != "sequential"
+        or config.prompt_batching is not None
+    ):
+        audit_row.update(
+            {
+                "dispatch": config.sem_agg_dispatch,
+                "prompt_batching": (
+                    None
+                    if config.prompt_batching is None
+                    else config.prompt_batching.to_dict()
+                ),
+                "structured_output_repaired": syntax_repair_method is not None,
+                "structured_output_repair_method": syntax_repair_method or "",
+            }
+        )
     write_structured_generation_trace(
         config.trace_dir(),
         operator="sem_agg",
         rows=[audit_row],
         snapshots={"group": group.loc[:, list(input_cols)].copy()},
     )
+
+
+def _execute_independent_sem_agg_groups(
+    documents_by_group: Sequence[Sequence[str]],
+    model: Any,
+    instruction: str,
+    *,
+    config: LotusExecutionConfig,
+    output_cols: Sequence[ColumnSpec] | None = None,
+    failure_extra_by_group: Sequence[Mapping[str, Any]] | None = None,
+) -> list[_SemAggExecution]:
+    """Batch ready prompts while preserving independent aggregate groups."""
+
+    if failure_extra_by_group is not None and len(failure_extra_by_group) != len(
+        documents_by_group
+    ):
+        raise ValueError("sem_agg failure metadata must match aggregate groups")
+    states = [
+        _SemAggGroupState(
+            group_index=group_index,
+            documents=[str(document) for document in documents],
+        )
+        for group_index, documents in enumerate(documents_by_group)
+    ]
+    if any(not state.documents for state in states):
+        raise ValueError("sem_agg aggregate groups cannot be empty")
+
+    while any(state.execution is None for state in states):
+        regular_prompts: list[list[dict[str, str]]] = []
+        regular_refs: list[tuple[_SemAggGroupState, int]] = []
+        regular_counts: dict[int, int] = {}
+        structured_prompts: list[list[dict[str, str]]] = []
+        structured_states: list[_SemAggGroupState] = []
+
+        for state in states:
+            if state.execution is not None:
+                continue
+            prompts = _build_independent_sem_agg_level_prompts(
+                state.documents,
+                model,
+                instruction,
+                tree_level=state.tree_level,
+                lotus_native_prompt=output_cols is None,
+            )
+            if output_cols is not None and len(prompts) == 1:
+                structured_prompts.append(prompts[0])
+                structured_states.append(state)
+                continue
+            regular_counts[state.group_index] = len(prompts)
+            for prompt_index, prompt in enumerate(prompts):
+                regular_prompts.append(prompt)
+                regular_refs.append((state, prompt_index))
+
+        if regular_prompts:
+            regular_output = model(
+                regular_prompts,
+                progress_bar_desc=config.sem_agg_progress_bar_desc,
+            )
+            raw_outputs = [str(value) for value in regular_output.outputs]
+            if len(raw_outputs) != len(regular_prompts):
+                raise ValueError(
+                    "sem_agg provider batch returned an unexpected number of "
+                    f"outputs: expected {len(regular_prompts)}, got {len(raw_outputs)}"
+                )
+            outputs_by_group: dict[int, list[str]] = {
+                group_index: [""] * count
+                for group_index, count in regular_counts.items()
+            }
+            for (state, prompt_index), raw_output in zip(
+                regular_refs,
+                raw_outputs,
+                strict=True,
+            ):
+                outputs_by_group[state.group_index][prompt_index] = raw_output
+            for state in states:
+                outputs = outputs_by_group.get(state.group_index)
+                if outputs is None:
+                    continue
+                state.documents = outputs
+                state.tree_level += 1
+                if len(outputs) == 1 and output_cols is None:
+                    state.execution = _SemAggExecution(raw_output=outputs[0])
+
+        if structured_prompts:
+            failure_extra = (
+                {
+                    prompt_index: dict(failure_extra_by_group[state.group_index])
+                    for prompt_index, state in enumerate(structured_states)
+                }
+                if failure_extra_by_group is not None
+                else None
+            )
+            retry_result = execute_structured_lm_retry_result(
+                model,
+                structured_prompts,
+                lm_kwargs={
+                    "progress_bar_desc": config.sem_agg_progress_bar_desc,
+                    **structured_sem_agg_model_kwargs(config),
+                    "response_format": JSON_OBJECT_RESPONSE_FORMAT,
+                },
+                output_cols=output_cols or (),
+                shape="object",
+                require_explanation=False,
+                operator="sem_agg",
+                max_retries=config.structured_parse_retries,
+                failure_extra_by_index=failure_extra,
+            )
+            artifact_by_index = dict(
+                zip(
+                    retry_result.invalid_indices,
+                    retry_result.failure_artifact_paths,
+                    strict=True,
+                )
+            )
+            invalid_indices = set(retry_result.invalid_indices)
+            for prompt_index, state in enumerate(structured_states):
+                invalid = prompt_index in invalid_indices
+                state.execution = _SemAggExecution(
+                    raw_output=str(retry_result.raw_outputs[prompt_index]),
+                    retry_result=StructuredLMRetryResult(
+                        raw_outputs=(retry_result.raw_outputs[prompt_index],),
+                        raw_output_attempts=(
+                            retry_result.raw_output_attempts[prompt_index],
+                        ),
+                        invalid_indices=(0,) if invalid else (),
+                        failure_artifact_paths=(
+                            (artifact_by_index[prompt_index],) if invalid else ()
+                        ),
+                    ),
+                )
+
+        if config.sem_agg_safe_mode:
+            model.print_total_usage()
+
+    executions = [state.execution for state in states]
+    if any(execution is None for execution in executions):
+        raise RuntimeError("sem_agg provider batching did not complete every group")
+    return [execution for execution in executions if execution is not None]
+
+
+def _build_independent_sem_agg_level_prompts(
+    documents: Sequence[str],
+    model: Any,
+    instruction: str,
+    *,
+    tree_level: int,
+    lotus_native_prompt: bool,
+) -> list[list[dict[str, str]]]:
+    """Build one LOTUS-compatible tree level for one aggregate group."""
+
+    template = (
+        leaf_instruction_template(
+            instruction,
+            lotus_native_spacing=lotus_native_prompt,
+        )
+        if tree_level == 0
+        else node_instruction_template(
+            instruction,
+            lotus_native_spacing=lotus_native_prompt,
+        )
+    )
+    template_tokens = model.count_tokens(template)
+    context_str = ""
+    context_tokens = 0
+    document_counter = 1
+    prompts: list[list[dict[str, str]]] = []
+
+    for document in documents:
+        formatted = format_aggregate_doc(
+            tree_level,
+            str(document),
+            document_counter,
+        )
+        new_tokens = model.count_tokens(formatted)
+        if (
+            new_tokens + context_tokens + template_tokens
+            > model.max_ctx_len - model.max_tokens
+        ):
+            prompt = template.replace("{{docs_str}}", context_str)
+            prompts.append([{"role": "user", "content": prompt}])
+            document_counter = 1
+            formatted = format_aggregate_doc(
+                tree_level, str(document), document_counter
+            )
+            context_str = formatted
+            context_tokens = new_tokens
+            document_counter += 1
+            continue
+        context_str += formatted
+        context_tokens += new_tokens
+        document_counter += 1
+
+    if document_counter > 1 or len(documents) == 1:
+        prompt = template.replace("{{docs_str}}", context_str)
+        prompts.append([{"role": "user", "content": prompt}])
+    return prompts
 
 
 def lotus_style_sem_agg(
@@ -636,16 +1095,23 @@ def write_sem_agg_failure_artifact(
             0: {
                 "group_index": group_index,
                 "final_instruction": instruction,
-                "group_row_preview": group.head(5).astype(str).to_dict(orient="records"),
+                "group_row_preview": group.head(5)
+                .astype(str)
+                .to_dict(orient="records"),
             }
         },
     )
     return paths[0]
 
 
-def leaf_instruction_template(user_instruction: str) -> str:
+def leaf_instruction_template(
+    user_instruction: str,
+    *,
+    lotus_native_spacing: bool = False,
+) -> str:
     """Return the LOTUS leaf-level semantic aggregation prompt template."""
 
+    instruction_prefix = "Instruction:  " if lotus_native_spacing else "Instruction: "
     return (
         "Your job is to provide an answer to the user's instruction given the context below from multiple documents.\n"
         "Remember that your job is to answer the user's instruction by combining all relevant information from all provided documents, into a single coherent answer.\n"
@@ -654,13 +1120,18 @@ def leaf_instruction_template(user_instruction: str) -> str:
         "Follow the following format.\n\nContext: relevant facts from multiple documents\n\n"
         "Instruction: the instruction provided by the user\n\nAnswer: Write your answer\n\n---\n\n"
         "Context: {{docs_str}}\n\n"
-        f"Instruction: {user_instruction}\n\nAnswer:\n"
+        f"{instruction_prefix}{user_instruction}\n\nAnswer:\n"
     )
 
 
-def node_instruction_template(user_instruction: str) -> str:
+def node_instruction_template(
+    user_instruction: str,
+    *,
+    lotus_native_spacing: bool = False,
+) -> str:
     """Return the LOTUS intermediate-node semantic aggregation prompt template."""
 
+    instruction_prefix = "Instruction:  " if lotus_native_spacing else "Instruction: "
     return (
         "Your job is to provide an answer to the user's instruction given the context below from multiple sources.\n"
         "Note that each source may be formatted differently and contain information about several different documents.\n"
@@ -673,7 +1144,7 @@ def node_instruction_template(user_instruction: str) -> str:
         "Follow the following format.\n\nContext: relevant facts from multiple sources\n\n"
         "Instruction: the instruction provided by the user\n\nAnswer: Write your answer\n\n---\n\n"
         "Context: {{docs_str}}\n\n"
-        f"Instruction: {user_instruction}\n\nAnswer:\n"
+        f"{instruction_prefix}{user_instruction}\n\nAnswer:\n"
     )
 
 
@@ -691,7 +1162,9 @@ def parse_structured_sem_agg_output(
     """Parse and validate one structured LOTUS sem_agg output."""
 
     if isinstance(raw_output, Mapping):
-        missing = [column.name for column in output_cols if column.name not in raw_output]
+        missing = [
+            column.name for column in output_cols if column.name not in raw_output
+        ]
         if missing:
             raise ValueError(f"sem_agg JSON output is missing required keys: {missing}")
         return structured_scalar_values(
@@ -756,7 +1229,8 @@ def aggregate_groups_with_keys(
         str(key) for key in source.attrs.get("agent_memory_groupby_keys", ())
     )
     partition_keys = tuple(
-        str(key) for key in source.attrs.get("agent_memory_sem_groupby_partition_by", ())
+        str(key)
+        for key in source.attrs.get("agent_memory_sem_groupby_partition_by", ())
     )
     if deterministic_keys:
         return _aggregate_groups_by_keys(
@@ -786,7 +1260,9 @@ def _aggregate_groups_by_keys(
 
     missing = [column for column in group_keys if column not in source.columns]
     if missing:
-        raise ValueError(f"aggregate group key columns not found in DataFrame: {missing}")
+        raise ValueError(
+            f"aggregate group key columns not found in DataFrame: {missing}"
+        )
     if source.empty:
         return []
     groups: list[tuple[dict[str, Any], pd.DataFrame]] = []
@@ -797,7 +1273,9 @@ def _aggregate_groups_by_keys(
         groups.append(
             (
                 output_key_values,
-                group.drop(columns=list(drop_columns), errors="ignore").reset_index(drop=True),
+                group.drop(columns=list(drop_columns), errors="ignore").reset_index(
+                    drop=True
+                ),
             )
         )
     return groups
