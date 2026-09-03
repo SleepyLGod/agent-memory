@@ -242,6 +242,56 @@ def execute_join(
     ).reset_index(drop=True)
 
 
+def predicate_join_row_ids(
+    query: QueryExpr,
+    left: pd.DataFrame,
+    right: pd.DataFrame,
+    *,
+    on: Sequence[Mapping[str, Any]],
+) -> tuple[tuple[Any, Any], ...]:
+    """Return input row-ID pairs that satisfy a deterministic join predicate."""
+
+    predicates = tuple(on)
+    if not _is_predicate_join(predicates):
+        raise ValueError("predicate join row IDs require normalized predicate expressions")
+    if len(query.inputs) != 2:
+        raise ValueError("predicate join row IDs require exactly two query inputs")
+
+    left_id_column = _unused_column_name(
+        left,
+        right,
+        base="_agent_memory_join_left_row_id",
+    )
+    right_id_column = _unused_column_name(
+        left,
+        right,
+        base="_agent_memory_join_right_row_id",
+    )
+    left_with_ids = left.copy()
+    right_with_ids = right.copy()
+    left_with_ids[left_id_column] = list(left.index)
+    right_with_ids[right_id_column] = list(right.index)
+    joined = _execute_predicate_join(
+        query,
+        left_with_ids,
+        right_with_ids,
+        predicates=tuple(expr_from_param(predicate) for predicate in predicates),
+        how="inner",
+    )
+
+    left_alias = _relation_alias(query.inputs[0]) or "left"
+    right_alias = _relation_alias(query.inputs[1]) or "right"
+    left_output = f"{left_id_column}:{left_alias}"
+    right_output = f"{right_id_column}:{right_alias}"
+    return tuple(
+        zip(
+            joined[left_output],
+            joined[right_output],
+            strict=True,
+        )
+    )
+
+
 def execute_drop_duplicates(
     query: QueryExpr,
     inputs: Mapping[str, Any],
@@ -715,6 +765,20 @@ def _join_suffixes(query: QueryExpr) -> tuple[str, str]:
     left_alias = _relation_alias(query.inputs[0]) or "left"
     right_alias = _relation_alias(query.inputs[1]) or "right"
     return f":{left_alias}", f":{right_alias}"
+
+
+def _unused_column_name(
+    left: pd.DataFrame,
+    right: pd.DataFrame,
+    *,
+    base: str,
+) -> str:
+    """Return a temporary column name absent from both join inputs."""
+
+    candidate = base
+    while candidate in left.columns or candidate in right.columns:
+        candidate = f"_{candidate}"
+    return candidate
 
 
 def _relation_alias(query: QueryExpr) -> str | None:

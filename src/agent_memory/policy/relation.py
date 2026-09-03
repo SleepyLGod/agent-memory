@@ -134,20 +134,6 @@ def _normalize_group_keys(keys: str | Sequence[str]) -> tuple[str, ...]:
     return normalized
 
 
-def _normalize_sem_join_keys(keys: str | Sequence[str]) -> tuple[str, ...]:
-    """Normalize exact semantic-join key columns."""
-
-    if isinstance(keys, str):
-        normalized = (keys,)
-    else:
-        normalized = tuple(str(key) for key in keys)
-    if not normalized:
-        raise ValueError("sem_join on requires at least one key column")
-    if any(not key for key in normalized):
-        raise ValueError("sem_join on key columns cannot be empty")
-    return normalized
-
-
 def _normalize_drop_duplicates_subset(
     subset: str | Sequence[str],
 ) -> tuple[str, ...]:
@@ -635,7 +621,7 @@ class Relation(RelationHandle):
         *,
         instruction: str,
         how: str = "inner",
-        on: str | Sequence[str] | None = None,
+        on: JoinOn | None = None,
         k: int | None = None,
     ) -> "Relation":
         """Add a semantic join expression."""
@@ -646,7 +632,7 @@ class Relation(RelationHandle):
             "how": how,
         }
         if on is not None:
-            params["on"] = _normalize_sem_join_keys(on)
+            params["on"] = _normalize_join_on(on)
         if k is not None:
             if not isinstance(k, int) or isinstance(k, bool) or k < 1:
                 raise ValueError("sem_join k must be a positive integer")
