@@ -13,6 +13,13 @@ from agent_memory.adapters.lotus.context import (
     LotusExecutionConfig,
     LotusExecutionContext,
 )
+from agent_memory.adapters.lotus.algebraic_aggregates import (
+    execute_aggregate_finalize,
+    execute_aggregate_state,
+    execute_aggregate_state_update,
+    execute_algebraic_aggregate,
+    is_algebraic_aggregate_query,
+)
 from agent_memory.adapters.lotus.pair_execution import (
     semantic_pair_profiles_fingerprint,
 )
@@ -150,7 +157,23 @@ class LotusAdapter:
             case "unnest":
                 return self._execute_traced_relational(query, inputs, execute_unnest)
             case "agg":
+                if is_algebraic_aggregate_query(query):
+                    return self._execute_traced_relational(
+                        query, inputs, execute_algebraic_aggregate
+                    )
                 return self._execute_traced_semantic(query, inputs, execute_agg)
+            case "aggregate_state":
+                return self._execute_traced_relational(
+                    query, inputs, execute_aggregate_state
+                )
+            case "aggregate_state_update":
+                return self._execute_traced_relational(
+                    query, inputs, execute_aggregate_state_update
+                )
+            case "aggregate_finalize":
+                return self._execute_traced_relational(
+                    query, inputs, execute_aggregate_finalize
+                )
             case "concat":
                 return self._execute_traced_relational(query, inputs, execute_concat)
             case "union":

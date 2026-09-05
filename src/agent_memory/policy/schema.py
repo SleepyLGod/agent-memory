@@ -6,9 +6,12 @@ from collections.abc import Sequence
 
 from .aggregates import (
     ArrayAggregateSpec,
+    AvgAggregateSpec,
     CollectListAggregateSpec,
+    CountAggregateSpec,
     MinAggregateSpec,
     SemanticAggregateSpec,
+    SumAggregateSpec,
 )
 from .logical import ColumnSpec, QueryExpr
 
@@ -165,7 +168,24 @@ def output_columns(
             )
         if grouped.op == "sem_groupby":
             return _append_unique(_sem_groupby_partition_keys(grouped), outputs)
-        raise NotImplementedError("agg output columns require group_by or sem_groupby input")
+        if all(
+            isinstance(
+                aggregate,
+                (CountAggregateSpec, SumAggregateSpec, AvgAggregateSpec),
+            )
+            for aggregate in query.params.get("aggregates", ())
+        ):
+            return outputs
+        raise NotImplementedError(
+            "agg output columns require group_by, sem_groupby, or algebraic aggregates"
+        )
+    if query.op in {"aggregate_state", "aggregate_state_update"}:
+        return tuple(str(column) for column in query.params["state_columns"])
+    if query.op == "aggregate_finalize":
+        return _append_unique(
+            tuple(str(key) for key in query.params.get("group_keys", ())),
+            _aggregate_output_columns(query.params.get("aggregates", ())),
+        )
     if query.op in {"sem_map", "sem_flat_map"}:
         columns = _append_unique(
             output_columns(query.inputs[0], window_source_columns=window_source_columns),
@@ -312,7 +332,14 @@ def _aggregate_output_columns(aggregates: object) -> tuple[str, ...]:
             names = tuple(column.name for column in aggregate.output_cols)
         elif isinstance(
             aggregate,
-            (ArrayAggregateSpec, CollectListAggregateSpec, MinAggregateSpec),
+            (
+                ArrayAggregateSpec,
+                CollectListAggregateSpec,
+                MinAggregateSpec,
+                CountAggregateSpec,
+                SumAggregateSpec,
+                AvgAggregateSpec,
+            ),
         ):
             names = (aggregate.output_col,)
         else:

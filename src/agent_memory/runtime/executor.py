@@ -186,6 +186,12 @@ class PolicyExecutor:
 
             if node.execution_kind == "deterministic":
                 next_state = self._execute_deterministic(node_id, staged_node_state)
+            elif node.execution_kind == "algebraic_state":
+                next_state = self._execute_algebraic_state(
+                    node_id,
+                    old_state=old_state,
+                    parent_update=parent_updates[0],
+                )
             elif node.execution_kind in {
                 "relational_state",
                 "semantic_binary_state",
@@ -676,6 +682,32 @@ class PolicyExecutor:
             )
             inputs[f"{parent_id}__inserted"] = update.inserted_rows
         return self.adapter.execute(node.maintenance_query, inputs)
+
+    def _execute_algebraic_state(
+        self,
+        node_id: str,
+        *,
+        old_state: pd.DataFrame,
+        parent_update: NodeOutputUpdate,
+    ) -> pd.DataFrame:
+        """Apply exact parent insertions and retractions to aggregate state."""
+
+        node = self.policy.nodes[node_id]
+        if len(node.input_node_ids) != 1:
+            raise RuntimeError("Algebraic aggregate state requires exactly one input")
+        if node.maintenance_query is None:
+            raise RuntimeError(
+                f"Algebraic aggregate state node {node_id} has no maintenance query"
+            )
+        parent_id = node.input_node_ids[0]
+        return self.adapter.execute(
+            node.maintenance_query,
+            {
+                node_id: old_state,
+                f"{parent_id}__inserted": parent_update.inserted_rows,
+                f"{parent_id}__retracted": parent_update.retracted_rows,
+            },
+        )
 
     def _execute_semantic_row(
         self,

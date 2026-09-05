@@ -3,16 +3,24 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from typing import Any
+from typing import Any, cast
 
 from .aggregates import (
     AggregateSpec,
+    AlgebraicAggregateSpec,
+    AvgAggregateSpec,
     SemanticAggregateSpec,
+    SumAggregateSpec,
     aggregate_output_names,
+    avg as avg_aggregate,
+    count as count_aggregate,
+    is_algebraic_aggregate_spec,
     normalize_aggregate_specs,
     normalize_min_columns,
+    sum as sum_aggregate,
 )
 from .expressions import (
+    ArithmeticExpr,
     ArrayCatExpr,
     ColumnExpr,
     LeastExpr,
@@ -192,11 +200,11 @@ def _normalize_assignment_value(value: object) -> Mapping[str, Any]:
     """Normalize assign values to literal, column, or supported array expression params."""
 
     expr = ensure_expr(value)
-    if isinstance(expr, (ColumnExpr, ArrayCatExpr, LeastExpr)) or is_scalar(value):
+    if isinstance(expr, (ColumnExpr, ArithmeticExpr, ArrayCatExpr, LeastExpr)) or is_scalar(value):
         return expr.to_param()
     raise TypeError(
-        "assign values must be scalar literals, column expressions, array_cat expressions, "
-        "or least expressions"
+        "assign values must be scalar literals, column expressions, arithmetic expressions, "
+        "array_cat expressions, or least expressions"
     )
 
 
@@ -382,6 +390,30 @@ class Relation(RelationHandle):
                 params={"keys": _normalize_group_keys(keys)},
             )
         )
+
+    def agg(self, *aggregates: AggregateSpec) -> "Relation":
+        """Apply one or more exact global relational aggregates."""
+
+        specs = _normalize_algebraic_aggregates(
+            aggregates,
+            source_columns=output_columns(self.expr),
+        )
+        return self._derive("agg", aggregates=specs)
+
+    def count(self, *, output_col: str) -> "Relation":
+        """Count all rows in this relation."""
+
+        return self.agg(count_aggregate(output_col=output_col))
+
+    def sum(self, *, column: str, output_col: str) -> "Relation":
+        """Sum one numeric column while ignoring null values."""
+
+        return self.agg(sum_aggregate(column=column, output_col=output_col))
+
+    def avg(self, *, column: str, output_col: str) -> "Relation":
+        """Average one numeric column while ignoring null values."""
+
+        return self.agg(avg_aggregate(column=column, output_col=output_col))
 
     def drop_duplicates(
         self,
@@ -716,10 +748,9 @@ class Log(Relation):
 
 
 class GroupedRelation(RelationHandle):
-    """Intermediate grouped expression returned by sem_groupby.
+    """Intermediate expression returned by group_by or sem_groupby.
 
-    A GroupedRelation represents semantic partition state before aggregation. It
-    becomes a normal Relation only after sem_agg is called.
+    It becomes a normal Relation after applying a supported aggregate.
     """
 
     def sem_agg(
@@ -801,11 +832,35 @@ class GroupedRelation(RelationHandle):
             )
         )
 
+    def count(self, *, output_col: str) -> Relation:
+        """Count all rows in each ordinary relational group."""
+
+        return self.agg(count_aggregate(output_col=output_col))
+
+    def sum(self, *, column: str, output_col: str) -> Relation:
+        """Sum one numeric column in each ordinary relational group."""
+
+        return self.agg(sum_aggregate(column=column, output_col=output_col))
+
+    def avg(self, *, column: str, output_col: str) -> Relation:
+        """Average one numeric column in each ordinary relational group."""
+
+        return self.agg(avg_aggregate(column=column, output_col=output_col))
+
     def agg(self, *aggregates: AggregateSpec) -> Relation:
         """Aggregate each group with one or more declared aggregate functions."""
 
         specs = normalize_aggregate_specs(aggregates)
+        algebraic = tuple(
+            specification
+            for specification in specs
+            if is_algebraic_aggregate_spec(specification)
+        )
         if self.expr.op == "sem_groupby":
+            if algebraic:
+                raise NotImplementedError(
+                    "sem_groupby numeric algebraic aggregates are not supported"
+                )
             semantic_outputs = set(_semantic_aggregate_output_names(specs))
             if not semantic_outputs:
                 raise NotImplementedError(
@@ -819,6 +874,18 @@ class GroupedRelation(RelationHandle):
                     "sem_groupby(...).agg(...) requires semantic keys to appear "
                     f"in sem_agg output_cols; missing {missing_keys}."
                 )
+        elif algebraic:
+            if len(algebraic) != len(specs):
+                raise NotImplementedError(
+                    "ordinary group_by cannot mix numeric algebraic and existing "
+                    "aggregate specs"
+                )
+            keys = tuple(str(key) for key in self.expr.params["keys"])
+            _normalize_algebraic_aggregates(
+                algebraic,
+                source_columns=output_columns(self.expr.inputs[0]),
+                group_keys=keys,
+            )
         return Relation(
             QueryExpr(
                 op="agg",
@@ -826,6 +893,40 @@ class GroupedRelation(RelationHandle):
                 params={"aggregates": specs},
             )
         )
+
+
+def _normalize_algebraic_aggregates(
+    aggregates: Sequence[AggregateSpec],
+    *,
+    source_columns: Sequence[str],
+    group_keys: Sequence[str] = (),
+) -> tuple[AlgebraicAggregateSpec, ...]:
+    """Validate exact numeric aggregate descriptors against one relation schema."""
+
+    specs = normalize_aggregate_specs(aggregates)
+    if not all(is_algebraic_aggregate_spec(specification) for specification in specs):
+        raise TypeError(
+            "Relation.agg accepts only agent_memory.count(...), "
+            "agent_memory.sum(...), and agent_memory.avg(...)"
+        )
+    algebraic = cast(tuple[AlgebraicAggregateSpec, ...], specs)
+    inputs = {
+        specification.column
+        for specification in algebraic
+        if isinstance(specification, (SumAggregateSpec, AvgAggregateSpec))
+    }
+    missing = sorted(inputs.difference(source_columns))
+    if missing:
+        raise ValueError(f"aggregate input columns not found: {missing}")
+    output_names = tuple(
+        output
+        for specification in algebraic
+        for output in aggregate_output_names(specification)
+    )
+    conflicts = sorted(set(group_keys).intersection(output_names))
+    if conflicts:
+        raise ValueError(f"aggregate output columns conflict with group keys: {conflicts}")
+    return algebraic
 
 
 class WindowedRelation(RelationHandle):

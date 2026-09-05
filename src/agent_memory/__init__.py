@@ -20,10 +20,13 @@ from .policy import (
     RetrievalResult,
     UserQuery,
     array_agg,
+    avg,
     collect_list,
+    count,
     least,
     min,
     sem_agg,
+    sum,
 )
 
 __version__ = "0.0.1"
@@ -49,8 +52,11 @@ __all__ = [
     "ZepMemoryExtended",
     "__version__",
     "array_agg",
+    "avg",
     "collect_list",
+    "count",
     "least",
     "min",
     "sem_agg",
+    "sum",
 ]

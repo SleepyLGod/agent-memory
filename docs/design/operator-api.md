@@ -237,7 +237,21 @@ rows = rows.assign(
 
 Use `assign` for cheap, deterministic fields. Use `sem_map` when the new fields
 require semantic interpretation. Assignment values are scalar literals, column
-expressions, row-wise `array_cat`, or `am.least(...)` expressions.
+expressions, arithmetic expressions, row-wise `array_cat`, or `am.least(...)`
+expressions.
+
+Arithmetic uses the usual Python operators over relation columns:
+
+```python
+metrics = counts.assign(
+    ratio=counts.col("positive_count") / counts.col("total_count"),
+    age=2026 - counts.col("year"),
+)
+```
+
+`+`, `-`, `*`, and `/` accept numeric operands but reject booleans and other
+non-numeric values. A null operand produces null. Division by zero raises
+`ZeroDivisionError` instead of silently returning infinity.
 
 `am.least(a, b, ...)` is a scalar expression, not an aggregate. It compares two
 or more values in the same row, ignores null operands, and returns null only
@@ -452,6 +466,55 @@ occurrence identity. It is stable while earlier occurrences remain in the same
 group, but it is not a permanent UUID: full recomputation may change extraction
 order, and future group merge/split support needs downstream remapping. A
 storage backend may map this logical tuple to a physical UUID later.
+
+### `count`, `sum`, and `avg`
+
+These are exact relational aggregates. They do not call an LLM and do not use
+semantic grouping.
+
+```python
+overall = rows.agg(
+    am.count(output_col="row_count"),
+    am.sum(column="amount", output_col="total_amount"),
+    am.avg(column="amount", output_col="average_amount"),
+)
+
+by_region = rows.group_by("region").agg(
+    am.count(output_col="row_count"),
+    am.sum(column="amount", output_col="total_amount"),
+    am.avg(column="amount", output_col="average_amount"),
+)
+```
+
+Convenience methods build the same query when only one aggregate is needed:
+
+```python
+rows.count(output_col="row_count")
+rows.sum(column="amount", output_col="total_amount")
+rows.avg(column="amount", output_col="average_amount")
+
+rows.group_by("region").count(output_col="row_count")
+```
+
+The behavior follows a small SQL-style contract:
+
+- `count` is `COUNT(*)`: it counts every row, even when `amount` is null.
+- `sum` and `avg` ignore null input values. If no non-null value exists, their
+  result is null.
+- `sum` and `avg` require numeric non-null values and reject booleans.
+- An empty global input returns one row: count is zero and sum/avg are null.
+- An empty grouped input returns no groups. Null grouping keys form an ordinary
+  group when rows with null keys are present.
+- Aggregate output names must be unique. A grouped numeric aggregate output may
+  not reuse a grouping-key name.
+
+`Relation.agg(...)` accepts only `count`, `sum`, and `avg`. Ordinary
+`group_by(...).agg(...)` also accepts this numeric family, but it cannot mix it
+with `sem_agg`, `array_agg`, `collect_list`, or `min` in the same call yet.
+`sem_groupby(...).count/sum/avg(...)` is not supported. The current
+semantic-grouped aggregate contract requires `sem_agg` to produce the semantic
+key columns, and the numeric aggregate lowering does not consume semantic group
+assignments.
 
 ### `array_cat`
 
@@ -979,10 +1042,23 @@ Supported aggregate specs:
   column.
 - `am.min(columns=[...], output_col=...)`: deterministic lexicographic minimum
   over complete grouped tuples.
+- `am.count(output_col=...)`: exact `COUNT(*)` for an ordinary relation or
+  ordinary `group_by`.
+- `am.sum(column=..., output_col=...)`: exact numeric sum for an ordinary
+  relation or ordinary `group_by`.
+- `am.avg(column=..., output_col=...)`: exact numeric average for an ordinary
+  relation or ordinary `group_by`.
+
+This is the union of supported aggregate families, not permission to combine
+every item. A numeric `count/sum/avg` call must contain only numeric algebraic
+aggregate specs. Existing semantic/evidence aggregation may combine
+`sem_agg`, `array_agg`, `collect_list`, and `min` under its documented rules.
+Numeric algebraic aggregates are not accepted after `sem_groupby`.
 
 For deterministic `group_by(K).agg(...)`, output columns are `K + outputs(A*)`.
-If aggregate output names overlap deterministic keys, the deterministic key
-column wins.
+For the existing semantic/evidence aggregate family, a deterministic key wins
+when an aggregate output uses the same name. The numeric algebraic family is
+stricter and rejects that collision while authoring the query.
 
 For semantic `sem_groupby(..., partition_by=P).agg(...)`, output columns are
 `P + outputs(A*)`. At least one `sem_agg(...)` spec is required, and the
@@ -1362,6 +1438,34 @@ V_prime = V.union(
     .select(V_columns)
 )
 ```
+
+Exact relational `count`, `sum`, and `avg` use hidden additive state. For one
+numeric input column, the runtime keeps only:
+
+```text
+row_count
+numeric_sum
+non_null_count
+```
+
+For inserted rows these values are added; for retracted parent rows they are
+subtracted. The public result is then finalized as:
+
+```text
+count = row_count
+sum   = null if non_null_count == 0 else numeric_sum
+avg   = null if non_null_count == 0 else numeric_sum / non_null_count
+```
+
+The same update is applied independently per exact `group_by` key. A grouped
+state row disappears when its row count reaches zero; the global aggregate
+continues to expose its one SQL-style output row. Hidden state columns are an
+implementation detail, are saved in checkpoints, and never appear in the
+declared view schema.
+
+This is an exact differential rule for the parent insertions and retractions
+that reach the aggregate node. It does not call an LLM and does not select a
+`rule-join-map` or `rule-re-group` strategy.
 
 Semantic group-by with aggregation can use either re-group or join-map
 maintenance. These are differential-rule choices, not alternative meanings of

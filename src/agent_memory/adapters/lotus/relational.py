@@ -24,6 +24,7 @@ from agent_memory.adapters.lotus.sem_agg import (
     execute_structured_sem_agg_groups,
 )
 from agent_memory.policy.expressions import (
+    ArithmeticExpr,
     ArrayCatExpr,
     BooleanExpr,
     ColumnExpr,
@@ -158,10 +159,13 @@ def execute_assign(
             source[column_name] = value
             continue
         expr = expr_from_param(value)
-        if not isinstance(expr, (LiteralExpr, ColumnExpr, ArrayCatExpr, LeastExpr)):
+        if not isinstance(
+            expr,
+            (LiteralExpr, ColumnExpr, ArithmeticExpr, ArrayCatExpr, LeastExpr),
+        ):
             raise TypeError(
                 "assign values must be scalar literals, column expressions, "
-                "array_cat expressions, or least expressions"
+                "arithmetic expressions, array_cat expressions, or least expressions"
             )
         source[column_name] = evaluate_expr(expr, source)
     return source
@@ -1068,6 +1072,8 @@ def evaluate_expr(expr: Expr, frame: Any) -> Any:
         return expr.value
     if isinstance(expr, ComparisonExpr):
         return _evaluate_comparison(expr, frame)
+    if isinstance(expr, ArithmeticExpr):
+        return _evaluate_arithmetic(expr, frame)
     if isinstance(expr, BooleanExpr):
         return _evaluate_boolean(expr, frame)
     if isinstance(expr, ArrayCatExpr):
@@ -1075,6 +1081,71 @@ def evaluate_expr(expr: Expr, frame: Any) -> Any:
     if isinstance(expr, LeastExpr):
         return _evaluate_least(expr, frame)
     raise TypeError(f"Unsupported expression type: {type(expr).__name__}")
+
+
+def _evaluate_arithmetic(expr: ArithmeticExpr, frame: Any) -> Any:
+    """Evaluate numeric arithmetic with null propagation and explicit zero checks."""
+
+    left = evaluate_expr(expr.left, frame)
+    right = evaluate_expr(expr.right, frame)
+    if not isinstance(left, pd.Series) and not isinstance(right, pd.Series):
+        return _evaluate_arithmetic_value(expr.op, left, right)
+    left_series = (
+        left
+        if isinstance(left, pd.Series)
+        else pd.Series([left] * len(frame), index=frame.index, dtype=object)
+    )
+    right_series = (
+        right
+        if isinstance(right, pd.Series)
+        else pd.Series([right] * len(frame), index=frame.index, dtype=object)
+    )
+    return pd.Series(
+        [
+            _evaluate_arithmetic_value(expr.op, left_value, right_value)
+            for left_value, right_value in zip(left_series, right_series, strict=True)
+        ],
+        index=frame.index,
+        dtype=object,
+    )
+
+
+def _evaluate_arithmetic_value(op: str, left: Any, right: Any) -> Any:
+    """Evaluate one pair of nullable numeric scalar operands."""
+
+    if _is_arithmetic_null(left) or _is_arithmetic_null(right):
+        return None
+    _require_arithmetic_numeric(left)
+    _require_arithmetic_numeric(right)
+    if op == "add":
+        return left + right
+    if op == "subtract":
+        return left - right
+    if op == "multiply":
+        return left * right
+    if op == "divide":
+        if right == 0:
+            raise ZeroDivisionError("arithmetic division by zero")
+        return left / right
+    raise ValueError(f"Unsupported arithmetic expression op: {op!r}")
+
+
+def _require_arithmetic_numeric(value: Any) -> None:
+    """Require one non-null arithmetic operand to be numeric but not boolean."""
+
+    from numbers import Number
+
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, Number):
+        raise TypeError("arithmetic expressions require numeric non-null operands")
+
+
+def _is_arithmetic_null(value: Any) -> bool:
+    """Return whether one scalar arithmetic operand is null."""
+
+    if value is None or value is pd.NA:
+        return True
+    result = pd.isna(value)
+    return isinstance(result, (bool, np.bool_)) and bool(result)
 
 
 def _column_values(frame: Any, expr: ColumnExpr) -> Any:
