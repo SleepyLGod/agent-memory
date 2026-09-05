@@ -27,6 +27,7 @@ from agent_memory.evaluation.run import (  # noqa: E402
     SEM_AGG_DISPATCH_METHODS,
     SEMANTIC_PAIR_PROFILES,
     SEM_JOIN_TOPK_METHODS,
+    resolve_grouped_agg_rule,
     run_agent_memory_bundle,
 )
 from agent_memory.adapters.lotus.prompt_batching import (  # noqa: E402
@@ -120,7 +121,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     run.add_argument(
         "--grouped-agg-rule",
         choices=GROUPED_AGG_RULES,
-        default="rule-all-group",
+        default=None,
     )
     run.add_argument(
         "--sem-topk-method",
@@ -170,6 +171,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     if getattr(args, "question_ids", None) is not None:
         args.question_ids = tuple(args.question_ids)
     if args.command == "run":
+        args.grouped_agg_rule = resolve_grouped_agg_rule(
+            args.system,
+            args.grouped_agg_rule,
+        )
         sem_join_topk_requested = any(
             argument == "--sem-join-topk-method"
             or argument.startswith("--sem-join-topk-method=")

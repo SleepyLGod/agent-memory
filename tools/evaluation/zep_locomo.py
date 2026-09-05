@@ -20,7 +20,10 @@ from agent_memory.evaluation.zep.locomo import (  # noqa: E402
     ZepLocomoRunConfig,
     run_zep_locomo,
 )
-from agent_memory.planner import GROUPED_AGG_RULES  # noqa: E402
+from agent_memory.planner import (  # noqa: E402
+    DEFAULT_GROUPED_AGG_RULE,
+    GROUPED_AGG_RULES,
+)
 
 LOCOMO_CACHE_PATH = PROJECT_ROOT / ".cache" / "agent-memory" / "locomo10.json"
 
@@ -66,7 +69,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--grouped-agg-rule",
         choices=GROUPED_AGG_RULES,
-        default="rule-re-group",
+        default=DEFAULT_GROUPED_AGG_RULE,
     )
     parser.add_argument("--namespace", default=None)
     parser.add_argument("--output-dir", type=Path, default=default_output_dir())

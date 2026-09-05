@@ -32,6 +32,7 @@ from agent_memory.adapters.lotus.context import (
     SEM_JOIN_TOPK_METHODS,
 )
 from agent_memory.adapters.lotus.prompt_batching import PromptBatching
+from agent_memory.planner import DEFAULT_GROUPED_AGG_RULE
 from .artifacts import BenchmarkArtifactStore
 from .bundle import BenchmarkBundle
 from .harness import BenchmarkRunner, MemorySystemContract, TaskContract
@@ -70,6 +71,19 @@ _BUILT_IN_CONTRACTS = {
 }
 
 
+def resolve_grouped_agg_rule(
+    system_id: str,
+    grouped_agg_rule: str | None,
+) -> str:
+    """Resolve the grouped-aggregate default for one built-in system."""
+
+    if grouped_agg_rule is not None:
+        return grouped_agg_rule
+    if system_id in {"mem0-memory", "mem0-enhanced"}:
+        return "rule-all-group"
+    return DEFAULT_GROUPED_AGG_RULE
+
+
 def _namespace(benchmark_id: str, output_dir: Path) -> str:
     label = re.sub(r"[^a-z0-9]+", "-", benchmark_id.lower()).strip("-")
     digest = sha256(str(output_dir.resolve()).encode("utf-8")).hexdigest()[:12]
@@ -101,7 +115,7 @@ def run_agent_memory_bundle(
     answer_model_id: str = DEFAULT_PROVIDER_MODEL_ID,
     judge_model_id: str = DEFAULT_PROVIDER_MODEL_ID,
     base_namespace: str | None = None,
-    grouped_agg_rule: str = "rule-all-group",
+    grouped_agg_rule: str | None = None,
     sem_topk_method: str | None = None,
     sem_join_topk_method: str | None = None,
     sem_groupby_pair_batch_size: int | None = None,
@@ -126,6 +140,7 @@ def run_agent_memory_bundle(
 
     if system_id not in AGENT_MEMORY_SYSTEMS:
         raise ValueError(f"unsupported agent-memory benchmark system {system_id!r}")
+    grouped_agg_rule = resolve_grouped_agg_rule(system_id, grouped_agg_rule)
     if (
         isinstance(refresh_every, bool)
         or not isinstance(refresh_every, int)

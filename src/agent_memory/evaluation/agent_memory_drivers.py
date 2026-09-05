@@ -28,6 +28,7 @@ from agent_memory.evaluation.semantic_pair_config import SemanticPairSiteBinding
 from agent_memory.evaluation.types import BenchmarkEvent, RetrievalRequest
 from agent_memory.evaluation.zep.answering import format_retrieval_context
 from agent_memory.policy.retrieval import RetrievalResult
+from agent_memory.planner import DEFAULT_GROUPED_AGG_RULE
 from agent_memory.storage import EmbeddingSpec
 from agent_memory.tracing.semantic import trace_event_count
 
@@ -662,7 +663,7 @@ class ClaudeMemoryDriverFactory:
         self,
         *,
         model_id: str = "deepseek/deepseek-v4-flash",
-        grouped_agg_rule: str = "rule-all-group",
+        grouped_agg_rule: str = DEFAULT_GROUPED_AGG_RULE,
         sem_topk_method: str = "pairwise-naive",
         sem_groupby_pair_batch_size: int | None = None,
         sem_groupby_pair_batch_retries: int = 0,
@@ -779,7 +780,7 @@ class ZepMemoryDriverFactory:
         connector: Any,
         base_namespace: str,
         model_id: str = "deepseek/deepseek-v4-flash",
-        grouped_agg_rule: str = "rule-re-group",
+        grouped_agg_rule: str = DEFAULT_GROUPED_AGG_RULE,
         sem_join_topk_method: str = "listwise",
         sem_groupby_pair_batch_size: int | None = None,
         sem_groupby_pair_batch_retries: int = 0,
@@ -846,7 +847,7 @@ class ZepMemoryDriverFactory:
         *,
         base_namespace: str,
         model_id: str = "deepseek/deepseek-v4-flash",
-        grouped_agg_rule: str = "rule-re-group",
+        grouped_agg_rule: str = DEFAULT_GROUPED_AGG_RULE,
         sem_join_topk_method: str = "listwise",
         sem_groupby_pair_batch_size: int | None = None,
         sem_groupby_pair_batch_retries: int = 0,

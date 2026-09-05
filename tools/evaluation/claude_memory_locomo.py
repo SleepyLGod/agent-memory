@@ -20,6 +20,7 @@ from agent_memory.evaluation.claude_memory.locomo import (  # noqa: E402
     SEM_TOPK_METHODS,
     run_claude_memory_locomo,
 )
+from agent_memory.planner import DEFAULT_GROUPED_AGG_RULE  # noqa: E402
 
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / ".memory-test" / "locomo-benchmark" / "latest"
 LOCOMO_CACHE_PATH = PROJECT_ROOT / ".cache" / "agent-memory" / "locomo10.json"
@@ -55,7 +56,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--grouped-agg-rule",
         choices=GROUPED_AGG_RULES,
-        default="compressed",
+        default=DEFAULT_GROUPED_AGG_RULE,
         help="Grouped aggregate differential rule strategy for this evaluation run.",
     )
     parser.add_argument(

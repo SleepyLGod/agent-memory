@@ -44,6 +44,7 @@ GROUPED_AGG_RULES = (
     "rule-all-group",
     "rule-all-group-optimized",
 )
+DEFAULT_GROUPED_AGG_RULE = "rule-join-map"
 PLACEHOLDER_PATTERN = re.compile(
     r"(?<!\{)\{([A-Za-z_][A-Za-z0-9_]*)(?::(left|right))?\}(?!\})"
 )
@@ -142,7 +143,11 @@ class DifferentialInstructionRewriter:
 class DifferentialRules:
     """Operator-level and pattern-level differential rules."""
 
-    def __init__(self, *, grouped_agg_rule: str = "compressed") -> None:
+    def __init__(
+        self,
+        *,
+        grouped_agg_rule: str = DEFAULT_GROUPED_AGG_RULE,
+    ) -> None:
         """Configure differential rule strategy experiments."""
 
         if grouped_agg_rule not in GROUPED_AGG_RULES:

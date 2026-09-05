@@ -1467,6 +1467,12 @@ This is an exact differential rule for the parent insertions and retractions
 that reach the aggregate node. It does not call an LLM and does not select a
 `rule-join-map` or `rule-re-group` strategy.
 
+`rule-join-map` is the default differential strategy for semantic grouped
+aggregates. Other supported strategies, including `rule-re-group` and
+`rule-all-group`, remain available when a policy or an ablation selects them
+explicitly. This default changes the maintenance plan, not the meaning of the
+static `sem_groupby(...).agg(...)` query.
+
 Semantic group-by with aggregation can use either re-group or join-map
 maintenance. These are differential-rule choices, not alternative meanings of
 the static `sem_groupby` API.

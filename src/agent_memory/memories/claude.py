@@ -177,9 +177,13 @@ class ClaudeMemory(Memory):
                 "session_id",
             ]
         )
+        # Membership is intentionally unspecified, so rule-join-map preserves the
+        # current multi-target matching behavior for Claude topics.
         .sem_groupby(
             input_cols=["name", "description", "type"],
             instruction=_GROUP_INSTRUCTION,
+            # Future single-target experiment:
+            # membership="exclusive",
         )
         .sem_agg(
             input_cols=[
