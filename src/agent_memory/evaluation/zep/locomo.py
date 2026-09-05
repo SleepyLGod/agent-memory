@@ -37,6 +37,7 @@ from agent_memory.evaluation.zep.scoring import (
 )
 from agent_memory.evaluation.zep.artifacts import ArtifactStore, PricingSnapshot
 from agent_memory.policy.retrieval import RetrievalResult
+from agent_memory.planner import DEFAULT_GROUPED_AGG_RULE
 from agent_memory.tracing.semantic import semantic_trace_scope
 
 _LOCOMO_TIMESTAMP_PATTERN = re.compile(
@@ -105,7 +106,7 @@ class ZepLocomoRunConfig:
     question_numbers: tuple[int, ...] | None = None
     include_adversarial: bool = True
     model: str = DEFAULT_MODEL
-    grouped_agg_rule: str = "rule-re-group"
+    grouped_agg_rule: str = DEFAULT_GROUPED_AGG_RULE
     namespace: str | None = None
 
 

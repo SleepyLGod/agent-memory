@@ -12,6 +12,34 @@ from tools.evaluation import locomo, longmemeval, memory_agent_bench
 
 
 @pytest.mark.parametrize("module", (locomo, longmemeval, memory_agent_bench))
+@pytest.mark.parametrize(
+    ("system_id", "expected_rule"),
+    (
+        ("claude-memory", "rule-join-map"),
+        ("zep-memory", "rule-join-map"),
+        ("mem0-memory", "rule-all-group"),
+        ("mem0-enhanced", "rule-all-group"),
+    ),
+)
+def test_agent_benchmark_clis_resolve_grouped_agg_default_by_system(
+    module, system_id, expected_rule, tmp_path
+) -> None:
+    args = module.parse_args(
+        [
+            "run",
+            "--bundle-dir",
+            str(tmp_path / "bundle"),
+            "--output-dir",
+            str(tmp_path / "output"),
+            "--system",
+            system_id,
+        ]
+    )
+
+    assert args.grouped_agg_rule == expected_rule
+
+
+@pytest.mark.parametrize("module", (locomo, longmemeval, memory_agent_bench))
 @pytest.mark.parametrize("method", ("pairwise-quick", "listwise"))
 def test_agent_benchmark_clis_select_sem_join_topk_access_path(
     module, method, tmp_path
@@ -273,7 +301,7 @@ def test_longmemeval_cli_separates_bundle_preparation_from_system_run(tmp_path) 
     assert run.memory_model_id == "deepseek-v4-flash"
     assert run.answer_model == "deepseek/deepseek-v4-flash"
     assert run.judge_model == "deepseek/deepseek-v4-flash"
-    assert run.grouped_agg_rule == "rule-all-group"
+    assert run.grouped_agg_rule == "rule-join-map"
     assert run.sem_topk_method == "pairwise-naive"
     assert run.memory_thinking == "disabled"
 
@@ -335,8 +363,8 @@ def test_longmemeval_cli_selects_zep_memory_without_claude_options(tmp_path) -> 
     assert args.system == "zep-memory"
     assert args.namespace == "longmemeval-zep-smoke"
     assert args.memory_thinking == "enabled"
-    assert args.grouped_agg_rule == "rule-all-group"
-    assert longmemeval._condition_id(args) == "zep-memory-rule-all-group"
+    assert args.grouped_agg_rule == "rule-join-map"
+    assert longmemeval._condition_id(args) == "zep-memory-rule-join-map"
 
 
 @pytest.mark.parametrize(
@@ -461,7 +489,7 @@ def test_longmemeval_cli_allows_derived_namespace_for_zep(tmp_path) -> None:
     )
 
     assert args.namespace is None
-    assert longmemeval._condition_id(args) == "zep-memory-rule-all-group"
+    assert longmemeval._condition_id(args) == "zep-memory-rule-join-map"
 
 
 def test_longmemeval_zep_run_forwards_existing_runner_contract(

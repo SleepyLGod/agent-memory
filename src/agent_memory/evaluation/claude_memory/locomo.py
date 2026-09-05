@@ -43,6 +43,7 @@ from agent_memory.evaluation.metrics import (
 )
 from agent_memory.evaluation.types import BenchmarkEvent, BenchmarkQuestion
 from agent_memory.planner import (
+    DEFAULT_GROUPED_AGG_RULE,
     GROUPED_AGG_RULES,
     DifferentialRules,
     PolicyDifferentiator,
@@ -91,7 +92,7 @@ class ClaudeMemoryLocomoRunConfig:
     trace: bool = False
     answer: bool = False
     resume: bool = False
-    grouped_agg_rule: str = "compressed"
+    grouped_agg_rule: str = DEFAULT_GROUPED_AGG_RULE
     sem_topk_method: str = "pairwise-naive"
     restore_csv_state: bool = False
     restore_artifact_csv_state: bool = False
@@ -549,7 +550,7 @@ def checkpoint_manifest(
     question_limit: int,
     model: str,
     answer: bool,
-    grouped_agg_rule: str = "compressed",
+    grouped_agg_rule: str = DEFAULT_GROUPED_AGG_RULE,
     sem_topk_method: str = "pairwise-naive",
     maintenance_mode: str = "ingest",
     source_run_dir: str = "",
@@ -604,7 +605,7 @@ def save_checkpoint(
     question_limit: int,
     model: str,
     answer: bool,
-    grouped_agg_rule: str = "compressed",
+    grouped_agg_rule: str = DEFAULT_GROUPED_AGG_RULE,
     sem_topk_method: str = "pairwise-naive",
     maintenance_mode: str = "ingest",
     source_run_dir: str = "",
@@ -666,7 +667,7 @@ def load_checkpoint(
     question_limit: int,
     model: str,
     answer: bool,
-    grouped_agg_rule: str = "compressed",
+    grouped_agg_rule: str = DEFAULT_GROUPED_AGG_RULE,
     sem_topk_method: str = "pairwise-naive",
     maintenance_mode: str = "ingest",
     source_run_dir: str = "",
@@ -1159,7 +1160,7 @@ def create_memory(
     *,
     model: str,
     trace_dir: Path | None,
-    grouped_agg_rule: str = "compressed",
+    grouped_agg_rule: str = DEFAULT_GROUPED_AGG_RULE,
     sem_topk_method: str = "pairwise-naive",
 ) -> am.ClaudeMemory:
     """Create the ClaudeMemory instance used by one benchmark run."""
@@ -1180,9 +1181,6 @@ def create_memory(
         ),
     )
     memory = am.ClaudeMemory(adapter=adapter)
-    if grouped_agg_rule == "compressed":
-        return memory
-
     policy = PolicyDifferentiator(
         rules=DifferentialRules(grouped_agg_rule=grouped_agg_rule),
     ).differentiate(am.ClaudeMemory.spec())
@@ -1322,7 +1320,7 @@ def summary_frame(
     *,
     run_mode: str,
     model: str,
-    grouped_agg_rule: str = "compressed",
+    grouped_agg_rule: str = DEFAULT_GROUPED_AGG_RULE,
     sem_topk_method: str = "pairwise-naive",
     sample_index: int,
     maintenance_mode: str,
@@ -1432,7 +1430,7 @@ def write_run_artifacts(
     output_dir: Path,
     run_mode: str,
     model: str,
-    grouped_agg_rule: str = "compressed",
+    grouped_agg_rule: str = DEFAULT_GROUPED_AGG_RULE,
     sem_topk_method: str = "pairwise-naive",
     sample_index: int,
     maintenance_mode: str,

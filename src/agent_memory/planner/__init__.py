@@ -8,12 +8,14 @@ from .differential_policy import (
 from .differential_query import QueryDifferentiator
 from .retrieval import RetrievalNode, RetrievalPlan, RetrievalPlanner
 from .rules import (
+    DEFAULT_GROUPED_AGG_RULE,
     GROUPED_AGG_RULES,
     DifferentialInstructionRewriter,
     DifferentialRules,
 )
 
 __all__ = [
+    "DEFAULT_GROUPED_AGG_RULE",
     "DifferentialInstructionRewriter",
     "DifferentialNode",
     "DifferentialRules",

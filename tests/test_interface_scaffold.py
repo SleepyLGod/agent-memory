@@ -2101,10 +2101,12 @@ def test_differential_rules_support_explode_and_unnest_fragments() -> None:
     assert differentiated.inputs[0].inputs[0].op == "log"
 
 
-def test_differential_query_planner_builds_claude_topics_full_next_view() -> None:
+def test_compressed_rule_builds_claude_topics_full_next_view() -> None:
     view = am.ClaudeMemory.spec().views["topics"]
 
-    differentiated = QueryDifferentiator().differentiate(view)
+    differentiated = QueryDifferentiator(
+        rules=DifferentialRules(grouped_agg_rule="compressed"),
+    ).differentiate(view)
 
     assert differentiated.op == "select"
     assert differentiated.params["columns"] == ("name", "description", "type", "body")
@@ -2134,18 +2136,18 @@ def test_differential_query_planner_builds_claude_topics_full_next_view() -> Non
     )
 
 
-def test_claude_topics_differentiated_query_no_longer_uses_join_map_merge() -> None:
+def test_default_grouped_agg_rule_uses_join_map() -> None:
     view = am.ClaudeMemory.spec().views["topics"]
 
     differentiated = QueryDifferentiator().differentiate(view)
     ops = _query_ops(differentiated)
 
     assert "union_by_name" in ops
-    assert "sem_join" not in ops
+    assert "sem_join" in ops
     assert "sem_map" not in ops
 
 
-def test_default_grouped_agg_rule_stays_compressed() -> None:
+def test_explicit_compressed_grouped_agg_rule_remains_available() -> None:
     view = am.ClaudeMemory.spec().views["topics"]
 
     differentiated = QueryDifferentiator(

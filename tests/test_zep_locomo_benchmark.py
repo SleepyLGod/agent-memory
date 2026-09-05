@@ -96,7 +96,7 @@ def test_cli_has_explicit_smoke_and_full_benchmark_defaults(tmp_path: Path) -> N
     assert (benchmark.start_row, benchmark.row_limit) == (1, None)
     assert (benchmark.question_start, benchmark.question_limit) == (1, None)
     assert benchmark.include_adversarial is True
-    assert smoke.grouped_agg_rule == "rule-re-group"
+    assert smoke.grouped_agg_rule == "rule-join-map"
 
 
 @pytest.mark.parametrize("grouped_agg_rule", GROUPED_AGG_RULES)

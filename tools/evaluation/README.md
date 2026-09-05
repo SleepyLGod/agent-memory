@@ -13,12 +13,15 @@ Dataset adapters prepare evidence. Task contracts define prompts and scoring.
 System drivers only add events and retrieve context. The runner owns case
 isolation, resume, answering, grading, trace, and artifacts.
 
-All agent-memory runners accept the planner's complete
-`--grouped-agg-rule` choice set. In particular, `rule-re-group` and
-`rule-join-map` have the same meaning for every policy and benchmark. A
-strict strategy remains selectable even when a particular policy cannot
-compile it; that run fails before insertion instead of being hidden or silently
-changed by the CLI.
+Claude and Zep runners default to `rule-join-map`. They continue to accept the
+planner's other grouped-aggregate rules as explicit compatibility or ablation
+conditions. If a selected rule cannot compile a policy, the run fails before
+insertion instead of silently changing the requested rule.
+
+Mem0 does not contain a grouped aggregate, so its public benchmark CLI rejects
+an explicit `--grouped-agg-rule`. The runner preserves its existing internal
+`rule-all-group` identity only for benchmark compatibility and fingerprints;
+Mem0 does not execute that grouped-aggregate rule.
 
 ## Install
 

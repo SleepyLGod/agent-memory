@@ -173,18 +173,18 @@ def test_aggregate_snapshot_restore_preserves_hidden_state() -> None:
     )
 
 
-def test_aggregate_plan_fingerprint_is_stable_and_old_policies_do_not_change() -> None:
+def test_aggregate_plan_fingerprint_is_stable_and_builtin_defaults_are_pinned() -> None:
     assert (
         _GlobalAggregateMemory.differentiate_policy().fingerprint
         == _GlobalAggregateMemory.differentiate_policy().fingerprint
     )
     assert (
         am.ClaudeMemory.differentiate_policy().fingerprint
-        == "22a85199cb2bfbaf68682b4fdc4ff6c96aaf7e6d76c605ef8be9b2af84d5a742"
+        == "625a53555e82e283d04576eacf7e937c590b546a485bcccc6224d3b8c4dae5fe"
     )
     assert (
         am.ZepMemory.differentiate_policy().fingerprint
-        == "4ef8ce0c653f2bb45c573e70ffc4a98abc6af43f16d3df73a891084cbd6b427b"
+        == "9d1cb107ef677e9624dffeb22399dd6edd7eb6d058e4a37da26c61c2a8e64059"
     )
     assert (
         am.Mem0Memory.differentiate_policy().fingerprint

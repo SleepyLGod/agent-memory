@@ -11,6 +11,7 @@ import agent_memory as am
 import agent_memory.planner as planner
 from agent_memory.adapters import LotusAdapter
 from agent_memory.adapters.lotus.sem_flat_map import apply_flat_map_outputs
+from agent_memory.adapters.lotus.sem_join import assemble_join_frame
 from agent_memory.policy.aggregates import (
     ArrayAggregateSpec,
     CollectListAggregateSpec,
@@ -743,9 +744,27 @@ class _ClaudeStubAdapter(LotusAdapter):
             source = self.execute(query.inputs[0], inputs).copy()
             source[GROUP_ID_COLUMN] = pd.factorize(source["name"], sort=False)[0]
             return source
+        if query.op == "sem_join":
+            left = self.execute(query.inputs[0], inputs)
+            right = self.execute(query.inputs[1], inputs)
+            matches = [
+                (left_index, right_index, None)
+                for left_index, left_row in left.iterrows()
+                for right_index, right_row in right.iterrows()
+                if left_row["name"] == right_row["name"]
+            ]
+            return assemble_join_frame(
+                left,
+                right,
+                matches,
+                how=str(query.params["how"]),
+                id_columns=tuple(query.params["id_columns"]),
+            )
         if query.op == "sem_agg":
             source = self.execute(query.inputs[0], inputs)
             output_names = [column.name for column in query.params["output_cols"]]
+            if source.empty:
+                return pd.DataFrame(columns=output_names)
             groups = (
                 source.groupby(GROUP_ID_COLUMN, sort=False, dropna=False)
                 if GROUP_ID_COLUMN in source.columns

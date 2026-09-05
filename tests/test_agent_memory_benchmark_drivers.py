@@ -1353,6 +1353,7 @@ def test_claude_search_filter_rejects_rule_without_join_before_external_setup(
             contracts={},
             system_id="claude-memory",
             output_dir=tmp_path / "output",
+            grouped_agg_rule="rule-all-group",
             semantic_pair_profile="search-filter",
             semantic_pair_min_similarity=0.6,
         )
