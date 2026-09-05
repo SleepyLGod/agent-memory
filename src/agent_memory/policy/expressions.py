@@ -86,6 +86,15 @@ def expr_from_param(value: object) -> "Expr":
             left=expr_from_param(value.get("left")),
             right=expr_from_param(value.get("right")),
         )
+    if kind == "arithmetic":
+        op = value.get("op")
+        if op not in {"add", "subtract", "multiply", "divide"}:
+            raise ValueError(f"Unsupported arithmetic expression op: {op!r}")
+        return ArithmeticExpr(
+            op=op,  # type: ignore[arg-type]
+            left=expr_from_param(value.get("left")),
+            right=expr_from_param(value.get("right")),
+        )
     if kind == "boolean":
         op = value.get("op")
         operands = value.get("operands")
@@ -171,6 +180,46 @@ class Expr:
 
         return ArrayCatExpr(left=self, right=ensure_expr(other))
 
+    def __add__(self, other: object) -> "ArithmeticExpr":
+        """Build an addition expression."""
+
+        return ArithmeticExpr(op="add", left=self, right=ensure_expr(other))
+
+    def __radd__(self, other: object) -> "ArithmeticExpr":
+        """Build an addition expression with a scalar left operand."""
+
+        return ArithmeticExpr(op="add", left=ensure_expr(other), right=self)
+
+    def __sub__(self, other: object) -> "ArithmeticExpr":
+        """Build a subtraction expression."""
+
+        return ArithmeticExpr(op="subtract", left=self, right=ensure_expr(other))
+
+    def __rsub__(self, other: object) -> "ArithmeticExpr":
+        """Build a subtraction expression with a scalar left operand."""
+
+        return ArithmeticExpr(op="subtract", left=ensure_expr(other), right=self)
+
+    def __mul__(self, other: object) -> "ArithmeticExpr":
+        """Build a multiplication expression."""
+
+        return ArithmeticExpr(op="multiply", left=self, right=ensure_expr(other))
+
+    def __rmul__(self, other: object) -> "ArithmeticExpr":
+        """Build a multiplication expression with a scalar left operand."""
+
+        return ArithmeticExpr(op="multiply", left=ensure_expr(other), right=self)
+
+    def __truediv__(self, other: object) -> "ArithmeticExpr":
+        """Build a division expression."""
+
+        return ArithmeticExpr(op="divide", left=self, right=ensure_expr(other))
+
+    def __rtruediv__(self, other: object) -> "ArithmeticExpr":
+        """Build a division expression with a scalar left operand."""
+
+        return ArithmeticExpr(op="divide", left=ensure_expr(other), right=self)
+
 
 @dataclass(frozen=True, eq=False)
 class ColumnExpr(Expr):
@@ -236,6 +285,25 @@ class ComparisonExpr(Expr):
 
         return {
             "kind": "comparison",
+            "op": self.op,
+            "left": self.left.to_param(),
+            "right": self.right.to_param(),
+        }
+
+
+@dataclass(frozen=True)
+class ArithmeticExpr(Expr):
+    """Binary numeric expression with SQL-style null propagation."""
+
+    op: Literal["add", "subtract", "multiply", "divide"]
+    left: Expr
+    right: Expr
+
+    def to_param(self) -> ExprParam:
+        """Return a QueryExpr parameter representation."""
+
+        return {
+            "kind": "arithmetic",
             "op": self.op,
             "left": self.left.to_param(),
             "right": self.right.to_param(),

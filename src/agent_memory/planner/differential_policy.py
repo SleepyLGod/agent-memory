@@ -12,6 +12,13 @@ from agent_memory.policy.logical import MemorySpec, MemoryView, QueryExpr
 from agent_memory.policy.retrieval import RetrievalQuery
 from agent_memory.policy.schema import output_columns
 from agent_memory.planner.differential_query import QueryDifferentiator
+from agent_memory.planner.algebraic_aggregates import (
+    aggregate_finalize_query,
+    aggregate_layout,
+    aggregate_state_query,
+    aggregate_state_update_query,
+    is_algebraic_aggregate_query,
+)
 from agent_memory.planner.retrieval import RetrievalPlan, RetrievalPlanner
 from agent_memory.planner.serialization import stable_json, stable_value
 from agent_memory.planner.rules import (
@@ -226,6 +233,9 @@ class _DifferentialPolicyBuilder:
         if query.op == "process_window":
             return self._compile_process_window(query, spec=spec)
 
+        if is_algebraic_aggregate_query(query):
+            return self._compile_algebraic_aggregate(query, spec=spec)
+
         if self._is_grouped_aggregate(query):
             return self._compile_grouped_aggregate(query, spec=spec)
 
@@ -280,6 +290,65 @@ class _DifferentialPolicyBuilder:
             maintenance_query=maintenance_query,
         )
         return self._register(query, node)
+
+    def _compile_algebraic_aggregate(
+        self,
+        query: QueryExpr,
+        *,
+        spec: MemorySpec,
+    ) -> str:
+        """Compile count/sum/avg into hidden algebraic state and a finalizer."""
+
+        aggregate_input = query.inputs[0]
+        source_query = (
+            aggregate_input.inputs[0]
+            if aggregate_input.op == "group_by"
+            else aggregate_input
+        )
+        source_node_id = self._compile_query(source_query, spec=spec)
+        source_leaf = self._node_leaf(source_node_id)
+        layout = aggregate_layout(query)
+        state_query = aggregate_state_query(source_leaf, layout=layout)
+        state_node_id = self._node_id(state_query)
+        state_columns = tuple(str(column) for column in layout["state_columns"])
+        current_state = QueryExpr(
+            op="materialized_view",
+            params={"name": state_node_id, "columns": state_columns},
+        )
+        inserted_rows = self._inserted_node_leaf(source_node_id)
+        retracted_rows = QueryExpr(
+            op="materialized_view",
+            params={
+                "name": f"{source_node_id}__retracted",
+                "columns": source_leaf.params["columns"],
+            },
+        )
+        state_node = DifferentialNode(
+            node_id=state_node_id,
+            query=state_query,
+            input_node_ids=(source_node_id,),
+            execution_kind="algebraic_state",
+            output_columns=state_columns,
+            maintenance_query=aggregate_state_update_query(
+                current_state=current_state,
+                inserted_rows=inserted_rows,
+                retracted_rows=retracted_rows,
+                layout=layout,
+            ),
+        )
+        self._register(state_query, state_node)
+
+        final_query = aggregate_finalize_query(
+            self._node_leaf(state_node_id),
+            layout=layout,
+        )
+        public_node = self._make_node(
+            query=query,
+            local_query=final_query,
+            input_node_ids=(state_node_id,),
+            execution_kind="deterministic",
+        )
+        return self._register(query, public_node)
 
     def _compile_grouped_aggregate(self, query: QueryExpr, *, spec: MemorySpec) -> str:
         """Compile one aggregate together with its grouping carrier."""

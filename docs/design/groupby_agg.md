@@ -7,7 +7,8 @@
   `input_cols` 细节。
 - 第三部分记录 implementation-wise differential rules，说明实际 lowering 里
   `sem_agg(input_cols=...)`、`collect_list(...)`、`flatten(...)`、`min(...)`
-  和 `least(...)` 带来的 rule 变体。
+  和 `least(...)` 带来的 rule 变体，并单独说明普通 relational
+  `count/sum/avg` 的精确增量状态。
 
 这里的 rules 分成 paper-wise 和 implementation-wise 两层。本文档不承诺当前
 implementation 已经支持所有 rules，也不决定 optimizer 如何选择 rule。
@@ -113,6 +114,44 @@ input 输出零组。
 直接调用 `group_by(keys).min(..., output_col=o)` 时，`o` 不能和 deterministic
 keys 重名；重名会直接报错。作为 mixed `group_by(keys).agg(...)` 中的 aggregate
 spec 使用时，则遵循该 mixed `.agg(...)` 的 key precedence contract。
+
+#### `count`、`sum` 和 `avg`
+
+这三个是普通 relational aggregates，不调用 LLM：
+
+```python
+overall = rows.agg(
+    count(output_col="row_count"),
+    sum(column="amount", output_col="total_amount"),
+    avg(column="amount", output_col="average_amount"),
+)
+
+by_region = rows.group_by("region").agg(
+    count(output_col="row_count"),
+    sum(column="amount", output_col="total_amount"),
+    avg(column="amount", output_col="average_amount"),
+)
+```
+
+它们的合同是：
+
+```text
+Relation.agg(...):
+  many rows -> one output row
+  output schema = aggregate output columns
+
+group_by(K).agg(...):
+  many rows per exact key -> one output row per key
+  output schema = K + aggregate output columns
+```
+
+`count` 是 `COUNT(*)`，包括含 null 的 row。`sum` 和 `avg` 忽略 null；没有非 null
+数值时输出 null。空的 global relation 仍输出一行，其中 count 为 0，sum/avg 为
+null；空的 grouped relation 输出零行。
+
+当前 numeric aggregate family 只能包含 `count/sum/avg`，不能在同一次 `.agg(...)`
+里混入 `sem_agg`、`array_agg`、`collect_list` 或 `min`。它只适用于普通 `Relation`
+和 deterministic `group_by`；`sem_groupby(...).count/sum/avg(...)` 尚未实现。
 
 ### 1.3 `sem_groupby(keys).sem_agg(...)`
 
@@ -261,6 +300,12 @@ Rules:
 - `am.min(column=..., output_col=...)` 或
   `am.min(columns=[...], output_col=...)` 可以和 `sem_agg`、`array_agg`、
   `collect_list` 一起作为 aggregate spec。
+- 普通 `Relation` 或 deterministic `group_by` 可以使用只包含
+  `count/sum/avg` 的 numeric aggregate family。
+- Numeric aggregate family 暂时不能和上面的 semantic/evidence aggregate
+  family 混用，也不能用于 `sem_groupby`。
+- Numeric aggregate outputs 不能和 deterministic keys 重名；多个 outputs
+  之间也不能重名。
 
 例子：
 
@@ -691,6 +736,38 @@ semantic keys `Ks`仍然只参与`θg`，不要求精确相等。
 `Kr`找到受影响的partition；只有这些partition内部的changed semantic groups需要继续
 执行join-map或re-group。未被delta触及的partition原样保留。
 
+### 2.9 Exact relational `count/sum/avg`
+
+普通 relational aggregate 不需要 semantic rule family。它把每个 exact key 的
+输入压成可加减的状态：
+
+```text
+S(D) = (
+  row_count(D),
+  numeric_sum(D),
+  non_null_count(D)
+)
+```
+
+设 `Δ+` 是 parent 插入，`Δ-` 是 parent 撤回：
+
+```text
+S' = S + S(Δ+) - S(Δ-)
+
+count = row_count
+sum   = null if non_null_count = 0 else numeric_sum
+avg   = null if non_null_count = 0 else numeric_sum / non_null_count
+```
+
+有 `group_by(K)` 时，同一公式按 `K` 分开执行：
+
+```text
+S'[k] = S[k] + S(Δ+[k]) - S(Δ-[k])
+```
+
+说人话就是：新row属于哪个普通key，就只更新那个key的计数和总和；旧row被上游确定性
+变化撤回时，再从同一个key减掉。旧key之间不做join，也不重新扫描未变化的groups。
+
 ## 3. Implementation-wise differential rules
 
 paper-wise rules 里不写 `input_cols`。implementation 里必须写，因为
@@ -930,18 +1007,43 @@ rule-join-map:
 semantic outer join，再在结果上filter Kr”，因为那会丢失本应保留的unmatched rows，
 改变outer-join语义。
 
+### 3.10 Exact relational aggregate state
+
+实现不会把 `avg` 当成一个可以直接相加的输出值。Planner为整组
+`count/sum/avg`建立一个隐藏的 aggregate-state node：
+
+```text
+logical query:
+  D[.group_by(K)].agg(count, sum, avg)
+
+hidden state:
+  K, row_count, numeric_sum, non_null_count
+
+public finalizer:
+  K, declared count/sum/avg outputs
+```
+
+同一个 input column 被 `sum` 和 `avg` 同时使用时，只维护一份 sum 和 non-null
+count。Runtime把 parent的`inserted_rows`加进state，把`retracted_rows`减出state；
+grouped state的row count变成0时删除该group，global state则始终保留一行。隐藏列会进入
+checkpoint，但不会进入public view schema。
+
+这里没有`rule-join-map`、`rule-re-group`或`rule-all-group`选择，因为key和状态更新都是
+确定性的。它也不改变`min`、`array_agg`或semantic aggregates现有的retraction边界。
+
 ## 4. 本文档不定义什么
 
 本文档不决定：
 
 - optimizer 应该选择哪个 rule family；
-- delete / negative delta 时保存 raw group、ordered state，还是 full recompute；
+- `min`、`array_agg` 和 semantic aggregates 遇到 delete / negative delta 时保存
+  raw group、ordered state，还是 full recompute；
 - DAG runtime 应该使用哪种 indexed physical aggregate state。
 
 当前 implementation 已用真实 `QueryExpr` operator graph 实现本文第三章覆盖的
-`sem_agg`、`array_agg`、mixed `.agg(...)` 和 `min` lowering；不存在 public 或
-internal `agg_merge` operator。Shared `PolicyExecutor` 会在这些 stateful node
-boundary 对 insert-only change 执行本章定义的 maintenance query。如果 parent
-change 含 internal retraction，executor 会在 parent 的完整 next state 上重算当前
-semantic aggregate node，再把 replacement change 传给下游。Source delete 和更
-高效的 indexed aggregate state 仍未实现。
+`sem_agg`、`array_agg`、mixed `.agg(...)`、`min` 和 numeric `count/sum/avg`
+lowering；不存在 public `aggregate_state` 或 `agg_merge` operator。Numeric
+aggregates直接维护hidden additive state，可以消费parent产生的insertions和
+retractions。现有semantic aggregate node遇到parent retraction时，仍会在parent完整
+next state上重算，再把replacement change传给下游。Source delete API、numeric与
+semantic aggregate混合，以及`sem_groupby`后的numeric aggregates仍未实现。

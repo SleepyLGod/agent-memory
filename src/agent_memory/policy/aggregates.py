@@ -42,11 +42,38 @@ class MinAggregateSpec:
     output_col: str
 
 
+@dataclass(frozen=True)
+class CountAggregateSpec:
+    """Serializable descriptor for relational ``COUNT(*)``."""
+
+    output_col: str
+
+
+@dataclass(frozen=True)
+class SumAggregateSpec:
+    """Serializable descriptor for one nullable numeric sum."""
+
+    column: str
+    output_col: str
+
+
+@dataclass(frozen=True)
+class AvgAggregateSpec:
+    """Serializable descriptor for one nullable numeric average."""
+
+    column: str
+    output_col: str
+
+
+AlgebraicAggregateSpec: TypeAlias = (
+    CountAggregateSpec | SumAggregateSpec | AvgAggregateSpec
+)
 AggregateSpec: TypeAlias = (
     SemanticAggregateSpec
     | ArrayAggregateSpec
     | CollectListAggregateSpec
     | MinAggregateSpec
+    | AlgebraicAggregateSpec
 )
 ColumnOutput: TypeAlias = Sequence[str] | Mapping[str, str]
 
@@ -110,6 +137,30 @@ def min(
     return MinAggregateSpec(columns=normalized_columns, output_col=str(output_col))
 
 
+def count(*, output_col: str) -> CountAggregateSpec:
+    """Declare relational ``COUNT(*)`` for global or ordinary grouped ``agg``."""
+
+    return CountAggregateSpec(output_col=_require_column_name(output_col, field="output_col"))
+
+
+def sum(*, column: str, output_col: str) -> SumAggregateSpec:
+    """Declare a nullable numeric sum for global or ordinary grouped ``agg``."""
+
+    return SumAggregateSpec(
+        column=_require_column_name(column, field="column"),
+        output_col=_require_column_name(output_col, field="output_col"),
+    )
+
+
+def avg(*, column: str, output_col: str) -> AvgAggregateSpec:
+    """Declare a nullable numeric average for global or ordinary grouped ``agg``."""
+
+    return AvgAggregateSpec(
+        column=_require_column_name(column, field="column"),
+        output_col=_require_column_name(output_col, field="output_col"),
+    )
+
+
 def normalize_min_columns(
     *,
     column: str | None,
@@ -136,7 +187,17 @@ def aggregate_output_names(spec: AggregateSpec) -> tuple[str, ...]:
 
     if isinstance(spec, SemanticAggregateSpec):
         return tuple(column.name for column in spec.output_cols)
-    if isinstance(spec, (ArrayAggregateSpec, CollectListAggregateSpec, MinAggregateSpec)):
+    if isinstance(
+        spec,
+        (
+            ArrayAggregateSpec,
+            CollectListAggregateSpec,
+            MinAggregateSpec,
+            CountAggregateSpec,
+            SumAggregateSpec,
+            AvgAggregateSpec,
+        ),
+    ):
         return (spec.output_col,)
     raise TypeError(f"Unsupported aggregate spec: {type(spec).__name__}")
 
@@ -157,13 +218,18 @@ def normalize_aggregate_specs(specs: Sequence[AggregateSpec]) -> tuple[Aggregate
                 ArrayAggregateSpec,
                 CollectListAggregateSpec,
                 MinAggregateSpec,
+                CountAggregateSpec,
+                SumAggregateSpec,
+                AvgAggregateSpec,
             ),
         )
     ]
     if invalid:
         raise TypeError(
             "agg accepts only agent_memory.sem_agg(...), agent_memory.array_agg(...), "
-            "agent_memory.collect_list(...), or agent_memory.min(...) "
+            "agent_memory.collect_list(...), agent_memory.min(...), "
+            "agent_memory.count(...), agent_memory.sum(...), or "
+            "agent_memory.avg(...) "
             f"aggregate specs; got {invalid}"
         )
     outputs = [
@@ -175,6 +241,22 @@ def normalize_aggregate_specs(specs: Sequence[AggregateSpec]) -> tuple[Aggregate
     if duplicates:
         raise ValueError(f"aggregate output columns must be unique: {duplicates}")
     return normalized
+
+
+def is_algebraic_aggregate_spec(spec: object) -> bool:
+    """Return whether a descriptor has exact additive aggregate state."""
+
+    return isinstance(spec, (CountAggregateSpec, SumAggregateSpec, AvgAggregateSpec))
+
+
+def _require_column_name(value: object, *, field: str) -> str:
+    """Validate one aggregate input or output column name."""
+
+    if not isinstance(value, str):
+        raise TypeError(f"aggregate {field} must be a string")
+    if not value:
+        raise ValueError(f"aggregate {field} cannot be empty")
+    return value
 
 
 def _normalize_output_cols(output_cols: ColumnOutput) -> tuple[ColumnSpec, ...]:
