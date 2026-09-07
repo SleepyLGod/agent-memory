@@ -431,11 +431,13 @@ def test_runner_answers_once_and_records_primary_and_secondary_graders(
             "mean_ms": 0.7,
             "median_ms": 0.7,
             "p95_ms": 0.7,
+            "max_ms": 0.7,
         },
         "secondary": {
             "mean_ms": 860.0,
             "median_ms": 860.0,
             "p95_ms": 860.0,
+            "max_ms": 860.0,
         },
     }
     with (tmp_path / "metrics" / "per_question.csv").open(
@@ -605,6 +607,10 @@ def test_insertion_metrics_separate_measured_semantic_trace_io(
         newline="", encoding="utf-8"
     ) as stream:
         case_row = next(csv.DictReader(stream))
+    with (tmp_path / "metrics" / "overview.csv").open(
+        newline="", encoding="utf-8"
+    ) as stream:
+        overview_row = next(csv.DictReader(stream))
     summary = json.loads((tmp_path / "metrics" / "summary.json").read_text())
 
     assert len(event_rows) == 2
@@ -622,7 +628,72 @@ def test_insertion_metrics_separate_measured_semantic_trace_io(
         case_row["semantic_trace_bytes_written"]
     )
     assert summary["semantic_trace_io_wall_latency"]["mean_ms"] is not None
-    assert summary["insertion_wall_latency_excluding_trace_io"]["mean_ms"] is not None
+    adjusted = summary["insertion_wall_latency_excluding_trace_io"]
+    adjusted_values = [
+        float(row["insertion_latency_excluding_trace_io_ms"])
+        for row in event_rows
+    ]
+    expected_middle = round(sum(adjusted_values) / 2, 3)
+    assert adjusted["mean_ms"] == expected_middle
+    assert adjusted["median_ms"] == expected_middle
+    assert adjusted["p95_ms"] == pytest.approx(
+        round(min(adjusted_values) * 0.05 + max(adjusted_values) * 0.95, 3)
+    )
+    assert adjusted["max_ms"] == round(max(adjusted_values), 3)
+    insertion = summary["insertion_wall_latency"]
+    assert float(overview_row["insertion_mean_latency_ms"]) == pytest.approx(
+        insertion["mean_ms"]
+    )
+    assert float(overview_row["insertion_median_latency_ms"]) == pytest.approx(
+        insertion["median_ms"]
+    )
+    assert float(overview_row["insertion_p95_latency_ms"]) == pytest.approx(
+        insertion["p95_ms"]
+    )
+    assert float(
+        overview_row["insertion_excluding_semantic_trace_mean_ms"]
+    ) == pytest.approx(adjusted["mean_ms"])
+    assert float(
+        overview_row["insertion_excluding_semantic_trace_median_ms"]
+    ) == pytest.approx(adjusted["median_ms"])
+    assert float(
+        overview_row["insertion_excluding_semantic_trace_p95_ms"]
+    ) == pytest.approx(adjusted["p95_ms"])
+    assert float(
+        overview_row["insertion_excluding_semantic_trace_max_ms"]
+    ) == pytest.approx(adjusted["max_ms"])
+
+    events_path = tmp_path / "trace" / "events.jsonl"
+    trace_rows = [json.loads(line) for line in events_path.read_text().splitlines()]
+    for row in trace_rows:
+        if row.get("event_type") != "insertion_result":
+            continue
+        row.pop("semantic_trace_io_latency_ms", None)
+        row.pop("semantic_trace_bytes_written", None)
+        row.pop("insertion_latency_excluding_trace_io_ms", None)
+    events_path.write_text(
+        "".join(f"{json.dumps(row)}\n" for row in trace_rows),
+        encoding="utf-8",
+    )
+    BenchmarkArtifactStore(tmp_path).finalize_metrics()
+
+    legacy_summary = json.loads(
+        (tmp_path / "metrics" / "summary.json").read_text()
+    )
+    with (tmp_path / "metrics" / "overview.csv").open(
+        newline="", encoding="utf-8"
+    ) as stream:
+        legacy_overview = next(csv.DictReader(stream))
+    assert legacy_summary["insertion_wall_latency_excluding_trace_io"] == {
+        "mean_ms": None,
+        "median_ms": None,
+        "p95_ms": None,
+        "max_ms": None,
+    }
+    assert legacy_overview["insertion_excluding_semantic_trace_mean_ms"] == ""
+    assert legacy_overview["insertion_excluding_semantic_trace_median_ms"] == ""
+    assert legacy_overview["insertion_excluding_semantic_trace_p95_ms"] == ""
+    assert legacy_overview["insertion_excluding_semantic_trace_max_ms"] == ""
 
 
 def test_operation_usage_separates_calls_batches_and_provider_responses(
