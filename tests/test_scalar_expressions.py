@@ -2,12 +2,49 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+import operator
+from typing import Any
+
 import pandas as pd
 import pytest
 
 import agent_memory as am
 from agent_memory.adapters import LotusAdapter
-from agent_memory.policy.expressions import CaseWhenExpr, TryCastExpr, expr_from_param
+from agent_memory.policy.expressions import CaseWhenExpr, ComparisonExpr, TryCastExpr, expr_from_param
+
+
+@pytest.mark.parametrize("kind", ["arithmetic", "cast", "case"])
+@pytest.mark.parametrize(
+    ("compare", "expected"),
+    [(operator.eq, [2]), (operator.ne, [1, 3]), (operator.lt, [1]),
+     (operator.le, [1, 2]), (operator.gt, [3]), (operator.ge, [2, 3])],
+)
+@pytest.mark.parametrize("reversed_operands", [False, True])
+def test_composite_comparisons_filter_rows(
+    kind: str, compare: Callable[[Any, Any], Any], expected: list[int], reversed_operands: bool,
+) -> None:
+    source = am.Source({"value": "Value."})
+    value = source.col("value")
+    expr = {
+        "arithmetic": value + 0,
+        "cast": am.try_cast(value, to="float"),
+        "case": am.case_when(True, value, 0),
+    }[kind]
+    comparison = compare(2, expr) if reversed_operands else compare(expr, 2)
+    assert isinstance(comparison, ComparisonExpr)
+    assert expr_from_param(comparison.to_param()).to_param() == comparison.to_param()
+    with pytest.raises(TypeError):
+        bool(comparison)
+    with pytest.raises(TypeError):
+        hash(expr)
+    result = LotusAdapter().execute(
+        source.filter(comparison).expr,
+        {"log": pd.DataFrame({"value": [1, 2, 3]})},
+    )
+    assert result["value"].tolist() == (
+        sorted(4 - item for item in expected) if reversed_operands else expected
+    )
 
 
 def test_try_cast_and_case_when_execute_inside_assign() -> None:
