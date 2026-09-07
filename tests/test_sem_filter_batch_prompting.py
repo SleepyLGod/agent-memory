@@ -88,6 +88,38 @@ def test_batch_prompting_preserves_order_multiplicity_and_uses_stable_ids(
     assert kwargs["response_format"] == {"type": "json_object"}
 
 
+def test_batch_prompting_keeps_one_fixed_output_limit_for_many_tasks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import lotus
+
+    task_count = 128
+    source = pd.DataFrame(
+        {
+            "left": [f"left-{index}" for index in range(task_count)],
+            "right": [f"right-{index}" for index in range(task_count)],
+        }
+    )
+    decisions = ",".join(
+        f'{{"row_id":"row_{index}","keep":true}}'
+        for index in range(task_count)
+    )
+    lm = FakeBatchLM([[f'{{"decisions":[{decisions}]}}']])
+    monkeypatch.setattr(lotus.settings, "lm", lm)
+    monkeypatch.setattr(lotus.settings, "enable_cache", False)
+    context = _context(batch_size=task_count)
+
+    result = execute_batch_prompted_sem_filter(
+        source,
+        instruction="{left} matches {right}.",
+        prompt_batching=context.config.prompt_batching,
+        context=context,
+    )
+
+    assert len(result.frame) == task_count
+    assert lm.calls[0][1]["max_tokens"] == context.config.structured_max_tokens
+
+
 def test_batch_prompting_retries_only_invalid_batches(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

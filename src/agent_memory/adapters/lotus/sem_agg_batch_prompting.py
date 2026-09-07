@@ -7,6 +7,9 @@ from dataclasses import dataclass
 import json
 from typing import Any
 
+from agent_memory.adapters.lotus.json_output import (
+    load_structured_json_with_syntax_repair,
+)
 from agent_memory.adapters.lotus.prompt_batching import (
     ParsedPromptBatch,
     PromptBatchItem,
@@ -15,7 +18,6 @@ from agent_memory.adapters.lotus.prompt_batching import (
     run_prompt_batches,
 )
 from agent_memory.adapters.lotus.structured import (
-    load_structured_json_with_syntax_repair,
     structured_scalar_values,
 )
 from agent_memory.policy.logical import ColumnSpec
@@ -59,10 +61,11 @@ def execute_batch_prompted_sem_agg(
     model_kwargs: Mapping[str, Any],
     progress_bar_desc: str,
     trace_dir: Any = None,
+    structured_output_transport: str = "chat-json-object",
 ) -> BatchPromptedSemAggResult:
     """Aggregate independent groups in bounded shared prompts."""
 
-    max_tokens = int(model_kwargs.get("max_tokens", model.max_tokens))
+    output_token_limit = int(model_kwargs.get("max_tokens", model.max_tokens))
     tasks = tuple(
         _BatchPromptTask(
             group_index=group_index,
@@ -83,7 +86,7 @@ def execute_batch_prompted_sem_agg(
             batch,
             instruction=instruction,
             output_cols=output_cols,
-            max_tokens=max_tokens,
+            max_tokens=output_token_limit,
         ),
         parse_results=lambda raw_output: _parse_outputs(
             raw_output,
@@ -91,6 +94,8 @@ def execute_batch_prompted_sem_agg(
         ),
         model=model,
         config=prompt_batching,
+        output_schema=_aggregate_schema(output_cols),
+        structured_output_transport=structured_output_transport,
         max_retries=max_retries,
         progress_bar_desc=progress_bar_desc,
         operator="sem_agg",
@@ -104,6 +109,37 @@ def execute_batch_prompted_sem_agg(
         retry_count=execution.retry_count,
         repair_methods=execution.repair_methods,
     )
+
+
+def _aggregate_schema(output_cols: Sequence[ColumnSpec]) -> dict[str, Any]:
+    fields = {
+        column.name: {"type": ["string", "number", "boolean", "null"]}
+        for column in output_cols
+    }
+    return {
+        "type": "object",
+        "properties": {
+            "results": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "group_id": {"type": "string"},
+                        "output": {
+                            "type": "object",
+                            "properties": fields,
+                            "required": list(fields),
+                            "additionalProperties": False,
+                        },
+                    },
+                    "required": ["group_id", "output"],
+                    "additionalProperties": False,
+                },
+            }
+        },
+        "required": ["results"],
+        "additionalProperties": False,
+    }
 
 
 def _build_request(

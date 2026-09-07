@@ -96,6 +96,7 @@ def execute_structured_sem_map(
         structured_parse_retries=config.structured_parse_retries,
         semantic_trace_dir=config.trace_dir(),
         prompt_batching=config.prompt_batching,
+        structured_output_transport=config.structured_output_transport,
     )
     return apply_structured_map_outputs(
         source,

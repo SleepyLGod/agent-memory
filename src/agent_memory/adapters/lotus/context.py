@@ -10,7 +10,10 @@ from typing import Any
 from agent_memory.adapters.lotus.pair_execution import (
     SemanticPairExecutionProfile,
 )
-from agent_memory.adapters.lotus.prompt_batching import PromptBatching
+from agent_memory.adapters.lotus.prompt_batching import (
+    PromptBatching,
+    validate_structured_output_transport,
+)
 from agent_memory.adapters.lotus.provider_usage_lm import provider_usage_tracing_lm_class
 from agent_memory.adapters.lotus.traced_lm import TracedLM
 from agent_memory.storage.embedding import EmbeddingProvider
@@ -47,6 +50,7 @@ class LotusExecutionConfig:
     lm_rate_limit: int | None = None
     lm_model_kwargs: Mapping[str, Any] = field(default_factory=dict)
     lm_enable_cache: bool | None = None
+    # Fixed per-request ceiling for structured output, independent of task count.
     structured_max_tokens: int = DEFAULT_STRUCTURED_MAX_TOKENS
     structured_parse_retries: int = DEFAULT_STRUCTURED_PARSE_RETRIES
     semantic_trace_dir: Path | str | None = None
@@ -55,6 +59,7 @@ class LotusExecutionConfig:
         default_factory=dict
     )
     prompt_batching: PromptBatching | None = None
+    structured_output_transport: str = "chat-json-object"
 
     sem_filter_examples: Sequence[Mapping[str, Any]] | None = None
     sem_filter_helper_examples: Sequence[Mapping[str, Any]] | None = None
@@ -99,6 +104,7 @@ class LotusExecutionConfig:
     def __post_init__(self) -> None:
         """Validate bounded semantic execution settings."""
 
+        validate_structured_output_transport(self.structured_output_transport)
         if self.prompt_batching is not None and not isinstance(
             self.prompt_batching, PromptBatching
         ):
@@ -170,6 +176,13 @@ class LotusExecutionContext:
         repr=False,
     )
 
+    def __post_init__(self) -> None:
+        """Reject unsupported transport/model combinations before configuring LOTUS."""
+
+        validate_structured_output_transport(
+            self.config.structured_output_transport, model=self.model
+        )
+
     def configure(self) -> None:
         """Configure LOTUS before invoking semantic dataframe operators."""
 
@@ -203,10 +216,17 @@ class LotusExecutionContext:
             )
 
         trace_dir = self.config.trace_dir()
+        lm_class = LM
+        if self.config.structured_output_transport == "responses-json-schema":
+            from agent_memory.adapters.lotus.deepseek_responses_lm import (
+                deepseek_responses_lm_class,
+            )
+
+            lm_class = deepseek_responses_lm_class(LM)
         base_lm = (
-            provider_usage_tracing_lm_class(LM)(**lm_kwargs, trace_dir=trace_dir)
-            if trace_dir is not None
-            else LM(**lm_kwargs)
+            provider_usage_tracing_lm_class(lm_class)(**lm_kwargs, trace_dir=trace_dir)
+            if trace_dir is not None or self.config.prompt_batching is not None
+            else lm_class(**lm_kwargs)
         )
         lm = TracedLM(base_lm, trace_dir) if trace_dir is not None else base_lm
         self._lm = lm

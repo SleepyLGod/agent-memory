@@ -31,7 +31,36 @@ class ProviderUsageTracingMixin:
         **kwargs: Any,
     ) -> None:
         self._provider_usage_trace_dir = trace_dir
+        self._completion_metadata: list[dict[str, Any]] = []
         super().__init__(*args, **kwargs)
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        """Keep completion metadata aligned with outputs, including cache hits."""
+
+        self._completion_metadata = []
+        parent: Any = super()
+        output = parent.__call__(*args, **kwargs)
+        output.response_metadata = tuple(self._completion_metadata)
+        return output
+
+    def _get_top_choice(self, response: Any) -> str:
+        """Preserve the finish state discarded by LOTUS's text-only LMOutput."""
+
+        parent: Any = super()
+        text = parent._get_top_choice(response)
+        metadata = getattr(response, "provider_response_metadata", {})
+        choices = getattr(response, "choices", ())
+        self._completion_metadata.append(
+            {
+                "finish_reason": metadata.get(
+                    "finish_reason",
+                    getattr(choices[0], "finish_reason", None) if choices else None,
+                ),
+                "status": metadata.get("status"),
+                "incomplete_reason": metadata.get("incomplete_reason"),
+            }
+        )
+        return text
 
     def _process_uncached_messages(
         self,

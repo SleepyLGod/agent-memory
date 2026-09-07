@@ -31,7 +31,9 @@ from agent_memory.evaluation.run import (  # noqa: E402
     run_agent_memory_bundle,
 )
 from agent_memory.adapters.lotus.prompt_batching import (  # noqa: E402
+    STRUCTURED_OUTPUT_TRANSPORTS,
     parse_prompt_batch_size,
+    validate_structured_output_transport,
 )
 from agent_memory.planner import GROUPED_AGG_RULES  # noqa: E402
 
@@ -141,6 +143,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     run.add_argument("--prompt-batch-size", type=parse_prompt_batch_size)
     run.add_argument(
+        "--structured-output-transport",
+        choices=STRUCTURED_OUTPUT_TRANSPORTS,
+        default="chat-json-object",
+    )
+    run.add_argument(
         "--semantic-pair-profile",
         choices=SEMANTIC_PAIR_PROFILES,
         default="oracle-only",
@@ -171,6 +178,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     if getattr(args, "question_ids", None) is not None:
         args.question_ids = tuple(args.question_ids)
     if args.command == "run":
+        try:
+            validate_structured_output_transport(
+                args.structured_output_transport, model=args.memory_model
+            )
+        except ValueError as error:
+            parser.error(str(error))
         args.grouped_agg_rule = resolve_grouped_agg_rule(
             args.system,
             args.grouped_agg_rule,
@@ -303,6 +316,11 @@ def main(argv: Sequence[str] | None = None) -> Path:
         maintenance_only=args.maintenance_only,
         maintenance_checkpoint_output_dir=args.maintenance_checkpoint_output_dir,
         max_new_cases=args.max_new_cases,
+        **(
+            {"structured_output_transport": args.structured_output_transport}
+            if args.structured_output_transport != "chat-json-object"
+            else {}
+        ),
     )
     if not args.maintenance_only:
         store = BenchmarkArtifactStore(output)
