@@ -198,6 +198,7 @@ def _latency_stats(values: list[float]) -> dict[str, float | None]:
         "mean_ms": round(mean(values), 3) if values else None,
         "median_ms": round(median(values), 3) if values else None,
         "p95_ms": _percentile(values, 0.95),
+        "max_ms": round(max(values), 3) if values else None,
     }
 
 
@@ -2120,6 +2121,18 @@ class BenchmarkArtifactStore:
                     "insertion_median_latency_ms": _latency_stats(
                         insertion_latencies
                     )["median_ms"],
+                    "insertion_excluding_semantic_trace_mean_ms": summary[
+                        "insertion_wall_latency_excluding_trace_io"
+                    ]["mean_ms"],
+                    "insertion_excluding_semantic_trace_median_ms": summary[
+                        "insertion_wall_latency_excluding_trace_io"
+                    ]["median_ms"],
+                    "insertion_excluding_semantic_trace_p95_ms": summary[
+                        "insertion_wall_latency_excluding_trace_io"
+                    ]["p95_ms"],
+                    "insertion_excluding_semantic_trace_max_ms": summary[
+                        "insertion_wall_latency_excluding_trace_io"
+                    ]["max_ms"],
                     "retrieval_mean_latency_ms": _latency_stats(
                         retrieval_latencies
                     )["mean_ms"],
