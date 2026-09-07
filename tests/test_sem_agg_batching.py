@@ -14,6 +14,8 @@ from agent_memory.adapters.lotus.context import LotusExecutionConfig
 from agent_memory.adapters.lotus.prompt_batching import PromptBatching
 from agent_memory.adapters.lotus.relational import execute_agg
 from agent_memory.adapters.lotus.sem_agg import (
+    _execute_independent_sem_agg_groups,
+    _execute_lotus_style_sem_agg,
     execute_native_sem_agg_groups,
     execute_structured_sem_agg_groups,
 )
@@ -52,6 +54,77 @@ def _native_output(prompt: Any) -> str:
     if "beta" in text:
         return "beta summary"
     return "summary"
+
+
+class _BudgetModel(_RecordingModel):
+    max_ctx_len = 10
+    max_tokens = 1
+
+    def count_tokens(self, value: Any) -> int:
+        text = str(value)
+        if "{{docs_str}}" in text:
+            return 1
+        return 100 if "oversized" in text else 4
+
+
+def _run_local_aggregate(path: str, documents: list[str], model: _RecordingModel) -> None:
+    if path == "independent":
+        _execute_independent_sem_agg_groups(
+            [documents], model, "Summarize.", config=LotusExecutionConfig(),
+        )
+    else:
+        _execute_lotus_style_sem_agg(
+            documents, model, "Summarize.", [0] * len(documents),
+            safe_mode=False, progress_bar_desc="Test", response_format=None,
+            final_model_kwargs=None,
+        )
+
+
+@pytest.mark.parametrize("path", ["independent", "lotus-style"])
+@pytest.mark.parametrize("documents", [["oversized"], ["small", "oversized"]])
+def test_local_aggregate_rejects_oversized_document_before_provider(
+    path: str, documents: list[str],
+) -> None:
+    model = _BudgetModel()
+    with pytest.raises(ValueError, match="sem_agg document does not fit"):
+        _run_local_aggregate(path, documents, model)
+    assert model.calls == []
+
+
+@pytest.mark.parametrize("path", ["independent", "lotus-style"])
+def test_local_aggregate_rejects_oversized_summary_at_next_level(path: str) -> None:
+    model = _BudgetModel(outputs=[("oversized", "summary")])
+    with pytest.raises(ValueError, match="sem_agg document does not fit"):
+        _run_local_aggregate(path, ["one", "two", "three"], model)
+    assert len(model.calls) == 1
+    assert len(model.calls[0][0]) == 2
+
+
+@pytest.mark.parametrize("path", ["independent", "lotus-style"])
+def test_local_aggregate_accepts_exact_budget_without_empty_prompts(path: str) -> None:
+    model = _BudgetModel()
+    _run_local_aggregate(path, ["one", "two"], model)
+    assert len(model.calls) == 1
+    assert len(model.calls[0][0]) == 1
+    prompt = model.calls[0][0][0][0]["content"]
+    assert "one" in prompt and "two" in prompt
+
+
+@pytest.mark.parametrize("path", ["independent", "lotus-style"])
+def test_local_aggregate_recounts_after_document_number_reset(path: str) -> None:
+    class NumberSensitiveModel(_BudgetModel):
+        def count_tokens(self, value: Any) -> int:
+            text = str(value)
+            if "{{docs_str}}" in text or "Source" in text:
+                return 1
+            return 3 if "Document 1: second" in text else 5
+
+    model = NumberSensitiveModel()
+    _run_local_aggregate(path, ["first", "second", "third"], model)
+    assert [len(prompts) for prompts, _kwargs in model.calls] == [2, 1]
+    second_prompt = model.calls[0][0][1][0]["content"]
+    assert "Document 1: second" in second_prompt
+    assert "Document 2: third" in second_prompt
 
 
 def _query(*, structured: bool = False) -> QueryExpr:

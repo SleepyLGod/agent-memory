@@ -353,10 +353,31 @@ class _DeepSeekResponsesMixin:
                 try:
                     return _normalize_response(native_response)
                 except Exception as error:
+                    try:
+                        envelope = _response_envelope(
+                            native_response, "normalization_error", ""
+                        )
+                    except Exception as accounting_error:
+                        error.add_note(
+                            "Response accounting unavailable: "
+                            f"{type(accounting_error).__name__}: {accounting_error}"
+                        )
+                        # Do not read malformed native fields again in this fallback.
+                        envelope = ModelResponse(
+                            model=self.model,
+                            created=0,
+                            choices=[],
+                            usage=None,
+                            provider_response_metadata={
+                                "transport": _TRANSPORT,
+                                "status": None,
+                                "incomplete_reason": None,
+                                "finish_reason": "normalization_error",
+                                "raw_usage": None,
+                            },
+                        )
                     normalization_failure = _ResponseFailure(
-                        _response_envelope(native_response, "normalization_error", ""),
-                        error,
-                        native_response,
+                        envelope, error, native_response
                     )
                     normalization_failure.__cause__ = error
                     return normalization_failure
