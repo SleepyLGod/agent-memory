@@ -845,6 +845,7 @@ def _build_independent_sem_agg_level_prompts(
         )
     )
     template_tokens = model.count_tokens(template)
+    budget = model.max_ctx_len - model.max_tokens - template_tokens
     context_str = ""
     context_tokens = 0
     document_counter = 1
@@ -857,20 +858,21 @@ def _build_independent_sem_agg_level_prompts(
             document_counter,
         )
         new_tokens = model.count_tokens(formatted)
-        if (
-            new_tokens + context_tokens + template_tokens
-            > model.max_ctx_len - model.max_tokens
-        ):
+        if new_tokens + context_tokens > budget and document_counter > 1:
             prompt = template.replace("{{docs_str}}", context_str)
             prompts.append([{"role": "user", "content": prompt}])
             document_counter = 1
             formatted = format_aggregate_doc(
                 tree_level, str(document), document_counter
             )
-            context_str = formatted
-            context_tokens = new_tokens
-            document_counter += 1
-            continue
+            new_tokens = model.count_tokens(formatted)
+            context_str = ""
+            context_tokens = 0
+        if new_tokens > budget:
+            raise ValueError(
+                "sem_agg document does not fit one prompt: "
+                f"{new_tokens} tokens exceed the {budget}-token budget"
+            )
         context_str += formatted
         context_tokens += new_tokens
         document_counter += 1
@@ -980,6 +982,7 @@ def _execute_lotus_style_sem_agg(
             else node_instruction_template(user_instruction)
         )
         template_tokens = model.count_tokens(template)
+        budget = model.max_ctx_len - model.max_tokens - template_tokens
         context_tokens = 0
         doc_counter = 1
         new_partition_ids: list[int] = []
@@ -990,9 +993,9 @@ def _execute_lotus_style_sem_agg(
             new_tokens = model.count_tokens(formatted_doc)
 
             if (
-                new_tokens + context_tokens + template_tokens
-                > model.max_ctx_len - model.max_tokens
-            ) or (partition_id != current_partition_id and not do_fold):
+                new_tokens + context_tokens > budget
+                or (partition_id != current_partition_id and not do_fold)
+            ) and doc_counter > 1:
                 prompt = template.replace("{{docs_str}}", context_str)
                 lotus.logger.debug(f"Prompt added to batch: {prompt}")
                 batch.append([{"role": "user", "content": prompt}])
@@ -1001,13 +1004,17 @@ def _execute_lotus_style_sem_agg(
                 doc_counter = 1
 
                 formatted_doc = format_aggregate_doc(tree_level, doc, doc_counter)
-                context_str = formatted_doc
-                context_tokens = new_tokens
-                doc_counter += 1
-            else:
-                context_str += formatted_doc
-                context_tokens += new_tokens
-                doc_counter += 1
+                new_tokens = model.count_tokens(formatted_doc)
+                context_str = ""
+                context_tokens = 0
+            if new_tokens > budget:
+                raise ValueError(
+                    "sem_agg document does not fit one prompt: "
+                    f"{new_tokens} tokens exceed the {budget}-token budget"
+                )
+            context_str += formatted_doc
+            context_tokens += new_tokens
+            doc_counter += 1
 
         if doc_counter > 1 or len(doc_list) == 1:
             prompt = template.replace("{{docs_str}}", context_str)

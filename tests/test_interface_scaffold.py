@@ -6995,7 +6995,7 @@ def test_lotus_style_sem_agg_passes_response_format_only_on_final_pass() -> None
         def count_tokens(self, value: Any) -> int:
             text = str(value)
             if "doc two" in text:
-                return 100
+                return 8
             return 1
 
         def __call__(self, batch: list[Any], **kwargs: Any) -> Any:
@@ -7068,7 +7068,7 @@ def test_lotus_style_structured_sem_agg_retries_only_final_call() -> None:
         max_tokens = 1
 
         def count_tokens(self, value: Any) -> int:
-            return 100 if "doc two" in str(value) else 1
+            return 8 if "doc two" in str(value) else 1
 
         def __call__(self, batch: list[Any], **kwargs: Any) -> Any:
             calls.append((len(batch), dict(kwargs)))

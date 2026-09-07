@@ -665,6 +665,46 @@ def test_missing_usage_is_not_fabricated(
 
 
 @pytest.mark.parametrize("cache_enabled", [False, True])
+@pytest.mark.parametrize("bad_field", ["created_at", "usage"])
+def test_malformed_accounting_preserves_order_and_other_usage(
+    clients: list[FakeClient], monkeypatch: pytest.MonkeyPatch,
+    bad_field: str, cache_enabled: bool,
+) -> None:
+    native = _native().model_copy(update={
+        bad_field: None if bad_field == "created_at" else {"invalid": "usage"},
+    })
+    error = ValueError("original normalization failure")
+    original_normalizer = adapter._normalize_response
+
+    def normalize(response: Response) -> Any:
+        if response is native:
+            raise error
+        return original_normalizer(response)
+
+    client = FakeClient()
+    client.handler = lambda p: native if p["input"][0]["content"] == "1" else _native()
+    monkeypatch.setattr(adapter, "OpenAI", lambda **_: client)
+    monkeypatch.setattr(adapter, "_normalize_response", normalize)
+    monkeypatch.setattr(lotus.settings, "enable_cache", cache_enabled)
+    lm = _lm()
+    responses = _process(lm, count=3)
+    assert isinstance(responses[0], ModelResponse)
+    assert isinstance(responses[2], ModelResponse)
+    failure = responses[1]
+    assert isinstance(failure, OpenAIError)
+    assert failure.native_response is native
+    assert failure.__cause__ is error
+    assert any("accounting" in note for note in error.__notes__)
+    assert failure.provider_response_metadata["finish_reason"] == "normalization_error"
+    assert failure.provider_response_metadata["raw_usage"] is None
+    assert getattr(failure, "usage", None) is None
+    with pytest.raises(OpenAIError, match="original normalization failure"):
+        lm(_messages(3), response_format=SCHEMA, show_progress_bar=False)
+    assert lm.stats.physical_usage.total_tokens == 38
+    assert lm.stats.virtual_usage.total_tokens == 38
+
+
+@pytest.mark.parametrize("cache_enabled", [False, True])
 @pytest.mark.parametrize("usage_available", [False, True])
 @pytest.mark.parametrize("failure_stage", ["normalizer", "output_serialization"])
 def test_normalizer_failure_preserves_native_response_and_batch_usage(
