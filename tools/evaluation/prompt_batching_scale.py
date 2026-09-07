@@ -1153,17 +1153,21 @@ def _validate_condition(
 def _safe_stop(
     paths: ExperimentPaths, process: subprocess.Popen[Any], *, reason: str
 ) -> None:
-    _log(paths, f"SAFETY_STOP reason={reason} pid={process.pid}")
-    _set_state(paths, "experiment-state", "safety-stopped")
     try:
-        os.killpg(process.pid, signal.SIGINT)
-    except ProcessLookupError:
-        return
-    try:
-        process.wait(timeout=60)
-    except subprocess.TimeoutExpired:
-        os.killpg(process.pid, signal.SIGTERM)
-        process.wait(timeout=30)
+        _log(paths, f"SAFETY_STOP reason={reason} pid={process.pid}")
+        _set_state(paths, "experiment-state", "safety-stopped")
+    finally:
+        # A full disk or broken status file must not prevent stopping paid work.
+        try:
+            os.killpg(process.pid, signal.SIGINT)
+        except ProcessLookupError:
+            pass
+        else:
+            try:
+                process.wait(timeout=60)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGTERM)
+                process.wait(timeout=30)
 
 
 def _before_condition(paths: ExperimentPaths) -> None:
@@ -1256,30 +1260,40 @@ def run_experiment(root: Path) -> None:
                 env=_condition_environment(paths),
                 start_new_session=True,
             )
-            _atomic_text(paths.control / "runner.pid", f"{process.pid}\n")
-            while process.poll() is None:
-                trace = output / "trace" / "events.jsonl"
-                if trace.exists() and trace.stat().st_size:
-                    monitor = _update_monitor(trace, directory / "monitor-state.json")
-                    if monitor["reasoning_tokens"] != 0:
-                        _safe_stop(paths, process, reason="reasoning_tokens_nonzero")
-                        raise RuntimeError("reasoning tokens were observed")
-                    if monitor["provider_contract_violations"]:
-                        _safe_stop(paths, process, reason="provider_contract_violation")
-                        raise RuntimeError(str(monitor["provider_contract_violations"]))
-                    if _total_cost(paths) >= HARD_STOP_CNY:
-                        _safe_stop(paths, process, reason="50_cny_hard_stop")
-                        raise RuntimeError("50 CNY safety boundary reached")
-                if _directory_bytes(output) > MAX_CONDITION_BYTES:
-                    _safe_stop(paths, process, reason="artifact_size_limit")
-                    raise RuntimeError("condition artifact exceeded 2 GiB")
-                if _disk_available_gib(Path("/mnt/data")) < MIN_DISK_GIB:
-                    _safe_stop(paths, process, reason="disk_limit")
-                    raise RuntimeError("disk safety boundary reached")
-                if time.monotonic() - started > MAX_CONDITION_SECONDS:
-                    _safe_stop(paths, process, reason="condition_timeout")
-                    raise RuntimeError("condition exceeded its six-hour limit")
-                time.sleep(POLL_SECONDS)
+            try:
+                _atomic_text(paths.control / "runner.pid", f"{process.pid}\n")
+                while process.poll() is None:
+                    trace = output / "trace" / "events.jsonl"
+                    if trace.exists() and trace.stat().st_size:
+                        monitor = _update_monitor(trace, directory / "monitor-state.json")
+                        if monitor["reasoning_tokens"] != 0:
+                            _safe_stop(paths, process, reason="reasoning_tokens_nonzero")
+                            raise RuntimeError("reasoning tokens were observed")
+                        if monitor["provider_contract_violations"]:
+                            _safe_stop(paths, process, reason="provider_contract_violation")
+                            raise RuntimeError(str(monitor["provider_contract_violations"]))
+                        if _total_cost(paths) >= HARD_STOP_CNY:
+                            _safe_stop(paths, process, reason="50_cny_hard_stop")
+                            raise RuntimeError("50 CNY safety boundary reached")
+                    if _directory_bytes(output) > MAX_CONDITION_BYTES:
+                        _safe_stop(paths, process, reason="artifact_size_limit")
+                        raise RuntimeError("condition artifact exceeded 2 GiB")
+                    if _disk_available_gib(Path("/mnt/data")) < MIN_DISK_GIB:
+                        _safe_stop(paths, process, reason="disk_limit")
+                        raise RuntimeError("disk safety boundary reached")
+                    if time.monotonic() - started > MAX_CONDITION_SECONDS:
+                        _safe_stop(paths, process, reason="condition_timeout")
+                        raise RuntimeError("condition exceeded its six-hour limit")
+                    time.sleep(POLL_SECONDS)
+            except BaseException as error:
+                if process.poll() is None:
+                    try:
+                        _safe_stop(paths, process, reason="supervision_error")
+                    except Exception as stop_error:
+                        error.add_note(
+                            f"Child cleanup failed: {type(stop_error).__name__}: {stop_error}"
+                        )
+                raise
         _atomic_json(
             directory / "timing.json",
             {"wall_seconds": time.monotonic() - started},

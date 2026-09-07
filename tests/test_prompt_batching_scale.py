@@ -5,6 +5,7 @@ from decimal import Decimal
 import json
 from pathlib import Path
 from typing import Any
+from unittest.mock import Mock, call
 
 import pytest
 
@@ -202,6 +203,118 @@ class _SuccessfulProcess:
 
     def poll(self) -> int:
         return 0
+
+
+@pytest.mark.parametrize(
+    "failure_site",
+    ["pid", "_update_monitor", "_total_cost", "_directory_bytes", "_disk_available_gib", "interrupt"],
+)
+@pytest.mark.parametrize("stop_write_failure", [None, "log", "state"])
+def test_supervision_failure_stops_child_before_propagating(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    failure_site: str,
+    stop_write_failure: str | None,
+) -> None:
+    conditions = [
+        controller.ConditionSpec(1, "original", 1, None),
+        controller.ConditionSpec(2, "original", 1, None),
+    ]
+    control = tmp_path / "control"
+    control.mkdir()
+    (control / "experiment-contract.json").write_text(
+        json.dumps(_contract(tmp_path, [c.to_dict() for c in conditions]))
+    )
+    (control / "experiment-state").write_text("prepared\n")
+    directory = tmp_path / "conditions" / conditions[0].run_id
+    trace = directory / "output" / "trace" / "events.jsonl"
+    trace.parent.mkdir(parents=True)
+    trace.write_text("{}\n")
+    error = (
+        KeyboardInterrupt("interrupted")
+        if failure_site == "interrupt"
+        else OSError("monitor failed")
+    )
+    process = Mock(pid=456, returncode=None)
+    process.poll.side_effect = lambda: process.returncode
+
+    def wait(**_kwargs: Any) -> int:
+        process.returncode = 0
+        return 0
+
+    process.wait.side_effect = wait
+    killpg = Mock()
+    monkeypatch.setattr(controller.os, "killpg", killpg)
+    monkeypatch.setattr(controller.subprocess, "Popen", lambda *_a, **_k: process)
+    monkeypatch.setattr(controller, "_before_condition", lambda _p: None)
+    monkeypatch.setattr(
+        controller, "_update_monitor",
+        lambda *_a: {"reasoning_tokens": 0, "provider_contract_violations": []},
+    )
+    monkeypatch.setattr(controller, "_total_cost", lambda _p: 0)
+    monkeypatch.setattr(controller, "_directory_bytes", lambda _p: 0)
+    monkeypatch.setattr(controller, "_disk_available_gib", lambda _p: 200)
+    if failure_site == "pid":
+        original_write = controller._atomic_text
+
+        def write(path: Path, text: str) -> None:
+            if path.name == "runner.pid":
+                raise error
+            original_write(path, text)
+
+        monkeypatch.setattr(controller, "_atomic_text", write)
+    elif failure_site == "interrupt":
+        monkeypatch.setattr(controller.time, "sleep", Mock(side_effect=error))
+    else:
+        monkeypatch.setattr(controller, failure_site, Mock(side_effect=error))
+    if stop_write_failure == "log":
+        original_log = controller._log
+
+        def log(paths: Any, message: str) -> None:
+            if message.startswith("SAFETY_STOP"):
+                raise OSError("stop log failed")
+            original_log(paths, message)
+
+        monkeypatch.setattr(controller, "_log", log)
+    elif stop_write_failure == "state":
+        original_set_state = controller._set_state
+
+        def set_state(paths: Any, key: str, value: str) -> None:
+            if value == "safety-stopped":
+                raise OSError("stop state failed")
+            original_set_state(paths, key, value)
+
+        monkeypatch.setattr(controller, "_set_state", set_state)
+
+    with pytest.raises(type(error)) as raised:
+        controller.run_experiment(tmp_path)
+
+    assert raised.value is error
+    killpg.assert_called_once_with(process.pid, controller.signal.SIGINT)
+    process.wait.assert_called_once_with(timeout=60)
+    assert not (tmp_path / "conditions" / conditions[1].run_id).exists()
+    if stop_write_failure is not None:
+        assert any(f"stop {stop_write_failure} failed" in note for note in error.__notes__)
+
+
+def test_safe_stop_preserves_timeout_escalation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    paths = controller.ExperimentPaths.from_contract(tmp_path, _contract(tmp_path, []))
+    process = Mock(pid=456)
+    process.wait.side_effect = [controller.subprocess.TimeoutExpired("worker", 60), 0]
+    killpg = Mock()
+    monkeypatch.setattr(controller.os, "killpg", killpg)
+    monkeypatch.setattr(controller, "_log", Mock())
+    monkeypatch.setattr(controller, "_set_state", Mock())
+
+    controller._safe_stop(paths, process, reason="test")
+
+    assert killpg.call_args_list == [
+        call(process.pid, controller.signal.SIGINT),
+        call(process.pid, controller.signal.SIGTERM),
+    ]
+    assert process.wait.call_args_list == [call(timeout=60), call(timeout=30)]
 
 
 def test_second_pass_starts_only_after_the_first_pass_completes(
