@@ -1,6 +1,7 @@
 """Semantic memory framework experiments for agent developers."""
 
 from .api import CountRefresh, Memory, Message
+from .dataflow import SemanticDataflow, Source
 from .memories import (
     ClaudeMemory,
     Mem0Memory,
@@ -18,15 +19,18 @@ from .policy import (
     Log,
     RetrievalQuery,
     RetrievalResult,
+    Relation,
     UserQuery,
     array_agg,
     avg,
+    case_when,
     collect_list,
     count,
     least,
     min,
     sem_agg,
     sum,
+    try_cast,
 )
 
 __version__ = "0.0.1"
@@ -45,18 +49,23 @@ __all__ = [
     "Memory",
     "Message",
     "RRF",
+    "Relation",
     "RetrievalQuery",
     "RetrievalResult",
+    "SemanticDataflow",
+    "Source",
     "UserQuery",
     "ZepMemory",
     "ZepMemoryExtended",
     "__version__",
     "array_agg",
     "avg",
+    "case_when",
     "collect_list",
     "count",
     "least",
     "min",
     "sem_agg",
     "sum",
+    "try_cast",
 ]

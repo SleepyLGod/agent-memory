@@ -8504,5 +8504,7 @@ def test_runtime_query_output_columns_reject_unknown_ops() -> None:
         memory._runtime._query_output_columns(QueryExpr(op="unknown"))
 
 
-def test_relation_is_not_top_level_public_api() -> None:
-    assert not hasattr(am, "Relation")
+def test_relation_is_top_level_public_api() -> None:
+    from agent_memory.policy import Relation
+
+    assert am.Relation is Relation
