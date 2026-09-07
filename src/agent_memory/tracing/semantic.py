@@ -265,6 +265,8 @@ def write_provider_usage_trace(
         trace_id = f"{batch_id}-{index:04d}"
         usage = getattr(response, "usage", None)
         raw_usage = _usage_payload(usage)
+        response_metadata = getattr(response, "provider_response_metadata", {})
+        choices = getattr(response, "choices", ())
         event: dict[str, Any] = {
             "trace_id": trace_id,
             "timestamp": _timestamp(),
@@ -275,6 +277,13 @@ def write_provider_usage_trace(
             "provider_batch_size": len(responses),
             "model": model,
             "provider_usage_available": raw_usage is not None,
+            "provider_finish_reason": response_metadata.get(
+                "finish_reason",
+                getattr(choices[0], "finish_reason", None) if choices else None,
+            ),
+            "provider_response_status": response_metadata.get("status"),
+            "provider_incomplete_reason": response_metadata.get("incomplete_reason"),
+            "provider_response_model": getattr(response, "model", None),
         }
         event.update(scope)
         if request_metadata:
@@ -287,7 +296,14 @@ def write_provider_usage_trace(
                 root / TRACE_OUTPUTS_DIR,
                 trace_id,
                 "provider-usage.json",
-                raw_usage,
+                response_metadata.get("raw_usage") or raw_usage,
+            )
+        partial_response = getattr(response, "response", None)
+        partial_choices = getattr(partial_response, "choices", ())
+        if partial_choices:
+            event["provider_partial_output_path"] = _write_json_artifact(
+                root / TRACE_OUTPUTS_DIR, trace_id, "partial-output.json",
+                {"output": getattr(partial_choices[0].message, "content", None)},
             )
         _append_event(root, event)
         rows.append(event)

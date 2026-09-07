@@ -10,6 +10,9 @@ from typing import TYPE_CHECKING, Any
 import pandas as pd
 from lotus.cache import operator_cache
 
+from agent_memory.adapters.lotus.json_output import (
+    load_structured_json_with_syntax_repair,
+)
 from agent_memory.adapters.lotus.prompt_batching import (
     ParsedPromptBatch,
     PromptBatchItem,
@@ -69,6 +72,7 @@ class _BatchPromptingExecutor:
         progress_bar_desc: str,
         trace_dir: Any = None,
         operator: str = "sem_filter",
+        structured_output_transport: str = "chat-json-object",
     ) -> BatchPromptingResult:
         """Evaluate independent tuples in bounded structured prompts."""
 
@@ -106,15 +110,18 @@ class _BatchPromptingExecutor:
             )
 
         current_max_tokens = int(getattr(lm, "max_tokens", 512) or 512)
+        output_token_limit = max(current_max_tokens, structured_max_tokens)
         execution = run_prompt_batches(
             tasks,
             task_id=lambda task: task.row_id,
             build_request=lambda batch: _build_request(
                 batch,
                 claim=claim,
-                max_tokens=max(current_max_tokens, structured_max_tokens),
+                max_tokens=output_token_limit,
             ),
             parse_results=_parse_decisions,
+            output_schema=_decision_schema(),
+            structured_output_transport=structured_output_transport,
             model=lm,
             config=prompt_batching,
             max_retries=structured_parse_retries,
@@ -159,6 +166,7 @@ def execute_batch_prompted_sem_filter(
         progress_bar_desc=context.config.sem_filter_progress_bar_desc,
         trace_dir=context.config.trace_dir(),
         operator="sem_filter",
+        structured_output_transport=context.config.structured_output_transport,
     )
 
 
@@ -172,6 +180,7 @@ def execute_batch_prompted_predicate(
     progress_bar_desc: str,
     trace_dir: Any = None,
     operator: str = "sem_filter",
+    structured_output_transport: str = "chat-json-object",
 ) -> BatchPromptingResult:
     """Evaluate independent boolean predicate tasks in shared prompts."""
 
@@ -183,6 +192,7 @@ def execute_batch_prompted_predicate(
         progress_bar_desc=progress_bar_desc,
         trace_dir=trace_dir,
         operator=operator,
+        structured_output_transport=structured_output_transport,
     )
 
 
@@ -262,10 +272,6 @@ def _build_request(
 def _parse_decisions(
     raw_output: str,
 ) -> ParsedPromptBatch[bool]:
-    from agent_memory.adapters.lotus.structured import (
-        load_structured_json_with_syntax_repair,
-    )
-
     if not raw_output.strip():
         raise ValueError("batch-prompting sem_filter output is empty")
     decoded = load_structured_json_with_syntax_repair(
@@ -299,6 +305,28 @@ def _parse_decisions(
         items=tuple(parsed),
         repair_method=decoded.repair_method,
     )
+
+
+def _decision_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "decisions": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "row_id": {"type": "string"},
+                        "keep": {"type": "boolean"},
+                    },
+                    "required": ["row_id", "keep"],
+                    "additionalProperties": False,
+                },
+            }
+        },
+        "required": ["decisions"],
+        "additionalProperties": False,
+    }
 
 
 __all__ = [

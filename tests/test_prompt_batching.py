@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -151,6 +152,7 @@ def test_shared_runner_records_compact_execution_mechanics(tmp_path) -> None:
     assert event["task_count"] == 2
     assert event["prompt_count"] == 1
     assert event["chunk_sizes"] == [2]
+    assert event["structured_output_token_limit"] == 100
     assert event["retry_count"] == 0
 
 
@@ -174,8 +176,8 @@ def test_explicit_limit_chunks_tasks_deterministically() -> None:
     assert result.chunk_sizes == (2, 2, 1)
 
 
-def test_model_context_selects_largest_fitting_prefix() -> None:
-    model = _Model([["task_0=A,task_1=B", "task_2=C"]])
+def test_configured_batch_fails_instead_of_silently_shrinking_for_context() -> None:
+    model = _Model([])
     model.max_ctx_len = 109
     tasks = (
         _Task("task_0", "AAAA"),
@@ -183,20 +185,48 @@ def test_model_context_selects_largest_fitting_prefix() -> None:
         _Task("task_2", "CCCC"),
     )
 
-    result = run_prompt_batches(
-        tasks,
-        task_id=lambda task: task.task_id,
-        build_request=_request,
-        parse_results=_parse,
-        model=model,
-        config=PromptBatching(),
-        max_retries=0,
-        progress_bar_desc="Testing",
-        operator="test",
-    )
+    with pytest.raises(ValueError, match="configured prompt batch"):
+        run_prompt_batches(
+            tasks,
+            task_id=lambda task: task.task_id,
+            build_request=_request,
+            parse_results=_parse,
+            model=model,
+            config=PromptBatching(),
+            max_retries=0,
+            progress_bar_desc="Testing",
+            operator="test",
+        )
 
-    assert result.outputs == ("A", "B", "C")
-    assert result.chunk_sizes == (2, 1)
+    assert model.calls == []
+
+
+def test_prompt_batches_require_one_fixed_output_token_limit() -> None:
+    model = _Model([])
+    tasks = (_Task("task_0", "A"), _Task("task_1", "B"))
+
+    def varying_request(batch: tuple[_Task, ...]) -> PromptBatchRequest:
+        request = _request(batch)
+        return PromptBatchRequest(
+            task_ids=request.task_ids,
+            prompt=request.prompt,
+            max_tokens=100 + int(batch[0].task_id.removeprefix("task_")),
+        )
+
+    with pytest.raises(ValueError, match="same output token limit"):
+        run_prompt_batches(
+            tasks,
+            task_id=lambda task: task.task_id,
+            build_request=varying_request,
+            parse_results=_parse,
+            model=model,
+            config=PromptBatching(max_tasks=1),
+            max_retries=0,
+            progress_bar_desc="Testing",
+            operator="test",
+        )
+
+    assert model.calls == []
 
 
 def test_only_invalid_prompt_is_retried() -> None:
@@ -369,3 +399,166 @@ def test_structured_flat_map_keeps_emitted_rows_with_their_source_task(
         [{"fact": "A1"}, {"fact": "A2"}],
         [],
     )
+
+
+@pytest.mark.parametrize(
+    ("raw_output", "expected"),
+    (
+        ('{"rows":[]}', []),
+        ('{"rows":[{"fact":"A1"},{"fact":"A2"}]}', [
+            {"fact": "A1"},
+            {"fact": "A2"},
+        ]),
+    ),
+)
+def test_structured_flat_map_repairs_a_valid_singleton_output_envelope(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    raw_output: str,
+    expected: list[dict[str, str]],
+) -> None:
+    import lotus
+
+    from agent_memory.adapters.lotus.structured import StructuredLMExecutor
+    from agent_memory.policy.logical import ColumnSpec
+
+    model = _Model([[raw_output]])
+    model.max_tokens = 128
+    model.max_ctx_len = 100_000
+    model.cache = None
+    monkeypatch.setattr(lotus.settings, "lm", model)
+    monkeypatch.setattr(lotus.settings, "enable_cache", False)
+
+    generation = StructuredLMExecutor(pd.DataFrame({"text": ["alpha"]}))(
+        input_cols=("text",),
+        output_cols=(ColumnSpec("fact"),),
+        instruction="Extract facts from {text}.",
+        shape="array",
+        progress_bar_desc="Flat mapping",
+        model_kwargs={},
+        structured_max_tokens=128,
+        structured_parse_retries=0,
+        semantic_trace_dir=tmp_path,
+        prompt_batching=PromptBatching(max_tasks=1),
+        operator="sem_flat_map",
+    )
+
+    assert generation.parsed_outputs == (expected,)
+    assert generation.raw_output_attempts == ((raw_output,),)
+    assert len(model.calls) == 1
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "events.jsonl").read_text().splitlines()
+    ]
+    [batch_event] = [
+        event for event in events if event["event_type"] == "prompt_batching"
+    ]
+    assert batch_event["retry_count"] == 0
+    assert batch_event["structured_output_repair_count"] == 1
+    assert batch_event["structured_output_repair_methods"] == [
+        "singleton-envelope"
+    ]
+
+
+def test_structured_map_repairs_a_valid_singleton_output_envelope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import lotus
+
+    from agent_memory.adapters.lotus.structured import StructuredLMExecutor
+    from agent_memory.policy.logical import ColumnSpec
+
+    raw_output = '{"label":"A"}'
+    model = _Model([[raw_output]])
+    model.max_tokens = 128
+    model.max_ctx_len = 100_000
+    model.cache = None
+    monkeypatch.setattr(lotus.settings, "lm", model)
+    monkeypatch.setattr(lotus.settings, "enable_cache", False)
+
+    generation = StructuredLMExecutor(pd.DataFrame({"text": ["alpha"]}))(
+        input_cols=("text",),
+        output_cols=(ColumnSpec("label"),),
+        instruction="Label {text}.",
+        shape="object",
+        progress_bar_desc="Mapping",
+        model_kwargs={},
+        structured_max_tokens=128,
+        structured_parse_retries=0,
+        prompt_batching=PromptBatching(max_tasks=1),
+        operator="sem_map",
+    )
+
+    assert generation.parsed_outputs == ({"label": "A"},)
+    assert generation.raw_output_attempts == ((raw_output,),)
+    assert len(model.calls) == 1
+
+
+def test_structured_prompt_batch_does_not_guess_a_multi_task_envelope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import lotus
+
+    from agent_memory.adapters.lotus.structured import StructuredLMExecutor
+    from agent_memory.policy.logical import ColumnSpec
+
+    model = _Model([['{"rows":[]}']])
+    model.max_tokens = 128
+    model.max_ctx_len = 100_000
+    model.cache = None
+    monkeypatch.setattr(lotus.settings, "lm", model)
+    monkeypatch.setattr(lotus.settings, "enable_cache", False)
+
+    with pytest.raises(ValueError, match="after 1 attempt"):
+        StructuredLMExecutor(pd.DataFrame({"text": ["alpha", "beta"]}))(
+            input_cols=("text",),
+            output_cols=(ColumnSpec("fact"),),
+            instruction="Extract facts from {text}.",
+            shape="array",
+            progress_bar_desc="Flat mapping",
+            model_kwargs={},
+            structured_max_tokens=128,
+            structured_parse_retries=0,
+            prompt_batching=PromptBatching(),
+            operator="sem_flat_map",
+        )
+
+
+@pytest.mark.parametrize(
+    "raw_output",
+    (
+        '{"rows":[],"extra":true}',
+        '{"rows":[],"rows":[]}',
+        '{"rows":[{"wrong":"value"}]}',
+        '{"rows":',
+    ),
+)
+def test_structured_prompt_batch_rejects_invalid_singleton_inner_outputs(
+    monkeypatch: pytest.MonkeyPatch,
+    raw_output: str,
+) -> None:
+    import lotus
+
+    from agent_memory.adapters.lotus.structured import StructuredLMExecutor
+    from agent_memory.policy.logical import ColumnSpec
+
+    model = _Model([[raw_output]])
+    model.max_tokens = 128
+    model.max_ctx_len = 100_000
+    model.cache = None
+    monkeypatch.setattr(lotus.settings, "lm", model)
+    monkeypatch.setattr(lotus.settings, "enable_cache", False)
+
+    with pytest.raises(ValueError, match="after 1 attempt"):
+        StructuredLMExecutor(pd.DataFrame({"text": ["alpha"]}))(
+            input_cols=("text",),
+            output_cols=(ColumnSpec("fact"),),
+            instruction="Extract facts from {text}.",
+            shape="array",
+            progress_bar_desc="Flat mapping",
+            model_kwargs={},
+            structured_max_tokens=128,
+            structured_parse_retries=0,
+            prompt_batching=PromptBatching(max_tasks=1),
+            operator="sem_flat_map",
+        )

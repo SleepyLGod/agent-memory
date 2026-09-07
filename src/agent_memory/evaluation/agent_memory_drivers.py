@@ -20,7 +20,10 @@ from agent_memory.adapters.lotus.pair_execution import (
     semantic_pair_site_id,
     semantic_pair_site_physical_contract,
 )
-from agent_memory.adapters.lotus.prompt_batching import PromptBatching
+from agent_memory.adapters.lotus.prompt_batching import (
+    PromptBatching,
+    validate_structured_output_transport,
+)
 from agent_memory.evaluation.claude_memory.bindings import event_to_claude_log_row
 from agent_memory.evaluation.embedding_trace import TracingEmbeddingProvider
 from agent_memory.evaluation.harness import RetrievalOutput
@@ -670,6 +673,7 @@ class ClaudeMemoryDriverFactory:
         semantic_pair_profiles: dict[str, SemanticPairExecutionProfile] | None = None,
         prompt_batching: PromptBatching | None = None,
         sem_agg_dispatch: str = "sequential",
+        structured_output_transport: str = "chat-json-object",
         semantic_trace_snapshot_mode: str = "compact",
         lotus_cache_mode: str = "disabled",
         refresh_every: int = 1,
@@ -678,6 +682,9 @@ class ClaudeMemoryDriverFactory:
         from agent_memory.adapters.lotus.context import SEM_TOPK_METHODS
         from agent_memory.planner.rules import GROUPED_AGG_RULES
 
+        validate_structured_output_transport(
+            structured_output_transport, model=model_id
+        )
         if grouped_agg_rule not in GROUPED_AGG_RULES:
             raise ValueError(
                 "grouped_agg_rule must be one of: " + ", ".join(GROUPED_AGG_RULES)
@@ -694,6 +701,7 @@ class ClaudeMemoryDriverFactory:
         self.semantic_pair_profiles = dict(semantic_pair_profiles or {})
         self.prompt_batching = prompt_batching
         self.sem_agg_dispatch = sem_agg_dispatch
+        self.structured_output_transport = structured_output_transport
         _semantic_pair_embedding_contract(self.semantic_pair_profiles)
         self.semantic_trace_snapshot_mode = semantic_trace_snapshot_mode
         _validate_lotus_cache_mode(lotus_cache_mode)
@@ -752,6 +760,7 @@ class ClaudeMemoryDriverFactory:
                 semantic_pair_profiles=self.semantic_pair_profiles,
                 prompt_batching=self.prompt_batching,
                 sem_agg_dispatch=self.sem_agg_dispatch,
+                structured_output_transport=self.structured_output_transport,
                 semantic_trace_snapshot_mode=self.semantic_trace_snapshot_mode,
             ),
             pair_embedding_provider=pair_embedding_provider,
@@ -787,6 +796,7 @@ class ZepMemoryDriverFactory:
         semantic_pair_profiles: dict[str, SemanticPairExecutionProfile] | None = None,
         prompt_batching: PromptBatching | None = None,
         sem_agg_dispatch: str = "sequential",
+        structured_output_transport: str = "chat-json-object",
         embedding_device: str = "cpu",
         semantic_trace_snapshot_mode: str = "compact",
         lotus_cache_mode: str = "disabled",
@@ -797,6 +807,9 @@ class ZepMemoryDriverFactory:
     ) -> None:
         from agent_memory.planner.rules import GROUPED_AGG_RULES
 
+        validate_structured_output_transport(
+            structured_output_transport, model=model_id
+        )
         if not base_namespace:
             raise ValueError("Zep benchmark base_namespace must be non-empty")
         if grouped_agg_rule not in GROUPED_AGG_RULES:
@@ -813,6 +826,7 @@ class ZepMemoryDriverFactory:
         self.semantic_pair_profiles = dict(semantic_pair_profiles or {})
         self.prompt_batching = prompt_batching
         self.sem_agg_dispatch = sem_agg_dispatch
+        self.structured_output_transport = structured_output_transport
         embedding_contract = _semantic_pair_embedding_contract(
             self.semantic_pair_profiles
         )
@@ -854,6 +868,7 @@ class ZepMemoryDriverFactory:
         semantic_pair_profiles: dict[str, SemanticPairExecutionProfile] | None = None,
         prompt_batching: PromptBatching | None = None,
         sem_agg_dispatch: str = "sequential",
+        structured_output_transport: str = "chat-json-object",
         embedding_device: str = "cpu",
         semantic_trace_snapshot_mode: str = "compact",
         lotus_cache_mode: str = "disabled",
@@ -862,6 +877,9 @@ class ZepMemoryDriverFactory:
     ) -> ZepMemoryDriverFactory:
         """Create the pinned Graphiti-compatible deployment connector."""
 
+        validate_structured_output_transport(
+            structured_output_transport, model=model_id
+        )
         neo4j_image = os.getenv("AGENT_MEMORY_NEO4J_IMAGE")
         neo4j_image_digest = os.getenv("AGENT_MEMORY_NEO4J_IMAGE_DIGEST")
         if not neo4j_image or not neo4j_image_digest:
@@ -905,6 +923,7 @@ class ZepMemoryDriverFactory:
             semantic_pair_profiles=semantic_pair_profiles,
             prompt_batching=prompt_batching,
             sem_agg_dispatch=sem_agg_dispatch,
+            structured_output_transport=structured_output_transport,
             embedding_device=embedding_device,
             semantic_trace_snapshot_mode=semantic_trace_snapshot_mode,
             lotus_cache_mode=lotus_cache_mode,
@@ -977,6 +996,7 @@ class ZepMemoryDriverFactory:
                 semantic_pair_profiles=self.semantic_pair_profiles,
                 prompt_batching=self.prompt_batching,
                 sem_agg_dispatch=self.sem_agg_dispatch,
+                structured_output_transport=self.structured_output_transport,
                 semantic_trace_snapshot_mode=self.semantic_trace_snapshot_mode,
             ),
             pair_embedding_provider=(
@@ -1033,12 +1053,16 @@ class Mem0MemoryDriverFactory:
         semantic_pair_profiles: dict[str, SemanticPairExecutionProfile] | None = None,
         prompt_batching: PromptBatching | None = None,
         sem_agg_dispatch: str = "sequential",
+        structured_output_transport: str = "chat-json-object",
         embedding_device: str = "cpu",
         semantic_trace_snapshot_mode: str = "compact",
         lotus_cache_mode: str = "disabled",
         refresh_every: int = 1,
         thinking_enabled: bool = False,
     ) -> None:
+        validate_structured_output_transport(
+            structured_output_transport, model=model_id
+        )
         if not base_namespace:
             raise ValueError("Mem0 benchmark base_namespace must be non-empty")
         self.base_namespace = base_namespace
@@ -1048,6 +1072,7 @@ class Mem0MemoryDriverFactory:
         self.semantic_pair_profiles = dict(semantic_pair_profiles or {})
         self.prompt_batching = prompt_batching
         self.sem_agg_dispatch = sem_agg_dispatch
+        self.structured_output_transport = structured_output_transport
         if embedding_device not in {"cpu", "cuda"}:
             raise ValueError("Mem0 embedding_device must be 'cpu' or 'cuda'")
         self.embedding_device = embedding_device
@@ -1132,9 +1157,7 @@ class Mem0MemoryDriverFactory:
                         "extra_body": {
                             "thinking": {
                                 "type": (
-                                    "enabled"
-                                    if self.thinking_enabled
-                                    else "disabled"
+                                    "enabled" if self.thinking_enabled else "disabled"
                                 )
                             }
                         }
@@ -1147,6 +1170,7 @@ class Mem0MemoryDriverFactory:
                     semantic_pair_profiles=self.semantic_pair_profiles,
                     prompt_batching=self.prompt_batching,
                     sem_agg_dispatch=self.sem_agg_dispatch,
+                    structured_output_transport=self.structured_output_transport,
                     semantic_trace_snapshot_mode=self.semantic_trace_snapshot_mode,
                 ),
                 pair_embedding_provider=embedding_provider,
@@ -1197,6 +1221,7 @@ class Mem0MemoryEnhancedDriverFactory(Mem0MemoryDriverFactory):
         semantic_pair_profiles: dict[str, SemanticPairExecutionProfile] | None = None,
         prompt_batching: PromptBatching | None = None,
         sem_agg_dispatch: str = "sequential",
+        structured_output_transport: str = "chat-json-object",
         embedding_device: str = "cpu",
         semantic_trace_snapshot_mode: str = "compact",
         lotus_cache_mode: str = "disabled",
@@ -1217,6 +1242,7 @@ class Mem0MemoryEnhancedDriverFactory(Mem0MemoryDriverFactory):
             semantic_pair_profiles=semantic_pair_profiles,
             prompt_batching=prompt_batching,
             sem_agg_dispatch=sem_agg_dispatch,
+            structured_output_transport=structured_output_transport,
             embedding_device=embedding_device,
             semantic_trace_snapshot_mode=semantic_trace_snapshot_mode,
             lotus_cache_mode=lotus_cache_mode,

@@ -95,13 +95,24 @@ class LotusAdapter:
             self.config.semantic_pair_profiles
         )
         sem_agg_configured = self.config.sem_agg_dispatch != "sequential"
-        if sem_agg_configured or self.config.prompt_batching is not None:
+        transport_configured = (
+            self.config.structured_output_transport != "chat-json-object"
+        )
+        if (
+            sem_agg_configured
+            or self.config.prompt_batching is not None
+            or transport_configured
+        ):
             base_fingerprint = self._base_maintenance_execution_fingerprint(
                 pair_fingerprint
             )
             parts = [f"base_execution_fingerprint={base_fingerprint}"]
             if sem_agg_configured:
                 parts.append(f"sem_agg_dispatch={self.config.sem_agg_dispatch}")
+            if transport_configured:
+                parts.append(
+                    f"structured_output_transport={self.config.structured_output_transport}"
+                )
             if self.config.prompt_batching is not None:
                 parts.append(
                     "prompt_batching="

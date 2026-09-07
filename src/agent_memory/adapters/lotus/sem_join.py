@@ -387,6 +387,7 @@ def verify_semantic_join_candidates(
                 columns=(left_label, right_label),
             ),
             prompt_batching=config.prompt_batching,
+            structured_output_transport=config.structured_output_transport,
             structured_parse_retries=config.structured_parse_retries,
             structured_max_tokens=config.structured_max_tokens,
             progress_bar_desc=config.sem_join_progress_bar_desc,

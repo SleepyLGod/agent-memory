@@ -277,6 +277,34 @@ def test_batch_prompted_sem_agg_keeps_group_outputs_independent(
     assert all(row["raw_output_attempts"] == (raw_batch_output,) for row in audit_rows)
 
 
+def test_batch_prompted_sem_agg_keeps_one_fixed_output_limit_for_many_groups(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import lotus
+
+    group_count = 128
+    groups = [pd.DataFrame({"body": [f"body-{index}"]}) for index in range(group_count)]
+    outputs = ",".join(
+        f'{{"group_id":"group_{index}","output":'
+        f'{{"name":"name-{index}","summary":"summary-{index}"}}}}'
+        for index in range(group_count)
+    )
+    model = _RecordingModel(outputs=((f'{{"results":[{outputs}]}}',),))
+    monkeypatch.setattr(lotus.settings, "lm", model)
+    config = LotusExecutionConfig(prompt_batching=PromptBatching(max_tasks=group_count))
+
+    result = execute_structured_sem_agg_groups(
+        _query(structured=True),
+        groups,
+        ("body",),
+        (ColumnSpec("name"), ColumnSpec("summary")),
+        config,
+    )
+
+    assert len(result) == group_count
+    assert model.calls[0][1]["max_tokens"] == config.structured_max_tokens
+
+
 def test_batch_prompted_sem_agg_accepts_one_extra_closing_brace(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -316,8 +344,7 @@ def test_batch_prompted_sem_agg_accepts_one_extra_closing_brace(
     assert len(model.calls) == 1
     assert len(audit_rows) == 2
     assert all(
-        row["syntax_repair_method"] == "json5-extra-closing-brace"
-        for row in audit_rows
+        row["syntax_repair_method"] == "bounded-json-syntax" for row in audit_rows
     )
 
 
@@ -402,7 +429,7 @@ def test_sem_agg_audit_records_syntax_repair(
     )
 
 
-def test_batch_prompted_sem_agg_rejects_more_than_one_extra_closing_brace(
+def test_batch_prompted_sem_agg_repairs_multiple_extra_closing_braces(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import lotus
@@ -417,17 +444,18 @@ def test_batch_prompted_sem_agg_rejects_more_than_one_extra_closing_brace(
     )
     monkeypatch.setattr(lotus.settings, "lm", model)
 
-    with pytest.raises(ValueError, match="invalid JSON"):
-        execute_structured_sem_agg_groups(
-            _query(structured=True),
-            _groups()[:1],
-            ("body",),
-            (ColumnSpec("name"), ColumnSpec("summary")),
-            LotusExecutionConfig(
-                prompt_batching=PromptBatching(max_tasks=1),
-                structured_parse_retries=0,
-            ),
-        )
+    result = execute_structured_sem_agg_groups(
+        _query(structured=True),
+        _groups()[:1],
+        ("body",),
+        (ColumnSpec("name"), ColumnSpec("summary")),
+        LotusExecutionConfig(
+            prompt_batching=PromptBatching(max_tasks=1),
+            structured_parse_retries=0,
+        ),
+    )
+    assert result == [{"name": "alpha", "summary": "A"}]
+    assert len(model.calls) == 1
 
 
 @pytest.mark.parametrize(

@@ -32,7 +32,9 @@ from agent_memory.evaluation.run import (  # noqa: E402
     run_agent_memory_bundle,
 )
 from agent_memory.adapters.lotus.prompt_batching import (  # noqa: E402
+    STRUCTURED_OUTPUT_TRANSPORTS,
     parse_prompt_batch_size,
+    validate_structured_output_transport,
 )
 from agent_memory.planner import GROUPED_AGG_RULES  # noqa: E402
 
@@ -97,6 +99,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     run.add_argument("--prompt-batch-size", type=parse_prompt_batch_size)
     run.add_argument(
+        "--structured-output-transport",
+        choices=STRUCTURED_OUTPUT_TRANSPORTS,
+        default="chat-json-object",
+    )
+    run.add_argument(
         "--semantic-pair-profile",
         choices=SEMANTIC_PAIR_PROFILES,
         default="oracle-only",
@@ -118,6 +125,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     run.add_argument("--refresh-every", type=int, default=1)
     args = parser.parse_args(raw_args)
     if args.command == "run":
+        try:
+            validate_structured_output_transport(
+                args.structured_output_transport, model=args.model
+            )
+        except ValueError as error:
+            parser.error(str(error))
         args.grouped_agg_rule = resolve_grouped_agg_rule(
             args.system,
             args.grouped_agg_rule,
@@ -243,6 +256,11 @@ def main(argv: Sequence[str] | None = None) -> Path:
         refresh_every=args.refresh_every,
         memory_thinking_enabled=False,
         condition_id=args.condition_id or "",
+        **(
+            {"structured_output_transport": args.structured_output_transport}
+            if args.structured_output_transport != "chat-json-object"
+            else {}
+        ),
     )
 
 

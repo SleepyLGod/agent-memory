@@ -27,7 +27,7 @@ from agent_memory.adapters.lotus.pair_execution import (
 )
 from agent_memory.adapters.lotus.sem_topk import LOTUS_PAIRWISE_METHODS
 from agent_memory.adapters.lotus.structured import normalize_strategy
-from agent_memory.adapters.lotus.structured import (
+from agent_memory.adapters.lotus.json_output import (
     load_structured_json_with_syntax_repair,
 )
 from agent_memory.policy.logical import QueryExpr
@@ -203,6 +203,8 @@ def _listwise_topk(
             ),
             model=lm,
             config=context.config.prompt_batching,
+            output_schema=_listwise_batch_schema(),
+            structured_output_transport=context.config.structured_output_transport,
             max_retries=context.config.structured_parse_retries,
             progress_bar_desc="Listwise join resolution",
             operator="sem_join",
@@ -362,6 +364,28 @@ def _listwise_tasks(
             )
         )
     return tasks
+
+
+def _listwise_batch_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "results": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "task_id": {"type": "string"},
+                        "selected_ids": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["task_id", "selected_ids"],
+                    "additionalProperties": False,
+                },
+            }
+        },
+        "required": ["results"],
+        "additionalProperties": False,
+    }
 
 
 def _build_listwise_batch_request(

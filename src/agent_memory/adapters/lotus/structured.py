@@ -11,13 +11,15 @@ from pathlib import Path
 from typing import Any, Literal, TypeAlias
 from uuid import uuid4
 
-import json5
 import pandas as pd
 from lotus.cache import operator_cache
 
 from agent_memory.adapters.lotus.context import (
     DEFAULT_STRUCTURED_MAX_TOKENS,
     DEFAULT_STRUCTURED_PARSE_RETRIES,
+)
+from agent_memory.adapters.lotus.json_output import (
+    load_structured_json_with_syntax_repair,
 )
 from agent_memory.adapters.lotus.prompt_batching import (
     ParsedPromptBatch,
@@ -95,14 +97,6 @@ class StructuredLMRetryResult:
     raw_output_attempts: Sequence[Sequence[str]]
     invalid_indices: Sequence[int]
     failure_artifact_paths: Sequence[Path]
-
-
-@dataclass(frozen=True)
-class StructuredJsonResult:
-    """One decoded JSON value plus any safe syntax repair that was applied."""
-
-    value: Any
-    repair_method: str | None = None
 
 
 @dataclass(frozen=True)
@@ -415,78 +409,6 @@ def _load_structured_json(raw_output: str, *, operator: str, expected_shape: str
         ) from error
 
 
-def load_structured_json_with_syntax_repair(
-    raw_output: str,
-    *,
-    operator: str,
-    expected_shape: str,
-) -> StructuredJsonResult:
-    """Parse structured output while tolerating only complete JSON5 syntax."""
-
-    text = raw_output.strip()
-    try:
-        return StructuredJsonResult(_load_json_without_duplicate_keys(text))
-    except (json.JSONDecodeError, ValueError):
-        pass
-
-    candidate, fenced = _strip_json_code_fence(text)
-    try:
-        value = _load_json5_without_duplicate_keys(candidate)
-        method = "json5-code-fence" if fenced else "json5"
-        return StructuredJsonResult(value, method)
-    except ValueError as tolerant_error:
-        if candidate.endswith("}"):
-            try:
-                value = _load_json5_without_duplicate_keys(candidate[:-1])
-                method = "json5-extra-closing-brace"
-                if fenced:
-                    method += "-code-fence"
-                return StructuredJsonResult(value, method)
-            except ValueError:
-                pass
-        raise ValueError(
-            f"{operator} returned invalid JSON; expected {expected_shape}; "
-            f"raw_output={_preview_raw_output(raw_output)!r}"
-        ) from tolerant_error
-
-
-def _load_json_without_duplicate_keys(value: str) -> Any:
-    return json.loads(
-        value,
-        object_pairs_hook=_unique_json_object,
-        parse_constant=_reject_nonfinite_json_constant,
-    )
-
-
-def _load_json5_without_duplicate_keys(value: str) -> Any:
-    return json5.loads(
-        value,
-        allow_duplicate_keys=False,
-        consume_trailing=True,
-        parse_constant=_reject_nonfinite_json_constant,
-    )
-
-
-def _unique_json_object(pairs: Sequence[tuple[str, Any]]) -> dict[str, Any]:
-    result: dict[str, Any] = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError(f"duplicate JSON object key: {key!r}")
-        result[key] = value
-    return result
-
-
-def _reject_nonfinite_json_constant(value: str) -> Any:
-    raise ValueError(f"non-finite JSON value is not supported: {value}")
-
-
-def _strip_json_code_fence(value: str) -> tuple[str, bool]:
-    match = re.fullmatch(r"```(?:json)?[ \t]*\n(.*)\n```", value, flags=re.DOTALL)
-    if match is None:
-        return value, False
-    return match.group(1).strip(), True
-
-
 def _preview_raw_output(raw_output: str) -> str:
     """Return a bounded raw output preview for errors."""
 
@@ -559,6 +481,7 @@ class StructuredLMExecutor:
         semantic_trace_dir: Any = None,
         operator: str = "sem_map",
         prompt_batching: PromptBatching | None = None,
+        structured_output_transport: str = "chat-json-object",
     ) -> StructuredGenerationResult:
         """Run a structured LOTUS-backed LM batch and parse JSON outputs."""
 
@@ -639,6 +562,7 @@ class StructuredLMExecutor:
                 prompts,
                 model=lotus.settings.lm,
                 prompt_batching=prompt_batching,
+                structured_output_transport=structured_output_transport,
                 output_cols=output_cols,
                 shape=shape,
                 require_explanation=require_explanation and shape == "object",
@@ -755,6 +679,7 @@ def _execute_structured_prompt_batches(
     *,
     model: Any,
     prompt_batching: PromptBatching,
+    structured_output_transport: str,
     output_cols: Sequence[ColumnSpec],
     shape: Literal["object", "array"],
     require_explanation: bool,
@@ -786,6 +711,25 @@ def _execute_structured_prompt_batches(
             require_explanation=require_explanation,
             operator=operator,
         ),
+        parse_single_result=lambda raw_output: _parse_single_structured_prompt_output(
+            raw_output,
+            output_cols=output_cols,
+            shape=shape,
+            require_explanation=require_explanation,
+            operator=operator,
+        ),
+        parse_repaired_results=lambda raw_output: _parse_structured_prompt_batch(
+            raw_output,
+            output_cols=output_cols,
+            shape=shape,
+            require_explanation=require_explanation,
+            operator=operator,
+            strict_fields=True,
+        ),
+        output_schema=_structured_batch_schema(
+            output_cols, shape=shape, require_explanation=require_explanation
+        ),
+        structured_output_transport=structured_output_transport,
         model=model,
         config=prompt_batching,
         max_retries=max_retries,
@@ -845,6 +789,7 @@ def _parse_structured_prompt_batch(
     shape: Literal["object", "array"],
     require_explanation: bool,
     operator: str,
+    strict_fields: bool = False,
 ) -> ParsedPromptBatch[tuple[Any, str | None]]:
     decoded = load_structured_json_with_syntax_repair(
         raw_output,
@@ -871,6 +816,16 @@ def _parse_structured_prompt_batch(
         if not isinstance(output, Mapping):
             raise ValueError(f"prompt-batched {operator} output must be an object")
         serialized = json.dumps(output, ensure_ascii=False)
+        if strict_fields:
+            parsed, explanation = _parse_single_structured_prompt_output(
+                serialized,
+                output_cols=output_cols,
+                shape=shape,
+                require_explanation=require_explanation,
+                operator=operator,
+            )
+            items.append(PromptBatchItem(identifier, (parsed, explanation)))
+            continue
         if shape == "object":
             parsed, explanation = parse_structured_object_json(
                 serialized,
@@ -889,6 +844,106 @@ def _parse_structured_prompt_batch(
     return ParsedPromptBatch(
         items=tuple(items),
         repair_method=decoded.repair_method,
+    )
+
+
+def _structured_batch_schema(
+    output_cols: Sequence[ColumnSpec], *, shape: str, require_explanation: bool
+) -> dict[str, Any]:
+    fields: dict[str, Any] = {
+        column.name: {"type": ["string", "number", "boolean", "null"]}
+        for column in output_cols
+    }
+    if require_explanation:
+        fields[EXPLANATION_FIELD] = {"type": "string"}
+    output: dict[str, Any] = {
+        "type": "object",
+        "properties": fields,
+        "required": list(fields),
+        "additionalProperties": False,
+    }
+    if shape == "array":
+        output = {
+            "type": "object",
+            "properties": {"rows": {"type": "array", "items": output}},
+            "required": ["rows"],
+            "additionalProperties": False,
+        }
+    return {
+        "type": "object",
+        "properties": {
+            "results": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {"task_id": {"type": "string"}, "output": output},
+                    "required": ["task_id", "output"],
+                    "additionalProperties": False,
+                },
+            }
+        },
+        "required": ["results"],
+        "additionalProperties": False,
+    }
+
+
+def _parse_single_structured_prompt_output(
+    raw_output: str,
+    *,
+    output_cols: Sequence[ColumnSpec],
+    shape: Literal["object", "array"],
+    require_explanation: bool,
+    operator: str,
+) -> tuple[Any, str | None]:
+    """Parse one unwrapped task result when its task identity is unambiguous."""
+
+    decoded = load_structured_json_with_syntax_repair(
+        raw_output,
+        operator=f"singleton prompt-batched {operator}",
+        expected_shape="the operator's exact JSON output object",
+    )
+    if decoded.repair_method is not None:
+        raise ValueError(
+            f"singleton prompt-batched {operator} output must be strict JSON"
+        )
+    payload = decoded.value
+    if not isinstance(payload, Mapping):
+        raise ValueError(
+            f"singleton prompt-batched {operator} output must be an object"
+        )
+
+    if shape == "object":
+        expected_fields = {column.name for column in output_cols}
+        if require_explanation:
+            expected_fields.add(EXPLANATION_FIELD)
+        if set(payload) != expected_fields:
+            raise ValueError(
+                f"singleton prompt-batched {operator} output fields do not match "
+                "the declared schema"
+            )
+        return parse_structured_object_json(
+            raw_output,
+            output_cols,
+            require_explanation=require_explanation,
+            operator=operator,
+        )
+
+    if set(payload) != {FLAT_MAP_ROWS_FIELD}:
+        raise ValueError(
+            f"singleton prompt-batched {operator} output must contain only "
+            f"{FLAT_MAP_ROWS_FIELD!r}"
+        )
+    rows = payload[FLAT_MAP_ROWS_FIELD]
+    expected_fields = {column.name for column in output_cols}
+    if not isinstance(rows, list) or any(
+        not isinstance(row, Mapping) or set(row) != expected_fields for row in rows
+    ):
+        raise ValueError(
+            f"singleton prompt-batched {operator} rows do not match the declared schema"
+        )
+    return (
+        parse_structured_array_json(raw_output, output_cols, operator=operator),
+        None,
     )
 
 

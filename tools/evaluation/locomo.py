@@ -27,7 +27,9 @@ from agent_memory.evaluation.run import (  # noqa: E402
     run_agent_memory_bundle,
 )
 from agent_memory.adapters.lotus.prompt_batching import (  # noqa: E402
+    STRUCTURED_OUTPUT_TRANSPORTS,
     parse_prompt_batch_size,
+    validate_structured_output_transport,
 )
 from agent_memory.planner import GROUPED_AGG_RULES  # noqa: E402
 
@@ -93,6 +95,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     run.add_argument("--prompt-batch-size", type=parse_prompt_batch_size)
     run.add_argument(
+        "--structured-output-transport",
+        choices=STRUCTURED_OUTPUT_TRANSPORTS,
+        default="chat-json-object",
+    )
+    run.add_argument(
         "--semantic-pair-profile",
         choices=SEMANTIC_PAIR_PROFILES,
         default="oracle-only",
@@ -113,6 +120,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     args = parser.parse_args(raw_args)
     if args.command == "run":
+        try:
+            validate_structured_output_transport(
+                args.structured_output_transport, model=args.memory_model
+            )
+        except ValueError as error:
+            parser.error(str(error))
         args.grouped_agg_rule = resolve_grouped_agg_rule(
             args.system,
             args.grouped_agg_rule,
@@ -210,9 +223,7 @@ def main(argv: Sequence[str] | None = None) -> Path:
         raise ValueError("bundle is not the pinned LOCOMO dataset")
     return run_agent_memory_bundle(
         bundle=bundle,
-        contracts={
-            "locomo": locomo_task_contract(judge_model_id=args.judge_model)
-        },
+        contracts={"locomo": locomo_task_contract(judge_model_id=args.judge_model)},
         system_id=args.system,
         output_dir=args.output_dir,
         memory_provider_model_id=args.memory_model,
@@ -238,6 +249,11 @@ def main(argv: Sequence[str] | None = None) -> Path:
         condition_id=args.condition_id or "",
         maintenance_only=args.maintenance_only,
         maintenance_checkpoint_output_dir=args.maintenance_checkpoint_output_dir,
+        **(
+            {"structured_output_transport": args.structured_output_transport}
+            if args.structured_output_transport != "chat-json-object"
+            else {}
+        ),
     )
 
 

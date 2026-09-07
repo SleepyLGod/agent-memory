@@ -42,6 +42,7 @@ def execute_sem_flat_map(
         semantic_trace_dir=context.config.trace_dir(),
         operator="sem_flat_map",
         prompt_batching=context.config.prompt_batching,
+        structured_output_transport=context.config.structured_output_transport,
     )
     return apply_flat_map_outputs(
         source,

@@ -87,6 +87,7 @@ def execute_sem_groupby(
             profile=profile,
             embedding_provider=context.pair_embedding_provider,
             prompt_batching=context.config.prompt_batching,
+            structured_output_transport=context.config.structured_output_transport,
             structured_parse_retries=context.config.structured_parse_retries,
             structured_max_tokens=context.config.structured_max_tokens,
         )
@@ -98,6 +99,7 @@ def execute_sem_groupby(
             label_col=str(query.params.get("label_col", "_label")),
             instruction=str(query.params["instruction"]),
             prompt_batching=context.config.prompt_batching,
+            structured_output_transport=context.config.structured_output_transport,
         )
 
     unique_rows, row_to_unique = exact_unique_key_rows(source, input_cols)
@@ -113,6 +115,7 @@ def execute_sem_groupby(
         profile=profile,
         embedding_provider=context.pair_embedding_provider,
         prompt_batching=context.config.prompt_batching,
+        structured_output_transport=context.config.structured_output_transport,
         structured_parse_retries=context.config.structured_parse_retries,
         structured_max_tokens=context.config.structured_max_tokens,
     )
@@ -156,6 +159,7 @@ def execute_partitioned_sem_groupby(
     prompt_batching: PromptBatching | None,
     structured_parse_retries: int,
     structured_max_tokens: int,
+    structured_output_transport: str = "chat-json-object",
 ) -> pd.DataFrame:
     """Assign semantic group ids independently within deterministic partitions."""
 
@@ -180,6 +184,7 @@ def execute_partitioned_sem_groupby(
                 label_col=label_col,
                 instruction=instruction,
                 prompt_batching=prompt_batching,
+                structured_output_transport=structured_output_transport,
             )
         else:
             unique_rows, row_to_unique = exact_unique_key_rows(partition, input_cols)
@@ -195,6 +200,7 @@ def execute_partitioned_sem_groupby(
                 profile=profile,
                 embedding_provider=embedding_provider,
                 prompt_batching=prompt_batching,
+                structured_output_transport=structured_output_transport,
                 structured_parse_retries=structured_parse_retries,
                 structured_max_tokens=structured_max_tokens,
             )
@@ -238,6 +244,7 @@ def assign_declared_labels(
     label_col: str,
     instruction: str,
     prompt_batching: PromptBatching | None = None,
+    structured_output_transport: str = "chat-json-object",
 ) -> pd.DataFrame:
     """Assign rows to declared closed-world labels with LOTUS structured output."""
 
@@ -273,6 +280,7 @@ def assign_declared_labels(
         model_kwargs={},
         operator="sem_groupby",
         prompt_batching=prompt_batching,
+        structured_output_transport=structured_output_transport,
     )
 
     label_to_group = {name: index for index, name in enumerate(label_names)}
@@ -409,6 +417,7 @@ def evaluate_group_matches(
     prompt_batching: PromptBatching | None = None,
     structured_parse_retries: int = 0,
     structured_max_tokens: int = 8192,
+    structured_output_transport: str = "chat-json-object",
 ) -> list[tuple[int, int]]:
     """Evaluate candidate row pairs with LOTUS sem_filter."""
 
@@ -479,6 +488,7 @@ def evaluate_group_matches(
             pairs.loc[:, ["left", "right"]],
             instruction=user_instruction,
             prompt_batching=prompt_batching,
+            structured_output_transport=structured_output_transport,
             structured_parse_retries=structured_parse_retries,
             structured_max_tokens=structured_max_tokens,
             progress_bar_desc="Grouping comparisons",

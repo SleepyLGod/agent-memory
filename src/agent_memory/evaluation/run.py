@@ -31,7 +31,11 @@ from agent_memory.adapters.lotus.context import (
     SEM_AGG_DISPATCH_METHODS,
     SEM_JOIN_TOPK_METHODS,
 )
-from agent_memory.adapters.lotus.prompt_batching import PromptBatching
+from agent_memory.adapters.lotus.json_output import JSON_REPAIR_VERSION
+from agent_memory.adapters.lotus.prompt_batching import (
+    PromptBatching,
+    validate_structured_output_transport,
+)
 from agent_memory.planner import DEFAULT_GROUPED_AGG_RULE
 from .artifacts import BenchmarkArtifactStore
 from .bundle import BenchmarkBundle
@@ -122,6 +126,7 @@ def run_agent_memory_bundle(
     sem_groupby_pair_batch_retries: int = 0,
     sem_agg_dispatch: str = "sequential",
     prompt_batching: PromptBatching | None = None,
+    structured_output_transport: str = "chat-json-object",
     semantic_pair_profile: str = "oracle-only",
     semantic_pair_top_k: int | None = None,
     semantic_pair_min_similarity: float | None = None,
@@ -140,6 +145,9 @@ def run_agent_memory_bundle(
 
     if system_id not in AGENT_MEMORY_SYSTEMS:
         raise ValueError(f"unsupported agent-memory benchmark system {system_id!r}")
+    validate_structured_output_transport(
+        structured_output_transport, model=memory_provider_model_id
+    )
     grouped_agg_rule = resolve_grouped_agg_rule(system_id, grouped_agg_rule)
     if (
         isinstance(refresh_every, bool)
@@ -380,6 +388,11 @@ def run_agent_memory_bundle(
                 if prompt_batching is not None
                 else ""
             ),
+            (
+                f"structured-output-transport:{structured_output_transport}"
+                if structured_output_transport != "chat-json-object"
+                else ""
+            ),
             f"refresh:count:{refresh_every}" if refresh_every > 1 else "",
             f"lotus-cache:{LOTUS_MEMORY_CACHE_ID}"
             if lotus_cache_mode == "memory"
@@ -456,6 +469,11 @@ def run_agent_memory_bundle(
     if prompt_batching is not None:
         lotus_execution_provenance["prompt_batching"] = (
             prompt_batching.to_dict()
+        )
+        lotus_execution_provenance["json_repair_version"] = JSON_REPAIR_VERSION
+    if structured_output_transport != "chat-json-object":
+        lotus_execution_provenance["structured_output_transport"] = (
+            structured_output_transport
         )
     if site_profile_config is not None:
         lotus_execution_provenance.update(
@@ -541,6 +559,11 @@ def run_agent_memory_bundle(
         if prompt_batching is not None
         else {}
     )
+    structured_transport_options = (
+        {"structured_output_transport": structured_output_transport}
+        if structured_output_transport != "chat-json-object"
+        else {}
+    )
     refresh_execution_options: dict[str, Any] = {}
     if refresh_every > 1:
         refresh_execution_options["refresh_every"] = refresh_every
@@ -557,11 +580,13 @@ def run_agent_memory_bundle(
             thinking_enabled=memory_thinking_enabled,
             **sem_agg_execution_options,
             **prompt_batching_options,
+            **structured_transport_options,
             **refresh_execution_options,
         )
     elif system_id == "zep-memory":
         driver_factory = ZepMemoryDriverFactory.from_environment(
-            base_namespace=base_namespace or _namespace(bundle.benchmark_id, output_dir),
+            base_namespace=base_namespace
+            or _namespace(bundle.benchmark_id, output_dir),
             model_id=memory_provider_model_id,
             grouped_agg_rule=grouped_agg_rule,
             sem_join_topk_method=resolved_sem_join_topk_method,
@@ -574,11 +599,13 @@ def run_agent_memory_bundle(
             thinking_enabled=memory_thinking_enabled,
             **sem_agg_execution_options,
             **prompt_batching_options,
+            **structured_transport_options,
             **refresh_execution_options,
         )
     elif system_id == "mem0-memory":
         driver_factory = Mem0MemoryDriverFactory(
-            base_namespace=base_namespace or _namespace(bundle.benchmark_id, output_dir),
+            base_namespace=base_namespace
+            or _namespace(bundle.benchmark_id, output_dir),
             model_id=memory_provider_model_id,
             sem_groupby_pair_batch_size=sem_groupby_pair_batch_size,
             sem_groupby_pair_batch_retries=sem_groupby_pair_batch_retries,
@@ -589,11 +616,13 @@ def run_agent_memory_bundle(
             thinking_enabled=memory_thinking_enabled,
             **sem_agg_execution_options,
             **prompt_batching_options,
+            **structured_transport_options,
             **refresh_execution_options,
         )
     else:
         driver_factory = Mem0MemoryEnhancedDriverFactory(
-            base_namespace=base_namespace or _namespace(bundle.benchmark_id, output_dir),
+            base_namespace=base_namespace
+            or _namespace(bundle.benchmark_id, output_dir),
             model_id=memory_provider_model_id,
             sem_topk_method=sem_topk_method,
             sem_groupby_pair_batch_size=sem_groupby_pair_batch_size,
@@ -605,6 +634,7 @@ def run_agent_memory_bundle(
             thinking_enabled=memory_thinking_enabled,
             **sem_agg_execution_options,
             **prompt_batching_options,
+            **structured_transport_options,
             **refresh_execution_options,
         )
     try:
