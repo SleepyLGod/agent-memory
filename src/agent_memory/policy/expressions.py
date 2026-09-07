@@ -163,9 +163,11 @@ def expr_from_param(value: object) -> "Expr":
     raise ValueError(f"Unsupported expression kind: {kind!r}")
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class Expr:
     """Base class for serializable relational expressions."""
+
+    __hash__ = None  # type: ignore[assignment]
 
     def to_param(self) -> ExprParam:
         """Return a QueryExpr parameter representation."""
@@ -179,6 +181,24 @@ class Expr:
             "Relational expressions cannot be used as Python booleans. "
             "Pass them to filter/join, or compare to_param() for structural checks."
         )
+
+    def __eq__(self, other: object) -> "ComparisonExpr":  # type: ignore[override]
+        return ComparisonExpr(op="eq", left=self, right=ensure_expr(other))
+
+    def __ne__(self, other: object) -> "ComparisonExpr":  # type: ignore[override]
+        return ComparisonExpr(op="ne", left=self, right=ensure_expr(other))
+
+    def __lt__(self, other: object) -> "ComparisonExpr":
+        return ComparisonExpr(op="lt", left=self, right=ensure_expr(other))
+
+    def __le__(self, other: object) -> "ComparisonExpr":
+        return ComparisonExpr(op="le", left=self, right=ensure_expr(other))
+
+    def __gt__(self, other: object) -> "ComparisonExpr":
+        return ComparisonExpr(op="gt", left=self, right=ensure_expr(other))
+
+    def __ge__(self, other: object) -> "ComparisonExpr":
+        return ComparisonExpr(op="ge", left=self, right=ensure_expr(other))
 
     def __and__(self, other: object) -> "BooleanExpr":
         """Build a boolean AND expression."""
@@ -265,8 +285,6 @@ class Expr:
 class ColumnExpr(Expr):
     """Reference to one relation column, optionally qualified by an alias."""
 
-    __hash__ = None  # type: ignore[assignment]
-
     name: str
     qualifier: str | None = None
 
@@ -281,26 +299,8 @@ class ColumnExpr(Expr):
 
         return {"kind": "column", "name": self.name, "qualifier": self.qualifier}
 
-    def __eq__(self, other: object) -> "ComparisonExpr":  # type: ignore[override]
-        return ComparisonExpr(op="eq", left=self, right=ensure_expr(other))
 
-    def __ne__(self, other: object) -> "ComparisonExpr":  # type: ignore[override]
-        return ComparisonExpr(op="ne", left=self, right=ensure_expr(other))
-
-    def __lt__(self, other: object) -> "ComparisonExpr":
-        return ComparisonExpr(op="lt", left=self, right=ensure_expr(other))
-
-    def __le__(self, other: object) -> "ComparisonExpr":
-        return ComparisonExpr(op="le", left=self, right=ensure_expr(other))
-
-    def __gt__(self, other: object) -> "ComparisonExpr":
-        return ComparisonExpr(op="gt", left=self, right=ensure_expr(other))
-
-    def __ge__(self, other: object) -> "ComparisonExpr":
-        return ComparisonExpr(op="ge", left=self, right=ensure_expr(other))
-
-
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class LiteralExpr(Expr):
     """Scalar literal expression."""
 
@@ -312,7 +312,7 @@ class LiteralExpr(Expr):
         return {"kind": "literal", "value": self.value}
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class ComparisonExpr(Expr):
     """Binary comparison expression."""
 
@@ -331,7 +331,7 @@ class ComparisonExpr(Expr):
         }
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class ArithmeticExpr(Expr):
     """Binary numeric expression with SQL-style null propagation."""
 
@@ -350,7 +350,7 @@ class ArithmeticExpr(Expr):
         }
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class TryCastExpr(Expr):
     """Nullable scalar conversion expression."""
 
@@ -367,7 +367,7 @@ class TryCastExpr(Expr):
         }
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class CaseWhenExpr(Expr):
     """SQL-style conditional expression with an explicit else branch."""
 
@@ -386,7 +386,7 @@ class CaseWhenExpr(Expr):
         }
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class BooleanExpr(Expr):
     """Boolean expression over relational expressions."""
 
@@ -403,7 +403,7 @@ class BooleanExpr(Expr):
         }
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class ArrayCatExpr(Expr):
     """Row-wise JSON array-state concatenation expression."""
 
@@ -420,7 +420,7 @@ class ArrayCatExpr(Expr):
         }
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class LeastExpr(Expr):
     """Row-wise minimum expression over two or more nullable operands."""
 
