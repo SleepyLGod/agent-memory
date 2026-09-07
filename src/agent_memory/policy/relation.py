@@ -22,8 +22,10 @@ from .aggregates import (
 from .expressions import (
     ArithmeticExpr,
     ArrayCatExpr,
+    CaseWhenExpr,
     ColumnExpr,
     LeastExpr,
+    TryCastExpr,
     ensure_boolean_expr,
     ensure_expr,
     expr_to_param,
@@ -200,11 +202,20 @@ def _normalize_assignment_value(value: object) -> Mapping[str, Any]:
     """Normalize assign values to literal, column, or supported array expression params."""
 
     expr = ensure_expr(value)
-    if isinstance(expr, (ColumnExpr, ArithmeticExpr, ArrayCatExpr, LeastExpr)) or is_scalar(value):
+    if isinstance(
+        expr,
+        (
+            ColumnExpr,
+            ArithmeticExpr,
+            ArrayCatExpr,
+            LeastExpr,
+            TryCastExpr,
+            CaseWhenExpr,
+        ),
+    ) or is_scalar(value):
         return expr.to_param()
     raise TypeError(
-        "assign values must be scalar literals, column expressions, arithmetic expressions, "
-        "array_cat expressions, or least expressions"
+        "assign values must be scalar literals or supported row expressions"
     )
 
 

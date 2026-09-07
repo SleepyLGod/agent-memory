@@ -27,11 +27,13 @@ from agent_memory.policy.expressions import (
     ArithmeticExpr,
     ArrayCatExpr,
     BooleanExpr,
+    CaseWhenExpr,
     ColumnExpr,
     ComparisonExpr,
     Expr,
     LeastExpr,
     LiteralExpr,
+    TryCastExpr,
     expr_from_param,
     is_scalar,
 )
@@ -161,11 +163,18 @@ def execute_assign(
         expr = expr_from_param(value)
         if not isinstance(
             expr,
-            (LiteralExpr, ColumnExpr, ArithmeticExpr, ArrayCatExpr, LeastExpr),
+            (
+                LiteralExpr,
+                ColumnExpr,
+                ArithmeticExpr,
+                ArrayCatExpr,
+                LeastExpr,
+                TryCastExpr,
+                CaseWhenExpr,
+            ),
         ):
             raise TypeError(
-                "assign values must be scalar literals, column expressions, "
-                "arithmetic expressions, array_cat expressions, or least expressions"
+                "assign values must be scalar literals or supported row expressions"
             )
         source[column_name] = evaluate_expr(expr, source)
     return source
@@ -1074,6 +1083,10 @@ def evaluate_expr(expr: Expr, frame: Any) -> Any:
         return _evaluate_comparison(expr, frame)
     if isinstance(expr, ArithmeticExpr):
         return _evaluate_arithmetic(expr, frame)
+    if isinstance(expr, TryCastExpr):
+        return _evaluate_try_cast(expr, frame)
+    if isinstance(expr, CaseWhenExpr):
+        return _evaluate_case_when(expr, frame)
     if isinstance(expr, BooleanExpr):
         return _evaluate_boolean(expr, frame)
     if isinstance(expr, ArrayCatExpr):
@@ -1108,6 +1121,58 @@ def _evaluate_arithmetic(expr: ArithmeticExpr, frame: Any) -> Any:
         index=frame.index,
         dtype=object,
     )
+
+
+def _evaluate_try_cast(expr: TryCastExpr, frame: Any) -> Any:
+    """Convert scalars to floats, returning null for failed conversions."""
+
+    if expr.target != "float":
+        raise ValueError("try_cast currently only supports the 'float' target")
+    value = evaluate_expr(expr.value, frame)
+    if isinstance(value, pd.Series):
+        return value.map(_try_cast_float)
+    return _try_cast_float(value)
+
+
+def _try_cast_float(value: Any) -> float | None:
+    """Convert one nullable scalar using Python float semantics."""
+
+    if _is_arithmetic_null(value):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _evaluate_case_when(expr: CaseWhenExpr, frame: Any) -> pd.Series:
+    """Evaluate CASE WHEN, treating a null condition as false."""
+
+    condition = evaluate_predicate(expr.condition, frame)
+    selected = condition.to_numpy(dtype=bool)
+    result = np.empty(len(frame), dtype=object)
+    for branch, mask in (
+        (expr.then_value, selected),
+        (expr.else_value, ~selected),
+    ):
+        positions = np.flatnonzero(mask)
+        if positions.size == 0:
+            continue
+        branch_frame = frame.iloc[positions]
+        branch_values = _as_expression_series(
+            evaluate_expr(branch, branch_frame),
+            branch_frame,
+        )
+        result[positions] = branch_values.to_numpy(dtype=object)
+    return pd.Series(result, index=frame.index, dtype=object)
+
+
+def _as_expression_series(value: Any, frame: pd.DataFrame) -> pd.Series:
+    """Broadcast a scalar expression result to the current frame."""
+
+    if isinstance(value, pd.Series):
+        return value
+    return pd.Series([value] * len(frame), index=frame.index, dtype=object)
 
 
 def _evaluate_arithmetic_value(op: str, left: Any, right: Any) -> Any:

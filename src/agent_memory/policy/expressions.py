@@ -31,6 +31,28 @@ def least(*values: object) -> "LeastExpr":
     return LeastExpr(operands=tuple(ensure_expr(value) for value in values))
 
 
+def try_cast(value: object, *, to: str) -> "TryCastExpr":
+    """Build a nullable scalar conversion expression."""
+
+    if to != "float":
+        raise ValueError("try_cast currently only supports the 'float' target")
+    return TryCastExpr(value=ensure_expr(value), target=to)
+
+
+def case_when(
+    condition: object,
+    then_value: object,
+    else_value: object,
+) -> "CaseWhenExpr":
+    """Build a SQL-style conditional scalar expression."""
+
+    return CaseWhenExpr(
+        condition=ensure_boolean_expr(condition),
+        then_value=ensure_expr(then_value),
+        else_value=ensure_expr(else_value),
+    )
+
+
 def ensure_expr(value: object) -> "Expr":
     """Normalize supported public expression values into expression objects."""
 
@@ -41,11 +63,15 @@ def ensure_expr(value: object) -> "Expr":
     raise TypeError(f"Expected a relational expression or scalar literal, got {type(value).__name__}")
 
 
-def ensure_boolean_expr(value: object) -> "BooleanExpr | ColumnExpr | ComparisonExpr":
+def ensure_boolean_expr(
+    value: object,
+) -> "BooleanExpr | ColumnExpr | ComparisonExpr | LiteralExpr":
     """Normalize and require a boolean-valued expression."""
 
     expr = ensure_expr(value)
     if isinstance(expr, (BooleanExpr, ColumnExpr, ComparisonExpr)):
+        return expr
+    if isinstance(expr, LiteralExpr) and isinstance(expr.value, bool):
         return expr
     raise TypeError(f"Expected a boolean relational expression, got {type(expr).__name__}")
 
@@ -94,6 +120,20 @@ def expr_from_param(value: object) -> "Expr":
             op=op,  # type: ignore[arg-type]
             left=expr_from_param(value.get("left")),
             right=expr_from_param(value.get("right")),
+        )
+    if kind == "try_cast":
+        target = value.get("target")
+        if target != "float":
+            raise ValueError("try_cast currently only supports the 'float' target")
+        return TryCastExpr(
+            value=expr_from_param(value.get("value")),
+            target=target,
+        )
+    if kind == "case_when":
+        return CaseWhenExpr(
+            condition=ensure_boolean_expr(expr_from_param(value.get("condition"))),
+            then_value=expr_from_param(value.get("then")),
+            else_value=expr_from_param(value.get("else")),
         )
     if kind == "boolean":
         op = value.get("op")
@@ -307,6 +347,42 @@ class ArithmeticExpr(Expr):
             "op": self.op,
             "left": self.left.to_param(),
             "right": self.right.to_param(),
+        }
+
+
+@dataclass(frozen=True)
+class TryCastExpr(Expr):
+    """Nullable scalar conversion expression."""
+
+    value: Expr
+    target: Literal["float"]
+
+    def to_param(self) -> ExprParam:
+        """Return a QueryExpr parameter representation."""
+
+        return {
+            "kind": "try_cast",
+            "value": self.value.to_param(),
+            "target": self.target,
+        }
+
+
+@dataclass(frozen=True)
+class CaseWhenExpr(Expr):
+    """SQL-style conditional expression with an explicit else branch."""
+
+    condition: Expr
+    then_value: Expr
+    else_value: Expr
+
+    def to_param(self) -> ExprParam:
+        """Return a QueryExpr parameter representation."""
+
+        return {
+            "kind": "case_when",
+            "condition": self.condition.to_param(),
+            "then": self.then_value.to_param(),
+            "else": self.else_value.to_param(),
         }
 
 

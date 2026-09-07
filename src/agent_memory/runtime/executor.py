@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict, deque
 from collections.abc import Callable, Hashable, Mapping
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from typing import Any
@@ -113,6 +114,19 @@ class PolicyExecutor:
         """Return the number of source rows in the committed state."""
 
         return len(self._state.get("log", ()))
+
+    def read_view(self, name: str) -> pd.DataFrame:
+        """Return a defensive copy of one declared public view."""
+
+        if name not in self.spec.views:
+            raise KeyError(f"unknown public view: {name!r}")
+        value = self._state.get(name)
+        if value is None:
+            return self._empty_view_frame(self.spec.views[name])
+        result = value.copy(deep=True)
+        for column in result.select_dtypes(include="object").columns:
+            result[column] = result[column].map(deepcopy)
+        return result
 
     def add(self, message: MessageInput) -> None:
         """Append one source row and propagate its change through the shared DAG."""
