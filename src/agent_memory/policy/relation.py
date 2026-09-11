@@ -302,6 +302,15 @@ class Relation(RelationHandle):
 
         return self._derive("select", columns=tuple(columns))
 
+    def limit(self, n: int) -> "Relation":
+        """Return at most n rows, without promising an order or chosen subset."""
+
+        if isinstance(n, bool) or not isinstance(n, int):
+            raise TypeError("limit requires a non-negative integer")
+        if n < 0:
+            raise ValueError("limit requires a non-negative integer")
+        return self._derive("limit", n=n)
+
     def alias(self, name: str) -> "Relation":
         """Assign a temporary relation qualifier for self-joins."""
 

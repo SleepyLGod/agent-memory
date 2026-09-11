@@ -102,6 +102,7 @@ examples/helloworld/
 ## Design Documents
 
 - `docs/design/operator-api.md`: DataFrame-style semantic operator API
+- `docs/design/lotus-lowering.md`: LOTUS physical lowering and execution contracts
 - `docs/design/TODO.md`: unresolved interface, runtime, and research questions
 - `docs/optimization/incremental-semantic-view-maintenance.tex`: semantic IVM theory draft
 
