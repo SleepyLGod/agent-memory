@@ -28,7 +28,10 @@ from agent_memory.adapters.lotus.prompt_batching import (
     PromptBatching,
     run_prompt_batches,
 )
-from agent_memory.tracing.semantic import write_structured_generation_trace
+from agent_memory.tracing.semantic import (
+    trace_scope_value,
+    write_structured_generation_trace,
+)
 from agent_memory.policy.logical import ColumnSpec, QueryExpr
 
 EXPLANATION_FIELD = "_explanation"
@@ -1193,6 +1196,9 @@ def write_structured_failure_artifacts(
 ) -> list[Path]:
     """Write structured generation failure artifacts for local inspection."""
 
+    if trace_scope_value("provider_journal", False):
+        # Raw responses are already durable; do not duplicate failed rows as files.
+        return []
     STRUCTURED_FAILURE_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     paths: list[Path] = []

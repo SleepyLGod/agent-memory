@@ -109,8 +109,7 @@ def trace_event_count(
     root = _event_root(trace_dir)
     with _TRACE_WRITE_LOCK:
         return sum(
-            _TRACE_EVENT_COUNTS.get((root, event_type), 0)
-            for event_type in event_types
+            _TRACE_EVENT_COUNTS.get((root, event_type), 0) for event_type in event_types
         )
 
 
@@ -128,6 +127,13 @@ def write_trace_event(
 
     if trace_dir is None:
         return None
+
+    journaled = trace_scope_value("provider_journal", False)
+    if journaled:
+        if event_type == "pair_decision":
+            return None
+        raw_output = parsed_output = None
+        snapshots = None
 
     root = _event_root(trace_dir)
     root.mkdir(parents=True, exist_ok=True)
@@ -182,7 +188,7 @@ def write_llm_call_trace(
 ) -> list[dict[str, Any]]:
     """Write actual LOTUS LM request/response trace events."""
 
-    if trace_dir is None:
+    if trace_dir is None or trace_scope_value("provider_journal", False):
         return []
 
     root = _event_root(trace_dir)
@@ -251,14 +257,16 @@ def write_provider_usage_trace(
 ) -> list[dict[str, Any]]:
     """Write raw provider usage payloads observed at the ModelResponse boundary."""
 
-    if trace_dir is None:
+    if trace_dir is None or trace_scope_value("provider_journal", False):
         return []
 
     root = _event_root(trace_dir)
     root.mkdir(parents=True, exist_ok=True)
     scope = active_trace_scope()
     operator = str(scope.get("operator", scope.get("semantic_operator", "llm")))
-    trace_operator = "provider-usage" if operator == "llm" else f"{operator}-provider-usage"
+    trace_operator = (
+        "provider-usage" if operator == "llm" else f"{operator}-provider-usage"
+    )
     batch_id = _trace_id(trace_operator)
     rows: list[dict[str, Any]] = []
     for index, response in enumerate(responses):
@@ -302,7 +310,9 @@ def write_provider_usage_trace(
         partial_choices = getattr(partial_response, "choices", ())
         if partial_choices:
             event["provider_partial_output_path"] = _write_json_artifact(
-                root / TRACE_OUTPUTS_DIR, trace_id, "partial-output.json",
+                root / TRACE_OUTPUTS_DIR,
+                trace_id,
+                "partial-output.json",
                 {"output": getattr(partial_choices[0].message, "content", None)},
             )
         _append_event(root, event)
@@ -503,7 +513,9 @@ def _json_safe(value: Any) -> Any:
     except TypeError:
         if isinstance(value, Mapping):
             return {str(key): _json_safe(item) for key, item in value.items()}
-        if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        if isinstance(value, Sequence) and not isinstance(
+            value, (str, bytes, bytearray)
+        ):
             return [_json_safe(item) for item in value]
         return str(value)
 
@@ -539,7 +551,9 @@ def _normalized_provider_usage(usage: Any, raw_usage: Any) -> dict[str, Any]:
 
     return {
         "provider_prompt_tokens": _usage_value(usage, raw_usage, "prompt_tokens"),
-        "provider_completion_tokens": _usage_value(usage, raw_usage, "completion_tokens"),
+        "provider_completion_tokens": _usage_value(
+            usage, raw_usage, "completion_tokens"
+        ),
         "provider_total_tokens": _usage_value(usage, raw_usage, "total_tokens"),
         "provider_prompt_cache_hit_tokens": _usage_value(
             usage,
