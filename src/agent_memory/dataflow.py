@@ -36,6 +36,18 @@ class SemanticDataflow:
                 raise ValueError("view names must be non-empty strings")
             if not isinstance(relation, Relation):
                 raise TypeError("views values must be Relation instances")
+            pending = [relation.expr]
+            visited: set[int] = set()
+            while pending:
+                query = pending.pop()
+                if id(query) in visited:
+                    continue
+                visited.add(id(query))
+                if query.op == "log" and query is not source.expr:
+                    raise ValueError(
+                        f"view {name!r} must derive from the declared source"
+                    )
+                pending.extend(query.inputs)
             declared_views[name] = MemoryView(name=name, query=relation.expr)
 
         spec = MemorySpec(
@@ -57,3 +69,11 @@ class SemanticDataflow:
         """Return a defensive copy of one named public view."""
 
         return self._executor.read_view(name)
+
+    def snapshot_state(self) -> dict[str, Any]:
+        """Return the executor's existing snapshot for trusted persistence."""
+        return self._executor.snapshot_state()
+
+    def restore_state(self, snapshot: Mapping[str, Any]) -> None:
+        """Restore a snapshot, including the executor's compatibility checks."""
+        self._executor.restore_state(snapshot)

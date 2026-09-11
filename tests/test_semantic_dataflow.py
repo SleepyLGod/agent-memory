@@ -106,3 +106,53 @@ def test_semantic_dataflow_validates_declared_views() -> None:
             views={"result": object()},  # type: ignore[dict-item]
             adapter=LotusAdapter(),
         )
+
+
+@pytest.mark.parametrize("same_schema", [False, True])
+@pytest.mark.parametrize("mixed", [False, True])
+def test_semantic_dataflow_rejects_foreign_source(
+    same_schema: bool, mixed: bool,
+) -> None:
+    source = am.Source({"value": "Numeric value."})
+    foreign = am.Source(
+        {"value": "Numeric value."} if same_schema else {"other": "Other value."}
+    )
+    view = foreign.select(["value"] if same_schema else ["other"])
+    if mixed:
+        view = source.union_by_name(view)
+
+    with pytest.raises(ValueError, match="view 'result'.*declared source"):
+        am.SemanticDataflow(
+            source=source, views={"result": view}, adapter=LotusAdapter(),
+        )
+
+
+def test_semantic_dataflow_accepts_self_join_and_window_source() -> None:
+    source = am.Source({"value": "Numeric value."})
+    joined = source.alias("left").join(source.alias("right"), on="value")
+    windowed = source.count_window(size=2).process_window(
+        lambda window: window.select(["value"])
+    )
+    flow = am.SemanticDataflow(
+        source=source, views={"joined": joined, "windowed": windowed},
+        adapter=LotusAdapter(),
+    )
+    flow.apply(pd.DataFrame({"value": [1, 2]}))
+    assert len(flow.view("joined")) == 2
+    assert flow.view("windowed")["value"].tolist() == [1, 2]
+
+
+def test_semantic_dataflow_owns_nested_input_after_apply() -> None:
+    flow = _build_flow()
+    payload = {"evidence": ["original"]}
+    batch = pd.DataFrame([{"category": "keep", "value": payload}])
+    flow.apply(batch)
+
+    payload["evidence"].append("changed")
+    batch.loc[0, "value"]["extra"] = ["caller"]
+    assert flow.view("selected").loc[0, "value"] == {"evidence": ["original"]}
+
+    # A later update must still consume the detached, original source row.
+    flow.apply(pd.DataFrame([{"category": "keep", "value": 2}]))
+    assert flow.view("selected").loc[0, "value"] == {"evidence": ["original"]}
+    assert flow.view("counts").loc[0, "row_count"] == 2

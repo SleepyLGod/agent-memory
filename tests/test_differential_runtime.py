@@ -28,6 +28,45 @@ from agent_memory.runtime.executor import NodeOutputUpdate, PolicyExecutor
 from agent_memory.runtime.legacy import LegacyViewRuntime
 
 
+@pytest.fixture(autouse=True)
+def _block_provider_configuration(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Runtime tests must stub every semantic operator before provider setup."""
+
+    from agent_memory.adapters.lotus.context import LotusExecutionContext
+
+    def reject_provider(self: LotusExecutionContext) -> None:
+        raise AssertionError("Runtime test reached an unstubbed semantic operator")
+
+    monkeypatch.setattr(LotusExecutionContext, "configure", reject_provider)
+
+
+def _join_stub_keys(
+    query: am.QueryExpr,
+    left: pd.DataFrame,
+    right: pd.DataFrame,
+    keys: tuple[str, ...],
+) -> pd.DataFrame:
+    """Use fixture equality as the semantic oracle, retaining join assembly."""
+
+    keys = (*tuple(query.params.get("on", ())), *keys)
+    matches = []
+    for left_index, left_row in left.iterrows():
+        selected = [
+            (left_index, right_index, None)
+            for right_index, right_row in right.iterrows()
+            if all(left_row[key] == right_row[key] for key in keys)
+        ]
+        k = query.params.get("k")
+        matches.extend(selected if k is None else selected[:k])
+    return assemble_join_frame(
+        left,
+        right,
+        matches,
+        how=str(query.params["how"]),
+        id_columns=tuple(query.params["id_columns"]),
+    )
+
+
 def test_planner_exports_differentiator_components_not_free_functions() -> None:
     assert planner.QueryDifferentiator.__name__ == "QueryDifferentiator"
     assert planner.PolicyDifferentiator.__name__ == "PolicyDifferentiator"
@@ -277,6 +316,13 @@ class _SemanticAggregateAdapter(LotusAdapter):
                 return source
             if query.op == "sem_agg":
                 return self._execute_sem_agg(query, inputs)
+            if query.op == "sem_join":
+                return _join_stub_keys(
+                    query,
+                    self.execute(query.inputs[0], inputs),
+                    self.execute(query.inputs[1], inputs),
+                    ("key",),
+                )
             return super().execute(query, inputs)
         finally:
             self._depth -= 1
@@ -417,6 +463,10 @@ def test_semantic_state_uses_maintenance_query_for_insert_only_change() -> None:
 
     assert any(query is node.maintenance_query for query in adapter.root_queries)
     assert not any(query is node.query for query in adapter.root_queries)
+    assert memory._runtime._state["summaries"].to_dict("records") == [
+        {"key": "a", "summary": "5", "propagated": True},
+        {"key": "b", "summary": "7", "propagated": True},
+    ]
 
 
 def test_semantic_state_recomputes_node_on_parent_replacement_and_propagates() -> None:
@@ -832,6 +882,16 @@ class _ZepStubAdapter(LotusAdapter):
     ) -> pd.DataFrame:
         if query.op == "sem_flat_map":
             return self._flat_map(query, inputs)
+        if query.op == "sem_join":
+            left = self.execute(query.inputs[0], inputs)
+            right = self.execute(query.inputs[1], inputs)
+            if "fact" in left.columns:
+                keys = ("relation_type", "fact")
+            elif "members" in left.columns:
+                keys = ("name", "summary")
+            else:
+                keys = ("name",)
+            return _join_stub_keys(query, left, right, keys)
         if query.op == "sem_groupby":
             source = self.execute(query.inputs[0], inputs).copy()
             grouping_columns = (
