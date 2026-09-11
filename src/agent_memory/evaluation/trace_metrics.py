@@ -27,6 +27,7 @@ def normalize_provider_calls(
     *,
     output_dir: Path,
     pricing: PricingSnapshot | None = None,
+    include_cost: bool = True,
 ) -> list[dict[str, Any]]:
     """Return one normalized row per provider response.
 
@@ -34,9 +35,11 @@ def normalize_provider_calls(
     provider event is authoritative when both exist, avoiding double counting.
     Responses retain their framework batch identity so reports can distinguish
     logical operator calls, framework batches, and provider calls.
+    With include_cost=False, both cost fields remain unknown; no default price
+    is applied. Existing callers retain the historical pricing behavior.
     """
 
-    pricing = pricing or PricingSnapshot.deepseek_2026_07_17()
+    pricing = (pricing or PricingSnapshot.deepseek_2026_07_17()) if include_cost else None
     pending_semantic_calls: dict[
         tuple[str, int], deque[Mapping[str, Any]]
     ] = defaultdict(deque)
@@ -191,7 +194,7 @@ def summarize_framework_cache_usage(
 def _agent_provider_row(
     event: Mapping[str, Any],
     output_dir: Path,
-    pricing: PricingSnapshot,
+    pricing: PricingSnapshot | None,
     *,
     semantic_event: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
@@ -223,7 +226,7 @@ def _agent_provider_row(
 
 def _agent_runner_row(
     event: Mapping[str, Any],
-    pricing: PricingSnapshot,
+    pricing: PricingSnapshot | None,
 ) -> dict[str, Any]:
     error = event.get("event_type") == "llm_batch_error"
     return _row(
@@ -249,7 +252,7 @@ def _agent_runner_row(
 
 def _native_graphiti_row(
     event: Mapping[str, Any],
-    pricing: PricingSnapshot,
+    pricing: PricingSnapshot | None,
 ) -> dict[str, Any]:
     usage = _mapping(event.get("usage"))
     provider_cache = _mapping(event.get("provider_cache"))
@@ -272,7 +275,7 @@ def _native_graphiti_row(
 
 def _native_claude_row(
     event: Mapping[str, Any],
-    pricing: PricingSnapshot,
+    pricing: PricingSnapshot | None,
 ) -> dict[str, Any]:
     usage = _mapping(event.get("usage"))
     error = event.get("event_type") == "llm_call_error"
@@ -309,10 +312,10 @@ def _row(
     completion_tokens: int | None,
     reasoning_tokens: int | None,
     usage_available: bool,
-    pricing: PricingSnapshot,
+    pricing: PricingSnapshot | None,
 ) -> dict[str, Any]:
     total = _sum_optional(prompt_tokens, completion_tokens)
-    cost = pricing.estimate_cost_usd(
+    cost = None if pricing is None else pricing.estimate_cost_usd(
         cache_hit_input_tokens=cache_hit_tokens,
         cache_miss_input_tokens=cache_miss_tokens,
         output_tokens=completion_tokens,
@@ -362,7 +365,7 @@ def _row(
         "total_tokens": total,
         "usage_available": usage_available,
         "known_cost_usd": (
-            float(round(cost, 12)) if cost is not None else 0.0
+            None if pricing is None else float(round(cost, 12)) if cost is not None else 0.0
         ),
         "estimated_cost_usd": (
             float(round(cost, 12)) if cost is not None else None

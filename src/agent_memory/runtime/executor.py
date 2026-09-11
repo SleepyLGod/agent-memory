@@ -193,7 +193,15 @@ class PolicyExecutor:
 
             parent_updates = tuple(updates[parent_id] for parent_id in node.input_node_ids)
             old_state = self._node_state.get(node_id, self._empty_node_frame(node_id))
-            if all(update.is_empty for update in parent_updates):
+            needs_global_aggregate_identity = (
+                node.execution_kind == "algebraic_state"
+                and old_state.empty
+                and not tuple(node.query.params["group_keys"])
+            )
+            if (
+                all(update.is_empty for update in parent_updates)
+                and not needs_global_aggregate_identity
+            ):
                 staged_node_state.setdefault(node_id, old_state)
                 updates[node_id] = NodeOutputUpdate.between(old_state, old_state.copy())
                 continue

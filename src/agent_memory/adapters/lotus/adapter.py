@@ -37,6 +37,7 @@ from agent_memory.adapters.lotus.relational import (
     execute_group_by,
     execute_join,
     execute_let,
+    execute_limit,
     execute_min,
     execute_select,
     execute_subtract,
@@ -145,6 +146,8 @@ class LotusAdapter:
                 return execute_window_source(inputs)
             case "select":
                 return self._execute_traced_relational(query, inputs, execute_select)
+            case "limit":
+                return self._execute_traced_relational(query, inputs, execute_limit)
             case "alias":
                 return self._execute_traced_relational(query, inputs, execute_alias)
             case "assign":

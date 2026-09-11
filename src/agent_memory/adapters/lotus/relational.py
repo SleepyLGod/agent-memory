@@ -53,6 +53,21 @@ def execute_select(
     return source.loc[:, list(query.params["columns"])].copy()
 
 
+def execute_limit(
+    query: QueryExpr,
+    inputs: Mapping[str, Any],
+    execute: Callable[[QueryExpr, Mapping[str, Any]], Any],
+) -> Any:
+    """Select a legal bounded bag; physical position is not a query guarantee."""
+
+    n = query.params["n"]
+    if isinstance(n, bool) or not isinstance(n, int):
+        raise TypeError("limit requires a non-negative integer")
+    if n < 0:
+        raise ValueError("limit requires a non-negative integer")
+    return execute(query.inputs[0], inputs).iloc[:n].copy()
+
+
 def execute_alias(
     query: QueryExpr,
     inputs: Mapping[str, Any],

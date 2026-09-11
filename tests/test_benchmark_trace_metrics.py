@@ -11,6 +11,19 @@ from agent_memory.evaluation.trace_metrics import (
 )
 
 
+def test_normalize_provider_calls_can_omit_pricing(tmp_path: Path) -> None:
+    events = [{
+        "event_type": "provider_usage", "provider_usage_available": True,
+        "provider_prompt_tokens": 10, "provider_completion_tokens": 2,
+        "provider_prompt_cache_hit_tokens": 4, "provider_prompt_cache_miss_tokens": 6,
+    }]
+    priced = normalize_provider_calls(events, output_dir=tmp_path)[0]
+    unpriced = normalize_provider_calls(events, output_dir=tmp_path, include_cost=False)[0]
+    assert priced["estimated_cost_usd"] is not None
+    for key, value in priced.items():
+        assert unpriced[key] == (None if key.endswith("cost_usd") else value)
+
+
 def test_normalize_provider_calls_deduplicates_agent_semantic_usage(
     tmp_path: Path,
 ) -> None:

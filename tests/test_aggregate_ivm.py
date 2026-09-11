@@ -29,6 +29,16 @@ class _GlobalAggregateMemory(am.Memory):
     )
 
 
+class _FilteredGlobalAggregateMemory(am.Memory):
+    log = am.Log({"kind": "Row kind.", "amount": "Numeric amount."})
+    _selected = log.filter(log.col("kind") == "selected")
+    metrics = _selected.agg(
+        am.count(output_col="row_count"),
+        am.sum(column="amount", output_col="total"),
+        am.avg(column="amount", output_col="average"),
+    )
+
+
 class _GroupedAggregateMemory(am.Memory):
     log = am.Log({"region": "Region.", "amount": "Numeric amount."})
     metrics = log.group_by("region").agg(
@@ -105,6 +115,19 @@ def test_global_incremental_result_matches_full_recomputation_after_each_batch()
     assert memory._runtime._state["metrics"].to_dict(orient="records") == [
         {"row_count": 4, "total": 50, "average": 50 / 3}
     ]
+
+
+def test_global_aggregate_materializes_identity_when_parent_delta_is_empty() -> None:
+    memory = _FilteredGlobalAggregateMemory()
+
+    memory.add({"kind": "ignored", "amount": 10})
+
+    assert memory._runtime._state["metrics"].to_dict(orient="records") == [
+        {"row_count": 0, "total": None, "average": None}
+    ]
+    assert _bag(memory._runtime._state["metrics"]) == _bag(
+        _full_view(memory, "metrics")
+    )
 
 
 def test_grouped_incremental_result_matches_full_recomputation() -> None:

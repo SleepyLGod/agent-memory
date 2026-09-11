@@ -47,7 +47,7 @@ def output_columns(
                 f"{conflicts}"
             )
         return source_columns + metadata_columns
-    if query.op in {"alias", "group_by"}:
+    if query.op in {"alias", "group_by", "limit"}:
         return output_columns(query.inputs[0], window_source_columns=window_source_columns)
     if query.op == "let":
         return output_columns(query.inputs[1], window_source_columns=window_source_columns)
