@@ -11,6 +11,11 @@ from typing import Any
 import pandas as pd
 
 from agent_memory.adapters.lotus.context import LotusExecutionConfig, LotusExecutionContext
+from agent_memory.adapters.lotus.predicate import (
+    execute_schema_predicate,
+    single_schema_predicate,
+    validate_schema_predicate,
+)
 from agent_memory.adapters.lotus.pair_execution import (
     PairCandidateSelection,
     select_semantic_pair_candidates,
@@ -48,6 +53,8 @@ def execute_sem_filter(
     batch_prompting = prompt_batching is not None
     if batch_prompting:
         validate_batch_prompting_sem_filter_config(context.config)
+    if single_schema_predicate(context.config):
+        validate_schema_predicate(context.config, "sem_filter")
     if profile is not None and profile.mode in {"search-filter", "proxy-only"}:
         if (
             profile.mode == "proxy-only"
@@ -94,6 +101,15 @@ def execute_sem_filter(
         result = lotus_source.copy()
     elif selection is not None and lotus_source.empty:
         result = lotus_source.copy()
+    elif single_schema_predicate(context.config):
+        decision = execute_schema_predicate(
+            lotus_source,
+            instruction=instruction,
+            config=context.config,
+            operator="sem_filter",
+        )
+        selected_positions = [i for i, keep in enumerate(decision.decisions) if keep]
+        result = lotus_source.iloc[selected_positions].copy()
     elif batch_prompting:
         assert prompt_batching is not None
         prompted = execute_batch_prompted_sem_filter(

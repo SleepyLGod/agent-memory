@@ -55,6 +55,7 @@ JUDGED_QUESTION_COUNT = 54
 FIRST_EVENT_ID = "D1:1"
 LAST_EVENT_ID = "D7:20"
 CLIENT_REQUEST_MAX_WORKERS = 64
+LM_MAX_CTX_LEN = 1_000_000
 BGE_M3_REVISION = "5617a9f61b028005a4858fdac845db406aefb181"
 SOFT_STOP_CNY = Decimal("48")
 HARD_STOP_CNY = Decimal("50")
@@ -169,6 +170,8 @@ def build_condition_command(
         "claude-memory",
         "--condition-id",
         f"Claude-BatchingScale-{condition.run_id}-128e",
+        "--lm-max-ctx-len",
+        str(LM_MAX_CTX_LEN),
         "--memory-model",
         "deepseek/deepseek-v4-flash",
         "--answer-model",
@@ -548,8 +551,8 @@ def _capture_continuation(
 
     origin = origin.resolve()
     previous = _read_contract(origin)
-    if previous.get("continuation"):
-        raise RuntimeError("nested continuations are not supported")
+    _validate_continuation(previous)
+    inherited = previous.get("continuation") or {}
     if (origin / "control/experiment-state").read_text().strip() not in {
         "failed", "safety-stopped", "completed",
     }:
@@ -564,12 +567,21 @@ def _capture_continuation(
         origin / "control/experiment-contract.json",
         origin / "control/source-evidence.json",
     }
+    if inherited:
+        files.update(
+            Path(inherited["origin_root"]) / name
+            for name in inherited["files_sha256"]
+        )
     reused = {}
+    reused_sources = {}
     for run_id in run_ids:
-        directory = origin / "conditions" / run_id
+        directory = _result_directory(origin, previous, run_id)
         output = directory / "output"
         if (directory / "state").read_text().strip() != "completed":
             raise RuntimeError(f"reuse condition is not completed: {run_id}")
+        trace = output / "trace/events.jsonl"
+        if not trace.is_file():
+            raise RuntimeError(f"reuse cost evidence is missing for {run_id}: {trace}")
         result = json.loads((directory / "validation.json").read_text())
         summary = json.loads((output / "metrics/summary.json").read_text())
         monitor = json.loads((directory / "monitor-state.json").read_text())
@@ -590,6 +602,10 @@ def _capture_continuation(
         # Hash the small completed artifacts, including checkpoint and question payloads.
         files.update(p for p in directory.rglob("*") if p.is_file())
         reused[run_id] = str(directory)
+        reused_sources[run_id] = (
+            inherited.get("reused_sources", {}).get(run_id, inherited.get("source"))
+            if run_id in inherited.get("reused_conditions", {}) else previous["source"]
+        )
     condition_costs = {}
     for trace in sorted(origin.glob("conditions/*/output/trace/events.jsonl")):
         files.add(trace)
@@ -608,10 +624,16 @@ def _capture_continuation(
         "origin_root": str(origin),
         "source": previous["source"],
         "reused_conditions": reused,
-        "files_sha256": {str(p.relative_to(origin)): _sha256_file(p) for p in sorted(files)},
-        "prior_cost_cny": str(sum((Decimal(value) for value in condition_costs.values()), Decimal(0))),
-        "prior_condition_costs_cny": condition_costs,
-        "interpretation": "Exploratory mixed-repair first pass; second pass uses the new source.",
+        "reused_sources": reused_sources,
+        "files_sha256": {os.path.relpath(p, origin): _sha256_file(p) for p in sorted(files)},
+        "prior_cost_cny": str(sum(
+            (Decimal(value) for value in condition_costs.values()),
+            Decimal(str(inherited.get("prior_cost_cny", "0"))),
+        )),
+        "prior_condition_costs_cny": {
+            **inherited.get("prior_condition_costs_cny", {}), **condition_costs,
+        },
+        "interpretation": "Exploratory mixed-source first pass; second pass uses the new source.",
     }
 
 
@@ -774,6 +796,7 @@ def initialize(
 
     contract["structured_output"] = {
         "transport": "chat-json-object", "repair_version": JSON_REPAIR_VERSION,
+        "lm_max_ctx_len": LM_MAX_CTX_LEN,
     }
     if (reuse_root is None) != (not reuse_conditions):
         raise ValueError("reuse-root and reuse-condition must be supplied together")
@@ -866,11 +889,12 @@ def preflight(root: Path) -> dict[str, Any]:
         raise RuntimeError(f"CUDA contract failed: torch={torch.__version__}")
     if paths.source not in Path(agent_memory.__file__).resolve().parents:
         raise RuntimeError(f"wrong agent_memory source: {agent_memory.__file__}")
-    config = LotusExecutionConfig()
+    config = LotusExecutionConfig(lm_model_kwargs={"max_ctx_len": LM_MAX_CTX_LEN})
     from agent_memory.adapters.lotus.json_output import JSON_REPAIR_VERSION
 
     if contract.get("structured_output") != {
         "transport": config.structured_output_transport, "repair_version": JSON_REPAIR_VERSION,
+        "lm_max_ctx_len": config.lm_model_kwargs["max_ctx_len"],
     }:
         raise RuntimeError("structured output contract changed")
     signature = inspect.signature(LM.__init__)
@@ -1059,6 +1083,8 @@ def _validate_condition(
         or execution.get("prompt_batching") != _expected_prompt_contract(condition)
     ):
         raise RuntimeError(f"physical execution contract drifted: {execution}")
+    if execution.get("lm_max_ctx_len") != LM_MAX_CTX_LEN:
+        raise RuntimeError("memory LM context capacity changed")
     profiles = execution.get("semantic_pair_query_profiles")
     if not isinstance(profiles, Mapping) or len(profiles) != 1:
         raise RuntimeError(f"expected one Claude Search-Filter site: {profiles}")
@@ -1340,7 +1366,11 @@ def summarize(root: Path) -> dict[str, Any]:
             result["result_origin"] = {
                 "status": "reused-completed" if is_reused else "completed",
                 "directory": str(directory),
-                "source": contract["continuation"]["source"] if is_reused else contract["source"],
+                "source": (
+                    contract["continuation"].get("reused_sources", {}).get(
+                        run_id, contract["continuation"]["source"],
+                    ) if is_reused else contract["source"]
+                ),
                 "repair_version": None if is_reused else (contract.get("structured_output") or {}).get("repair_version"),
             }
             results.append(result)

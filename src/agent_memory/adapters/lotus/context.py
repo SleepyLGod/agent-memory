@@ -40,6 +40,15 @@ _LM_OWNED_KWARGS = {
 }
 
 
+def validate_lm_max_ctx_len(value: int | None) -> None:
+    """Validate an optional client-side context capacity override."""
+
+    if value is not None and (
+        isinstance(value, bool) or not isinstance(value, int) or value <= 0
+    ):
+        raise ValueError("lm_max_ctx_len must be a positive integer or None")
+
+
 @dataclass(frozen=True)
 class LotusExecutionConfig:
     """Backend execution knobs that are not part of policy query semantics."""
@@ -104,6 +113,7 @@ class LotusExecutionConfig:
     def __post_init__(self) -> None:
         """Validate bounded semantic execution settings."""
 
+        validate_lm_max_ctx_len(self.lm_model_kwargs.get("max_ctx_len"))
         validate_structured_output_transport(self.structured_output_transport)
         if self.prompt_batching is not None and not isinstance(
             self.prompt_batching, PromptBatching

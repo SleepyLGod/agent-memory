@@ -9,6 +9,11 @@ from typing import Any, cast
 import pandas as pd
 
 from agent_memory.adapters.lotus.context import LotusExecutionConfig, LotusExecutionContext
+from agent_memory.adapters.lotus.predicate import (
+    execute_schema_predicate,
+    single_schema_predicate,
+    validate_schema_predicate,
+)
 from agent_memory.adapters.lotus.pair_execution import (
     PAIR_LEFT_ID_COLUMN,
     PAIR_LEFT_TEXT_COLUMN,
@@ -40,6 +45,8 @@ def execute_sem_join(
     profile = context.config.semantic_pair_profiles.get(digest)
     id_columns = _join_id_columns(query.params.get("id_columns"))
     on = tuple(cast(Sequence[Any], query.params.get("on", ())))
+    if single_schema_predicate(context.config):
+        validate_schema_predicate(context.config, "sem_join")
     if query.params.get("k") is not None and context.config.sem_join_cascade_args is not None:
         raise ValueError("top-k sem_join cannot be combined with LOTUS sem_join cascade")
     if (
@@ -150,7 +157,10 @@ def execute_sem_join(
             profile=profile,
             embedding_provider=context.pair_embedding_provider,
         )
-    elif context.config.prompt_batching is not None:
+    elif (
+        context.config.prompt_batching is not None
+        or single_schema_predicate(context.config)
+    ):
         left_series, right_series, left_label, right_label, instruction = join_series(
             left,
             right,
@@ -397,6 +407,16 @@ def verify_semantic_join_candidates(
         outputs = list(prompted.decisions)
         raw_outputs = [attempts[-1] for attempts in prompted.raw_output_attempts]
         explanations: list[str | None] = [None] * len(outputs)
+    elif single_schema_predicate(config):
+        decision = execute_schema_predicate(
+            oracle_frame,
+            instruction=instruction,
+            config=config,
+            operator="sem_join",
+        )
+        outputs = list(decision.decisions)
+        raw_outputs = list(decision.raw_outputs)
+        explanations = [None] * len(outputs)
     else:
         import lotus
         from lotus.sem_ops.sem_filter import sem_filter

@@ -463,11 +463,45 @@ def _completed_origin(root: Path) -> dict[str, Any]:
     return contract
 
 
+@pytest.mark.parametrize("damage", ["missing", "malformed"])
+def test_continuation_requires_cost_evidence(tmp_path: Path, damage: str) -> None:
+    contract = _completed_origin(tmp_path)
+    trace = tmp_path / "conditions/pass-1-original/output/trace/events.jsonl"
+    if damage == "missing":
+        trace.rename(trace.with_suffix(".saved"))
+        with pytest.raises(RuntimeError, match="reuse.*cost.*pass-1-original"):
+            controller._capture_continuation(tmp_path, ("pass-1-original",), contract)
+    else:
+        trace.write_text("{invalid JSON\n")
+        with pytest.raises(json.JSONDecodeError):
+            controller._capture_continuation(tmp_path, ("pass-1-original",), contract)
+
+
+def test_chained_continuation_keeps_original_results_and_all_cost(tmp_path: Path) -> None:
+    old = tmp_path / "old"
+    original = _completed_origin(old)
+    middle = tmp_path / "middle"
+    contract = _completed_origin(middle)
+    contract["continuation"] = controller._capture_continuation(
+        old, ("pass-1-original",), original,
+    )
+    controller._atomic_json(middle / "control/experiment-contract.json", contract)
+    result = controller._capture_continuation(middle, ("pass-1-original",), contract)
+    assert result["reused_conditions"]["pass-1-original"] == str(old / "conditions/pass-1-original")
+    assert Decimal(result["prior_cost_cny"]) == Decimal("3.0")
+    assert result["reused_sources"]["pass-1-original"] == original["source"]
+    controller._validate_continuation({"continuation": result})
+    (old / "conditions/pass-1-original/validation.json").write_text("{}")
+    with pytest.raises(RuntimeError, match="changed"):
+        controller._validate_continuation({"continuation": result})
+
+
 def test_continuation_preserves_origin_and_failed_cost(tmp_path: Path) -> None:
     origin = tmp_path / "old"
     contract = _completed_origin(origin)
     before = {str(p): p.read_bytes() for p in origin.rglob("*") if p.is_file()}
     continuation = controller._capture_continuation(origin, ("pass-1-original",), contract)
+    assert Decimal(continuation["prior_condition_costs_cny"]["pass-1-original"]) == 0
     assert Decimal(continuation["prior_cost_cny"]) == Decimal("1.5")
     assert {str(p): p.read_bytes() for p in origin.rglob("*") if p.is_file()} == before
     new = tmp_path / "new"
@@ -568,3 +602,12 @@ def test_successful_continuation_enters_second_pass(
     monkeypatch.setattr(controller, "_validate_condition", validate)
     controller.run_experiment(root)
     assert observed == ["pass-1-packed-16", "pass-2-original"]
+
+
+def test_scale_commands_explicitly_set_memory_context() -> None:
+    for condition in controller.condition_matrix():
+        command = controller.build_condition_command(
+            condition, source=Path("/source"), venv=Path("/venv"),
+            bundle=Path("/bundle"), output=Path("/output"),
+        )
+        assert command[command.index("--lm-max-ctx-len") + 1] == "1000000"
