@@ -562,3 +562,38 @@ def test_structured_prompt_batch_rejects_invalid_singleton_inner_outputs(
             prompt_batching=PromptBatching(max_tasks=1),
             operator="sem_flat_map",
         )
+
+
+@pytest.mark.parametrize("context_limit", (128_000, 1_000_000))
+def test_p64_budget_uses_configured_context_without_reducing_output(
+    context_limit: int,
+) -> None:
+    tasks = tuple(_Task(f"task_{i}", "x") for i in range(64))
+    model = _Model([[",".join(f"{task.task_id}=ok" for task in tasks)]])
+    model.max_ctx_len = context_limit
+
+    def request(batch: tuple[_Task, ...]) -> PromptBatchRequest:
+        return PromptBatchRequest(
+            task_ids=tuple(task.task_id for task in batch),
+            prompt=[{"role": "system", "content": ""},
+                    {"role": "user", "content": "x" * 150_049}],
+            max_tokens=32_768,
+        )
+
+    def execute() -> Any:
+        return run_prompt_batches(
+            tasks, task_id=lambda task: task.task_id,
+            build_request=request, parse_results=_parse, model=model,
+            config=PromptBatching(max_tasks=64), max_retries=0,
+            progress_bar_desc="Testing", operator="test",
+        )
+
+    if context_limit == 128_000:
+        with pytest.raises(ValueError, match="context_limit=128000"):
+            execute()
+        assert model.calls == []
+    else:
+        result = execute()
+        assert result.outputs == ("ok",) * 64
+        assert result.chunk_sizes == (64,)
+        assert model.calls[0][1]["max_tokens"] == 32_768

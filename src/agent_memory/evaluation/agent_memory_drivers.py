@@ -20,6 +20,7 @@ from agent_memory.adapters.lotus.pair_execution import (
     semantic_pair_site_id,
     semantic_pair_site_physical_contract,
 )
+from agent_memory.adapters.lotus.context import validate_lm_max_ctx_len
 from agent_memory.adapters.lotus.prompt_batching import (
     PromptBatching,
     validate_structured_output_transport,
@@ -674,6 +675,7 @@ class ClaudeMemoryDriverFactory:
         prompt_batching: PromptBatching | None = None,
         sem_agg_dispatch: str = "sequential",
         structured_output_transport: str = "chat-json-object",
+        lm_max_ctx_len: int | None = None,
         semantic_trace_snapshot_mode: str = "compact",
         lotus_cache_mode: str = "disabled",
         refresh_every: int = 1,
@@ -682,6 +684,7 @@ class ClaudeMemoryDriverFactory:
         from agent_memory.adapters.lotus.context import SEM_TOPK_METHODS
         from agent_memory.planner.rules import GROUPED_AGG_RULES
 
+        validate_lm_max_ctx_len(lm_max_ctx_len)
         validate_structured_output_transport(
             structured_output_transport, model=model_id
         )
@@ -702,6 +705,7 @@ class ClaudeMemoryDriverFactory:
         self.prompt_batching = prompt_batching
         self.sem_agg_dispatch = sem_agg_dispatch
         self.structured_output_transport = structured_output_transport
+        self.lm_max_ctx_len = lm_max_ctx_len
         _semantic_pair_embedding_contract(self.semantic_pair_profiles)
         self.semantic_trace_snapshot_mode = semantic_trace_snapshot_mode
         _validate_lotus_cache_mode(lotus_cache_mode)
@@ -746,6 +750,10 @@ class ClaudeMemoryDriverFactory:
                 semantic_trace_dir=trace_dir,
                 lm_num_retries=BENCHMARK_LM_NUM_RETRIES,
                 lm_model_kwargs={
+                    **(
+                        {"max_ctx_len": self.lm_max_ctx_len}
+                        if self.lm_max_ctx_len is not None else {}
+                    ),
                     "extra_body": {
                         "thinking": {
                             "type": "enabled" if self.thinking_enabled else "disabled"
@@ -797,6 +805,7 @@ class ZepMemoryDriverFactory:
         prompt_batching: PromptBatching | None = None,
         sem_agg_dispatch: str = "sequential",
         structured_output_transport: str = "chat-json-object",
+        lm_max_ctx_len: int | None = None,
         embedding_device: str = "cpu",
         semantic_trace_snapshot_mode: str = "compact",
         lotus_cache_mode: str = "disabled",
@@ -807,6 +816,7 @@ class ZepMemoryDriverFactory:
     ) -> None:
         from agent_memory.planner.rules import GROUPED_AGG_RULES
 
+        validate_lm_max_ctx_len(lm_max_ctx_len)
         validate_structured_output_transport(
             structured_output_transport, model=model_id
         )
@@ -827,6 +837,7 @@ class ZepMemoryDriverFactory:
         self.prompt_batching = prompt_batching
         self.sem_agg_dispatch = sem_agg_dispatch
         self.structured_output_transport = structured_output_transport
+        self.lm_max_ctx_len = lm_max_ctx_len
         embedding_contract = _semantic_pair_embedding_contract(
             self.semantic_pair_profiles
         )
@@ -869,6 +880,7 @@ class ZepMemoryDriverFactory:
         prompt_batching: PromptBatching | None = None,
         sem_agg_dispatch: str = "sequential",
         structured_output_transport: str = "chat-json-object",
+        lm_max_ctx_len: int | None = None,
         embedding_device: str = "cpu",
         semantic_trace_snapshot_mode: str = "compact",
         lotus_cache_mode: str = "disabled",
@@ -877,6 +889,7 @@ class ZepMemoryDriverFactory:
     ) -> ZepMemoryDriverFactory:
         """Create the pinned Graphiti-compatible deployment connector."""
 
+        validate_lm_max_ctx_len(lm_max_ctx_len)
         validate_structured_output_transport(
             structured_output_transport, model=model_id
         )
@@ -924,6 +937,7 @@ class ZepMemoryDriverFactory:
             prompt_batching=prompt_batching,
             sem_agg_dispatch=sem_agg_dispatch,
             structured_output_transport=structured_output_transport,
+            lm_max_ctx_len=lm_max_ctx_len,
             embedding_device=embedding_device,
             semantic_trace_snapshot_mode=semantic_trace_snapshot_mode,
             lotus_cache_mode=lotus_cache_mode,
@@ -982,6 +996,10 @@ class ZepMemoryDriverFactory:
                 semantic_trace_dir=trace_dir,
                 lm_num_retries=BENCHMARK_LM_NUM_RETRIES,
                 lm_model_kwargs={
+                    **(
+                        {"max_ctx_len": self.lm_max_ctx_len}
+                        if self.lm_max_ctx_len is not None else {}
+                    ),
                     "extra_body": {
                         "thinking": {
                             "type": "enabled" if self.thinking_enabled else "disabled"
@@ -1054,12 +1072,14 @@ class Mem0MemoryDriverFactory:
         prompt_batching: PromptBatching | None = None,
         sem_agg_dispatch: str = "sequential",
         structured_output_transport: str = "chat-json-object",
+        lm_max_ctx_len: int | None = None,
         embedding_device: str = "cpu",
         semantic_trace_snapshot_mode: str = "compact",
         lotus_cache_mode: str = "disabled",
         refresh_every: int = 1,
         thinking_enabled: bool = False,
     ) -> None:
+        validate_lm_max_ctx_len(lm_max_ctx_len)
         validate_structured_output_transport(
             structured_output_transport, model=model_id
         )
@@ -1073,6 +1093,7 @@ class Mem0MemoryDriverFactory:
         self.prompt_batching = prompt_batching
         self.sem_agg_dispatch = sem_agg_dispatch
         self.structured_output_transport = structured_output_transport
+        self.lm_max_ctx_len = lm_max_ctx_len
         if embedding_device not in {"cpu", "cuda"}:
             raise ValueError("Mem0 embedding_device must be 'cpu' or 'cuda'")
         self.embedding_device = embedding_device
@@ -1154,6 +1175,10 @@ class Mem0MemoryDriverFactory:
                     semantic_trace_dir=trace_dir,
                     lm_num_retries=BENCHMARK_LM_NUM_RETRIES,
                     lm_model_kwargs={
+                        **(
+                            {"max_ctx_len": self.lm_max_ctx_len}
+                            if self.lm_max_ctx_len is not None else {}
+                        ),
                         "extra_body": {
                             "thinking": {
                                 "type": (
@@ -1222,6 +1247,7 @@ class Mem0MemoryEnhancedDriverFactory(Mem0MemoryDriverFactory):
         prompt_batching: PromptBatching | None = None,
         sem_agg_dispatch: str = "sequential",
         structured_output_transport: str = "chat-json-object",
+        lm_max_ctx_len: int | None = None,
         embedding_device: str = "cpu",
         semantic_trace_snapshot_mode: str = "compact",
         lotus_cache_mode: str = "disabled",
@@ -1243,6 +1269,7 @@ class Mem0MemoryEnhancedDriverFactory(Mem0MemoryDriverFactory):
             prompt_batching=prompt_batching,
             sem_agg_dispatch=sem_agg_dispatch,
             structured_output_transport=structured_output_transport,
+            lm_max_ctx_len=lm_max_ctx_len,
             embedding_device=embedding_device,
             semantic_trace_snapshot_mode=semantic_trace_snapshot_mode,
             lotus_cache_mode=lotus_cache_mode,

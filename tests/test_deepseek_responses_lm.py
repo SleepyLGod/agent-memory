@@ -115,9 +115,9 @@ def clients(monkeypatch: pytest.MonkeyPatch) -> list[FakeClient]:
     return made
 
 
-def _lm(**kwargs: Any) -> Any:
+def _lm(*, model: str = MODEL, **kwargs: Any) -> Any:
     return adapter.deepseek_responses_lm_class(LM)(
-        model=MODEL, cache=InMemoryCache(max_size=64), **kwargs
+        model=model, cache=InMemoryCache(max_size=64), **kwargs
     )
 
 
@@ -137,6 +137,8 @@ def _process(lm: Any, count: int = 1, **kwargs: Any) -> list[Any]:
 @pytest.mark.parametrize(
     "model",
     [
+        "deepseek-flash",
+        "deepseek/deepseek-flash",
         "deepseek-v4-flash",
         "deepseek/deepseek-v4-flash",
         "deepseek-v4-pro",
@@ -150,6 +152,8 @@ def test_supported_model_names(model: str) -> None:
 @pytest.mark.parametrize(
     "model",
     [
+        "openai/deepseek-flash",
+        "openrouter/deepseek/deepseek-flash",
         "openai/deepseek-v4-flash",
         "openrouter/deepseek/deepseek-v4-flash",
         "deepseek/deepseek-chat",
@@ -170,7 +174,11 @@ def test_invalid_model_rejected_before_parent_resources(model: str) -> None:
         adapter.deepseek_responses_lm_class(ResourceBase)(model=model)
 
 
-def test_schema_payload_and_nonthinking_translation(clients: list[FakeClient]) -> None:
+@pytest.mark.parametrize("name", ["deepseek-flash", "deepseek-v4-flash", "deepseek-v4-pro"])
+@pytest.mark.parametrize("prefix", ["", "deepseek/"])
+def test_schema_payload_and_nonthinking_translation(
+    clients: list[FakeClient], name: str, prefix: str
+) -> None:
     schema = deepcopy(SCHEMA)
     kwargs = {
         "max_tokens": 1000,
@@ -181,7 +189,7 @@ def test_schema_payload_and_nonthinking_translation(clients: list[FakeClient]) -
         "extra_body": {"thinking": {"type": "disabled"}},
         "stream": False,
     }
-    lm = _lm(**kwargs)
+    lm = _lm(model=f"{prefix}{name}", **kwargs)
     messages = [
         [
             {"role": "system", "content": "Answer with JSON."},
@@ -201,7 +209,7 @@ def test_schema_payload_and_nonthinking_translation(clients: list[FakeClient]) -
     }
     assert clients[0].calls == [
         {
-            "model": "deepseek-v4-flash",
+            "model": name,
             "input": messages[0],
             "text": {"format": {"type": "json_schema", **SCHEMA["json_schema"]}},
             "reasoning": {"effort": "none"},
@@ -546,8 +554,12 @@ def test_partial_failures_preserve_all_usage_and_successful_cache_entries(
 @pytest.mark.parametrize(
     "response_format", [None, {"type": "json_object"}, {"type": "text"}]
 )
+@pytest.mark.parametrize("model", [MODEL, "deepseek/deepseek-flash"])
 def test_non_schema_delegates_native_chat_without_sdk_client(
-    clients: list[FakeClient], monkeypatch: pytest.MonkeyPatch, response_format: Any
+    clients: list[FakeClient],
+    monkeypatch: pytest.MonkeyPatch,
+    response_format: Any,
+    model: str,
 ) -> None:
     calls: list[dict[str, Any]] = []
 
@@ -561,7 +573,7 @@ def test_non_schema_delegates_native_chat_without_sdk_client(
 
     monkeypatch.setattr("lotus.models.lm.batch_completion", chat)
     monkeypatch.delenv("DEEPSEEK_API_KEY")
-    result = _lm()(
+    result = _lm(model=model)(
         _messages(),
         response_format=response_format,
         stop=["END"],
@@ -571,7 +583,7 @@ def test_non_schema_delegates_native_chat_without_sdk_client(
     assert clients == []
     assert calls[0]["response_format"] == response_format
     assert calls[0]["stop"] == ["END"]
-    assert calls[0]["model"] == MODEL
+    assert calls[0]["model"] == model
 
 
 def test_cache_hits_keep_virtual_usage_without_new_client(

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -992,6 +992,7 @@ def execute_structured_lm_retry_result(
     operator: str,
     max_retries: int,
     failure_extra_by_index: Mapping[int, Mapping[str, Any]] | None = None,
+    output_validator: Callable[[str], None] | None = None,
 ) -> StructuredLMRetryResult:
     """Call the LM and return retry metadata without hiding parse failures."""
 
@@ -999,9 +1000,12 @@ def execute_structured_lm_retry_result(
 
     output: LMOutput = model(prompts, **dict(lm_kwargs))
     raw_outputs = list(output.outputs)
+    if output_validator is not None and len(raw_outputs) != len(prompts):
+        raise ValueError(f"{operator} expected {len(prompts)} outputs, got {raw_outputs!r}")
     raw_output_attempts = [[raw_output] for raw_output in raw_outputs]
     invalid = invalid_structured_output_indices(
         raw_outputs,
+        output_validator=output_validator,
         output_cols=output_cols,
         shape=shape,
         require_explanation=require_explanation,
@@ -1018,12 +1022,18 @@ def execute_structured_lm_retry_result(
             f"{lm_kwargs.get('progress_bar_desc', 'Structured generation')} retry"
         )
         retry_output: LMOutput = model(retry_prompts, **retry_kwargs)
+        if output_validator is not None and len(retry_output.outputs) != len(invalid):
+            raise ValueError(
+                f"{operator} expected {len(invalid)} retry outputs, "
+                f"got {retry_output.outputs!r}"
+            )
         for index, raw_output in zip(invalid, retry_output.outputs):
             raw_outputs[index] = raw_output
             raw_output_attempts[index].append(raw_output)
         retries_left -= 1
         invalid = invalid_structured_output_indices(
             raw_outputs,
+            output_validator=output_validator,
             output_cols=output_cols,
             shape=shape,
             require_explanation=require_explanation,
@@ -1040,6 +1050,7 @@ def execute_structured_lm_retry_result(
             require_explanation=require_explanation,
             operator=operator,
             extra_by_index=failure_extra_by_index,
+            output_validator=output_validator,
         )
         _STRUCTURED_RETRY_STATS.failure_artifacts += len(artifact_paths)
     else:
@@ -1178,6 +1189,7 @@ def write_structured_failure_artifacts(
     require_explanation: bool,
     operator: str,
     extra_by_index: Mapping[int, Mapping[str, Any]] | None = None,
+    output_validator: Callable[[str], None] | None = None,
 ) -> list[Path]:
     """Write structured generation failure artifacts for local inspection."""
 
@@ -1188,6 +1200,7 @@ def write_structured_failure_artifacts(
         final_raw_output = raw_output_attempts[index][-1]
         parse_error = structured_parse_error(
             final_raw_output,
+            output_validator=output_validator,
             output_cols=output_cols,
             shape=shape,
             require_explanation=require_explanation,
@@ -1229,10 +1242,13 @@ def structured_parse_error(
     shape: Literal["object", "array"],
     require_explanation: bool,
     operator: str,
+    output_validator: Callable[[str], None] | None = None,
 ) -> str:
     """Return the parser error message for one structured raw output."""
 
     try:
+        if output_validator is not None:
+            output_validator(raw_output)
         parse_one_structured_output(
             raw_output,
             output_cols=output_cols,
@@ -1252,12 +1268,15 @@ def invalid_structured_output_indices(
     shape: Literal["object", "array"],
     require_explanation: bool,
     operator: str,
+    output_validator: Callable[[str], None] | None = None,
 ) -> list[int]:
     """Return output indices that fail the structured parser."""
 
     invalid: list[int] = []
     for index, raw_output in enumerate(raw_outputs):
         try:
+            if output_validator is not None:
+                output_validator(raw_output)
             parse_one_structured_output(
                 raw_output,
                 output_cols=output_cols,

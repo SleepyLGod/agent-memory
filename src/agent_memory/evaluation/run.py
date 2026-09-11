@@ -26,6 +26,7 @@ from agent_memory.adapters.lotus.pair_execution import (
     semantic_pair_profiles_fingerprint,
 )
 from agent_memory.adapters.lotus.context import (
+    validate_lm_max_ctx_len,
     LOTUS_MEMORY_CACHE_ID,
     LOTUS_MEMORY_CACHE_MAX_SIZE,
     SEM_AGG_DISPATCH_METHODS,
@@ -127,6 +128,7 @@ def run_agent_memory_bundle(
     sem_agg_dispatch: str = "sequential",
     prompt_batching: PromptBatching | None = None,
     structured_output_transport: str = "chat-json-object",
+    lm_max_ctx_len: int | None = None,
     semantic_pair_profile: str = "oracle-only",
     semantic_pair_top_k: int | None = None,
     semantic_pair_min_similarity: float | None = None,
@@ -145,6 +147,7 @@ def run_agent_memory_bundle(
 
     if system_id not in AGENT_MEMORY_SYSTEMS:
         raise ValueError(f"unsupported agent-memory benchmark system {system_id!r}")
+    validate_lm_max_ctx_len(lm_max_ctx_len)
     validate_structured_output_transport(
         structured_output_transport, model=memory_provider_model_id
     )
@@ -393,6 +396,7 @@ def run_agent_memory_bundle(
                 if structured_output_transport != "chat-json-object"
                 else ""
             ),
+            f"lm-max-ctx-len:{lm_max_ctx_len}" if lm_max_ctx_len is not None else "",
             f"refresh:count:{refresh_every}" if refresh_every > 1 else "",
             f"lotus-cache:{LOTUS_MEMORY_CACHE_ID}"
             if lotus_cache_mode == "memory"
@@ -475,6 +479,8 @@ def run_agent_memory_bundle(
         lotus_execution_provenance["structured_output_transport"] = (
             structured_output_transport
         )
+    if lm_max_ctx_len is not None:
+        lotus_execution_provenance["lm_max_ctx_len"] = lm_max_ctx_len
     if site_profile_config is not None:
         lotus_execution_provenance.update(
             {
@@ -564,6 +570,9 @@ def run_agent_memory_bundle(
         if structured_output_transport != "chat-json-object"
         else {}
     )
+    lm_context_options = (
+        {"lm_max_ctx_len": lm_max_ctx_len} if lm_max_ctx_len is not None else {}
+    )
     refresh_execution_options: dict[str, Any] = {}
     if refresh_every > 1:
         refresh_execution_options["refresh_every"] = refresh_every
@@ -581,6 +590,7 @@ def run_agent_memory_bundle(
             **sem_agg_execution_options,
             **prompt_batching_options,
             **structured_transport_options,
+            **lm_context_options,
             **refresh_execution_options,
         )
     elif system_id == "zep-memory":
@@ -600,6 +610,7 @@ def run_agent_memory_bundle(
             **sem_agg_execution_options,
             **prompt_batching_options,
             **structured_transport_options,
+            **lm_context_options,
             **refresh_execution_options,
         )
     elif system_id == "mem0-memory":
@@ -617,6 +628,7 @@ def run_agent_memory_bundle(
             **sem_agg_execution_options,
             **prompt_batching_options,
             **structured_transport_options,
+            **lm_context_options,
             **refresh_execution_options,
         )
     else:
@@ -635,6 +647,7 @@ def run_agent_memory_bundle(
             **sem_agg_execution_options,
             **prompt_batching_options,
             **structured_transport_options,
+            **lm_context_options,
             **refresh_execution_options,
         )
     try:

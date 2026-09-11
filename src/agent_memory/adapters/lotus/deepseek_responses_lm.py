@@ -27,7 +27,7 @@ from tqdm import tqdm
 
 __all__ = ["deepseek_responses_lm_class", "validate_deepseek_responses_model"]
 
-_MODELS = {"deepseek-v4-flash", "deepseek-v4-pro"}
+_MODELS = {"deepseek-flash", "deepseek-v4-flash", "deepseek-v4-pro"}
 _PARAMS = {
     "response_format",
     "max_tokens",
@@ -54,11 +54,11 @@ _TRANSPORT = "responses-json-schema"
 
 
 def validate_deepseek_responses_model(model: str) -> None:
-    """Reject non-native providers and models outside the supported V4 text pair."""
+    """Reject non-native providers and unsupported native DeepSeek model names."""
     if not isinstance(model, str) or model.removeprefix("deepseek/") not in _MODELS:
         raise ValueError(
             f"Unsupported DeepSeek Responses model: {model!r}; use "
-            "deepseek-v4-flash or deepseek-v4-pro, optionally prefixed with deepseek/"
+            f"{', '.join(sorted(_MODELS))}, optionally prefixed with deepseek/"
         )
 
 

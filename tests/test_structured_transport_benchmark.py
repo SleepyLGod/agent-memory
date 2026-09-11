@@ -135,13 +135,15 @@ def test_cli_rejects_transport_before_loading_inputs(
 
 @pytest.mark.parametrize("factory", FACTORIES)
 @pytest.mark.parametrize("transport", (None, DEFAULT_TRANSPORT, RESPONSES_TRANSPORT))
+@pytest.mark.parametrize("context_limit", (None, 1_000_000))
 def test_factory_passes_transport_into_execution_config(
+    context_limit: int | None,
     factory: type[Any],
     transport: str | None,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """All four factory paths deliver the selected transport to the adapter config."""
+    """All four factory paths deliver physical settings to the adapter config."""
 
     import agent_memory.adapters.lotus as lotus_module
     import agent_memory.storage.qdrant as qdrant_module
@@ -165,10 +167,14 @@ def test_factory_passes_transport_into_execution_config(
         lambda **kwargs: SimpleNamespace(close=lambda: None),
     )
     options = _factory_options(factory)
+    if context_limit is not None:
+        options["lm_max_ctx_len"] = context_limit
     if transport is not None:
         options["structured_output_transport"] = transport
     with pytest.raises(ConfigCaptured):
         factory(**options)("case", tmp_path / "state", tmp_path / "trace")
+    assert captured["config"].lm_model_kwargs.get("max_ctx_len") == context_limit
+    assert captured["config"].structured_max_tokens == 32_768
     assert captured["config"].structured_output_transport == (
         transport or DEFAULT_TRANSPORT
     )
@@ -252,7 +258,9 @@ def test_zep_from_environment_validates_before_external_initialization(
 @pytest.mark.parametrize("system_id", run_module.AGENT_MEMORY_SYSTEMS)
 @pytest.mark.parametrize("transport", (None, DEFAULT_TRANSPORT, RESPONSES_TRANSPORT))
 @pytest.mark.parametrize("batching", (None, PromptBatching(max_tasks=8)))
+@pytest.mark.parametrize("context_limit", (None, 1_000_000))
 def test_run_records_only_enabled_execution_contracts(
+    context_limit: int | None,
     system_id: str,
     transport: str | None,
     batching: PromptBatching | None,
@@ -302,6 +310,8 @@ def test_run_records_only_enabled_execution_contracts(
         run_module, "validate_run_provenance", lambda *args, **kwargs: None,
     )
     options: dict[str, Any] = {} if transport is None else {"structured_output_transport": transport}
+    if context_limit is not None:
+        options["lm_max_ctx_len"] = context_limit
     run_module.run_agent_memory_bundle(
         bundle=_bundle(), contracts={}, system_id=system_id,
         output_dir=tmp_path / "output", memory_thinking_enabled=False,
@@ -324,6 +334,13 @@ def test_run_records_only_enabled_execution_contracts(
         parts.append("structured-output-transport:responses-json-schema")
     else:
         assert "structured_output_transport" not in provenance
+    if context_limit is not None:
+        assert captured["factory"]["lm_max_ctx_len"] == context_limit
+        assert provenance["lm_max_ctx_len"] == context_limit
+        parts.append(f"lm-max-ctx-len:{context_limit}")
+    else:
+        assert "lm_max_ctx_len" not in captured["factory"]
+        assert "lm_max_ctx_len" not in provenance
     assert identity == "|".join(parts)
 
 
@@ -353,3 +370,62 @@ def test_run_validates_transport_before_environment_or_factories(
             output_dir=tmp_path / "output", memory_provider_model_id=model,
             structured_output_transport=transport,
         )
+
+
+@pytest.mark.parametrize("limit", (None, 1_000_000))
+def test_locomo_context_limit_is_opt_in(
+    limit: int | None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def run(**kwargs: Any) -> Path:
+        captured.update(kwargs)
+        return kwargs["output_dir"]
+
+    monkeypatch.setattr(locomo, "read_bundle", lambda _path: _bundle())
+    monkeypatch.setattr(locomo, "run_agent_memory_bundle", run)
+    args = _cli_args(tmp_path)
+    if limit is not None:
+        args.extend(("--lm-max-ctx-len", str(limit)))
+    locomo.main(args)
+    assert captured.get("lm_max_ctx_len") == limit
+    if limit is None:
+        assert "lm_max_ctx_len" not in captured
+
+
+@pytest.mark.parametrize("limit", (0, -1, True, 1.5))
+def test_invalid_context_limit_fails_before_resources(limit: Any) -> None:
+    from agent_memory.adapters.lotus.context import LotusExecutionConfig
+
+    with pytest.raises(ValueError, match="lm_max_ctx_len"):
+        LotusExecutionConfig(lm_model_kwargs={"max_ctx_len": limit})
+    for factory in FACTORIES:
+        with pytest.raises(ValueError, match="lm_max_ctx_len"):
+            factory(**_factory_options(factory), lm_max_ctx_len=limit)
+    with pytest.raises(ValueError, match="lm_max_ctx_len"):
+        drivers.ZepMemoryDriverFactory.from_environment(
+            base_namespace="unused", lm_max_ctx_len=limit,
+        )
+
+
+def test_context_override_reaches_lotus_and_changes_execution_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import lotus
+    from agent_memory.adapters.lotus import LotusAdapter
+    from agent_memory.adapters.lotus.context import LotusExecutionConfig, LotusExecutionContext
+
+    monkeypatch.setattr(lotus.settings, "lm", lotus.settings.lm)
+    monkeypatch.setattr(lotus.settings, "enable_cache", lotus.settings.enable_cache)
+    config = LotusExecutionConfig(lm_model_kwargs={"max_ctx_len": 1_000_000})
+    context = LotusExecutionContext(model="test/model", config=config)
+    context.configure()
+    assert lotus.settings.lm.max_ctx_len == 1_000_000
+    assert "max_ctx_len" not in lotus.settings.lm.kwargs
+    fingerprints = {
+        LotusAdapter(model="test/model", config=LotusExecutionConfig(
+            lm_model_kwargs=kwargs,
+        )).maintenance_execution_fingerprint
+        for kwargs in ({}, {"max_ctx_len": 128_000}, {"max_ctx_len": 1_000_000})
+    }
+    assert len(fingerprints) == 3

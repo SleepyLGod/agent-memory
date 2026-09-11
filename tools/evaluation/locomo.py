@@ -95,6 +95,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     run.add_argument("--prompt-batch-size", type=parse_prompt_batch_size)
     run.add_argument(
+        "--lm-max-ctx-len", type=int,
+        help="Memory LM context capacity in tokens; omitted uses LOTUS default.",
+    )
+    run.add_argument(
         "--structured-output-transport",
         choices=STRUCTURED_OUTPUT_TRANSPORTS,
         default="chat-json-object",
@@ -249,6 +253,10 @@ def main(argv: Sequence[str] | None = None) -> Path:
         condition_id=args.condition_id or "",
         maintenance_only=args.maintenance_only,
         maintenance_checkpoint_output_dir=args.maintenance_checkpoint_output_dir,
+        **(
+            {"lm_max_ctx_len": args.lm_max_ctx_len}
+            if args.lm_max_ctx_len is not None else {}
+        ),
         **(
             {"structured_output_transport": args.structured_output_transport}
             if args.structured_output_transport != "chat-json-object"

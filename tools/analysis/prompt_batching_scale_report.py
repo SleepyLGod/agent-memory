@@ -200,7 +200,10 @@ def load_completed_runs(root: Path) -> tuple[tuple[RunRow, ...], dict[str, dict[
         payload["result_origin"] = {
             "status": "reused-completed" if run_id in reused else "completed",
             "directory": str(directory),
-            "source": continuation["source"] if run_id in reused else contract["source"],
+            "source": (
+                continuation.get("reused_sources", {}).get(run_id, continuation["source"])
+                if run_id in reused else contract["source"]
+            ),
             "repair_version": None if run_id in reused else (contract.get("structured_output") or {}).get("repair_version"),
         }
         if row.run_id != run_id:

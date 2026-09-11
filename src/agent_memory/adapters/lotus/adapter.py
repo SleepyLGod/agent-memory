@@ -95,6 +95,7 @@ class LotusAdapter:
         pair_fingerprint = semantic_pair_profiles_fingerprint(
             self.config.semantic_pair_profiles
         )
+        context_limit = self.config.lm_model_kwargs.get("max_ctx_len")
         sem_agg_configured = self.config.sem_agg_dispatch != "sequential"
         transport_configured = (
             self.config.structured_output_transport != "chat-json-object"
@@ -103,11 +104,14 @@ class LotusAdapter:
             sem_agg_configured
             or self.config.prompt_batching is not None
             or transport_configured
+            or context_limit is not None
         ):
             base_fingerprint = self._base_maintenance_execution_fingerprint(
                 pair_fingerprint
             )
             parts = [f"base_execution_fingerprint={base_fingerprint}"]
+            if context_limit is not None:
+                parts.append(f"lm_max_ctx_len={context_limit}")
             if sem_agg_configured:
                 parts.append(f"sem_agg_dispatch={self.config.sem_agg_dispatch}")
             if transport_configured:
