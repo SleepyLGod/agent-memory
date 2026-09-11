@@ -123,10 +123,7 @@ class PolicyExecutor:
         value = self._state.get(name)
         if value is None:
             return self._empty_view_frame(self.spec.views[name])
-        result = value.copy(deep=True)
-        for column in result.select_dtypes(include="object").columns:
-            result[column] = result[column].map(deepcopy)
-        return result
+        return _copy_frame_with_objects(value)
 
     def add(self, message: MessageInput) -> None:
         """Append one source row and propagate its change through the shared DAG."""
@@ -146,7 +143,7 @@ class PolicyExecutor:
             raise ValueError(
                 "source delta columns must exactly match the declared log schema"
             )
-        changed_rows = changed_rows.copy()
+        changed_rows = _copy_frame_with_objects(changed_rows)
         staged_next_occurrence = self._next_occurrence
 
         def allocate(node_id: str) -> str:
@@ -985,6 +982,15 @@ class PolicyExecutor:
         from agent_memory.adapters import LotusAdapter
 
         return LotusAdapter()
+
+
+def _copy_frame_with_objects(frame: pd.DataFrame) -> pd.DataFrame:
+    """Detach caller-owned nested values at public input/output boundaries."""
+
+    result = frame.copy(deep=True)
+    for column in result.select_dtypes(include="object").columns:
+        result[column] = result[column].map(deepcopy)
+    return result
 
 
 def _multiset_difference(
