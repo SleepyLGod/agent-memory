@@ -25,6 +25,8 @@ from openai import OpenAI, OpenAIError
 from openai.types.responses import Response
 from tqdm import tqdm
 
+from .request_hook import next_request_batch
+
 __all__ = ["deepseek_responses_lm_class", "validate_deepseek_responses_model"]
 
 _MODELS = {"deepseek-flash", "deepseek-v4-flash", "deepseek-v4-pro"}
@@ -291,11 +293,16 @@ class _DeepSeekResponsesMixin:
         show_progress_bar: bool,
         progress_bar_desc: str,
     ) -> list[Any]:
+        recorded_batch = next_request_batch()
         response_format = all_kwargs.get("response_format")
         if (
             not isinstance(response_format, Mapping)
             or response_format.get("type") != "json_schema"
         ):
+            if recorded_batch is not None:
+                raise ValueError(
+                    "durable requests require Responses JSON schema; no fallback send"
+                )
             parent: Any = super()
             return parent._process_uncached_messages(
                 uncached_data, all_kwargs, show_progress_bar, progress_bar_desc
@@ -304,6 +311,8 @@ class _DeepSeekResponsesMixin:
             return []
         validate_deepseek_responses_model(self.model)
         payload, client_options = _request_options(all_kwargs)
+        if recorded_batch is not None and client_options.get("max_retries", 0) != 0:
+            raise ValueError("durable requests require SDK retries=0")
         batch = [messages for messages, _ in uncached_data]
         for messages in batch:
             if not messages or any(
@@ -326,7 +335,24 @@ class _DeepSeekResponsesMixin:
         ):
             responses_api: Any = client.responses
 
-            def request(messages: list[dict[str, str]]) -> ModelResponse | OpenAIError:
+            def request(
+                item: tuple[int, list[dict[str, str]]],
+            ) -> ModelResponse | OpenAIError:
+                index, messages = item
+                if recorded_batch is not None:
+                    hook, identity = recorded_batch
+                    body = {
+                        "model": self.model.removeprefix("deepseek/"),
+                        "input": messages,
+                        **payload,
+                    }
+
+                    def send() -> dict[str, Any]:
+                        return responses_api.create(**body).model_dump(mode="json")
+
+                    # Journal/control failures must reach the caller, not become False.
+                    raw = hook.execute({**identity, "item": index}, body, send)
+                    return _normalize_response(Response.model_validate(raw))
                 try:
                     native_response: Response = responses_api.create(
                         model=self.model.removeprefix("deepseek/"),
@@ -389,7 +415,7 @@ class _DeepSeekResponsesMixin:
             for start in range(0, len(batch), batch_size):
                 started = time.monotonic()
                 sub_batch = batch[start : start + batch_size]
-                responses.extend(executor.map(request, sub_batch))
+                responses.extend(executor.map(request, enumerate(sub_batch, start)))
                 pbar.update(len(sub_batch))
                 elapsed = time.monotonic() - started
                 if self.rate_limit is not None and start + batch_size < len(batch):
