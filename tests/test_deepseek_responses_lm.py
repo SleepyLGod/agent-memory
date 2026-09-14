@@ -15,9 +15,11 @@ from lotus.cache import InMemoryCache
 from lotus.models import LM
 from openai import APIConnectionError, OpenAI, OpenAIError
 from openai.types.responses import Response
+from pydantic import ValidationError
 import pytest
 
 from agent_memory.adapters.lotus import deepseek_responses_lm as adapter
+from agent_memory.adapters.lotus.request_hook import request_scope
 
 
 SCHEMA = {
@@ -34,6 +36,79 @@ SCHEMA = {
     },
 }
 MODEL = "deepseek/deepseek-v4-flash"
+
+
+@pytest.mark.parametrize("legacy_record", [False, True])
+def test_durable_sdk_schema_response_round_trip(
+    monkeypatch: pytest.MonkeyPatch, legacy_record: bool
+) -> None:
+    """Persist real SDK field aliases, and replay old records without mutation."""
+    native = Response.model_validate(
+        {
+            **_native().model_dump(mode="json"),
+            "text": {"format": {"type": "json_schema", **SCHEMA["json_schema"]}},
+        }
+    )
+    wire = native.model_dump(mode="json", by_alias=True)
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json=wire)
+
+    def client(**options: Any) -> OpenAI:
+        return OpenAI(
+            **options, http_client=httpx.Client(transport=httpx.MockTransport(handler))
+        )
+
+    class Journal:
+        def __init__(self) -> None:
+            self.record = native.model_dump(mode="json") if legacy_record else None
+
+        def execute(self, identity: Any, payload: Any, send: Any) -> dict[str, Any]:
+            if self.record is None:
+                self.record = send()
+            return self.record
+
+    monkeypatch.setattr(adapter, "OpenAI", client)
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "fake-deepseek-key")
+    journal = Journal()
+    lm = _lm(num_retries=0)
+    before = deepcopy(journal.record)
+    with request_scope(
+        journal, mode="incremental", event_id="8", checkpoint_id="inserted"
+    ):
+        first = _process(lm)[0]
+    assert first.choices[0].message.content == '{"answer":1}'
+    assert first.usage.prompt_tokens == 12
+    assert len(requests) == (0 if legacy_record else 1)
+    assert journal.record is not None
+    if legacy_record:
+        assert journal.record == before
+    else:
+        assert (
+            journal.record["text"]["format"]["schema"]
+            == SCHEMA["json_schema"]["schema"]
+        )
+        assert "schema_" not in journal.record["text"]["format"]
+    # Cross a JSON persistence boundary before replay, not only an in-memory cache.
+    journal.record = json.loads(json.dumps(journal.record))
+    saved = deepcopy(journal.record)
+    with request_scope(
+        journal, mode="incremental", event_id="8", checkpoint_id="inserted"
+    ):
+        replay = _process(lm)[0]
+    assert replay.choices[0].message.content == first.choices[0].message.content
+    assert len(requests) == (0 if legacy_record else 1)
+    assert journal.record == saved
+    # Alias compatibility must not bypass normal SDK response validation.
+    journal.record["text"]["format"].pop("schema_" if legacy_record else "schema")
+    with request_scope(
+        journal, mode="incremental", event_id="8", checkpoint_id="inserted"
+    ):
+        with pytest.raises(ValidationError):
+            _process(lm)
+    assert len(requests) == (0 if legacy_record else 1)
 
 
 def _native(text: str = '{"answer":1}', **overrides: Any) -> Response:
@@ -174,7 +249,9 @@ def test_invalid_model_rejected_before_parent_resources(model: str) -> None:
         adapter.deepseek_responses_lm_class(ResourceBase)(model=model)
 
 
-@pytest.mark.parametrize("name", ["deepseek-flash", "deepseek-v4-flash", "deepseek-v4-pro"])
+@pytest.mark.parametrize(
+    "name", ["deepseek-flash", "deepseek-v4-flash", "deepseek-v4-pro"]
+)
 @pytest.mark.parametrize("prefix", ["", "deepseek/"])
 def test_schema_payload_and_nonthinking_translation(
     clients: list[FakeClient], name: str, prefix: str
@@ -679,12 +756,16 @@ def test_missing_usage_is_not_fabricated(
 @pytest.mark.parametrize("cache_enabled", [False, True])
 @pytest.mark.parametrize("bad_field", ["created_at", "usage"])
 def test_malformed_accounting_preserves_order_and_other_usage(
-    clients: list[FakeClient], monkeypatch: pytest.MonkeyPatch,
-    bad_field: str, cache_enabled: bool,
+    clients: list[FakeClient],
+    monkeypatch: pytest.MonkeyPatch,
+    bad_field: str,
+    cache_enabled: bool,
 ) -> None:
-    native = _native().model_copy(update={
-        bad_field: None if bad_field == "created_at" else {"invalid": "usage"},
-    })
+    native = _native().model_copy(
+        update={
+            bad_field: None if bad_field == "created_at" else {"invalid": "usage"},
+        }
+    )
     error = ValueError("original normalization failure")
     original_normalizer = adapter._normalize_response
 

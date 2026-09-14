@@ -348,11 +348,17 @@ class _DeepSeekResponsesMixin:
                     }
 
                     def send() -> dict[str, Any]:
-                        return responses_api.create(**body).model_dump(mode="json")
+                        return responses_api.create(**body).model_dump(
+                            mode="json", by_alias=True
+                        )
 
                     # Journal/control failures must reach the caller, not become False.
                     raw = hook.execute({**identity, "item": index}, body, send)
-                    return _normalize_response(Response.model_validate(raw))
+                    # Older journals used SDK field names (e.g. schema_); accept
+                    # those without modifying the persisted response dictionary.
+                    return _normalize_response(
+                        Response.model_validate(raw, by_name=True)
+                    )
                 try:
                     native_response: Response = responses_api.create(
                         model=self.model.removeprefix("deepseek/"),
