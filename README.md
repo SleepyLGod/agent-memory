@@ -95,6 +95,9 @@ examples/claude/
 examples/zep/
   e2e_demo.py              real three-row LOCOMO + Zep policy demo
 
+examples/a_mem/
+  e2e_demo.py              real five-row LOCOMO + A-Mem note evolution demo
+
 examples/helloworld/
   helloworld_smoke.py      real LOCOMO + LOTUS sem_filter/sem_map/top-k smoke
 ```

@@ -2,6 +2,7 @@
 
 from .api import Memory, Message
 from .memories import (
+    AMem,
     ClaudeMemory,
     Mem0Memory,
     Mem0MemoryEnhanced,
@@ -29,6 +30,7 @@ from .policy import (
 __version__ = "0.0.1"
 
 __all__ = [
+    "AMem",
     "ClaudeMemory",
     "DifferentiatedPolicy",
     "BFS",
