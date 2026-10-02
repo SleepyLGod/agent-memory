@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from threading import Lock
 from typing import Any
 
 from agent_memory.adapters.lotus.pair_execution import (
@@ -256,6 +257,7 @@ class LotusExecutionContext:
     config: LotusExecutionConfig = field(default_factory=LotusExecutionConfig)
     pair_embedding_provider: EmbeddingProvider | None = None
     _configured: bool = field(default=False, init=False, repr=False)
+    _configure_lock: Lock = field(default_factory=Lock, init=False, repr=False, compare=False)
     _lm: Any | None = field(default=None, init=False, repr=False)
     _scoped_lm: ScopedLM | None = field(default=None, init=False, repr=False)
     _reported_cache_usage: dict[str, int] = field(
@@ -274,21 +276,21 @@ class LotusExecutionContext:
     def configure(self) -> None:
         """Configure LOTUS before invoking semantic dataframe operators."""
 
-        if self._configured:
-            return
+        with self._configure_lock:
+            if self._configured:
+                return
 
-        import lotus
+            import lotus
 
-        lm = self.new_lm()
-        self._lm = lm
-        settings_kwargs: dict[str, Any] = {"lm": lm}
-        if self.config.parallel_fact_extraction:
-            self._scoped_lm = ScopedLM(lm)
-            settings_kwargs["lm"] = self._scoped_lm
-        if self.config.lm_enable_cache is not None:
-            settings_kwargs["enable_cache"] = self.config.lm_enable_cache
-        lotus.settings.configure(**settings_kwargs)
-        self._configured = True
+            lm = self.new_lm()
+            scoped_lm = ScopedLM(lm) if self.config.parallel_fact_extraction else None
+            settings_kwargs: dict[str, Any] = {"lm": scoped_lm if scoped_lm is not None else lm}
+            if self.config.lm_enable_cache is not None:
+                settings_kwargs["enable_cache"] = self.config.lm_enable_cache
+            lotus.settings.configure(**settings_kwargs)
+            self._lm = lm
+            self._scoped_lm = scoped_lm
+            self._configured = True
 
     def fork(self) -> LotusExecutionContext:
         """Create private LM/cache counters without reconfiguring global settings."""
@@ -339,7 +341,7 @@ class LotusExecutionContext:
             lm_class = deepseek_responses_lm_class(LM)
         base_lm = (
             provider_usage_tracing_lm_class(lm_class)(**lm_kwargs, trace_dir=trace_dir)
-            if trace_dir is not None or self.config.prompt_batching is not None or self.config.sem_agg_prompt_batching is not None or self.config.pair_filter_batching or self.config.listwise_join_batching
+            if trace_dir is not None or self.config.prompt_batching is not None or self.config.sem_agg_prompt_batching is not None or self.config.pair_filter_batching or self.config.listwise_join_batching or self.config.groupby_prompt_batching
             else lm_class(**lm_kwargs)
         )
         return TracedLM(base_lm, trace_dir) if trace_dir is not None else base_lm

@@ -295,5 +295,6 @@ if __name__ == "__main__":
         try:
             run(args.output)
         except Exception as error:
-            save(args.output / "status.json", {"stage": "failed", "error": str(error), "type": type(error).__name__})
+            if (args.output / "status.json").exists():
+                save(args.output / "status.json", {"stage": "failed", "error": str(error), "type": type(error).__name__})
             raise

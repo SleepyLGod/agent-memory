@@ -1,7 +1,4 @@
-"""Experimental Zep variant: resolve identities before fact-derived summaries.
-
-This is a different logical view, not an equivalent lowering of ZepMemory.
-"""
+"""Entity identities and summaries derived from incident facts."""
 
 from dataclasses import replace
 

@@ -1,7 +1,6 @@
-"""Zep variant retaining the earliest text within each resolved fact group.
+"""Fact groups represented by their earliest occurrence.
 
-This changes the logical view. It is not an equivalent canonicalization rewrite
-or a reproduction of Native's event-local contradiction resolver.
+Provenance and temporal fields retain their aggregation rules.
 """
 
 from dataclasses import replace
