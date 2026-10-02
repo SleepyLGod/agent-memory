@@ -121,6 +121,8 @@ def preflight(old: Path, output: Path) -> None:
     save(output / "answer-inputs.json", saved_answers)
     contract = locomo_task_contract(judge_model_id=MODEL)
     save(output / "manifest.json", {"model": MODEL, "input_hashes": hashes,
+         "frozen_sha256": digest(output / "frozen.json"),
+         "answer-inputs_sha256": digest(output / "answer-inputs.json"),
          "script_sha256": digest(Path(__file__)), "source_path": agent_memory.__file__,
          "dependencies": {name: version(name) for name in ("lotus-ai", "litellm", "pandas")},
          "answer_prompt_digest": contract.answer_prompt_digest, "answer_parser_id": contract.answer_parser_id,
@@ -242,10 +244,11 @@ def run(output: Path) -> None:
         raise ValueError("historical evidence changed")
     if digest(Path(__file__)) != manifest["script_sha256"]:
         raise ValueError("script changed after preflight")
-    if manifest.get("kind") == "synthetic-controlled-contrasts":
-        for name in ("frozen", "assessment"):
-            if digest(output / f"{name}.json") != manifest[f"{name}_sha256"]:
-                raise ValueError("frozen synthetic evidence changed")
+    names = (("frozen", "assessment") if manifest.get("kind") == "synthetic-controlled-contrasts"
+             else ("frozen", "answer-inputs"))
+    for name in names:
+        if digest(output / f"{name}.json") != manifest.get(f"{name}_sha256"):
+            raise ValueError(f"frozen evidence changed or digest missing: {name}")
     try:
         if manifest.get("kind") != "synthetic-controlled-contrasts":
             save(output / "status.json", {"stage": "answer_replay"})

@@ -128,3 +128,60 @@ def test_synthetic_failure_stops_without_answer_replay(tmp_path: Path, monkeypat
     assert len(calls) == 1
     with pytest.raises(ValueError, match="refusing replay"):
         run(output)
+
+
+@pytest.mark.parametrize("artifact", ["frozen", "answer-inputs"])
+@pytest.mark.parametrize("change", ["none", "content", "missing_digest"])
+def test_historical_frozen_artifacts_checked_before_execution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, artifact: str, change: str,
+) -> None:
+    import tools.zep_frozen_followup as probe
+    import agent_memory.evaluation.provenance as provenance
+
+    monkeypatch.setattr(provenance, "build_source_evidence", lambda _: {})
+    old = tmp_path / "old"
+    trace_events = events()
+    for event in list(trace_events):
+        if event["event_type"] != "pair_decision":
+            continue
+        prompt = f"prompts/{event['trace_id']}.json"
+        probe.save(old / "fused" / prompt, [{"content": "identical repeated"}])
+        trace_events.append({"event_type": "llm_call", "operator": "sem_filter",
+                             "operator_call_id": event["operator_call_id"],
+                             "llm_item_index": event["pair_index"], "prompt_path": prompt})
+    trace = old / "fused/trace/events.jsonl"
+    trace.parent.mkdir(parents=True)
+    trace.write_text("".join(json.dumps(event) + "\n" for event in trace_events))
+    for mode in ("unfused", "fused"):
+        for relative, row in (
+            ("input/questions.jsonl", {"question_id": "q1"}),
+            ("cases/conv-26-2aac22fc/retrieval.jsonl", {"question_id": "q1", "context": "original"}),
+        ):
+            path = old / mode / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(row) + "\n")
+    output = tmp_path / "run"
+    probe.preflight(old, output)
+    manifest = json.loads((output / "manifest.json").read_text())
+    for name in ("frozen", "answer-inputs"):
+        assert manifest[f"{name}_sha256"] == probe.digest(output / f"{name}.json")
+    if change == "content":
+        with (output / f"{artifact}.json").open("a") as stream:
+            stream.write("\n")
+    elif change == "missing_digest":
+        manifest.pop(f"{artifact}_sha256")
+        probe.save(output / "manifest.json", manifest)
+    assert all(probe.digest(Path(path)) == value for path, value in manifest["input_hashes"].items())
+
+    def stop_before_provider(_: Path) -> None:
+        raise RuntimeError("offline execution reached")
+
+    monkeypatch.setattr(probe, "replay_answers", stop_before_provider)
+    monkeypatch.setattr(probe, "LotusAdapter", lambda **_: pytest.fail("unexpected provider setup"))
+    if change == "none":
+        with pytest.raises(RuntimeError, match="offline execution reached"):
+            run(output)
+    else:
+        with pytest.raises(ValueError, match=f"evidence changed or digest missing: {artifact}"):
+            run(output)
+        assert json.loads((output / "status.json").read_text()) == {"stage": "preflight_passed"}

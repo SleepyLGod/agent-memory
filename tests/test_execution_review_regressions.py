@@ -171,8 +171,12 @@ def test_followup_execution_failure_records_status(
     import tools.zep_frozen_followup as probe
 
     probe.save(tmp_path / "status.json", {"stage": "preflight_passed"})
+    probe.save(tmp_path / "frozen.json", [])
+    probe.save(tmp_path / "answer-inputs.json", {})
     probe.save(tmp_path / "manifest.json", {
         "input_hashes": {}, "script_sha256": probe.digest(Path(probe.__file__)),
+        "frozen_sha256": probe.digest(tmp_path / "frozen.json"),
+        "answer-inputs_sha256": probe.digest(tmp_path / "answer-inputs.json"),
     })
 
     def fail_replay(output: Path) -> None:

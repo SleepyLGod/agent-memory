@@ -252,7 +252,8 @@ def normalize_aggregate_specs(specs: Sequence[AggregateSpec]) -> tuple[Aggregate
     ]
     if invalid:
         raise TypeError(
-            "agg accepts only agent_memory.sem_agg(...), agent_memory.array_agg(...), "
+            "agg accepts only agent_memory.sem_agg(...), agent_memory.arg_min(...), "
+            "agent_memory.array_agg(...), "
             "agent_memory.collect_list(...), agent_memory.min(...), "
             "agent_memory.count(...), agent_memory.sum(...), or "
             "agent_memory.avg(...) "
