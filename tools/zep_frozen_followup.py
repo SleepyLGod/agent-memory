@@ -246,34 +246,38 @@ def run(output: Path) -> None:
         for name in ("frozen", "assessment"):
             if digest(output / f"{name}.json") != manifest[f"{name}_sha256"]:
                 raise ValueError("frozen synthetic evidence changed")
-    else:
-        save(output / "status.json", {"stage": "answer_replay"})
-        replay_answers(output)
-    groups = json.loads((output / "frozen.json").read_text())
-    summaries = {}
-    for mode in ("pointwise", "joint"):
-        directory = output / mode
-        save(output / "status.json", {"stage": "contradictions", "mode": mode})
-        adapter = LotusAdapter(model=MODEL, config=LotusExecutionConfig(
-            semantic_trace_dir=directory / "trace", lm_enable_cache=False, lm_num_retries=0,
-            lm_max_batch_size=1, structured_parse_retries=0, structured_max_tokens=8192,
-            prompt_batching=PromptBatching(max_tasks=10) if mode == "joint" else None,
-            lm_model_kwargs={"extra_body": {"thinking": {"type": "disabled"}}}))
-        results = []
-        for index, group in enumerate(groups):
-            trace = directory / "trace/events.jsonl"
-            before_count = len(read_lines(trace)) if trace.exists() else 0
-            started = time.perf_counter()
-            decisions = evaluate_group(adapter, group)
-            if mode == "pointwise":
-                validate_native_outputs(read_lines(trace)[before_count:], directory, decisions)
-            results.append({"group": index, "decisions": decisions, "wall_seconds": time.perf_counter() - started})
-            save(directory / "results.json", results)
-        calls = normalize_provider_calls(read_lines(directory / "trace/events.jsonl"), output_dir=directory, include_cost=False)
-        summaries[mode] = {"results": results, "usage": summarize_provider_calls(calls)}
-        save(directory / "calls.json", calls)
-        save(output / "summary.json", summaries)
-    save(output / "status.json", {"stage": "completed"})
+    try:
+        if manifest.get("kind") != "synthetic-controlled-contrasts":
+            save(output / "status.json", {"stage": "answer_replay"})
+            replay_answers(output)
+        groups = json.loads((output / "frozen.json").read_text())
+        summaries = {}
+        for mode in ("pointwise", "joint"):
+            directory = output / mode
+            save(output / "status.json", {"stage": "contradictions", "mode": mode})
+            adapter = LotusAdapter(model=MODEL, config=LotusExecutionConfig(
+                semantic_trace_dir=directory / "trace", lm_enable_cache=False, lm_num_retries=0,
+                lm_max_batch_size=1, structured_parse_retries=0, structured_max_tokens=8192,
+                prompt_batching=PromptBatching(max_tasks=10) if mode == "joint" else None,
+                lm_model_kwargs={"extra_body": {"thinking": {"type": "disabled"}}}))
+            results = []
+            for index, group in enumerate(groups):
+                trace = directory / "trace/events.jsonl"
+                before_count = len(read_lines(trace)) if trace.exists() else 0
+                started = time.perf_counter()
+                decisions = evaluate_group(adapter, group)
+                if mode == "pointwise":
+                    validate_native_outputs(read_lines(trace)[before_count:], directory, decisions)
+                results.append({"group": index, "decisions": decisions, "wall_seconds": time.perf_counter() - started})
+                save(directory / "results.json", results)
+            calls = normalize_provider_calls(read_lines(directory / "trace/events.jsonl"), output_dir=directory, include_cost=False)
+            summaries[mode] = {"results": results, "usage": summarize_provider_calls(calls)}
+            save(directory / "calls.json", calls)
+            save(output / "summary.json", summaries)
+        save(output / "status.json", {"stage": "completed"})
+    except Exception as error:
+        save(output / "status.json", {"stage": "failed", "error": str(error), "type": type(error).__name__})
+        raise
 
 
 if __name__ == "__main__":
@@ -292,9 +296,4 @@ if __name__ == "__main__":
             parser.error("synthetic-preflight requires --fixture")
         synthetic_preflight(args.fixture, args.output)
     else:
-        try:
-            run(args.output)
-        except Exception as error:
-            if (args.output / "status.json").exists():
-                save(args.output / "status.json", {"stage": "failed", "error": str(error), "type": type(error).__name__})
-            raise
+        run(args.output)

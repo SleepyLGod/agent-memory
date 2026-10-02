@@ -129,7 +129,7 @@ def test_groupby_only_batching_preserves_completion_metadata(
 
 
 @pytest.mark.parametrize("state", ["missing", "empty", "preflighted"])
-def test_followup_cli_failure_only_updates_existing_status(
+def test_followup_cli_precondition_failure_preserves_status(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, state: str,
 ) -> None:
     import tools.zep_frozen_followup as probe
@@ -144,7 +144,44 @@ def test_followup_cli_failure_only_updates_existing_status(
     with pytest.raises(FileNotFoundError):
         runpy.run_path(str(probe.__file__), run_name="__main__")
     if state == "preflighted":
-        assert json.loads(status.read_text())["stage"] == "failed"
+        assert json.loads(status.read_text()) == {"stage": "preflight_passed"}
     else:
         assert not status.exists()
         assert output.exists() == (state == "empty")
+
+
+@pytest.mark.parametrize("stage", ["completed", "answer_replay", "contradictions", "failed"])
+def test_followup_cli_rejected_replay_preserves_status(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, stage: str,
+) -> None:
+    import tools.zep_frozen_followup as probe
+
+    status = tmp_path / "status.json"
+    original = json.dumps({"stage": stage, "details": "original execution"}, indent=2)
+    status.write_text(original)
+    monkeypatch.setattr(sys, "argv", [probe.__file__, "run", "--output", str(tmp_path)])
+    with pytest.raises(ValueError, match="refusing replay"):
+        runpy.run_path(str(probe.__file__), run_name="__main__")
+    assert status.read_text() == original
+
+
+def test_followup_execution_failure_records_status(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    import tools.zep_frozen_followup as probe
+
+    probe.save(tmp_path / "status.json", {"stage": "preflight_passed"})
+    probe.save(tmp_path / "manifest.json", {
+        "input_hashes": {}, "script_sha256": probe.digest(Path(probe.__file__)),
+    })
+
+    def fail_replay(output: Path) -> None:
+        assert json.loads((output / "status.json").read_text())["stage"] == "answer_replay"
+        raise RuntimeError("offline injected failure")
+
+    monkeypatch.setattr(probe, "replay_answers", fail_replay)
+    with pytest.raises(RuntimeError, match="offline injected failure"):
+        probe.run(tmp_path)
+    assert json.loads((tmp_path / "status.json").read_text()) == {
+        "stage": "failed", "error": "offline injected failure", "type": "RuntimeError",
+    }
