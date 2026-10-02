@@ -278,9 +278,9 @@ def test_pinned_dataset_validation_rejects_wrong_bytes(tmp_path: Path) -> None:
         raise AssertionError("wrong LOCOMO bytes should be rejected")
 
 
-def test_answer_and_judge_contracts_match_locked_native_digests() -> None:
+def test_answer_format_fix_is_versioned_and_judge_digest_is_unchanged() -> None:
     assert ANSWER_PROMPT_DIGEST == (
-        "dbd2f002e7cfafb4552a18d5c17e591cb6dd7d5eb44c762afd34094736e7fb6b"
+        "1fdf5c73bc3c5b36d6bd0dce56a596a5b2fbe657d949cf65e6b6823ec5d896f5"
     )
     assert ZEP_JUDGE_PROMPT_DIGEST == (
         "e74e7fbe755a002e5a8a05b3c661ed159a13a15c75c1953841019fc72d3cf83a"

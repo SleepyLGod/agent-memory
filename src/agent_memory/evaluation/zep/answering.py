@@ -82,6 +82,11 @@ Context:
 {context}
 
 Question: {question}
+
+Return a JSON object with an "answer" field containing your actual answer as a
+non-empty string. The schema below describes the response, not the answer:
+do not copy the schema or return its properties, required, title, or type fields.
+If evidence is missing, put "No information available" in the "answer" field.
 """.strip()
 
 ZEP_JUDGE_SYSTEM_PROMPT = (

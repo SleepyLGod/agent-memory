@@ -28,7 +28,7 @@ LOCOMO_OFFICIAL_SCORER_ID = "locomo_official:v1"
 LOCOMO_OFFICIAL_SCORER_DIGEST = sha256(
     b"locomo_answer_score:category-1-5:v1"
 ).hexdigest()
-LOCOMO_ANSWER_PARSER_ID = "locomo-structured-or-raw-text:v1"
+LOCOMO_ANSWER_PARSER_ID = "locomo-structured-or-raw-text:v2"
 
 
 def _parse_json_object(response: str) -> Mapping[str, Any]:
@@ -47,12 +47,15 @@ def _parse_answer(response: str) -> str:
     if not raw:
         raise ValueError("LOCOMO answer must be non-empty")
     try:
-        answer = _parse_json_object(raw).get("answer")
+        parsed = _parse_json_object(raw)
     except (json.JSONDecodeError, ValueError):
+        if raw.startswith(("{", "[", "```")):
+            raise ValueError("LOCOMO structured answer must be a valid JSON object") from None
         return raw
+    answer = parsed.get("answer")
     if isinstance(answer, str) and answer.strip():
         return answer.strip()
-    return raw
+    raise ValueError("LOCOMO structured answer requires a non-empty answer string")
 
 
 def _parse_zep_judge(response: str) -> Mapping[str, str]:

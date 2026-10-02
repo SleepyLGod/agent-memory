@@ -9,6 +9,7 @@ from hashlib import sha256
 import json
 import math
 import re
+from pathlib import Path
 from time import perf_counter
 from typing import Any
 
@@ -354,10 +355,7 @@ def select_semantic_pair_candidates(
     vectors = embedding_provider.embed(profile.embedding, unique_texts)
     embedding_latency_ms = (perf_counter() - started) * 1000
     vectors_by_text = _validated_vectors(unique_texts, vectors, profile.embedding)
-    scores = tuple(
-        _cosine(vectors_by_text[left], vectors_by_text[right])
-        for left, right in pair_texts
-    )
+    scores = _memoized_cosines(vectors_by_text, pair_texts)
     selected = _select_positions(
         scores,
         left_ids=left_ids,
@@ -398,7 +396,7 @@ def semantic_pair_profiles_fingerprint(
 
 
 def write_semantic_pair_execution_trace(
-    trace_dir: object,
+    trace_dir: Path | str | None,
     *,
     operator: str,
     query_digest_value: str,
@@ -493,11 +491,18 @@ def _validated_vectors(
     return result
 
 
-def _cosine(left: Sequence[float], right: Sequence[float]) -> float:
-    dot = sum(a * b for a, b in zip(left, right, strict=True))
-    left_norm = math.sqrt(sum(value * value for value in left))
-    right_norm = math.sqrt(sum(value * value for value in right))
-    return dot / (left_norm * right_norm)
+def _memoized_cosines(
+    vectors: Mapping[str, Sequence[float]], pairs: Sequence[tuple[str, str]],
+) -> tuple[float, ...]:
+    """Reuse work within one selection, preserving the original scalar arithmetic."""
+    norms = {text: math.sqrt(sum(value * value for value in vector))
+             for text, vector in vectors.items()}
+    scores: dict[tuple[str, str], float] = {}
+    for left, right in pairs:
+        if (left, right) not in scores:
+            dot = sum(a * b for a, b in zip(vectors[left], vectors[right], strict=True))
+            scores[left, right] = dot / (norms[left] * norms[right])
+    return tuple(scores[pair] for pair in pairs)
 
 
 def _select_positions(

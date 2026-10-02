@@ -8,13 +8,14 @@ from typing import Any
 
 import pandas as pd
 
-from agent_memory.adapters.lotus.context import LotusExecutionContext
+from agent_memory.adapters.lotus.context import LotusExecutionConfig, LotusExecutionContext
 from agent_memory.adapters.lotus.pair_execution import (
     PAIR_LEFT_ID_COLUMN,
     PAIR_LEFT_TEXT_COLUMN,
     PAIR_RIGHT_ID_COLUMN,
     PAIR_RIGHT_TEXT_COLUMN,
     SemanticPairExecutionProfile,
+    semantic_pair_site_id,
     select_semantic_pair_candidates,
     write_semantic_pair_execution_trace,
 )
@@ -33,6 +34,14 @@ GROUP_ID_COLUMN = "_agent_memory_group_id"
 PAIRWISE_PLACEHOLDER_PATTERN = re.compile(
     r"(?<!\{)\{([A-Za-z_][A-Za-z0-9_]*)(?::(left|right))?\}(?!\})"
 )
+
+
+def validate_site_groupby_batching(query: QueryExpr, config: LotusExecutionConfig) -> None:
+    """Reject sites that do not execute independent pairwise group decisions."""
+    profile = config.semantic_pair_profiles.get(query_digest(query))
+    if (query.params.get("labels") or query.params.get("membership") not in {None, "exclusive"}
+        or (profile is not None and profile.mode == "proxy-only")):
+        raise ValueError("site groupby batching requires open-ended exclusive oracle grouping")
 
 
 def execute_sem_groupby(
@@ -54,6 +63,14 @@ def execute_sem_groupby(
     partition_by = tuple(str(column) for column in query.params.get("partition_by", ()))
     labels = tuple(query.params.get("labels") or ())
     digest = query_digest(query)
+    prompt_batching = context.config.prompt_batching
+    pair_batch_size = context.config.sem_groupby_pair_batch_size
+    if context.config.groupby_prompt_batching:
+        setting = context.config.groupby_prompt_batching.get(semantic_pair_site_id(query))
+        if setting is not None:
+            validate_site_groupby_batching(query, context.config)
+            prompt_batching = setting
+            pair_batch_size = None
     profile = context.config.semantic_pair_profiles.get(digest)
     if labels and profile is not None:
         raise ValueError(
@@ -80,13 +97,13 @@ def execute_sem_groupby(
             label_col=str(query.params.get("label_col", "_label")),
             instruction=str(query.params["instruction"]),
             default=context.config.sem_groupby_default,
-            pair_batch_size=context.config.sem_groupby_pair_batch_size,
+            pair_batch_size=pair_batch_size,
             pair_batch_retries=context.config.sem_groupby_pair_batch_retries,
             trace_dir=context.config.trace_dir(),
             query_digest_value=digest,
             profile=profile,
             embedding_provider=context.pair_embedding_provider,
-            prompt_batching=context.config.prompt_batching,
+            prompt_batching=prompt_batching,
             structured_output_transport=context.config.structured_output_transport,
             structured_parse_retries=context.config.structured_parse_retries,
             structured_max_tokens=context.config.structured_max_tokens,
@@ -98,7 +115,7 @@ def execute_sem_groupby(
             labels=labels,
             label_col=str(query.params.get("label_col", "_label")),
             instruction=str(query.params["instruction"]),
-            prompt_batching=context.config.prompt_batching,
+            prompt_batching=prompt_batching,
             structured_output_transport=context.config.structured_output_transport,
         )
 
@@ -108,13 +125,13 @@ def execute_sem_groupby(
         input_cols=input_cols,
         instruction=str(query.params["instruction"]),
         default=context.config.sem_groupby_default,
-        pair_batch_size=context.config.sem_groupby_pair_batch_size,
+        pair_batch_size=pair_batch_size,
         pair_batch_retries=context.config.sem_groupby_pair_batch_retries,
         trace_dir=context.config.trace_dir(),
         query_digest_value=digest,
         profile=profile,
         embedding_provider=context.pair_embedding_provider,
-        prompt_batching=context.config.prompt_batching,
+        prompt_batching=prompt_batching,
         structured_output_transport=context.config.structured_output_transport,
         structured_parse_retries=context.config.structured_parse_retries,
         structured_max_tokens=context.config.structured_max_tokens,
@@ -471,6 +488,25 @@ def evaluate_group_matches(
         "{left} and {right} satisfy this semantic grouping condition: "
         f"{lowered_instruction}"
     )
+    from agent_memory.adapters.lotus.identity_reuse import current_identity_decisions
+    decisions = current_identity_decisions.get()
+    original_pairs = pairs
+    keys = [decisions.key("group", user_instruction, default, row["left"], row["right"])
+            for _, row in pairs.iterrows()] if decisions is not None else []
+    known = {i: decisions.lookup(key, 1) for i, key in enumerate(keys)} if decisions is not None else {}
+    missing = [i for i in range(len(pairs)) if known.get(i) is None]
+    if decisions is not None:
+        from agent_memory.tracing.semantic import write_trace_event
+        write_trace_event(trace_dir, operator="sem_groupby", event_type="identity_reuse",
+                          payload={"reused": len(pairs) - len(missing), "total": len(pairs)})
+    pairs = pairs.iloc[missing].reset_index(drop=True)
+    if pairs.empty:
+        write_groupby_pair_trace(trace_dir, original_pairs, source_instruction=instruction,
+                                instruction=user_instruction, outputs=[bool(known[i]) for i in range(len(original_pairs))],
+                                raw_outputs=[""] * len(original_pairs),
+                                explanations=["reused identity decision"] * len(original_pairs), default=default)
+        return [(int(row["_left_unique_id"]), int(row["_right_unique_id"]))
+                for i, (_, row) in enumerate(original_pairs.iterrows()) if known[i]]
     if prompt_batching is not None:
         if default:
             raise ValueError(
@@ -528,6 +564,16 @@ def evaluate_group_matches(
                 aligned_batch_values(output, "explanations", len(pair_batch), "")
             )
 
+    if decisions is not None:
+        for position, keep in zip(missing, parsed_outputs, strict=True):
+            decisions.store(keys[position], 1, (0,) if keep else ())
+        generated = dict(zip(missing, zip(parsed_outputs, raw_outputs, explanations, strict=True), strict=True))
+        aligned = [generated[i] if i in generated else (bool(known[i]), "", "reused identity decision")
+                   for i in range(len(original_pairs))]
+        parsed_outputs = [v[0] for v in aligned]
+        raw_outputs = [v[1] for v in aligned]
+        explanations = [v[2] for v in aligned]
+        pairs = original_pairs
     write_groupby_pair_trace(
         trace_dir,
         pairs,

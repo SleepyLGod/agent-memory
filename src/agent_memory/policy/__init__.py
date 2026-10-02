@@ -1,6 +1,6 @@
 """Logical policy authoring objects and immutable query descriptors."""
 
-from .aggregates import array_agg, avg, collect_list, count, min, sem_agg, sum
+from .aggregates import arg_min, array_agg, avg, collect_list, count, min, sem_agg, sum
 from .expressions import case_when, least, try_cast
 from .logical import ColumnSpec, MemorySpec, MemoryView, QueryExpr, UserQuery
 from .relation import Log, Relation, SearchRelation
@@ -26,6 +26,7 @@ __all__ = [
     "SearchRelation",
     "UserQuery",
     "array_agg",
+    "arg_min",
     "avg",
     "case_when",
     "collect_list",

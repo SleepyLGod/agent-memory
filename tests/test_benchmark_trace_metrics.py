@@ -3,12 +3,88 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from agent_memory.evaluation.trace_metrics import (
     normalize_framework_cache_usage,
     normalize_provider_calls,
     summarize_framework_cache_usage,
     summarize_provider_calls,
 )
+
+
+def _cached_lotus_call(**changes: object) -> dict:
+    return {
+        "event_type": "llm_call", "operator_call_id": "op-1",
+        "llm_item_index": 0, "llm_batch_size": 1,
+        "latency_sec": 0.001, "usage_scope": "batch",
+        "usage_physical_prompt_tokens": 0,
+        "usage_physical_completion_tokens": 0,
+        "usage_physical_total_tokens": 0, "usage_cache_hits": 1,
+        "usage_virtual_prompt_tokens": 564,
+        "usage_virtual_completion_tokens": 86,
+        **changes,
+    }
+
+
+@pytest.mark.parametrize("size", [1, 3])
+def test_cache_only_lotus_batch_is_not_a_provider_call(tmp_path: Path, size: int) -> None:
+    events = [_cached_lotus_call(llm_batch_size=size, llm_item_index=i,
+                                usage_cache_hits=size) for i in range(size)]
+    assert normalize_provider_calls(events, output_dir=tmp_path) == []
+
+
+def test_cache_hit_does_not_take_later_provider_calls_latency(tmp_path: Path) -> None:
+    # One operator may first hit cache and then issue another request.
+    events = [_cached_lotus_call(), {
+        "event_type": "llm_call", "operator_call_id": "op-1",
+        "llm_item_index": 0, "latency_sec": 0.5,
+    }, {
+        "event_type": "provider_usage", "operator_call_id": "op-1",
+        "provider_item_index": 0, "provider_usage_available": True,
+        "provider_prompt_tokens": 10, "provider_completion_tokens": 2,
+        "provider_prompt_cache_hit_tokens": 0, "provider_prompt_cache_miss_tokens": 10,
+    }]
+    rows = normalize_provider_calls(events, output_dir=tmp_path)
+    assert len(rows) == 1
+    assert rows[0]["latency_ms"] == 500
+    assert summarize_provider_calls(rows)["estimated_cost_usd"] is not None
+
+
+@pytest.mark.parametrize("changes", [
+    {"usage_cache_hits": 0},
+    {"usage_physical_total_tokens": None},
+    {"llm_batch_size": 2},  # Only one of two items is known to be cached.
+    {"event_type": "llm_batch_error"},
+])
+def test_cache_counters_do_not_hide_unknown_or_failed_calls(tmp_path: Path, changes: dict) -> None:
+    rows = normalize_provider_calls([_cached_lotus_call(**changes)], output_dir=tmp_path)
+    assert len(rows) == 1
+    summary = summarize_provider_calls(rows)
+    assert summary["usage_complete"] is False
+    assert summary["estimated_cost_usd"] is None
+
+
+def test_partial_cache_batch_keeps_real_provider_response(tmp_path: Path) -> None:
+    events = [_cached_lotus_call(llm_batch_size=2, usage_physical_prompt_tokens=10,
+              usage_physical_completion_tokens=2, usage_physical_total_tokens=12), {
+        "event_type": "provider_usage", "operator_call_id": "op-1",
+        "provider_item_index": 0, "provider_usage_available": True,
+        "provider_prompt_tokens": 10, "provider_completion_tokens": 2,
+        "provider_prompt_cache_hit_tokens": 10, "provider_prompt_cache_miss_tokens": 0,
+    }]
+    rows = normalize_provider_calls(events, output_dir=tmp_path)
+    assert len(rows) == 1 and rows[0]["source"] == "agent-provider"
+    assert rows[0]["total_tokens"] == 12
+
+
+def test_explicit_provider_event_is_never_removed_by_cache_metadata(tmp_path: Path) -> None:
+    events = [_cached_lotus_call(), {"event_type": "provider_usage",
+              "operator_call_id": "op-1", "provider_item_index": 0,
+              "provider_usage_available": False}]
+    rows = normalize_provider_calls(events, output_dir=tmp_path)
+    assert len(rows) == 1 and rows[0]["source"] == "agent-provider"
+    assert summarize_provider_calls(rows)["usage_complete"] is False
 
 
 def test_normalize_provider_calls_can_omit_pricing(tmp_path: Path) -> None:

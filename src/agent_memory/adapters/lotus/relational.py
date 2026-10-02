@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import replace
 import json
 from typing import Any
 
@@ -10,6 +11,7 @@ import numpy as np
 import pandas as pd
 
 from agent_memory.policy.aggregates import (
+    ArgMinAggregateSpec,
     ArrayAggregateSpec,
     CollectListAggregateSpec,
     MinAggregateSpec,
@@ -462,9 +464,25 @@ def execute_agg(
         raise ValueError("agg expects group_by or sem_groupby input")
     if source.empty:
         return pd.DataFrame(columns=list(output_columns(query)))
+    if query.params.get("fact_summary") or query.params.get("identity_singleton"):
+        from agent_memory.memories.zep.fact_summary import IDENTITY_SPEC
+        from agent_memory.planner.physical import summary_specs
+        semantic_specs = tuple(s for s in aggregates if isinstance(s, SemanticAggregateSpec))
+        if query.params.get("fact_summary") and semantic_specs not in tuple((s,) for s in summary_specs()):
+            raise ValueError("fact summary shortcut requires the registered summary contract")
+        if query.params.get("identity_singleton") and semantic_specs != (IDENTITY_SPEC,):
+            raise ValueError("identity singleton requires the registered entity contract")
+        return _execute_agg_with_group_batching(query, source, aggregates, context=context)
+    if query.params.get("singleton_identity"):
+        from agent_memory.memories.zep.policy import ZepMemory
+        template = ZepMemory._deduplicated_facts.expr.inputs[0]
+        if aggregates != tuple(template.params["aggregates"]) or group_query.params != template.inputs[0].params:
+            raise ValueError("singleton identity is restricted to registered new Zep facts")
+        return _execute_agg_with_group_batching(query, source, aggregates, context=context)
     if (
         context.config.sem_agg_dispatch != "sequential"
         or context.config.prompt_batching is not None
+        or context.config.sem_agg_prompt_batching is not None
     ):
         return _execute_agg_with_group_batching(
             query,
@@ -479,6 +497,9 @@ def execute_agg(
     ):
         row: dict[str, Any] = dict(key_values)
         for aggregate in aggregates:
+            if isinstance(aggregate, ArgMinAggregateSpec):
+                _apply_deterministic_aggregate(aggregate, group, row)
+                continue
             if isinstance(aggregate, ArrayAggregateSpec):
                 if aggregate.output_col in row:
                     continue
@@ -542,11 +563,32 @@ def _execute_agg_with_group_batching(
     rows = [dict(key_values) for key_values, _group in grouped]
     for aggregate in aggregates:
         if isinstance(aggregate, SemanticAggregateSpec):
-            semantic_values = _execute_grouped_semantic_aggregate_spec_many(
+            passthrough = {
+                i: {c.name: group.iloc[0][c.name] for c in aggregate.output_cols}
+                for i, group in enumerate(groups)
+                if (query.params.get("singleton_identity") or query.params.get("identity_singleton")) and len(group) == 1
+                and all(isinstance(group.iloc[0][c.name], str) for c in aggregate.output_cols)
+            }
+            pending = [i for i in range(len(groups)) if i not in passthrough]
+            if query.params.get("fact_summary"):
+                for row, values in zip(rows, _fact_summary_values(groups, context=context), strict=True):
+                    row.update(values)
+                continue
+            if query.params.get("singleton_identity"):
+                from agent_memory.tracing.semantic import write_trace_event
+                write_trace_event(context.config.trace_dir(), operator="agg",
+                                  event_type="singleton_fact_identity", payload={
+                                      "passthrough_groups": len(passthrough),
+                                      "provider_groups": len(pending),
+                                      "approximate": True,
+                                  })
+            generated = _execute_grouped_semantic_aggregate_spec_many(
                 aggregate,
-                groups,
+                [groups[i] for i in pending],
                 context=context,
             )
+            values_by_group = {**passthrough, **dict(zip(pending, generated, strict=True))}
+            semantic_values = [values_by_group[i] for i in range(len(groups))]
             for row, values in zip(rows, semantic_values, strict=True):
                 for column, value in values.items():
                     if column not in row:
@@ -565,6 +607,77 @@ def _execute_agg_with_group_batching(
     return result
 
 
+def _truncate_summary(text: str, max_chars: int = 1000) -> str:
+    """Apply Graphiti's sentence-boundary length policy (Apache-2.0)."""
+    import re
+    if len(text) <= max_chars:
+        return text
+    prefix = text[:max_chars]
+    boundaries = list(re.finditer(r"[.!?](?:\s|$)", prefix))
+    return (text[:boundaries[-1].end()] if boundaries else prefix).rstrip()
+
+
+def _fact_summary_values(groups: Sequence[pd.DataFrame], *, context: Any) -> list[dict[str, str]]:
+    """Append short evidence verbatim; compress only over-threshold groups."""
+    from agent_memory.memories.zep.fact_summary import SUMMARY_SPEC
+    from agent_memory.tracing.semantic import write_trace_event
+    direct: dict[int, dict[str, str]] = {}
+    for i, group in enumerate(groups):
+        texts = group["summary"].tolist()
+        if any(not isinstance(text, str) for text in texts):
+            raise TypeError("fact summaries require string evidence")
+        joined = "\n".join(texts)
+        if len(joined) <= 2000:
+            direct[i] = {"summary": joined}
+    pending = [i for i in range(len(groups)) if i not in direct]
+    compression_spec = replace(SUMMARY_SPEC, instruction=(
+        "Compress the supplied {summary} evidence into one concise factual summary of at most "
+        "1000 characters including spaces and punctuation. Preserve supported names, relationships, "
+        "dates and qualifiers. Remove repetition first. Do not invent information."
+    ))
+    generated = _execute_grouped_semantic_aggregate_spec_many(
+        compression_spec, [groups[i] for i in pending], context=context) if pending else []
+    if len(generated) != len(pending):
+        raise ValueError("summary compression returned an incorrect number of groups")
+    if any(not isinstance(value.get("summary"), str) for value in generated):
+        raise TypeError("summary compression must return a string")
+    for i, value in enumerate(generated):
+        raw = value["summary"]
+        if not raw.strip():
+            raise ValueError("summary compression returned blank text")
+        clipped = _truncate_summary(raw)
+        if not clipped.strip():
+            raise ValueError("summary clipping returned blank text")
+        if clipped != raw:
+            write_trace_event(context.config.trace_dir(), operator="agg", event_type="fact_summary_truncation",
+                              payload={"version": "summary-sentence-boundary-v1", "group_index": pending[i],
+                                       "raw_summary": raw, "summary": clipped,
+                                       "before_chars": len(raw), "after_chars": len(clipped)})
+        generated[i] = {"summary": clipped}
+    values = {**direct, **dict(zip(pending, generated, strict=True))}
+    write_trace_event(context.config.trace_dir(), operator="agg", event_type="fact_summary_threshold",
+                      payload={"direct_groups": len(direct), "compression_groups": len(pending),
+                               "append_limit_chars": 2000, "compression_limit_chars": 1000})
+    return [values[i] for i in range(len(groups))]
+
+
+def execute_fact_summary_map(query: QueryExpr, inputs: Mapping[str, Any], execute: Callable, context: Any) -> pd.DataFrame:
+    """Merge old summaries and new evidence without regenerating short text."""
+    from agent_memory.memories.zep.fact_summary import SUMMARY_SPEC
+    from agent_memory.planner.rules import DifferentialInstructionRewriter
+    expected = DifferentialInstructionRewriter().agg_to_map(
+        SUMMARY_SPEC.instruction, input_cols=("summary",), output_cols=SUMMARY_SPEC.output_cols)
+    if query.params.get("instruction") != expected or query.params.get("output_cols") != SUMMARY_SPEC.output_cols:
+        raise ValueError("summary map requires the registered summary contract")
+    frame = execute(query.inputs[0], inputs).copy()
+    groups = []
+    for _, row in frame.iterrows():
+        texts = [row[c] for c in ("summary:right", "summary:left") if pd.notna(row[c])]
+        groups.append(pd.DataFrame({"summary": texts}))
+    frame["summary"] = [v["summary"] for v in _fact_summary_values(groups, context=context)]
+    return frame
+
+
 def _apply_deterministic_aggregate(
     aggregate: object,
     group: pd.DataFrame,
@@ -572,6 +685,21 @@ def _apply_deterministic_aggregate(
 ) -> None:
     """Apply one non-semantic aggregate spec to one grouped frame."""
 
+    if isinstance(aggregate, ArgMinAggregateSpec):
+        columns = (*aggregate.order_by, *aggregate.columns)
+        records = group.loc[:, list(columns)].to_dict("records")
+        if not records:
+            raise ValueError("arg_min requires a nonempty group")
+        if group.loc[:, list(aggregate.order_by)].isna().any().any():
+            raise ValueError("arg_min ordering keys cannot be null")
+        def key(record: dict[str, Any]) -> tuple[Any, ...]:
+            return tuple(record[c] for c in aggregate.order_by)
+        selected = min(records, key=key)
+        tied = group.loc[[key(record) == key(selected) for record in records], list(aggregate.columns)]
+        if len(tied.drop_duplicates()) != 1:
+            raise ValueError("arg_min tied ordering keys have conflicting payloads")
+        row.update(selected)
+        return
     if isinstance(aggregate, ArrayAggregateSpec):
         if aggregate.output_col not in row:
             row[aggregate.output_col] = _array_records_json(group, aggregate.columns)

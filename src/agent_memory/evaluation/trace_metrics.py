@@ -44,7 +44,8 @@ def normalize_provider_calls(
         tuple[str, int], deque[Mapping[str, Any]]
     ] = defaultdict(deque)
     for event in events:
-        if event.get("event_type") == "llm_call" and "status" not in event:
+        if (event.get("event_type") == "llm_call" and "status" not in event
+                and not _lotus_cache_only_call(event)):
             key = _agent_call_key(event, item_key="llm_item_index")
             if key is not None:
                 pending_semantic_calls[key].append(event)
@@ -76,12 +77,28 @@ def normalize_provider_calls(
         elif event_type == "llm_call" and "status" in event:
             rows.append(_native_graphiti_row(event, pricing))
         elif event_type in {"llm_call", "llm_batch_error"}:
+            if _lotus_cache_only_call(event):
+                continue
             if int(event.get("llm_item_index") or 0) != 0:
                 continue
             if event_type == "llm_call" and id(event) in paired_semantic_calls:
                 continue
             rows.append(_agent_runner_row(event, pricing))
     return rows
+
+
+def _lotus_cache_only_call(event: Mapping[str, Any]) -> bool:
+    """Exclude only proven all-cache successes, never unknown or failed calls."""
+    size = _optional_int(event.get("llm_batch_size"))
+    hits = _optional_int(event.get("usage_cache_hits"))
+    return (
+        event.get("event_type") == "llm_call"
+        and "status" not in event
+        and size is not None and size > 0
+        and hits is not None and hits >= size
+        and all(_optional_int(event.get(f"usage_physical_{kind}_tokens")) == 0
+                for kind in ("prompt", "completion", "total"))
+    )
 
 
 def summarize_provider_calls(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
@@ -229,23 +246,23 @@ def _agent_runner_row(
     pricing: PricingSnapshot | None,
 ) -> dict[str, Any]:
     error = event.get("event_type") == "llm_batch_error"
+    prompt = _optional_int(event.get("usage_prompt_tokens"))
+    completion = _optional_int(event.get("usage_completion_tokens"))
     return _row(
         event,
         source="agent-runner",
         status="error" if error else "success",
         latency_ms=_seconds_to_milliseconds(event.get("latency_sec")),
-        prompt_tokens=_optional_int(event.get("usage_prompt_tokens")),
+        prompt_tokens=prompt,
         cache_hit_tokens=_optional_int(
             event.get("usage_prompt_cache_hit_tokens")
         ),
         cache_miss_tokens=_optional_int(
             event.get("usage_prompt_cache_miss_tokens")
         ),
-        completion_tokens=_optional_int(event.get("usage_completion_tokens")),
+        completion_tokens=completion,
         reasoning_tokens=_optional_int(event.get("usage_reasoning_tokens")),
-        usage_available=not error and any(
-            key.startswith("usage_") for key in event
-        ),
+        usage_available=not error and prompt is not None and completion is not None,
         pricing=pricing,
     )
 

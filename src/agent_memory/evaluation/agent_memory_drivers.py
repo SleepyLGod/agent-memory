@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import pickle
 from typing import Any
+from agent_memory.memories.zep.fact_summary import zep_memory_type, zep_storage_statements
 
 import pandas as pd
 
@@ -21,6 +22,7 @@ from agent_memory.adapters.lotus.pair_execution import (
     semantic_pair_site_physical_contract,
 )
 from agent_memory.adapters.lotus.context import validate_lm_max_ctx_len
+from agent_memory.adapters.lotus.site_batching import PairFilterBatching
 from agent_memory.adapters.lotus.prompt_batching import (
     PromptBatching,
     validate_structured_output_transport,
@@ -403,8 +405,12 @@ def event_to_zep_log_row(event: BenchmarkEvent) -> dict[str, str]:
 
     if not event.timestamp:
         raise ValueError("Zep benchmark events require an explicit timestamp")
+    content = f"{event.speaker}: {event.text}"
+    caption = event.metadata.get("blip_caption")
+    if isinstance(caption, str) and caption.strip():
+        content += f"\n(description of attached image: {caption.strip()})"
     return {
-        "content": f"{event.speaker}: {event.text}",
+        "content": content,
         "role": event.speaker,
         "speaker": event.speaker,
         "reference_time": event.timestamp,
@@ -805,6 +811,16 @@ class ZepMemoryDriverFactory:
         prompt_batching: PromptBatching | None = None,
         sem_agg_dispatch: str = "sequential",
         structured_output_transport: str = "chat-json-object",
+        physical_fusion: str = "disabled",
+        pair_filter_batching: dict[str, PairFilterBatching] | None = None,
+        listwise_join_batching: dict[str, PromptBatching] | None = None,
+        groupby_prompt_batching: dict[str, PromptBatching] | None = None,
+        reuse_unchanged_entity_name: bool = False,
+        parallel_fact_extraction: bool = False,
+        sem_agg_prompt_batching: PromptBatching | None = None,
+        predicate_reuse_sites: tuple[str, ...] = (),
+        memory_num_retries: int = BENCHMARK_LM_NUM_RETRIES,
+        structured_parse_retries: int = 3,
         lm_max_ctx_len: int | None = None,
         embedding_device: str = "cpu",
         semantic_trace_snapshot_mode: str = "compact",
@@ -837,6 +853,16 @@ class ZepMemoryDriverFactory:
         self.prompt_batching = prompt_batching
         self.sem_agg_dispatch = sem_agg_dispatch
         self.structured_output_transport = structured_output_transport
+        self.physical_fusion = physical_fusion
+        self.pair_filter_batching = dict(pair_filter_batching or {})
+        self.listwise_join_batching = dict(listwise_join_batching or {})
+        self.groupby_prompt_batching = dict(groupby_prompt_batching or {})
+        self.reuse_unchanged_entity_name = reuse_unchanged_entity_name
+        self.parallel_fact_extraction = parallel_fact_extraction
+        self.sem_agg_prompt_batching = sem_agg_prompt_batching
+        self.predicate_reuse_sites = predicate_reuse_sites
+        self.memory_num_retries = memory_num_retries
+        self.structured_parse_retries = structured_parse_retries
         self.lm_max_ctx_len = lm_max_ctx_len
         embedding_contract = _semantic_pair_embedding_contract(
             self.semantic_pair_profiles
@@ -880,6 +906,16 @@ class ZepMemoryDriverFactory:
         prompt_batching: PromptBatching | None = None,
         sem_agg_dispatch: str = "sequential",
         structured_output_transport: str = "chat-json-object",
+        physical_fusion: str = "disabled",
+        pair_filter_batching: dict[str, PairFilterBatching] | None = None,
+        listwise_join_batching: dict[str, PromptBatching] | None = None,
+        groupby_prompt_batching: dict[str, PromptBatching] | None = None,
+        reuse_unchanged_entity_name: bool = False,
+        parallel_fact_extraction: bool = False,
+        sem_agg_prompt_batching: PromptBatching | None = None,
+        predicate_reuse_sites: tuple[str, ...] = (),
+        memory_num_retries: int = BENCHMARK_LM_NUM_RETRIES,
+        structured_parse_retries: int = 3,
         lm_max_ctx_len: int | None = None,
         embedding_device: str = "cpu",
         semantic_trace_snapshot_mode: str = "compact",
@@ -937,6 +973,16 @@ class ZepMemoryDriverFactory:
             prompt_batching=prompt_batching,
             sem_agg_dispatch=sem_agg_dispatch,
             structured_output_transport=structured_output_transport,
+            physical_fusion=physical_fusion,
+            pair_filter_batching=pair_filter_batching,
+            listwise_join_batching=listwise_join_batching,
+            groupby_prompt_batching=groupby_prompt_batching,
+            reuse_unchanged_entity_name=reuse_unchanged_entity_name,
+            parallel_fact_extraction=parallel_fact_extraction,
+            sem_agg_prompt_batching=sem_agg_prompt_batching,
+            predicate_reuse_sites=predicate_reuse_sites,
+            memory_num_retries=memory_num_retries,
+            structured_parse_retries=structured_parse_retries,
             lm_max_ctx_len=lm_max_ctx_len,
             embedding_device=embedding_device,
             semantic_trace_snapshot_mode=semantic_trace_snapshot_mode,
@@ -971,7 +1017,6 @@ class ZepMemoryDriverFactory:
         import agent_memory as am
         from agent_memory.adapters.lotus import LotusAdapter
         from agent_memory.adapters.lotus.context import LotusExecutionConfig
-        from agent_memory.memories.zep.storage import GRAPHITI_NEO4J_STATEMENTS
         from agent_memory.planner import DifferentialRules, PolicyDifferentiator
         from agent_memory.runtime import MemoryRuntime
         from agent_memory.storage import StorageDeployment
@@ -987,14 +1032,22 @@ class ZepMemoryDriverFactory:
             self.connector.embedding_provider = traced_embedding_provider
         storage = StorageDeployment(
             connector=self.connector,
-            statements=GRAPHITI_NEO4J_STATEMENTS,
+            statements=zep_storage_statements(self.physical_fusion),
             namespace=namespace,
         )
         adapter = LotusAdapter(
             model=self.model_id,
             config=LotusExecutionConfig(
                 semantic_trace_dir=trace_dir,
-                lm_num_retries=BENCHMARK_LM_NUM_RETRIES,
+                lm_num_retries=self.memory_num_retries,
+                structured_parse_retries=self.structured_parse_retries,
+                pair_filter_batching=self.pair_filter_batching,
+                listwise_join_batching=self.listwise_join_batching,
+                groupby_prompt_batching=self.groupby_prompt_batching,
+                reuse_unchanged_entity_name=self.reuse_unchanged_entity_name,
+                parallel_fact_extraction=self.parallel_fact_extraction,
+                sem_agg_prompt_batching=self.sem_agg_prompt_batching,
+                predicate_reuse_sites=self.predicate_reuse_sites,
                 lm_model_kwargs={
                     **(
                         {"max_ctx_len": self.lm_max_ctx_len}
@@ -1015,6 +1068,7 @@ class ZepMemoryDriverFactory:
                 prompt_batching=self.prompt_batching,
                 sem_agg_dispatch=self.sem_agg_dispatch,
                 structured_output_transport=self.structured_output_transport,
+                physical_fusion=self.physical_fusion,
                 semantic_trace_snapshot_mode=self.semantic_trace_snapshot_mode,
             ),
             pair_embedding_provider=(
@@ -1024,10 +1078,10 @@ class ZepMemoryDriverFactory:
         policy = PolicyDifferentiator(
             rules=DifferentialRules(grouped_agg_rule=self.grouped_agg_rule)
         ).differentiate(
-            am.ZepMemory.spec(),
+            zep_memory_type(self.physical_fusion).spec(),
             statements=storage.statements,
         )
-        memory = am.ZepMemory(adapter=adapter)
+        memory = zep_memory_type(self.physical_fusion)(adapter=adapter)
         if self.refresh_every > 1:
             memory._runtime = MemoryRuntime(
                 policy,

@@ -199,7 +199,7 @@ def execute_native_sem_agg(
 def _prompt_batching(config: LotusExecutionConfig) -> PromptBatching | None:
     """Return the shared prompt batching contract."""
 
-    return config.prompt_batching
+    return config.sem_agg_prompt_batching or config.prompt_batching
 
 
 def execute_native_sem_agg_groups(
@@ -663,15 +663,15 @@ def write_sem_agg_audit(
     }
     if (
         config.sem_agg_dispatch != "sequential"
-        or config.prompt_batching is not None
+        or _prompt_batching(config) is not None
     ):
         audit_row.update(
             {
                 "dispatch": config.sem_agg_dispatch,
                 "prompt_batching": (
                     None
-                    if config.prompt_batching is None
-                    else config.prompt_batching.to_dict()
+                    if (batching := _prompt_batching(config)) is None
+                    else batching.to_dict()
                 ),
                 "structured_output_repaired": syntax_repair_method is not None,
                 "structured_output_repair_method": syntax_repair_method or "",

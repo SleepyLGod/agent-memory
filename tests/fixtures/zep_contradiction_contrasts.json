@@ -1,0 +1,35 @@
+{
+  "kind": "synthetic-controlled-contrasts",
+  "groups": [
+    {"topic": "residence", "new_fact": "As of today, Alice has moved her sole current primary residence from London to Paris; she no longer lives in London.", "candidates": [
+      {"fact": "Alice currently has her primary residence in London.", "expected": true, "reason": "The new fact explicitly supersedes the same person's current residence."},
+      {"fact": "Bob currently lives in London.", "expected": false, "reason": "Different person."},
+      {"fact": "Alice lived in London during 2019.", "expected": false, "reason": "A past residence remains true after a move."},
+      {"fact": "Alice enjoys visiting museums.", "expected": false, "reason": "Independent preference."}]},
+    {"topic": "occupation", "new_fact": "Mira has left her job as a teacher at Elm School. Her only current job is now a nurse at City Hospital.", "candidates": [
+      {"fact": "Mira worked as a teacher at Elm School in 2018.", "expected": false, "reason": "Historical employment is preserved."},
+      {"fact": "Mira currently works as a teacher at Elm School.", "expected": true, "reason": "Explicitly left that current job."},
+      {"fact": "Leon currently teaches at Elm School.", "expected": false, "reason": "Different employee."},
+      {"fact": "Mira holds a teaching qualification.", "expected": false, "reason": "Changing jobs does not revoke qualifications."}]},
+    {"topic": "preference", "new_fact": "Nora says her current favorite beverage has changed: it is tea, not coffee; she no longer considers coffee her favorite.", "candidates": [
+      {"fact": "Nora's favorite dessert is cake.", "expected": false, "reason": "Different preference attribute."},
+      {"fact": "Nora preferred coffee to tea in 2020.", "expected": false, "reason": "Past preference is not contradicted."},
+      {"fact": "Nora's current favorite beverage is coffee.", "expected": true, "reason": "Explicit replacement of current favorite."},
+      {"fact": "Omar's favorite beverage is coffee.", "expected": false, "reason": "Different person."}]},
+    {"topic": "plan", "new_fact": "Iris has canceled her planned Kyoto trip for October 2027 and will not take that trip; she will instead stay home that month.", "candidates": [
+      {"fact": "Iris visited Kyoto in April 2024.", "expected": false, "reason": "Past completed trip."},
+      {"fact": "Iris plans to visit Rome in December 2027.", "expected": false, "reason": "Different trip and time."},
+      {"fact": "Kai plans to visit Kyoto in October 2027.", "expected": false, "reason": "Different traveler."},
+      {"fact": "Iris currently plans to visit Kyoto in October 2027.", "expected": true, "reason": "Same planned trip explicitly canceled."}]},
+    {"topic": "count correction", "new_fact": "The final attendance count for the 2025 Harbor Workshop is corrected to 18 people. The earlier total of 12 was a counting error, not a different session.", "candidates": [
+      {"fact": "The final attendance at the 2025 Harbor Workshop was 12 people.", "expected": true, "reason": "Explicit correction for the identical event and measure."},
+      {"fact": "The 2024 Harbor Workshop had 12 attendees.", "expected": false, "reason": "Different year's event."},
+      {"fact": "The 2025 Harbor Workshop offered 12 presentations.", "expected": false, "reason": "Different counted attribute."},
+      {"fact": "The 2025 Hill Workshop had 12 attendees.", "expected": false, "reason": "Different event."}]},
+    {"topic": "relationship status", "new_fact": "Lena and Sam have divorced. They are no longer married to each other.", "candidates": [
+      {"fact": "Lena and Sam married each other in 2016.", "expected": false, "reason": "Divorce does not invalidate the historical marriage event."},
+      {"fact": "Lena and Sam are currently married to each other.", "expected": true, "reason": "Current marital relationship explicitly ended."},
+      {"fact": "Lena and Sam have a daughter named Ava.", "expected": false, "reason": "Parenthood can persist after divorce."},
+      {"fact": "Ruth and Joel are currently married to each other.", "expected": false, "reason": "Different couple."}]}
+  ]
+}

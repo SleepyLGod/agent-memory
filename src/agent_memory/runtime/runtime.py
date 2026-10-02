@@ -37,6 +37,7 @@ class MemoryRuntime:
             adapter=adapter,
             storage=storage,
         )
+        self.policy = self._engine.policy
 
     @property
     def _state(self) -> dict[str, Any]:
@@ -124,6 +125,8 @@ class MemoryRuntime:
                 "count refresh contract requires a schema-v3 runtime checkpoint"
             )
         if schema_version == 1:
+            if not getattr(self._engine.adapter, "supports_legacy_restore", True):
+                raise ValueError("physical fusion cannot restore a legacy schema-v1 checkpoint")
             if self.storage is not None:
                 raise NotImplementedError(
                     "schema-v1 checkpoints cannot be restored with storage"

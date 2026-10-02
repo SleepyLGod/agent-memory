@@ -22,14 +22,16 @@ def execute_sem_flat_map(
     inputs: Mapping[str, Any],
     execute: Callable[[QueryExpr, Mapping[str, Any]], Any],
     context: LotusExecutionContext,
+    *, model: Any = None,
 ) -> Any:
     """Execute sem_flat_map as structured JSON rows-wrapper generation."""
 
-    context.configure()
+    if model is None:
+        context.configure()
     source = execute(query.inputs[0], inputs)
     cols = output_columns(query, operator="sem_flat_map")
     input_cols = resolve_input_cols(source, query, operator="sem_flat_map")
-    executor = StructuredLMExecutor(source)
+    executor = StructuredLMExecutor(source, model=model)
     generation = executor(
         input_cols=input_cols,
         output_cols=cols,
@@ -104,6 +106,6 @@ def apply_flat_map_outputs(
             columns.append(column.name)
     if ordinal_col is not None:
         columns.append(ordinal_col)
-    result = pd.DataFrame(rows, columns=columns)
+    result = pd.DataFrame(rows, columns=pd.Index(columns))
     result.index = pd.Index(row_indexes, dtype="object")
     return result
