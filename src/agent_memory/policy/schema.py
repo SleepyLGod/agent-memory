@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 from .aggregates import (
+    ArgMinAggregateSpec,
     ArrayAggregateSpec,
     AvgAggregateSpec,
     CollectListAggregateSpec,
@@ -328,7 +329,9 @@ def _aggregate_output_columns(aggregates: object) -> tuple[str, ...]:
 
     outputs: list[str] = []
     for aggregate in aggregates:  # type: ignore[union-attr]
-        if isinstance(aggregate, SemanticAggregateSpec):
+        if isinstance(aggregate, ArgMinAggregateSpec):
+            names = (*aggregate.order_by, *aggregate.columns)
+        elif isinstance(aggregate, SemanticAggregateSpec):
             names = tuple(column.name for column in aggregate.output_cols)
         elif isinstance(
             aggregate,

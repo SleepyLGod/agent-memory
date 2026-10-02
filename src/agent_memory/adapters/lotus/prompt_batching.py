@@ -142,6 +142,7 @@ def run_prompt_batches(
     operator: str,
     trace_dir: Any = None,
     model_kwargs: Mapping[str, Any] | None = None,
+    task_partitions: Sequence[Sequence[int]] | None = None,
 ) -> PromptBatchRunResult[ResultT]:
     """Run ready semantic tasks in deterministic, context-bounded prompts."""
 
@@ -177,17 +178,18 @@ def run_prompt_batches(
         return result
 
     try:
-        requests = _build_requests(
-            task_sequence,
-            task_ids=task_ids,
-            build_request=build_request,
-            model=model,
-            config=config,
-            output_schema=(
-                output_schema
-                if structured_output_transport == "responses-json-schema"
-                else None
-            ),
+        partitions = (tuple(range(len(task_sequence))),) if task_partitions is None else task_partitions
+        if sorted(position for group in partitions for position in group) != list(range(len(task_sequence))):
+            raise ValueError("task partitions must cover each task exactly once")
+        requests = tuple(
+            request
+            for group in partitions
+            for request in _build_requests(
+                tuple(task_sequence[i] for i in group),
+                task_ids=tuple(task_ids[i] for i in group),
+                build_request=build_request, model=model, config=config,
+                output_schema=output_schema if structured_output_transport == "responses-json-schema" else None,
+            )
         )
     except ValueError as error:
         _write_batch_failure(

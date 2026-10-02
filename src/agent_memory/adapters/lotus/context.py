@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from threading import Lock
 from typing import Any
 
 from agent_memory.adapters.lotus.pair_execution import (
@@ -16,6 +17,8 @@ from agent_memory.adapters.lotus.prompt_batching import (
 )
 from agent_memory.adapters.lotus.provider_usage_lm import provider_usage_tracing_lm_class
 from agent_memory.adapters.lotus.traced_lm import TracedLM
+from agent_memory.adapters.lotus.scoped_lm import ScopedLM
+from agent_memory.adapters.lotus.site_batching import PairFilterBatching
 from agent_memory.storage.embedding import EmbeddingProvider
 
 DEFAULT_STRUCTURED_MAX_TOKENS = 8192
@@ -68,7 +71,15 @@ class LotusExecutionConfig:
         default_factory=dict
     )
     prompt_batching: PromptBatching | None = None
+    sem_agg_prompt_batching: PromptBatching | None = None
     structured_output_transport: str = "chat-json-object"
+    physical_fusion: str = "disabled"
+    pair_filter_batching: Mapping[str, PairFilterBatching] = field(default_factory=dict)
+    listwise_join_batching: Mapping[str, PromptBatching] = field(default_factory=dict)
+    groupby_prompt_batching: Mapping[str, PromptBatching] = field(default_factory=dict)
+    reuse_unchanged_entity_name: bool = False
+    parallel_fact_extraction: bool = False
+    predicate_reuse_sites: tuple[str, ...] = ()
 
     sem_filter_examples: Sequence[Mapping[str, Any]] | None = None
     sem_filter_helper_examples: Sequence[Mapping[str, Any]] | None = None
@@ -114,6 +125,73 @@ class LotusExecutionConfig:
         """Validate bounded semantic execution settings."""
 
         validate_lm_max_ctx_len(self.lm_model_kwargs.get("max_ctx_len"))
+        if not isinstance(self.parallel_fact_extraction, bool):
+            raise TypeError("parallel_fact_extraction must be boolean")
+        if self.parallel_fact_extraction and (
+            self.physical_fusion != "zep-representative" or not isinstance(self.lm_enable_cache, bool)
+            or self.prompt_batching is not None
+        ):
+            raise ValueError("parallel fact extraction requires zep-representative, explicit cache mode, and no global batching")
+        if not isinstance(self.reuse_unchanged_entity_name, bool):
+            raise TypeError("reuse_unchanged_entity_name must be boolean")
+        if self.reuse_unchanged_entity_name and self.physical_fusion != "zep-representative":
+            raise ValueError("unchanged entity names require registered zep-representative fusion")
+        if self.groupby_prompt_batching:
+            if self.prompt_batching is not None or self.sem_groupby_default:
+                raise ValueError("site groupby batching requires no global batching and default=False")
+            for site, setting in self.groupby_prompt_batching.items():
+                if (not isinstance(site, str) or not site.startswith("sem_groupby:")
+                    or not isinstance(setting, PromptBatching) or setting.max_tasks is None):
+                    raise ValueError("groupby batching requires sem_groupby sites and bounded PromptBatching")
+        if self.listwise_join_batching:
+            if (self.prompt_batching is not None or self.sem_join_topk_method != "listwise"
+                or self.sem_join_examples is not None or self.sem_join_strategy is not None
+                or self.sem_join_cascade_args is not None or self.sem_join_safe_mode):
+                raise ValueError("site listwise batching requires plain listwise execution without global batching")
+            for site, setting in self.listwise_join_batching.items():
+                if (not isinstance(site, str) or not site.startswith("sem_join:")
+                    or not isinstance(setting, PromptBatching) or setting.max_tasks is None):
+                    raise ValueError("listwise batching requires sem_join sites and bounded PromptBatching")
+        if self.sem_agg_prompt_batching is not None:
+            if not isinstance(self.sem_agg_prompt_batching, PromptBatching):
+                raise TypeError("sem_agg_prompt_batching must be PromptBatching or None")
+            if self.prompt_batching is not None or self.sem_agg_dispatch != "sequential":
+                raise ValueError("aggregate-only batching requires no global batching and sequential dispatch")
+            if self.sem_agg_safe_mode or self.sem_agg_model_kwargs:
+                raise ValueError("aggregate-only batching does not support safe mode or custom aggregate model kwargs")
+        if self.predicate_reuse_sites:
+            if not isinstance(self.predicate_reuse_sites, tuple) or any(
+                not isinstance(site, str) or not site.startswith("sem_filter:")
+                for site in self.predicate_reuse_sites
+            ) or len(set(self.predicate_reuse_sites)) != len(self.predicate_reuse_sites):
+                raise ValueError("predicate_reuse_sites must contain distinct sem_filter sites")
+            from agent_memory.adapters.lotus.sem_filter_batch_prompting import validate_batch_prompting_sem_filter_config
+            validate_batch_prompting_sem_filter_config(self)
+        if self.pair_filter_batching:
+            if self.prompt_batching is not None or self.structured_output_transport != "chat-json-object":
+                raise ValueError("site batching requires no global batching and chat-json-object")
+            for site, setting in self.pair_filter_batching.items():
+                if not site.startswith("sem_filter:") or not isinstance(setting, PairFilterBatching):
+                    raise ValueError("site batching supports registered pair-shaped sem_filter sites only")
+            from agent_memory.adapters.lotus.sem_filter_batch_prompting import validate_batch_prompting_sem_filter_config
+            validate_batch_prompting_sem_filter_config(self)
+        if self.physical_fusion not in {"disabled", "zep-target-state", "zep-combined", "zep-fact-summary", "zep-representative"}:
+            raise ValueError(f"unknown physical fusion strategy: {self.physical_fusion!r}")
+        if self.physical_fusion != "disabled":
+            unsupported = (
+                self.prompt_batching is not None
+                or self.structured_output_transport != "chat-json-object"
+                or self.sem_join_topk_method != "listwise"
+                or self.sem_join_examples is not None
+                or self.sem_join_strategy is not None
+                or self.sem_join_cascade_args is not None
+                or self.sem_join_safe_mode
+                or self.sem_agg_safe_mode
+                or bool(self.sem_agg_model_kwargs)
+                or self.sem_agg_dispatch != "sequential"
+            )
+            if unsupported:
+                raise ValueError("target-state fusion requires plain listwise/chat-json-object execution")
         validate_structured_output_transport(self.structured_output_transport)
         if self.prompt_batching is not None and not isinstance(
             self.prompt_batching, PromptBatching
@@ -179,7 +257,9 @@ class LotusExecutionContext:
     config: LotusExecutionConfig = field(default_factory=LotusExecutionConfig)
     pair_embedding_provider: EmbeddingProvider | None = None
     _configured: bool = field(default=False, init=False, repr=False)
+    _configure_lock: Lock = field(default_factory=Lock, init=False, repr=False, compare=False)
     _lm: Any | None = field(default=None, init=False, repr=False)
+    _scoped_lm: ScopedLM | None = field(default=None, init=False, repr=False)
     _reported_cache_usage: dict[str, int] = field(
         default_factory=dict,
         init=False,
@@ -196,10 +276,36 @@ class LotusExecutionContext:
     def configure(self) -> None:
         """Configure LOTUS before invoking semantic dataframe operators."""
 
-        if self._configured:
-            return
+        with self._configure_lock:
+            if self._configured:
+                return
 
-        import lotus
+            import lotus
+
+            lm = self.new_lm()
+            scoped_lm = ScopedLM(lm) if self.config.parallel_fact_extraction else None
+            settings_kwargs: dict[str, Any] = {"lm": scoped_lm if scoped_lm is not None else lm}
+            if self.config.lm_enable_cache is not None:
+                settings_kwargs["enable_cache"] = self.config.lm_enable_cache
+            lotus.settings.configure(**settings_kwargs)
+            self._lm = lm
+            self._scoped_lm = scoped_lm
+            self._configured = True
+
+    def fork(self) -> LotusExecutionContext:
+        """Create private LM/cache counters without reconfiguring global settings."""
+        self.configure()
+        if self._scoped_lm is None:
+            raise RuntimeError("independent LM context requires parallel execution")
+        context = LotusExecutionContext(self.model, self.config, self.pair_embedding_provider)
+        context._lm = self.new_lm()
+        context._scoped_lm = self._scoped_lm
+        context._configured = True
+        return context
+
+    def new_lm(self) -> Any:
+        """Build a private LM with the same contract, without changing LOTUS settings."""
+
         from lotus.cache import InMemoryCache
         from lotus.models import LM
 
@@ -235,16 +341,10 @@ class LotusExecutionContext:
             lm_class = deepseek_responses_lm_class(LM)
         base_lm = (
             provider_usage_tracing_lm_class(lm_class)(**lm_kwargs, trace_dir=trace_dir)
-            if trace_dir is not None or self.config.prompt_batching is not None
+            if trace_dir is not None or self.config.prompt_batching is not None or self.config.sem_agg_prompt_batching is not None or self.config.pair_filter_batching or self.config.listwise_join_batching or self.config.groupby_prompt_batching
             else lm_class(**lm_kwargs)
         )
-        lm = TracedLM(base_lm, trace_dir) if trace_dir is not None else base_lm
-        self._lm = lm
-        settings_kwargs: dict[str, Any] = {"lm": lm}
-        if self.config.lm_enable_cache is not None:
-            settings_kwargs["enable_cache"] = self.config.lm_enable_cache
-        lotus.settings.configure(**settings_kwargs)
-        self._configured = True
+        return TracedLM(base_lm, trace_dir) if trace_dir is not None else base_lm
 
     def cache_usage_snapshot(self) -> dict[str, int]:
         """Return physical, virtual, and framework-cache counters for this LM."""

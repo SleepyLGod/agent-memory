@@ -53,6 +53,7 @@ class _BatchPromptingTask:
     position: int
     row_id: str
     context: str
+    shared_context: str = ""
 
 
 @dataclass
@@ -73,10 +74,13 @@ class _BatchPromptingExecutor:
         trace_dir: Any = None,
         operator: str = "sem_filter",
         structured_output_transport: str = "chat-json-object",
+        task_partitions: Sequence[Sequence[int]] | None = None,
+        shared_columns: tuple[str, ...] = (),
     ) -> BatchPromptingResult:
         """Evaluate independent tuples in bounded structured prompts."""
 
         import lotus
+        from lotus.nl_expression import parse_cols
         from lotus.templates import task_instructions
 
         lm = lotus.settings.lm
@@ -84,7 +88,7 @@ class _BatchPromptingExecutor:
             raise ValueError(
                 "batch-prompting sem_filter requires a configured language model"
             )
-        columns = tuple(lotus.nl_expression.parse_cols(instruction))
+        columns = tuple(parse_cols(instruction))
         if not columns:
             raise ValueError(
                 "batch-prompting sem_filter requires instruction column placeholders"
@@ -101,6 +105,15 @@ class _BatchPromptingExecutor:
             )
         claim = _render_claim(instruction, columns)
         tasks = _build_tasks(docs)
+        if shared_columns:
+            if not set(shared_columns) <= set(columns):
+                raise ValueError("shared context columns must be predicate dependencies")
+            remaining = [c for c in columns if c not in shared_columns]
+            contexts = task_instructions.df2multimodal_info(self._obj, remaining)
+            shared = task_instructions.df2multimodal_info(self._obj, list(shared_columns))
+            tasks = tuple(_BatchPromptingTask(i, f"row_{i}", str(doc.get("text", "")),
+                          str(common.get("text", "")))
+                          for i, (doc, common) in enumerate(zip(contexts, shared, strict=True)))
         if not tasks:
             return BatchPromptingResult(
                 frame=self._obj.copy(),
@@ -131,6 +144,7 @@ class _BatchPromptingExecutor:
             model_kwargs={
                 "show_progress_bar": True,
             },
+            task_partitions=task_partitions,
         )
         selected_positions = [
             task.position
@@ -154,6 +168,8 @@ def execute_batch_prompted_sem_filter(
     instruction: str,
     context: LotusExecutionContext,
     prompt_batching: PromptBatching,
+    task_partitions: Sequence[Sequence[int]] | None = None,
+    shared_columns: tuple[str, ...] = (),
 ) -> BatchPromptingResult:
     """Execute one explicitly configured batch-prompting semantic filter."""
 
@@ -166,6 +182,8 @@ def execute_batch_prompted_sem_filter(
         progress_bar_desc=context.config.sem_filter_progress_bar_desc,
         trace_dir=context.config.trace_dir(),
         operator="sem_filter",
+        task_partitions=task_partitions,
+        shared_columns=shared_columns,
         structured_output_transport=context.config.structured_output_transport,
     )
 
@@ -181,6 +199,8 @@ def execute_batch_prompted_predicate(
     trace_dir: Any = None,
     operator: str = "sem_filter",
     structured_output_transport: str = "chat-json-object",
+    task_partitions: Sequence[Sequence[int]] | None = None,
+    shared_columns: tuple[str, ...] = (),
 ) -> BatchPromptingResult:
     """Evaluate independent boolean predicate tasks in shared prompts."""
 
@@ -193,6 +213,8 @@ def execute_batch_prompted_predicate(
         trace_dir=trace_dir,
         operator=operator,
         structured_output_transport=structured_output_transport,
+        task_partitions=task_partitions,
+        shared_columns=shared_columns,
     )
 
 
@@ -256,6 +278,22 @@ def _build_request(
         ],
         "output_schema": {"decisions": [{"row_id": "row_id", "keep": True}]},
     }
+    if any(task.shared_context for task in tasks):
+        shared = {task.shared_context for task in tasks}
+        if len(shared) == 1:
+            payload["shared_context"] = tasks[0].shared_context
+            payload["context_contract"] = "Each row's context consists of shared_context plus that row's context."
+        else:
+            contexts = {text: f"context_{i}" for i, text in enumerate(dict.fromkeys(task.shared_context for task in tasks))}
+            payload["contexts"] = {key: text for text, key in contexts.items()}
+            payload["rows"] = [
+                {"row_id": task.row_id, "context_id": contexts[task.shared_context], "context": task.context}
+                for task in tasks
+            ]
+            payload["context_contract"] = (
+                "Evaluate each row using ONLY contexts[row.context_id] plus that row's context. "
+                "Other contexts and rows are unrelated tasks, not evidence for this row."
+            )
     return PromptBatchRequest(
         task_ids=tuple(task.row_id for task in tasks),
         prompt=[

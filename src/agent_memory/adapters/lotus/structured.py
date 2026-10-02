@@ -168,12 +168,12 @@ def resolve_input_cols(source: Any, query: QueryExpr, *, operator: str) -> tuple
     if explicit is not None:
         columns = tuple(str(column) for column in explicit)
     else:
-        import lotus
+        from lotus.nl_expression import parse_cols
 
         try:
             parsed = tuple(
                 column
-                for column in lotus.nl_expression.parse_cols(
+                for column in parse_cols(
                     str(query.params["instruction"])
                 )
                 if column in source.columns
@@ -463,6 +463,7 @@ class StructuredLMExecutor:
     """Internal executor that reuses LOTUS operator caching without pandas accessors."""
 
     _obj: Any
+    model: Any = None
 
     @operator_cache
     def __call__(
@@ -492,7 +493,8 @@ class StructuredLMExecutor:
         from lotus.templates import task_instructions
         from lotus.utils import show_safe_mode
 
-        if lotus.settings.lm is None:
+        model = self.model if self.model is not None else lotus.settings.lm
+        if model is None:
             raise ValueError(
                 "The language model must be an instance of LM. Please configure "
                 "a valid language model using lotus.settings.configure()"
@@ -517,7 +519,9 @@ class StructuredLMExecutor:
             input_cols=input_cols,
             output_cols=output_cols,
         )
-        formatted_instruction = lotus.nl_expression.nle2str(
+        from lotus.nl_expression import nle2str
+
+        formatted_instruction = nle2str(
             formatter_instruction,
             list(input_cols),
         )
@@ -542,7 +546,7 @@ class StructuredLMExecutor:
 
         prompts = [
             task_instructions.map_formatter(
-                lotus.settings.lm,
+                model,
                 doc,
                 user_instruction,
                 examples_multimodal_data=examples_multimodal_data,
@@ -555,15 +559,15 @@ class StructuredLMExecutor:
         ]
 
         if safe_mode:
-            estimated_cost = sum(lotus.settings.lm.count_tokens(prompt) for prompt in prompts)
+            estimated_cost = sum(model.count_tokens(prompt) for prompt in prompts)
             show_safe_mode(estimated_cost, len(prompts))
 
-        current_max_tokens = int(getattr(lotus.settings.lm, "max_tokens", 512) or 512)
+        current_max_tokens = int(getattr(model, "max_tokens", 512) or 512)
         max_tokens = max(current_max_tokens, structured_max_tokens)
         if prompt_batching is not None:
             execution = _execute_structured_prompt_batches(
                 prompts,
-                model=lotus.settings.lm,
+                model=model,
                 prompt_batching=prompt_batching,
                 structured_output_transport=structured_output_transport,
                 output_cols=output_cols,
@@ -603,7 +607,7 @@ class StructuredLMExecutor:
                 snapshots={"input": self._obj.loc[:, list(input_cols)].copy()},
             )
             if safe_mode:
-                lotus.settings.lm.print_total_usage()
+                model.print_total_usage()
             return StructuredGenerationResult(
                 parsed_outputs=tuple(parsed_outputs),
                 raw_outputs=tuple(raw_outputs),
@@ -618,7 +622,7 @@ class StructuredLMExecutor:
             "response_format": {"type": "json_object"},
         }
         retry_result = execute_structured_lm_retry_result(
-            lotus.settings.lm,
+            model,
             prompts,
             lm_kwargs=lm_kwargs,
             output_cols=output_cols,
@@ -667,7 +671,7 @@ class StructuredLMExecutor:
         )
 
         if safe_mode:
-            lotus.settings.lm.print_total_usage()
+            model.print_total_usage()
 
         return StructuredGenerationResult(
             parsed_outputs=parsed_outputs,
@@ -996,6 +1000,7 @@ def execute_structured_lm_retry_result(
     max_retries: int,
     failure_extra_by_index: Mapping[int, Mapping[str, Any]] | None = None,
     output_validator: Callable[[str], None] | None = None,
+    retry_prompt_builder: Callable[[Any, str, str], Any] | None = None,
 ) -> StructuredLMRetryResult:
     """Call the LM and return retry metadata without hiding parse failures."""
 
@@ -1017,7 +1022,20 @@ def execute_structured_lm_retry_result(
 
     retries_left = max_retries
     while invalid and retries_left > 0:
-        retry_prompts = [prompts[index] for index in invalid]
+        retry_prompts = []
+        for index in invalid:
+            prompt = prompts[index]
+            if retry_prompt_builder is not None:
+                error = structured_parse_error(
+                    raw_outputs[index],
+                    output_cols=output_cols,
+                    shape=shape,
+                    require_explanation=require_explanation,
+                    operator=operator,
+                    output_validator=output_validator,
+                )
+                prompt = retry_prompt_builder(prompt, raw_outputs[index], error)
+            retry_prompts.append(prompt)
         _STRUCTURED_RETRY_STATS.retry_batches += 1
         _STRUCTURED_RETRY_STATS.retry_rows += len(retry_prompts)
         retry_kwargs = dict(lm_kwargs)

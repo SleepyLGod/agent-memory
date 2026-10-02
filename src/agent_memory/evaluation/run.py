@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import re
 from typing import Any
+from agent_memory.memories.zep.fact_summary import zep_memory_type, zep_storage_statements
 
 from .agent_memory_drivers import (
     ClaudeMemoryDriverFactory,
@@ -33,6 +34,8 @@ from agent_memory.adapters.lotus.context import (
     SEM_JOIN_TOPK_METHODS,
 )
 from agent_memory.adapters.lotus.json_output import JSON_REPAIR_VERSION
+from agent_memory.adapters.lotus.site_batching import PairFilterBatching
+from agent_memory.planner.serialization import stable_json
 from agent_memory.adapters.lotus.prompt_batching import (
     PromptBatching,
     validate_structured_output_transport,
@@ -62,7 +65,7 @@ _BUILT_IN_CONTRACTS = {
         "claude-memory-declared-sem-topk:v1",
     ),
     "zep-memory": (
-        "benchmark-event-to-zep-log:v1",
+        "benchmark-event-to-zep-log:v2",
         "zep-memory-entity-rrf-fact-bfs-cross-encoder:v1",
     ),
     "mem0-memory": (
@@ -128,6 +131,17 @@ def run_agent_memory_bundle(
     sem_agg_dispatch: str = "sequential",
     prompt_batching: PromptBatching | None = None,
     structured_output_transport: str = "chat-json-object",
+    physical_fusion: str = "disabled",
+    pair_filter_batching: Mapping[str, PairFilterBatching] | None = None,
+    listwise_join_batching: Mapping[str, PromptBatching] | None = None,
+    groupby_prompt_batching: Mapping[str, PromptBatching] | None = None,
+    reuse_unchanged_entity_name: bool = False,
+    parallel_fact_extraction: bool = False,
+    sem_agg_prompt_batching: PromptBatching | None = None,
+    predicate_reuse_sites: tuple[str, ...] = (),
+    memory_num_retries: int | None = None,
+    structured_parse_retries: int | None = None,
+    parse_attempts: int = 4,
     lm_max_ctx_len: int | None = None,
     semantic_pair_profile: str = "oracle-only",
     semantic_pair_top_k: int | None = None,
@@ -152,6 +166,65 @@ def run_agent_memory_bundle(
         structured_output_transport, model=memory_provider_model_id
     )
     grouped_agg_rule = resolve_grouped_agg_rule(system_id, grouped_agg_rule)
+    site_execution_options: dict[str, Any] = {}
+    if parallel_fact_extraction:
+        from agent_memory.adapters.lotus.context import LotusExecutionConfig
+        LotusExecutionConfig(parallel_fact_extraction=True, physical_fusion=physical_fusion,
+            lm_enable_cache=lotus_cache_mode != "disabled", prompt_batching=prompt_batching)
+        site_execution_options["parallel_fact_extraction"] = True
+    if groupby_prompt_batching or reuse_unchanged_entity_name:
+        from agent_memory.adapters.lotus.context import LotusExecutionConfig
+        LotusExecutionConfig(groupby_prompt_batching=dict(groupby_prompt_batching or {}),
+            reuse_unchanged_entity_name=reuse_unchanged_entity_name, physical_fusion=physical_fusion,
+            prompt_batching=prompt_batching, structured_output_transport=structured_output_transport)
+        if groupby_prompt_batching:
+            site_execution_options["groupby_prompt_batching"] = dict(groupby_prompt_batching)
+        if reuse_unchanged_entity_name:
+            site_execution_options["reuse_unchanged_entity_name"] = True
+    if listwise_join_batching:
+        from agent_memory.adapters.lotus.context import LotusExecutionConfig
+        LotusExecutionConfig(listwise_join_batching=listwise_join_batching,
+            prompt_batching=prompt_batching, sem_join_topk_method=sem_join_topk_method or "listwise",
+            structured_output_transport=structured_output_transport)
+        site_execution_options["listwise_join_batching"] = dict(listwise_join_batching)
+    if sem_agg_prompt_batching is not None:
+        from agent_memory.adapters.lotus.context import LotusExecutionConfig
+        LotusExecutionConfig(
+            sem_agg_prompt_batching=sem_agg_prompt_batching,
+            prompt_batching=prompt_batching,
+            sem_agg_dispatch=sem_agg_dispatch,
+            structured_output_transport=structured_output_transport,
+        )
+        site_execution_options["sem_agg_prompt_batching"] = sem_agg_prompt_batching
+    if pair_filter_batching:
+        site_execution_options["pair_filter_batching"] = dict(pair_filter_batching)
+    if predicate_reuse_sites:
+        from agent_memory.adapters.lotus.context import LotusExecutionConfig
+        LotusExecutionConfig(predicate_reuse_sites=predicate_reuse_sites)
+        site_execution_options["predicate_reuse_sites"] = predicate_reuse_sites
+    for name, value in (("memory_num_retries", memory_num_retries), ("structured_parse_retries", structured_parse_retries)):
+        if value is not None:
+            if type(value) is not int or value < 0:
+                raise ValueError(f"{name} must be a nonnegative integer")
+            site_execution_options[name] = value
+    if site_execution_options and system_id != "zep-memory":
+        raise ValueError("site execution options currently support Zep only")
+    if physical_fusion != "disabled":
+        from agent_memory.adapters.lotus.context import LotusExecutionConfig
+        if system_id != "zep-memory":
+            raise ValueError("target-state fusion is registered only for Zep")
+        LotusExecutionConfig(
+            physical_fusion=physical_fusion,
+            structured_output_transport=structured_output_transport,
+            prompt_batching=prompt_batching,
+            sem_agg_dispatch=sem_agg_dispatch,
+            sem_join_topk_method=sem_join_topk_method or "listwise",
+            pair_filter_batching=dict(pair_filter_batching or {}),
+            listwise_join_batching=dict(listwise_join_batching or {}),
+            groupby_prompt_batching=dict(groupby_prompt_batching or {}),
+            reuse_unchanged_entity_name=reuse_unchanged_entity_name,
+            sem_agg_prompt_batching=sem_agg_prompt_batching,
+        )
     if (
         isinstance(refresh_every, bool)
         or not isinstance(refresh_every, int)
@@ -280,14 +353,13 @@ def run_agent_memory_bundle(
         else:
             from agent_memory.memories.zep.storage import (
                 GRAPHITI_BGE_M3,
-                GRAPHITI_NEO4J_STATEMENTS,
             )
 
             policy = PolicyDifferentiator(
                 rules=DifferentialRules(grouped_agg_rule=grouped_agg_rule)
             ).differentiate(
-                am.ZepMemory.spec(),
-                statements=GRAPHITI_NEO4J_STATEMENTS,
+                zep_memory_type(physical_fusion).spec(),
+                statements=zep_storage_statements(physical_fusion),
             )
             operators = ("sem_filter", "sem_join", "sem_groupby")
             embedding = GRAPHITI_BGE_M3
@@ -326,15 +398,14 @@ def run_agent_memory_bundle(
         import agent_memory as am
         from agent_memory.memories.zep.storage import (
             GRAPHITI_BGE_M3,
-            GRAPHITI_NEO4J_STATEMENTS,
         )
         from agent_memory.planner import DifferentialRules, PolicyDifferentiator
 
         policy = PolicyDifferentiator(
             rules=DifferentialRules(grouped_agg_rule=grouped_agg_rule)
         ).differentiate(
-            am.ZepMemory.spec(),
-            statements=GRAPHITI_NEO4J_STATEMENTS,
+            zep_memory_type(physical_fusion).spec(),
+            statements=zep_storage_statements(physical_fusion),
         )
         semantic_pair_profiles = build_operator_semantic_pair_profiles(
             policy,
@@ -405,6 +476,23 @@ def run_agent_memory_bundle(
         if part
     ]
     maintenance_execution_id = "|".join(maintenance_execution_parts)
+    from agent_memory.planner.physical import FUSION_VERSION, COMBINED_VERSION, SUMMARY_VERSION, REPRESENTATIVE_VERSION
+    fusion_version: str | None = None
+    if physical_fusion != "disabled":
+        fusion_version = {"zep-target-state": FUSION_VERSION, "zep-combined": COMBINED_VERSION,
+                          "zep-fact-summary": SUMMARY_VERSION, "zep-representative": REPRESENTATIVE_VERSION}[physical_fusion]
+        maintenance_execution_id += f"|physical-fusion:{fusion_version}"
+    if site_execution_options:
+        identity = {**site_execution_options, "pair_filter_batching": {
+            site: config.to_dict() for site, config in sorted((pair_filter_batching or {}).items())
+        }}
+        if sem_agg_prompt_batching is not None:
+            identity["sem_agg_prompt_batching"] = sem_agg_prompt_batching.to_dict()
+        if listwise_join_batching:
+            identity["listwise_join_batching"] = {site: setting.to_dict() for site, setting in sorted(listwise_join_batching.items())}
+        if groupby_prompt_batching:
+            identity["groupby_prompt_batching"] = {site: setting.to_dict() for site, setting in sorted(groupby_prompt_batching.items())}
+        maintenance_execution_id += "|site-execution:" + sha256(stable_json(identity).encode()).hexdigest()
     framework_cache_mode = (
         LOTUS_MEMORY_CACHE_ID if lotus_cache_mode == "memory" else "disabled"
     )
@@ -470,6 +558,17 @@ def run_agent_memory_bundle(
                 "sem_agg_dispatch": sem_agg_dispatch,
             }
         )
+    if fusion_version is not None:
+        lotus_execution_provenance["physical_fusion"] = physical_fusion
+        lotus_execution_provenance["fusion_version"] = fusion_version
+    if site_execution_options:
+        lotus_execution_provenance["site_execution"] = {
+            **{k: v for k, v in site_execution_options.items() if k not in {"pair_filter_batching", "sem_agg_prompt_batching", "listwise_join_batching", "groupby_prompt_batching"}},
+            **({"groupby_prompt_batching": {site: setting.to_dict() for site, setting in sorted(groupby_prompt_batching.items())}} if groupby_prompt_batching else {}),
+            **({"listwise_join_batching": {site: setting.to_dict() for site, setting in sorted(listwise_join_batching.items())}} if listwise_join_batching else {}),
+            **({"sem_agg_prompt_batching": sem_agg_prompt_batching.to_dict()} if sem_agg_prompt_batching is not None else {}),
+            "pair_filter_batching": {site: config.to_dict() for site, config in sorted((pair_filter_batching or {}).items())},
+        }
     if prompt_batching is not None:
         lotus_execution_provenance["prompt_batching"] = (
             prompt_batching.to_dict()
@@ -595,6 +694,8 @@ def run_agent_memory_bundle(
         )
     elif system_id == "zep-memory":
         driver_factory = ZepMemoryDriverFactory.from_environment(
+            **site_execution_options,
+            **({"physical_fusion": physical_fusion} if physical_fusion != "disabled" else {}),
             base_namespace=base_namespace
             or _namespace(bundle.benchmark_id, output_dir),
             model_id=memory_provider_model_id,
@@ -664,6 +765,7 @@ def run_agent_memory_bundle(
             else None
         )
         BenchmarkRunner(
+            parse_attempts=parse_attempts,
             system_contract=system_contract,
             contracts=contracts,
             driver_factory=driver_factory,

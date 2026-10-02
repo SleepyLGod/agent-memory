@@ -6,6 +6,7 @@ from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 import json
 import re
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
@@ -20,7 +21,9 @@ from agent_memory.adapters.lotus.pair_execution import (
     PairCandidateSelection,
     select_semantic_pair_candidates,
     write_semantic_pair_execution_trace,
+    semantic_pair_site_id,
 )
+from agent_memory.adapters.lotus.site_batching import execute_site_batching
 from agent_memory.adapters.lotus.sem_filter_batch_prompting import (
     execute_batch_prompted_sem_filter,
     validate_batch_prompting_sem_filter_config,
@@ -33,6 +36,8 @@ from agent_memory.tracing.semantic import (
 )
 from agent_memory.adapters.lotus.structured import examples_dataframe, normalize_strategy
 from agent_memory.policy.logical import QueryExpr
+from agent_memory.planner.physical import PREDICATE_DECISIONS_INPUT
+from agent_memory.adapters.lotus.predicate_reuse import reuse_predicate_decisions
 
 QUALIFIED_PLACEHOLDER_PATTERN = re.compile(
     r"(?<!\{)\{([A-Za-z_][A-Za-z0-9_]*):([A-Za-z_][A-Za-z0-9_]*)\}(?!\})"
@@ -49,7 +54,14 @@ def execute_sem_filter(
 
     digest = query_digest(query)
     profile = context.config.semantic_pair_profiles.get(digest)
+    site_batching = None
+    if context.config.pair_filter_batching and QUALIFIED_PLACEHOLDER_PATTERN.search(str(query.params["instruction"])):
+        site_batching = context.config.pair_filter_batching.get(semantic_pair_site_id(query))
     prompt_batching = context.config.prompt_batching
+    if site_batching is not None:
+        prompt_batching = site_batching.prompt_batching
+        if profile is not None and profile.mode == "proxy-only":
+            raise ValueError("site batching cannot replace proxy-only decisions")
     batch_prompting = prompt_batching is not None
     if batch_prompting:
         validate_batch_prompting_sem_filter_config(context.config)
@@ -97,35 +109,44 @@ def execute_sem_filter(
     verified_tuple_count: int | None = (
         len(lotus_source) if batch_prompting else None
     )
-    if profile is not None and profile.mode == "proxy-only":
-        result = lotus_source.copy()
-    elif selection is not None and lotus_source.empty:
-        result = lotus_source.copy()
-    elif single_schema_predicate(context.config):
-        decision = execute_schema_predicate(
-            lotus_source,
-            instruction=instruction,
-            config=context.config,
-            operator="sem_filter",
-        )
-        selected_positions = [i for i, keep in enumerate(decision.decisions) if keep]
-        result = lotus_source.iloc[selected_positions].copy()
-    elif batch_prompting:
-        assert prompt_batching is not None
-        prompted = execute_batch_prompted_sem_filter(
-            lotus_source,
-            instruction=instruction,
-            context=context,
-            prompt_batching=prompt_batching,
-        )
-        result = prompted.frame
+    def evaluate(frame: pd.DataFrame, positions: list[int]) -> pd.DataFrame:
+        nonlocal prompt_count, prompt_retry_count, verified_tuple_count
+        verified_tuple_count = len(frame)
+        if frame.empty or profile is not None and profile.mode == "proxy-only":
+            return frame.copy()
+        if single_schema_predicate(context.config):
+            decision = execute_schema_predicate(
+                frame, instruction=instruction, config=context.config, operator="sem_filter",
+            )
+            return frame.iloc[[i for i, keep in enumerate(decision.decisions) if keep]].copy()
+        if site_batching is not None:
+            prompted = execute_site_batching(
+                frame, identities=oracle_source.iloc[positions], instruction=instruction,
+                context=context, config=site_batching,
+            )
+        elif prompt_batching is not None:
+            prompted = execute_batch_prompted_sem_filter(
+                frame, instruction=instruction, context=context, prompt_batching=prompt_batching,
+            )
+        else:
+            return frame.sem_filter(instruction, **native_sem_filter_kwargs(context.config))
         prompt_count = prompted.prompt_count
         prompt_retry_count = prompted.retry_count
-    else:
-        result = lotus_source.sem_filter(
-            instruction,
-            **native_sem_filter_kwargs(context.config),
+        return prompted.frame
+
+    reused_positions: set[int] = set()
+    decisions = inputs.get(PREDICATE_DECISIONS_INPUT)
+    if decisions is not None and (profile is None or profile.mode != "proxy-only"):
+        if not isinstance(decisions, dict):
+            raise TypeError("predicate decisions must be executor-owned state")
+        verified_tuple_count = 0
+        result, reused_positions = reuse_predicate_decisions(
+            lotus_source, instruction, decisions, evaluate,
         )
+    elif not batch_prompting and not single_schema_predicate(context.config) and selection is None:
+        result = lotus_source.sem_filter(instruction, **native_sem_filter_kwargs(context.config))
+    else:
+        result = evaluate(lotus_source, list(range(len(lotus_source))))
     if restore_columns:
         result = result.rename(columns=restore_columns)
     with semantic_trace_scope(
@@ -137,6 +158,7 @@ def execute_sem_filter(
             result=result,
             instruction=str(query.params["instruction"]),
             profile=profile,
+            reused_positions=reused_positions,
         )
         trace_payload: dict[str, Any] = {
             "instruction": str(query.params["instruction"]),
@@ -161,6 +183,13 @@ def execute_sem_filter(
                     "verified_tuple_count": verified_tuple_count,
                 }
             )
+        if site_batching is not None:
+            trace_payload["pair_filter_batching"] = site_batching.to_dict()
+            trace_payload["semantic_pair_site_id"] = semantic_pair_site_id(query)
+        if decisions is not None:
+            trace_payload["predicate_reused_tuple_count"] = len(reused_positions)
+            trace_payload["predicate_evaluated_tuple_count"] = verified_tuple_count
+            trace_payload["predicate_coalesced_tuple_count"] = len(lotus_source) - len(reused_positions) - int(verified_tuple_count or 0)
         write_compact_operator_trace(
             context.config.trace_dir(),
             operator="sem_filter",
@@ -173,12 +202,13 @@ def execute_sem_filter(
 
 
 def write_pairwise_sem_filter_trace(
-    trace_dir: object,
+    trace_dir: Path | str | None,
     *,
     source: pd.DataFrame,
     result: pd.DataFrame,
     instruction: str,
     profile: Any,
+    reused_positions: set[int] | None = None,
 ) -> None:
     """Record pair-shaped filter decisions without full relation snapshots."""
 
@@ -193,7 +223,7 @@ def write_pairwise_sem_filter_trace(
         "proxy" if profile is not None and profile.mode == "proxy-only" else "oracle"
     )
     rows: list[dict[str, Any]] = []
-    for _, row in source.iterrows():
+    for position, (_, row) in enumerate(source.iterrows()):
         signature = _row_signature(row)
         matched = result_counts[signature] > 0
         if matched:
@@ -202,7 +232,7 @@ def write_pairwise_sem_filter_trace(
             {
                 "instruction": instruction,
                 "direction": direction,
-                "decision_source": decision_source,
+                "decision_source": "reused" if position in (reused_positions or ()) else decision_source,
                 "left_id": _endpoint_id(row, left_id_columns),
                 "right_id": _endpoint_id(row, right_id_columns),
                 "left": _endpoint_text(row, left_text_columns),

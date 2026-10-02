@@ -19,6 +19,28 @@ class SemanticAggregateSpec:
 
 
 @dataclass(frozen=True)
+class ArgMinAggregateSpec:
+    """Copy one row's payload and ordering key, retaining sufficient merge state."""
+
+    order_by: tuple[str, ...]
+    columns: tuple[str, ...]
+
+
+def arg_min(*, order_by: Sequence[str], columns: Sequence[str]) -> ArgMinAggregateSpec:
+    """Select the lexicographically earliest row; retain keys for incremental merge.
+
+    Keys must be non-null and comparable. Tied keys must have identical payloads;
+    ambiguous ties fail rather than silently depending on DataFrame row order.
+    """
+    keys, values = tuple(order_by), tuple(columns)
+    if not keys or not values or any(not isinstance(c, str) or not c for c in (*keys, *values)):
+        raise ValueError("arg_min requires nonempty ordering and payload column names")
+    if len(set((*keys, *values))) != len(keys) + len(values):
+        raise ValueError("arg_min ordering and payload columns must be distinct")
+    return ArgMinAggregateSpec(keys, values)
+
+
+@dataclass(frozen=True)
 class ArrayAggregateSpec:
     """Serializable descriptor for one grouped array aggregate."""
 
@@ -70,6 +92,7 @@ AlgebraicAggregateSpec: TypeAlias = (
 )
 AggregateSpec: TypeAlias = (
     SemanticAggregateSpec
+    | ArgMinAggregateSpec
     | ArrayAggregateSpec
     | CollectListAggregateSpec
     | MinAggregateSpec
@@ -185,6 +208,8 @@ def normalize_min_columns(
 def aggregate_output_names(spec: AggregateSpec) -> tuple[str, ...]:
     """Return output column names produced by one aggregate descriptor."""
 
+    if isinstance(spec, ArgMinAggregateSpec):
+        return (*spec.order_by, *spec.columns)
     if isinstance(spec, SemanticAggregateSpec):
         return tuple(column.name for column in spec.output_cols)
     if isinstance(
@@ -215,6 +240,7 @@ def normalize_aggregate_specs(specs: Sequence[AggregateSpec]) -> tuple[Aggregate
             spec,
             (
                 SemanticAggregateSpec,
+                ArgMinAggregateSpec,
                 ArrayAggregateSpec,
                 CollectListAggregateSpec,
                 MinAggregateSpec,
@@ -226,7 +252,8 @@ def normalize_aggregate_specs(specs: Sequence[AggregateSpec]) -> tuple[Aggregate
     ]
     if invalid:
         raise TypeError(
-            "agg accepts only agent_memory.sem_agg(...), agent_memory.array_agg(...), "
+            "agg accepts only agent_memory.sem_agg(...), agent_memory.arg_min(...), "
+            "agent_memory.array_agg(...), "
             "agent_memory.collect_list(...), agent_memory.min(...), "
             "agent_memory.count(...), agent_memory.sum(...), or "
             "agent_memory.avg(...) "

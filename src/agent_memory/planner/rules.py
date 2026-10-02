@@ -6,6 +6,7 @@ from collections.abc import Sequence
 import re
 
 from agent_memory.policy.aggregates import (
+    ArgMinAggregateSpec,
     ArrayAggregateSpec,
     CollectListAggregateSpec,
     MinAggregateSpec,
@@ -702,6 +703,9 @@ class DifferentialRules:
 
         specs: list[object] = []
         for spec in aggregate.params.get("aggregates", ()):
+            if isinstance(spec, ArgMinAggregateSpec):
+                specs.append(spec)
+                continue
             if isinstance(spec, SemanticAggregateSpec):
                 state_cols = aggregate_output_names(spec)
                 specs.append(
