@@ -1,145 +1,122 @@
-# agent-memory
+# Agent Memory
 
-`agent-memory` is an experimental semantic memory framework for agent
-developers. The v0.0 direction is DataFrame-first: policy authors describe
-memory as logical views over an append-only log, and the system will later
-rewrite and maintain those views incrementally.
+Agent Memory expresses persistent agent memory as semantic views over incoming
+messages. Declare extraction, grouping, consolidation, and retrieval with a
+DataFrame-style API; the framework compiles a maintenance plan and updates the
+views as new messages arrive.
 
-## Status
+The repository includes Claude-style topic memory, Mem0-style fact memory, and
+Zep-style graph memory, plus shared benchmark runners for LOCOMO, LongMemEval,
+and MemoryAgentBench.
 
-The current code implements the v0.0 interface layer.
+![Conceptual architecture of the incremental semantic view maintenance system](docs/assets/architecture/architecture.svg)
 
-It can:
+## Install
 
-- import `agent_memory as am`
-- define DataFrame-style memory policies
-- collect a `MemorySpec` from a policy class
-- inspect logical `QueryExpr` trees
-- instantiate the built-in `ClaudeMemory` policy
-- build an in-memory `DifferentiatedPolicy`
-- run the current LOTUS-backed operator execution path
+Use Python 3.12 or later and [uv](https://docs.astral.sh/uv/). From this checkout:
 
-It does not yet:
+```bash
+uv sync --frozen
+```
 
-- persist differentiated policies as durable JSON/YAML artifacts
-- run optimizer passes
-- persist views to storage
+For benchmarks, install the dependencies for the selected memory:
 
-Runtime and adapter execution are intentionally in-memory: v0.0 can append rows,
-execute compiled differentiated queries over the supported LOTUS adapter
-operators, and query materialized views with compiled retrieval templates.
-Unsupported expression operators such as arbitrary `filter(predicate=...)` and
-`assign(...)` still raise explicit errors.
+```bash
+# Claude and Zep benchmark environment
+uv sync --frozen --extra benchmarks --extra zep
 
-## Quick Start
+# Separate Mem0 benchmark environment
+UV_PROJECT_ENVIRONMENT=.venv-mem0 uv sync --frozen --extra benchmarks --extra mem0
+```
+
+Zep requires a running Neo4j instance. Mem0 uses local Qdrant storage.
+See the [experiment guide](tools/evaluation/README.md) for setup.
+
+## Configure credentials
+
+Copy [.env.example](.env.example) to a local `.env` and set
+`DEEPSEEK_API_KEY`. Keep credentials out of version control. Commands can load
+this file explicitly with `uv run --env-file .env`.
+Only Zep benchmarks require the Neo4j variables in that file.
+
+## Use a memory
+
+The following example performs real model calls when run:
 
 ```python
 import agent_memory as am
+from agent_memory.adapters.lotus import LotusAdapter
 
-
-spec = am.ClaudeMemory.spec()
-print(sorted(spec.views))
-policy = am.ClaudeMemory.differentiate_policy()
-print(policy.view_execution_order)
-
-memory = am.ClaudeMemory()
-memory.add(am.Message(content="Please remember concise design docs."))
-memory.query("design docs")
+memory = am.ClaudeMemory(
+    adapter=LotusAdapter(model="deepseek/deepseek-flash")
+)
+memory.add(am.Message(
+    content="Remember that the API tests require a local Redis instance.",
+    role="user",
+    timestamp="2026-01-01T09:00:00Z",
+))
+context = memory.query("What do I need before running the API tests?")
+print(context)
 ```
 
-`ClaudeMemory` declares materialized `topics` and `catalog` views plus a
-parameterized retrieval template. Retrieval selects from a lightweight topic
-manifest, then joins back to `topics` by identity to return the memory body;
-`catalog` remains the MEMORY.md index projection. The in-memory
-`DifferentiatedPolicy` stores differentiated view queries and retrieval query
-templates; durable artifact IO and storage are still future work. Use the
-HelloWorld smoke below for the minimal executable path.
+`add()` maintains the declared views. `query()` retrieves context from them;
+it does not generate an answer. Applications can pass that context to their
+own answerer.
 
-For an interface-only smoke demo:
+Inspect the built-in Claude policy and its compiled plan **without model calls**:
 
 ```bash
-uv run examples/claude/interface_smoke.py
+uv run python examples/claude/interface_smoke.py
 ```
 
-For a real LOTUS-backed HelloWorld e2e over a small LOCOMO dialogue slice, copy
-`.env.example` to `.env`, set `DEEPSEEK_API_KEY`, then run:
+To define your own memory, start with the
+[Operator API](docs/design/operator-api.md) and
+[grouped aggregation guide](docs/design/groupby_agg.md).
+
+## Run a benchmark
+
+All three runners use the same workflow: prepare a bundle, choose a system,
+run it, then inspect metrics. For a small LOCOMO integration run:
 
 ```bash
-uv run examples/helloworld/helloworld_smoke.py
+uv run --extra benchmarks --extra zep python tools/evaluation/locomo.py prepare \
+  --smoke --bundle-dir .memory-test/bundles/locomo-smoke
+
+uv run --env-file .env --extra benchmarks --extra zep \
+  python tools/evaluation/locomo.py run \
+  --bundle-dir .memory-test/bundles/locomo-smoke \
+  --memory-model deepseek/deepseek-flash \
+  --answer-model deepseek/deepseek-flash \
+  --judge-model deepseek/deepseek-flash \
+  --system claude-memory --output-dir .memory-test/runs/locomo-claude
 ```
 
-The default LOTUS model is `deepseek/deepseek-v4-pro`. Advanced users can
-override it by passing a custom `LotusAdapter(model=...)`.
+Preparation may download data. Running invokes paid APIs.
+Supported system selectors are `claude-memory`, `zep-memory`,
+`mem0-memory`, and `mem0-enhanced`. Use a separate output directory per
+condition and the corresponding dependency/storage setup.
 
+The [experiment guide](tools/evaluation/README.md) covers all benchmarks,
+system selection, checkpoints, scoring, and native-system comparisons.
+Use the guide's dataset selectors to run complete benchmark samples.
 
-To include the same real LOTUS path in pytest, set
-`AGENT_MEMORY_RUN_LOTUS_E2E=1`. The default test suite does not call external
-model APIs.
+## Documentation
 
-## V0.0 File Structure
+| Guide | Contents |
+| --- | --- |
+| [Operator API](docs/design/operator-api.md) | Memory definitions, relational and semantic operators, windows, retrieval |
+| [Architecture](docs/architecture.md) | Compilation, execution, storage, and retrieval |
+| [Configuration](docs/configuration.md) | Models, execution controls, caching, storage, and recovery |
+| [Experiments](tools/evaluation/README.md) | Dataset preparation, shared runners, metrics, and comparison |
+<!-- | [Grouped aggregation](docs/design/groupby_agg.md) | Group keys, semantic outputs, deterministic aggregates, maintenance | -->
 
-```text
-src/agent_memory/
-  __init__.py              public package exports
-  api.py                   Memory, Message, add/query boundary
-  policy/                  logical IR, Relation API, expressions, aggregates, schema
-  memories/claude.py       built-in ClaudeMemory policy
-  memories/zep.py          Zep-style temporal memory policy
-  planner/                 query and whole-policy differentiation
-  runtime/                 v2 executor, v1 compatibility, and window state
-  adapters/                execution adapter protocol and LOTUS-backed operator implementation
-
-examples/claude/
-  interface_smoke.py       inspectable v0.0 interface demo
-
-examples/zep/
-  e2e_demo.py              real three-row LOCOMO + Zep policy demo
-
-examples/helloworld/
-  helloworld_smoke.py      real LOCOMO + LOTUS sem_filter/sem_map/top-k smoke
-```
-
-## Design Documents
-
-- `docs/design/operator-api.md`: DataFrame-style semantic operator API
-- `docs/design/lotus-lowering.md`: LOTUS physical lowering and execution contracts
-- `docs/design/TODO.md`: unresolved interface, runtime, and research questions
-- `docs/optimization/incremental-semantic-view-maintenance.tex`: semantic IVM theory draft
-
-## Development
-
-Install and sync dependencies with `uv`:
+## Development checks
 
 ```bash
-uv sync
+uv run python -m pytest
+uv run ruff check src tests tools
+uv run pyright
 ```
 
-Run the interface smoke demo:
-
-```bash
-uv run examples/claude/interface_smoke.py
-```
-
-Run the real HelloWorld smoke:
-
-```bash
-uv run examples/helloworld/helloworld_smoke.py
-```
-
-Run tests:
-
-```bash
-uv run --with pytest python -m pytest
-```
-
-Run tests including the real LOTUS e2e:
-
-```bash
-AGENT_MEMORY_RUN_LOTUS_E2E=1 uv run --with pytest python -m pytest
-```
-
-Register the local Jupyter kernel if notebook exploration is needed:
-
-```bash
-uv run python -m ipykernel install --user --name agent-memory --display-name "Python (agent-memory)"
-```
+Live integration tests require explicit credentials and opt-in settings;
+ordinary API and planner checks do not require a model endpoint.

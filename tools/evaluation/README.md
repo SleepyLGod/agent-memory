@@ -1,400 +1,256 @@
-# Shared Memory Benchmarks
+# Memory Benchmarks
 
-LongMemEval v1 and MemoryAgentBench use canonical bundles and benchmark-neutral
-artifacts for agent-memory policies. Native products run from their own
-repositories and are compared only after all runs finish.
+Use one workflow across LOCOMO, LongMemEval, and MemoryAgentBench:
+**prepare data, select a memory, run, inspect results**.
+The runners share case isolation, input bundles, checkpoint handling, and
+artifact formats. Dataset-specific task contracts supply the questions,
+answer prompts, and scorers.
 
-- `claude-memory`
-- `zep-memory`
-- `mem0-memory`
-- `mem0-enhanced`
+## 1. Prepare the environment
 
-Dataset adapters prepare evidence. Task contracts define prompts and scoring.
-System drivers only add events and retrieve context. The runner owns case
-isolation, resume, answering, grading, trace, and artifacts.
+Run commands from the repository root with Python 3.12+ and uv.
 
-Claude and Zep runners default to `rule-join-map`. They continue to accept the
-planner's other grouped-aggregate rules as explicit compatibility or ablation
-conditions. If a selected rule cannot compile a policy, the run fails before
-insertion instead of silently changing the requested rule.
+| System selector | Representation and retrieval | Dependencies / storage |
+| --- | --- | --- |
+| `claude-memory` | Topic views and catalog; semantic top-k retrieval | Benchmark extras; embeddings needed only for selected execution profiles |
+| `zep-memory` | Entities, episodes, and facts; graph-backed search and reranking | `zep` extra and a running Neo4j instance |
+| `mem0-memory` | Fact view; cosine retrieval | `mem0` extra and case-local Qdrant |
+| `mem0-enhanced` | Same fact view; semantic top-k retrieval | `mem0` extra and case-local Qdrant |
 
-Mem0 does not contain a grouped aggregate, so its public benchmark CLI rejects
-an explicit `--grouped-agg-rule`. The runner preserves its existing internal
-`rule-all-group` identity only for benchmark compatibility and fingerprints;
-Mem0 does not execute that grouped-aggregate rule.
-
-## Install
+These selectors run this repository's policies, not the native products.
 
 ```bash
+# Claude/Zep
 uv sync --frozen --extra benchmarks --extra zep
+
+# Mem0, in a separate environment
+UV_PROJECT_ENVIRONMENT=.venv-mem0 uv sync --frozen --extra benchmarks --extra mem0
 ```
 
-Mem0 runs use the isolated environment described by the Mem0 design:
+Set `DEEPSEEK_API_KEY` in a private `.env` using
+[.env.example](../../.env.example). All `run` commands below make real API
+calls. Preparation may download the pinned datasets and tokenization resources
+but does not run the memory model. Embedding and reranker weights may also be
+downloaded on first use.
+
+### Zep storage
+
+Start an isolated Neo4j deployment before running Zep. Set its URI, credentials,
+database, actual image name, and digest in the `AGENT_MEMORY_NEO4J_*` variables
+documented in [Configuration](../../docs/configuration.md#storage).
+The runner connects to the server; it does not provision it.
+
+For a local Docker deployment, use a dedicated container and volume. Set
+`AGENT_MEMORY_NEO4J_PASSWORD` to a private password of at least eight characters
+in `.env`, then start Neo4j with the same password:
 
 ```bash
-UV_PROJECT_ENVIRONMENT=.venv-mem0 \
-  uv sync --frozen --extra benchmarks --extra mem0
+# Load your own local .env, using shell-compatible KEY=value assignments.
+set -a
+source .env
+set +a
+export NEO4J_AUTH="neo4j/${AGENT_MEMORY_NEO4J_PASSWORD:?Set a Neo4j password in .env}"
+docker pull neo4j:5.26.2
+docker run -d --name agent-memory-neo4j \
+  -p 127.0.0.1:7474:7474 -p 127.0.0.1:7687:7687 \
+  --env NEO4J_AUTH \
+  --volume agent-memory-neo4j-data:/data \
+  neo4j:5.26.2
+unset NEO4J_AUTH
+
+docker logs --tail 30 agent-memory-neo4j
+docker exec agent-memory-neo4j bash -c \
+  'cypher-shell -u neo4j -p "${NEO4J_AUTH#neo4j/}" "RETURN 1;"'
+docker image inspect neo4j:5.26.2 --format '{{index .RepoDigests 0}}'
 ```
 
-This does not modify the existing Claude/Zep `.venv`.
+Allow Neo4j to finish starting before the `RETURN 1` check. Set
+`AGENT_MEMORY_NEO4J_URI=bolt://localhost:7687`,
+`AGENT_MEMORY_NEO4J_USER=neo4j`, `AGENT_MEMORY_NEO4J_DATABASE=neo4j`, and
+`AGENT_MEMORY_NEO4J_IMAGE=neo4j:5.26.2` in `.env`. Set
+`AGENT_MEMORY_NEO4J_IMAGE_DIGEST` to the digest returned by Docker. The
+container keeps its data in the named volume; subsequent starts use
+`docker start agent-memory-neo4j` and the original database password.
+Keep native Graphiti and Agent Memory experiments in separate deployments.
+Mem0's embedded Qdrant driver does not need a separately running service.
 
-## LOCOMO
+## 2. Prepare a dataset bundle
 
-Prepare the fixed rows 26-28, one-question integration smoke:
+Each benchmark has a `prepare` subcommand. Reuse the same prepared bundle
+across system conditions.
+
+### LOCOMO
 
 ```bash
-UV_PROJECT_ENVIRONMENT=.venv-mem0 uv run --extra benchmarks --extra mem0 \
-  python tools/evaluation/locomo.py prepare \
-  --smoke \
-  --bundle-dir .memory-test/bundles/locomo-mem0-smoke
+uv run --extra benchmarks python tools/evaluation/locomo.py prepare \
+  --sample-index 0 --bundle-dir .memory-test/bundles/locomo-s0
 ```
 
-Run Agent Mem0 against that bundle:
+This selects Sample 0 without a row limit. `--dataset-path` selects a local
+dataset file; the default path is populated from the pinned source when needed.
+`--question-numbers` selects questions; `--no-include-adversarial` excludes
+adversarial questions. `--start-row` and `--row-limit` create explicit input
+subsets.
 
-```bash
-UV_PROJECT_ENVIRONMENT=.venv-mem0 uv run --extra benchmarks --extra mem0 \
-  python tools/evaluation/locomo.py run \
-  --bundle-dir .memory-test/bundles/locomo-mem0-smoke \
-  --system mem0-memory \
-  --output-dir .memory-test/runs/locomo-am-mem0
-```
+For integration only, replace the sample selector with `--smoke`; it selects
+fixed rows 26-28 and one question. A subset is not a full-sample score.
 
-Use `--system mem0-enhanced` for the same additive view with LLM-ranked
-retrieval. Its default method is `pairwise-quick`; an explicit
-`--sem-topk-method` selects another LOTUS implementation.
-
-The answer is generated once. `grades.jsonl` stores the official LOCOMO score
-and, for categories 1-4, the Zep judge result as separate scorer rows.
-
-Real runs require `DEEPSEEK_API_KEY`. Zep runs additionally require the
-`AGENT_MEMORY_NEO4J_*` variables. Native Graphiti uses `NEO4J_URI`,
-`NEO4J_USER`, and `NEO4J_PASSWORD` and should point to a separate empty Neo4j
-5.26.2 instance.
-
-### Zep join-map physical execution
-
-Zep declares exclusive semantic grouping in its policy. With
-`rule-join-map`, the compiler compares only changed groups with the current
-view and lowers each changed group to a zero-or-one-target semantic join.
-Fact groups also carry exact source/target endpoint keys, so semantic matching
-never crosses those deterministic partitions.
-
-The policy does not choose how the bounded semantic join is executed. Select
-that physical access path at run time:
-
-```bash
-uv run --extra benchmarks --extra zep \
-  python tools/evaluation/locomo.py run \
-  --bundle-dir .memory-test/bundles/locomo-s0 \
-  --system zep-memory \
-  --output-dir .memory-test/runs/locomo-zep-join-map \
-  --grouped-agg-rule rule-join-map \
-  --sem-join-topk-method listwise \
-  --semantic-pair-profile-config /path/to/zep-site-profiles.json \
-  --lotus-cache-mode disabled \
-  --embedding-device cuda \
-  --semantic-trace-snapshot-mode compact
-```
-
-`--sem-join-topk-method` accepts `listwise`, `pairwise-naive`,
-`pairwise-quick`, or `pairwise-heap`. It is currently valid only for Zep when
-`--grouped-agg-rule` is `join-map` or `rule-join-map`. The policy still contains
-the same `sem_join(k=1)` expression; this flag changes only how the adapter
-resolves that join.
-
-`--semantic-pair-profile-config` binds Search-Filter or Proxy-Only profiles to
-stable semantic predicate site IDs:
-
-```json
-{
-  "schema_version": 1,
-  "bindings": [
-    {
-      "site_id": "sem_join:<entity-site-digest>",
-      "mode": "search-filter",
-      "top_k": 15,
-      "min_similarity": 0.6
-    },
-    {
-      "site_id": "sem_join:<fact-site-digest>",
-      "mode": "search-filter",
-      "top_k": 10,
-      "min_similarity": null
-    },
-    {
-      "site_id": "sem_filter:<contradiction-site-digest>",
-      "mode": "search-filter",
-      "top_k": 10,
-      "min_similarity": null
-    }
-  ]
-}
-```
-
-Replace the placeholders with site IDs inventoried from the exact compiled
-policy revision; do not copy digests between revisions by hand. Unknown,
-duplicate, or drifted sites fail before model and storage initialization.
-Site-level config is mutually exclusive with the global
-`--semantic-pair-profile`, `--semantic-pair-top-k`, and
-`--semantic-pair-min-similarity` options.
-
-Prompt construction is a separate physical layer from candidate selection.
-Enable it for the whole LOTUS execution path with one option:
-
-```bash
---prompt-batch-size all
---prompt-batch-size 8
-```
-
-Omitting the option preserves the existing LOTUS prompts. `all` places all
-currently ready, independent tasks from one operator invocation into one
-prompt, unless the model context requires deterministic chunks. A positive
-integer caps each prompt at that many tasks. Search-Filter still runs first, so
-only selected candidates enter a prompt. The setting covers semantic filters,
-maps, flat maps, pairwise joins, pairwise group comparisons, multi-anchor
-top-k joins, and semantic aggregate groups. A direct listwise `sem_topk` is
-already one ranking task; delegated LOTUS pairwise ranking keeps its own
-algorithm-specific comparison schedule.
-
-This option changes prompt construction, so it is explicit opt-in and enters
-the maintenance/checkpoint identity. Operators validate every returned task ID
-and output schema. Syntax-only JSON repairs are recorded; missing, duplicate,
-unknown, or malformed task results fail instead of being guessed.
-
-Structural validation does not make prompt batching semantics-preserving. A
-packed request can return valid JSON while making different semantic decisions
-from the same tasks sent in smaller prompts. The current Claude/Mem0/Zep smoke
-did not establish a universal best batch size, and larger tested batches caused
-material quality loss in at least one policy. Treat every
-`--prompt-batch-size` value as a separate experiment condition; do not use
-`all` as a general default.
-
-Semantic aggregate provider dispatch remains a separate control:
-
-- `--sem-agg-dispatch provider-batched` keeps every per-group prompt unchanged
-  but submits ready prompts together through the LOTUS LM batch interface.
-
-`--sem-agg-dispatch provider-batched` and `--prompt-batch-size` are mutually
-exclusive. The former sends several unchanged prompts in one provider call;
-the latter puts several tasks inside one prompt. Both are disabled by default.
-
-`--refresh-every N` controls when source rows enter the maintenance DAG. Its
-default is `1`, which preserves one eager refresh per event. A value greater
-than one buffers normalized rows and publishes each full batch as one atomic
-delta; the benchmark flushes the final partial batch after the last event and
-before retrieval. That final flush remains inside the last event's insertion
-timing, so it is not hidden as unreported cleanup work.
-
-Count refresh is independent of prompt batching and provider request batching.
-It changes the physical execution identity and checkpoint contract. Resume
-must use the same `--refresh-every` value; intermediate dataset session
-boundaries do not force an early refresh.
-
-The remaining flags belong to separate physical layers:
-
-- `--lotus-cache-mode disabled|memory` controls LOTUS's process-local exact
-  cache. `memory` is an independent experiment condition and is not the same as
-  DeepSeek provider prompt caching.
-- `--embedding-device cpu|cuda` selects where the configured embedding model
-  runs. It does not choose or change the embedding model.
-- `--semantic-trace-snapshot-mode compact|full` controls trace detail.
-  `compact` keeps pair decisions and accounting without full intermediate
-  DataFrame snapshots; use `full` only for bounded debugging.
-
-These physical settings enter run provenance and checkpoint identity. Do not
-restore a checkpoint under a different join resolver, site profile, cache mode,
-embedding device, or trace contract.
-
-## LongMemEval v1
-
-Prepare selected complete questions from the pinned cleaned 500-question
-dataset:
+### LongMemEval
 
 ```bash
 uv run --extra benchmarks python tools/evaluation/longmemeval.py prepare \
-  --question-ids 852ce960 \
-  --bundle-dir .memory-test/bundles/longmemeval-smoke
+  --question-ids 852ce960 --bundle-dir .memory-test/bundles/longmemeval-selected
 ```
 
-Omit `--question-ids` only when intentionally preparing all 500 cases. Normal
-benchmark bundles always contain complete case histories.
+This prepares the complete history for the selected question. Omit
+`--question-ids` to prepare all cases in the pinned cleaned 500-question
+dataset. `--dataset-path` selects a local dataset file.
 
-Before a paid pilot, `--smoke` prepares one fixed integration-only prefix:
+`--smoke` instead prepares a fixed first-session prefix with annotated
+evidence. It tests the pipeline, not LongMemEval accuracy over complete
+histories.
 
-```bash
-uv run --extra benchmarks python tools/evaluation/longmemeval.py prepare \
-  --smoke \
-  --bundle-dir .memory-test/bundles/longmemeval-integration-smoke
-```
-
-This is case `8aef76bc` through its first complete session: 8 of 492 events.
-The prefix contains that question's annotated evidence, but omits later
-distractors. Its answer and grade validate the E2E pipeline only and must not be
-reported as LongMemEval accuracy. No arbitrary event-limit option is provided.
-
-Run the ClaudeMemory policy. LongMemEval's native Claude condition is not
-launched from this repository:
-
-```bash
-uv run --env-file /path/to/.env --extra benchmarks --extra zep \
-  python tools/evaluation/longmemeval.py run \
-  --bundle-dir .memory-test/bundles/longmemeval-smoke \
-  --memory-model deepseek/deepseek-v4-flash \
-  --answer-model deepseek/deepseek-v4-flash \
-  --judge-model deepseek/deepseek-v4-flash \
-  --output-dir .memory-test/runs/longmemeval-claude
-```
-
-Use `--system mem0-memory` from `.venv-mem0` for Base cosine retrieval, or
-`--system mem0-enhanced` for semantic top-k retrieval. Both reject grouped-rule
-options. Base rejects `--sem-topk-method`; Enhanced accepts it and defaults to
-`pairwise-quick`.
-
-Successful runs also write `official_hypotheses.jsonl` so the official
-evaluator can be run later without repeating memory insertion or answering.
-
-The 30-case matrix inserts each maintenance condition once, then reuses its
-read-only checkpoint for two retrieval methods:
-
-```bash
-# Maintenance checkpoints
-uv run python tools/evaluation/longmemeval.py run \
-  --bundle-dir .memory-test/bundles/longmemeval-30 \
-  --output-dir .memory-test/runs/JM-maintenance \
-  --grouped-agg-rule rule-join-map --maintenance-only
-
-uv run python tools/evaluation/longmemeval.py run \
-  --bundle-dir .memory-test/bundles/longmemeval-30 \
-  --output-dir .memory-test/runs/RG-maintenance \
-  --grouped-agg-rule rule-re-group --maintenance-only
-
-# JM-Q; use listwise and JM-L for the sibling run.
-uv run python tools/evaluation/longmemeval.py run \
-  --bundle-dir .memory-test/bundles/longmemeval-30 \
-  --output-dir .memory-test/runs/JM-Q \
-  --grouped-agg-rule rule-join-map \
-  --sem-topk-method pairwise-quick \
-  --maintenance-checkpoint-output-dir .memory-test/runs/JM-maintenance
-```
-
-Repeat the last command for `JM-L`, `RG-Q`, and `RG-L`. A JM checkpoint cannot
-be restored by RG, while quick and listwise intentionally share the matching
-maintenance state.
-
-Memory, answer, and judge models are separate run contracts. The default judge
-uses the official LongMemEval prompts with DeepSeek V4 Flash; its scorer ID
-names that model and is not reported as the official GPT-4o metric.
-
-## MemoryAgentBench
-
-The adapter, task registry, scorers, and CLI below are an implementation
-foundation. They have offline contract coverage, but the four memory systems
-have not all completed the real four-source smoke; do not describe this as a
-finished cross-system benchmark.
-
-Prepare one complete case and one question for each of the four official
-capability classes:
+### MemoryAgentBench
 
 ```bash
 uv run --extra benchmarks python tools/evaluation/memory_agent_bench.py prepare \
-  --smoke \
-  --bundle-dir .memory-test/bundles/mab-smoke
+  --smoke --bundle-dir .memory-test/bundles/mab-smoke
 ```
 
-`--smoke` selects EventQA 64k, ICL Banking77, DetectiveQA, and
-FactConsolidation SH 6k. It preserves the official 4096-token sentence-aligned
-chunks. Use `--sources ...` for an explicit source selection; omit both only
-when intentionally preparing every pinned source.
+The smoke selects one complete case and one question for each capability class:
+EventQA 64k, ICL Banking77, DetectiveQA, and FactConsolidation SH 6k.
+Preparation uses the dataset's 4096-token sentence-aligned chunks.
+Use `--sources` for explicit sources; omit both selectors for all pinned
+sources. `--dataset-dir`, `--max-cases-per-source`, and
+`--max-questions-per-case` control local data and selection.
 
-Run a built-in policy:
+## 3. Select a system and run
+
+Use the matching runner and bundle. Here are the same basic commands for each
+benchmark:
 
 ```bash
-uv run --env-file /path/to/.env --extra benchmarks --extra zep \
+uv run --env-file .env --extra benchmarks --extra zep \
+  python tools/evaluation/locomo.py run \
+  --bundle-dir .memory-test/bundles/locomo-s0 \
+  --memory-model deepseek/deepseek-flash \
+  --answer-model deepseek/deepseek-flash \
+  --judge-model deepseek/deepseek-flash \
+  --system claude-memory --output-dir .memory-test/runs/locomo-claude
+
+uv run --env-file .env --extra benchmarks --extra zep \
+  python tools/evaluation/longmemeval.py run \
+  --bundle-dir .memory-test/bundles/longmemeval-selected \
+  --memory-model-id deepseek-flash \
+  --memory-model deepseek/deepseek-flash \
+  --answer-model deepseek/deepseek-flash \
+  --judge-model deepseek/deepseek-flash \
+  --system claude-memory --output-dir .memory-test/runs/longmemeval-claude
+
+uv run --env-file .env --extra benchmarks --extra zep \
   python tools/evaluation/memory_agent_bench.py run \
   --bundle-dir .memory-test/bundles/mab-smoke \
-  --system claude-memory \
-  --output-dir .memory-test/runs/mab-claude
+  --model deepseek/deepseek-flash \
+  --system claude-memory --output-dir .memory-test/runs/mab-claude
 ```
 
-For Agent Mem0, run the same command from `.venv-mem0` with
-`--system mem0-memory` or `--system mem0-enhanced`. Each case owns a separate
-embedded Qdrant path; chunks are injected once and all questions reuse that
-state. A maintenance-only Mem0 checkpoint can feed both retrieval recipes
-because both policies declare the same maintenance identity and storage mapping.
-
-## Native Claude
-
-Native Claude independently reads the same pinned dataset and fixed case IDs:
+For Zep, change `--system` to `zep-memory` and use a distinct output directory
+after configuring Neo4j. For either Mem0 variant, use the same workflow with
+the Mem0 environment and selector:
 
 ```bash
-bun run tools/native-memory-benchmarks/longmemeval.ts \
-  --dataset-path /path/to/longmemeval_s_cleaned.json \
-  --output-dir .memory-test/longmemeval-native-30
+UV_PROJECT_ENVIRONMENT=.venv-mem0 uv run --env-file .env \
+  --extra benchmarks --extra mem0 python tools/evaluation/locomo.py run \
+  --bundle-dir .memory-test/bundles/locomo-s0 \
+  --memory-model deepseek/deepseek-flash \
+  --answer-model deepseek/deepseek-flash \
+  --judge-model deepseek/deepseek-flash \
+  --system mem0-memory --output-dir .memory-test/runs/locomo-mem0
 ```
 
-Resume uses only Native Claude's own session-boundary checkpoint:
+`mem0-enhanced` selects the same maintained fact representation with a
+different retrieval recipe. Substitute either Mem0 selector in the other two
+runner commands in exactly the same way.
+
+These commands explicitly select `deepseek/deepseek-flash`.
+LOCOMO and LongMemEval accept separate memory, answer, and judge model flags;
+MemoryAgentBench uses `--model`. Advanced execution parameters are centralized
+in [Configuration](../../docs/configuration.md). Use a new output directory for
+each changed condition.
+
+### Continue or reuse maintenance
+
+Reissue an unchanged run command to continue its output directory. Completed
+cases are skipped; supported drivers restore the latest compatible checkpoint
+for unfinished cases. Checkpoint boundaries are defined by the task contract
+(for example, session boundaries in LOCOMO), not every successful API call.
+Work after the latest durable checkpoint may repeat. Recovery does not promise
+zero repeated charges, and process-local caches restart cold.
+
+There is no generic `--resume` flag in these CLIs.
+Input, model, and execution identity checks apply when restoring. Do not run
+two writers against one output directory or load untrusted snapshots.
+
+LOCOMO and LongMemEval can save a completed maintenance condition with
+`--maintenance-only`. A separate run can use
+`--maintenance-checkpoint-output-dir <maintenance-output>` to evaluate
+compatible retrieval/answering settings without reinserting the history.
+Do not combine those two flags. MemoryAgentBench does not expose them.
+
+## 4. Inspect results
+
+| Artifact | Purpose |
+| --- | --- |
+| `manifest.json` | Dataset, model, system, and execution identities |
+| `input/*.jsonl` | Normalized cases, events, and questions |
+| `cases/<case_id>/retrieval.jsonl` | Retrieved context |
+| `cases/<case_id>/answers.jsonl` | Saved model answers |
+| `cases/<case_id>/grades.jsonl` | Scorer-specific results |
+| `metrics/summary.json` | Aggregate metrics |
+| `metrics/per_question.csv` | Question-level results |
+| `metrics/provider_usage.csv` | Provider accounting |
+| `trace/` | Phase events, prompts, responses, and diagnostic evidence |
+
+Inspect case completion and scorer IDs before interpreting averages.
+Insertion, retrieval, answering, and grading are separate phases. Token
+workload, cache-hit input, and monetary charges are different quantities;
+unknown usage is not a zero-cost call. Traces may contain personal source text,
+so keep output directories private.
+
+LOCOMO records its benchmark score and the Zep judge as separate scorer rows;
+the judge applies to categories 1-4. LongMemEval uses its official grading
+prompts with the selected judge model and also writes
+`official_hypotheses.jsonl` for external evaluation. A different judge model is
+a different metric condition. MemoryAgentBench uses the scorer appropriate to
+each task. Do not pool incompatible scorer denominators.
+
+## Native systems and comparisons
+
+Run Native Claude, Mem0, or Graphiti from their own execution checkouts and
+record those revisions. Their launchers and service setup are not installed
+by selecting `--system` in this repository. Native Graphiti's `NEO4J_*`
+environment variables are separate from Agent Memory's prefixed variables.
+
+When runs export the shared artifact contract, compare them with:
 
 ```bash
-bun run tools/native-memory-benchmarks/longmemeval.ts \
-  --dataset-path /path/to/longmemeval_s_cleaned.json \
-  --output-dir .memory-test/longmemeval-native-30 \
-  --resume
+uv run python tools/evaluation/compare_memory_systems.py \
+  --run-dir .memory-test/runs/locomo-claude \
+  --run-dir .memory-test/runs/locomo-mem0 \
+  --output-dir .memory-test/comparisons/locomo
 ```
 
-The native runner performs extraction, per-session consolidation, lenient
-retrieval, answering, grading, trace and metrics entirely inside the Claude
-Code checkout.
+The comparison requires matching dataset, normalized input, questions,
+answer contracts, scorers, and model identities. Native outputs must follow
+the shared artifact schema to be read by this command.
 
-## Compare
-
-Comparison first verifies dataset, normalized input, selected cases/questions,
-answer prompt, scorer, and model fingerprints:
+## Offline checks
 
 ```bash
-python tools/evaluation/compare_memory_systems.py \
-  --run-dir /path/to/native-claude \
-  --run-dir /path/to/JM-Q \
-  --run-dir /path/to/JM-L \
-  --run-dir /path/to/RG-Q \
-  --run-dir /path/to/RG-L \
-  --output-dir /path/to/comparison
+uv run python tools/evaluation/locomo.py run --help
+uv run python tools/evaluation/longmemeval.py run --help
+uv run python tools/evaluation/memory_agent_bench.py run --help
+uv run python -m pytest tests/test_benchmark_cli.py tests/test_benchmark_bundle.py
 ```
 
-Mismatched contracts fail instead of producing a misleading score table.
-
-## Artifacts
-
-Every run writes:
-
-```text
-manifest.json
-input/cases.jsonl
-input/events.jsonl
-input/questions.jsonl
-cases/<case_id>/retrieval.jsonl
-cases/<case_id>/answers.jsonl
-cases/<case_id>/grades.jsonl
-trace/events.jsonl
-trace/prompts/
-trace/outputs/
-metrics/summary.json
-metrics/per_question.csv
-metrics/provider_usage.csv
-```
-
-Trace phases are `insertion`, `retrieval`, `answering`, and `grading`.
-Retrieval candidates are artifacts, not fake LLM calls. Completed cases resume;
-failed cases start with a fresh state directory and storage namespace.
-
-Use `uv run python -m pytest` for Python verification. Calling the `pytest`
-console script directly does not reliably include this checkout's `tools`
-package when tests are selected in isolation.
-
-These are real, potentially expensive benchmarks. LongMemEval's smallest
-complete case still contains hundreds of turns, and MAB document chunks can
-produce many graph entities. The runner never truncates evidence, skips memory
-operators, or reports partial smoke results as benchmark accuracy.
-
-The fixed prefix smoke is an integration acceptance test: it proves insertion,
-checkpoint reuse, retrieval, answering, grading, and trace output. It is not a
-LongMemEval score and must not be presented as benchmark accuracy.
+Help and these contract tests validate the CLI and bundle interfaces offline.
