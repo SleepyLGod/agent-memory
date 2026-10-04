@@ -156,12 +156,15 @@ the selected input names for the aggregate result. Explicit names make the
 result schema easier to use downstream. Row-frame `sem_agg` requires explicit
 `output_cols`.
 
-A semantic join accepts `inner`, `left`, `right`, and `outer`. Unmatched
-outer-side rows retain their data with nulls for the opposite side.
-An `on` predicate restricts candidates before semantic matching.
-An optional positive `k` bounds selected targets per anchor; the configured
-resolver determines the supported bounded execution. Ordinary all-pairs
-predicate joins and bounded target selection are distinct execution paths.
+For a `sem_join` declared directly in a maintained memory view, use
+`how="inner"` and `k=None`. An `on` predicate restricts candidates before
+semantic matching.
+
+Static adapter execution and compiler-generated internal joins also support
+`left`, `right`, and `outer`; unmatched outer-side rows retain their data with
+nulls for the opposite side. A positive `k` selects bounded targets per anchor
+through the configured resolver. These execution forms are separate from
+direct semantic-join view maintenance.
 
 `sem_topk` is used in retrieval, where `UserQuery()` is bound at query time.
 Its available ranking algorithms are execution choices. Do not assume a

@@ -29,9 +29,10 @@ UV_PROJECT_ENVIRONMENT=.venv-mem0 uv sync --frozen --extra benchmarks --extra me
 
 Set `DEEPSEEK_API_KEY` in a private `.env` using
 [.env.example](../../.env.example). All `run` commands below make real API
-calls. Preparation may download the pinned datasets and tokenization resources
-but does not run the memory model. Embedding and reranker weights may also be
-downloaded on first use.
+calls. Preparation may download the pinned datasets but does not run the
+memory model. Install MemoryAgentBench's sentence-tokenization resource with
+the command below. Embedding and reranker weights may also be downloaded on
+first use.
 
 ### Zep storage
 
@@ -112,10 +113,18 @@ histories.
 
 ### MemoryAgentBench
 
+Install the sentence-tokenization resource before preparing the bundle:
+
 ```bash
+uv run --extra benchmarks python -m nltk.downloader \
+  -d .memory-test/datasets/nltk punkt_tab
+
 uv run --extra benchmarks python tools/evaluation/memory_agent_bench.py prepare \
   --smoke --bundle-dir .memory-test/bundles/mab-smoke
 ```
+
+The download directory matches the runner's default. For a different location,
+use that path for both the downloader's `-d` and preparation's `--nltk-data-dir`.
 
 The smoke selects one complete case and one question for each capability class:
 EventQA 64k, ICL Banking77, DetectiveQA, and FactConsolidation SH 6k.
@@ -203,13 +212,16 @@ Do not combine those two flags. MemoryAgentBench does not expose them.
 | --- | --- |
 | `manifest.json` | Dataset, model, system, and execution identities |
 | `input/*.jsonl` | Normalized cases, events, and questions |
-| `cases/<case_id>/retrieval.jsonl` | Retrieved context |
-| `cases/<case_id>/answers.jsonl` | Saved model answers |
-| `cases/<case_id>/grades.jsonl` | Scorer-specific results |
+| `cases/<case-directory>/retrieval.jsonl` | Retrieved context |
+| `cases/<case-directory>/answers.jsonl` | Saved model answers |
+| `cases/<case-directory>/grades.jsonl` | Scorer-specific results |
 | `metrics/summary.json` | Aggregate metrics |
 | `metrics/per_question.csv` | Question-level results |
 | `metrics/provider_usage.csv` | Provider accounting |
 | `trace/` | Phase events, prompts, responses, and diagnostic evidence |
+
+Each case directory uses a sanitized case ID followed by an eight-character
+hash suffix. Look under `cases/` for the generated directory names.
 
 Inspect case completion and scorer IDs before interpreting averages.
 Insertion, retrieval, answering, and grading are separate phases. Token
