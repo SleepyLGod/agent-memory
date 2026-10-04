@@ -241,3 +241,37 @@ docs/optimization/*.synctex.gz
 docs/optimization/*.toc
 # docs/optimization/*.pdf
 .github/hooks/dcg.json
+
+# Keep experiment artifacts and working notes local.
+/docs/experiments/*
+
+# Local research and development notes (public guides are tracked separately).
+/docs/design/TODO.md
+/docs/design/assets/user-issued-deletion-update/q7-sem-join-step-by-step.svg
+/docs/design/assets/zep-locomo-s0/comparison-dashboard.png
+/docs/design/assets/zep-locomo-s0/mechanism-and-scaling.png
+/docs/design/assets/zep-locomo-s0/quality-by-category.png
+/docs/design/claude-locomo-s0-report.zh.md
+/docs/design/future-mem-policy.zh.md
+/docs/design/groupby-aggregation-api-rationale.md
+/docs/design/lotus-lowering.md
+/docs/design/mem0-locomo-s0-report.zh.md
+/docs/design/mem0-locomo-s0-searchfilter-report.zh.md
+/docs/design/next-plan-sem-join-and-count-refresh.zh.md
+/docs/design/policy-differentiation-dataflow-runtime.zh.md
+/docs/design/prompt-batching-experiment-plan.zh.md
+/docs/design/proxy-cascade-design.md
+/docs/design/real-online-serving-exploration.zh.md
+/docs/design/sem-bench-ivm.md
+/docs/design/sem-groupby-join-map.zh.md
+/docs/design/sem-ivm-bench-and-bg.zh.md
+/docs/design/user-issued-deletion-update-analysis.zh.md
+/docs/design/v0.0-interface.md
+/docs/design/window.en.md
+/docs/design/window.md
+/docs/design/zep-cost-latency-plan.zh.md
+/docs/design/zep-locomo-s0-report.zh.md
+/docs/design/zep-native-am-alignment.zh.md
+/docs/optimization/incremental-semantic-view-maintenance.pdf
+/docs/optimization/incremental-semantic-view-maintenance.tex
+/docs/reference/rationale-df-mem-views.md
