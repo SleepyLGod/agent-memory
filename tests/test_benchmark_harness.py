@@ -141,7 +141,6 @@ def test_checkpoint_restore_rejects_changed_framework_cache_mode(
         ('{"answer":"Speyer"}', "Speyer"),
         ('```json\n{"answer":"Speyer"}\n```', "Speyer"),
         ("Speyer", "Speyer"),
-        ('{"wrong_field":"schema echo"}', '{"wrong_field":"schema echo"}'),
     ],
 )
 def test_locomo_answer_parser_accepts_structured_or_raw_text(
@@ -165,22 +164,20 @@ def test_locomo_answer_parser_rejects_empty_and_fingerprints_contract() -> None:
     assert contract.fingerprint != previous.fingerprint
 
 
-def test_locomo_schema_echo_is_scored_as_zero_without_special_case() -> None:
+@pytest.mark.parametrize("response", [
+    '{"type":"object","properties":{"answer":{"type":"string"}}}',
+    '{"wrong_field":"schema echo"}',
+    '{"answer":null}',
+    '{"answer":42}',
+    '{"answer":"  "}',
+    '{"answer":',
+    '[{"answer":"Speyer"}]',
+    '```json\n{"wrong_field":"echo"}\n```',
+])
+def test_locomo_invalid_structured_answer_is_not_scored(response: str) -> None:
     contract = locomo_task_contract()
-    question = BenchmarkQuestion(
-        question_id="q167",
-        sample_id="case",
-        question="What is not in memory?",
-        gold_answer="No information available",
-        evidence_event_ids=(),
-        category="5",
-    )
-    schema_echo = '{"type":"object","properties":{"answer":{"type":"string"}}}'
-    answer = contract.answer_parser(schema_echo)
-    assert contract.deterministic_scorer is not None
-
-    assert answer == schema_echo
-    assert contract.deterministic_scorer(question, answer).score == 0.0
+    with pytest.raises(ValueError, match="LOCOMO structured answer"):
+        contract.answer_parser(response)
 
 
 @dataclass
@@ -916,6 +913,27 @@ def test_resume_rejects_changed_semantic_trace_snapshot_mode(tmp_path: Path) -> 
         changed.run(_bundle())
 
 
+def test_resume_accepts_json_safe_contract_values(tmp_path: Path) -> None:
+    provenance = {
+        "source": {"commit": "source", "dirty": False},
+        "runtime": {
+            "python": "3.12",
+            "lotus_execution": {"predicate_reuse_sites": ("site-a",)},
+        },
+    }
+
+    for _ in range(2):
+        BenchmarkRunner(
+            system_contract=_system_contract(),
+            contracts={"task-1": _contract()},
+            driver_factory=lambda case_id, state_dir, trace_dir: _Driver(state_dir),
+            answer_model=_Model(),
+            judge_model=_Model(),
+            artifacts=BenchmarkArtifactStore(tmp_path),
+            runtime_provenance=provenance,
+        ).run(_bundle())
+
+
 def test_retrieval_system_error_scores_zero_and_completed_case_is_skipped(
     tmp_path: Path,
 ) -> None:
@@ -1290,7 +1308,8 @@ def test_control_signal_is_never_converted_to_system_error(tmp_path: Path) -> No
         runner.run(_bundle())
 
 
-def test_invalid_answer_retries_only_current_model_step(tmp_path) -> None:
+@pytest.mark.parametrize("invalid_response", ["", '{"properties":{"answer":{"type":"string"}}}'])
+def test_invalid_answer_retries_only_current_model_step(tmp_path, invalid_response) -> None:
     drivers: list[_Driver] = []
 
     def factory(case_id, state_dir, trace_dir):
@@ -1300,10 +1319,10 @@ def test_invalid_answer_retries_only_current_model_step(tmp_path) -> None:
         drivers.append(driver)
         return driver
 
-    model = _Model(["", "one", "two"])
+    model = _Model([invalid_response, "one", "two"])
     runner = BenchmarkRunner(
         system_contract=_system_contract(),
-        contracts={"task-1": _contract()},
+        contracts={"task-1": replace(_contract(), answer_parser=locomo_task_contract().answer_parser)},
         driver_factory=factory,
         answer_model=model,
         judge_model=model,

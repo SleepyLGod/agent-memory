@@ -140,6 +140,46 @@ def test_zep_event_mapping_is_benchmark_neutral() -> None:
     }
 
 
+def test_zep_driver_keeps_caption_outside_scoring_metadata(tmp_path: Path) -> None:
+    event = replace(
+        _event(),
+        metadata={
+            "blip_caption": "  a cup with a dog face  ",
+            "answer": "scoring-only answer",
+            "evidence": ["scoring-only evidence"],
+        },
+    )
+    memory = _Memory(None)
+    ZepMemoryDriver(memory, trace_dir=tmp_path).add(event)
+
+    assert memory.rows == [{
+        **event_to_zep_log_row(_event()),
+        "content": "user: I moved to Paris.\n"
+        "(description of attached image: a cup with a dog face)",
+    }]
+
+
+@pytest.mark.parametrize("caption", [None, "", "  ", 123, ["not text"]])
+def test_zep_empty_or_invalid_caption_preserves_plain_input(caption: object) -> None:
+    event = replace(_event(), metadata={"blip_caption": caption})
+    assert event_to_zep_log_row(event) == event_to_zep_log_row(_event())
+
+
+def test_zep_caption_contract_cannot_reuse_old_input_identity() -> None:
+    from agent_memory.evaluation.harness import MemorySystemContract
+    from agent_memory.evaluation.run import _BUILT_IN_CONTRACTS
+
+    input_id, retrieval_id = _BUILT_IN_CONTRACTS["zep-memory"]
+    current = MemorySystemContract(
+        system_id="zep-memory", memory_model_id="fake",
+        memory_provider_model_id="fake",
+        input_adapter_id=input_id, retrieval_recipe_id=retrieval_id,
+    )
+    old = replace(current, input_adapter_id="benchmark-event-to-zep-log:v1")
+    assert current.input_adapter_digest != old.input_adapter_digest
+    assert current.maintenance_fingerprint != old.maintenance_fingerprint
+
+
 def test_zep_driver_preserves_native_entity_and_fact_channels(tmp_path) -> None:
     retrieval = RetrievalResult(
         query="Where do I live?",
@@ -656,6 +696,89 @@ def test_zep_run_configures_existing_factory_and_checkpoint_flow(
         == maintenance_dir
     )
     assert captured["closed"] is True
+
+
+@pytest.mark.parametrize(
+    ("strategy", "expected_version"),
+    [
+        ("disabled", None),
+        ("zep-target-state", "zep-target-state-v1"),
+        ("zep-combined", "zep-combined-v2"),
+        ("zep-fact-summary", "zep-fact-summary-v2"),
+        ("zep-representative", "zep-representative-v2"),
+    ],
+)
+@pytest.mark.parametrize("site_options", [False, True])
+def test_run_records_actual_fusion_version(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    strategy: str,
+    expected_version: str | None,
+    site_options: bool,
+) -> None:
+    import agent_memory.evaluation.run as run_module
+
+    captured: dict[str, Any] = {}
+
+    class FakeFactory:
+        def __init__(self, **kwargs: Any) -> None:
+            pass
+
+        @classmethod
+        def from_environment(cls, **kwargs: Any) -> "FakeFactory":
+            return cls(**kwargs)
+
+        def close(self) -> None:
+            pass
+
+        def runtime_provenance(self) -> dict[str, Any]:
+            return {}
+
+    class FakeRunner:
+        def __init__(self, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+        def run(self, bundle: BenchmarkBundle) -> None:
+            pass
+
+    monkeypatch.setattr(run_module, "_require_environment", lambda _system: None)
+    monkeypatch.setattr(run_module, "ZepMemoryDriverFactory", FakeFactory)
+    monkeypatch.setattr(run_module, "BenchmarkRunner", FakeRunner)
+    monkeypatch.setattr(
+        run_module, "collect_runtime_provenance",
+        lambda *args, **kwargs: {"source": {}, "runtime": {}},
+    )
+    monkeypatch.setattr(run_module, "validate_run_provenance", lambda *args, **kwargs: None)
+    bundle = BenchmarkBundle(
+        "locomo",
+        "revision",
+        "sha256",
+        (
+            BenchmarkCase(
+                case_id="case-1",
+                task_id="locomo",
+                events=(_event(),),
+                questions=(BenchmarkQuestion("q1", "case-1", "?", "a", ()),),
+            ),
+        ),
+        {"run_mode": "integration-smoke"},
+    )
+    run_agent_memory_bundle(
+        bundle=bundle,
+        contracts={},
+        system_id="zep-memory",
+        output_dir=tmp_path / "run",
+        memory_provider_model_id="provider-model",
+        grouped_agg_rule="rule-join-map",
+        physical_fusion=strategy,
+        structured_parse_retries=0 if site_options else None,
+    )
+    execution = captured["runtime_provenance"]["runtime"]["lotus_execution"]
+    if expected_version is None:
+        assert "fusion_version" not in execution
+    else:
+        assert execution["fusion_version"] == expected_version
+        assert expected_version in captured["system_contract"].maintenance_execution_id
 
 
 def test_run_records_and_propagates_count_refresh_contract(

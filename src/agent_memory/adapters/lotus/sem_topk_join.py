@@ -12,6 +12,7 @@ import pandas as pd
 from agent_memory.adapters.lotus.context import LotusExecutionContext
 from agent_memory.adapters.lotus.prompt_batching import (
     ParsedPromptBatch,
+    PromptBatching,
     PromptBatchItem,
     PromptBatchRequest,
     run_prompt_batches,
@@ -22,6 +23,7 @@ from agent_memory.adapters.lotus.pair_execution import (
     PAIR_RIGHT_ID_COLUMN,
     PAIR_RIGHT_TEXT_COLUMN,
     SemanticPairExecutionProfile,
+    semantic_pair_site_id,
     select_semantic_pair_candidates,
     write_semantic_pair_execution_trace,
 )
@@ -94,6 +96,15 @@ def evaluate_sem_topk_join(
     )
 
     method = context.config.sem_join_topk_method
+    site_batching = None
+    if context.config.listwise_join_batching:
+        try:
+            site = semantic_pair_site_id(query)
+        except ValueError:
+            site = ""
+        site_batching = context.config.listwise_join_batching.get(site)
+    if site_batching is not None and profile is not None and profile.mode == "proxy-only":
+        raise ValueError("site listwise batching cannot replace proxy-only decisions")
     if profile is not None and profile.mode == "proxy-only":
         join_results = _proxy_topk(candidates, scores=scores, k=k)
         method = "proxy-only"
@@ -106,6 +117,7 @@ def evaluate_sem_topk_join(
             right_label=right_label,
             k=k,
             context=context,
+            prompt_batching=site_batching,
         )
     else:
         join_results = _pairwise_topk(
@@ -127,6 +139,7 @@ def evaluate_sem_topk_join(
         "oracle_candidate_count": len(candidates),
         "selected_pair_count": len(join_results),
         "structured_retry_count": retry_count,
+        **({"listwise_join_batching": site_batching.to_dict()} if site_batching is not None else {}),
     }
 
 
@@ -172,6 +185,7 @@ def _listwise_topk(
     right_label: str,
     k: int,
     context: LotusExecutionContext,
+    prompt_batching: PromptBatching | None = None,
 ) -> tuple[list[tuple[Any, Any, str | None]], int]:
     """Resolve zero-to-k right matches for each left row in listwise batches."""
 
@@ -190,19 +204,29 @@ def _listwise_topk(
         right_label=right_label,
         k=k,
     )
-    if context.config.prompt_batching is not None:
+    from agent_memory.adapters.lotus.identity_reuse import current_identity_decisions
+    decisions = current_identity_decisions.get()
+    all_tasks = tasks
+    keys = {task.task_id: decisions.key("listwise-v1", task.prompt, k) for task in tasks} if decisions else {}
+    cached = {task.left_id: tuple(list(task.candidate_positions.values())[i] for i in selected)
+              for task in tasks
+              if decisions is not None
+              and (selected := decisions.lookup(keys[task.task_id], len(task.candidate_positions))) is not None}
+    tasks = [task for task in tasks if task.left_id not in cached]
+    batching = prompt_batching or context.config.prompt_batching
+    if batching is not None:
         task_by_id = {task.task_id: task for task in tasks}
         execution = run_prompt_batches(
             tasks,
             task_id=lambda task: task.task_id,
-            build_request=_build_listwise_batch_request,
+            build_request=_build_compact_listwise_request if prompt_batching is not None else _build_listwise_batch_request,
             parse_results=lambda raw_output: _parse_listwise_prompt_batch(
                 raw_output,
                 tasks=task_by_id,
                 k=k,
             ),
             model=lm,
-            config=context.config.prompt_batching,
+            config=batching,
             output_schema=_listwise_batch_schema(),
             structured_output_transport=context.config.structured_output_transport,
             max_retries=context.config.structured_parse_retries,
@@ -226,6 +250,13 @@ def _listwise_topk(
             max_retries=context.config.structured_parse_retries,
         )
 
+    if decisions is not None:
+        for task in tasks:
+            positions = list(task.candidate_positions.values())
+            decisions.store(keys[task.task_id], len(positions),
+                            [positions.index(p) for p in selected_by_left[task.left_id]])
+    selected_by_left.update(cached)
+    tasks = all_tasks
     selected_positions = {
         position
         for positions in selected_by_left.values()
@@ -239,7 +270,7 @@ def _listwise_topk(
             {
                 "operator": "sem_join",
                 "instruction": instruction,
-                "decision_source": "listwise",
+                "decision_source": "identity-reuse" if row[PAIR_LEFT_ID_COLUMN] in cached else "listwise",
                 "left_id": row[PAIR_LEFT_ID_COLUMN],
                 "right_id": row[PAIR_RIGHT_ID_COLUMN],
                 "left": row[PAIR_LEFT_TEXT_COLUMN],
@@ -386,6 +417,27 @@ def _listwise_batch_schema() -> dict[str, Any]:
         "required": ["results"],
         "additionalProperties": False,
     }
+
+
+def _build_compact_listwise_request(tasks: tuple[_ListwiseTask, ...]) -> PromptBatchRequest:
+    """Share only the instruction; each anchor retains its own candidate domain."""
+    payloads = [json.loads(task.prompt[1]["content"]) for task in tasks]
+    instruction = payloads[0]["join_condition"]
+    if any(payload["join_condition"] != instruction for payload in payloads):
+        raise ValueError("listwise tasks must share the same instruction")
+    payload = {
+        "join_condition": instruction,
+        "tasks": [{"task_id": task.task_id, **{key: item[key] for key in
+                  ("max_matches", "left", "right_candidates")}}
+                  for task, item in zip(tasks, payloads, strict=True)],
+        "output_schema": {"results": [{"task_id": "task_id", "selected_ids": ["candidate_id"]}]},
+    }
+    return PromptBatchRequest(
+        task_ids=tuple(task.task_id for task in tasks),
+        prompt=[{"role": "system", "content": LISTWISE_JOIN_SYSTEM_PROMPT + " " + LISTWISE_JOIN_BATCH_SYSTEM_PROMPT},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)}],
+        max_tokens=LISTWISE_JOIN_MAX_TOKENS,
+    )
 
 
 def _build_listwise_batch_request(

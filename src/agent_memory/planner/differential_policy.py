@@ -7,7 +7,7 @@ import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
-from agent_memory.policy.aggregates import SemanticAggregateSpec
+from agent_memory.policy.aggregates import ArgMinAggregateSpec, SemanticAggregateSpec
 from agent_memory.policy.logical import MemorySpec, MemoryView, QueryExpr
 from agent_memory.policy.retrieval import RetrievalQuery
 from agent_memory.policy.schema import output_columns
@@ -370,7 +370,8 @@ class _DifferentialPolicyBuilder:
         semantic = query.op == "sem_agg" or (
             query.op == "agg"
             and any(
-                isinstance(specification, SemanticAggregateSpec)
+                (isinstance(specification, SemanticAggregateSpec)
+                 or (grouped.op == "sem_groupby" and isinstance(specification, ArgMinAggregateSpec)))
                 for specification in query.params.get("aggregates", ())
             )
         )

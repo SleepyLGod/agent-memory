@@ -346,6 +346,7 @@ class BenchmarkArtifactStore:
             expected["answer_parser_contracts"] = dict(
                 sorted(answer_parser_contracts.items())
             )
+        expected = _json_safe(expected)
         manifest_path = self.output_dir / "manifest.json"
         if manifest_path.exists():
             actual = json.loads(manifest_path.read_text(encoding="utf-8"))
