@@ -8,6 +8,7 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
+    "docetl==0.3.0",
     "dspy>=3.2.0",
     "json5>=0.14.0",
     "lotus-ai==1.1.4",
