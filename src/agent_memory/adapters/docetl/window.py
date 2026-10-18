@@ -1,9 +1,4 @@
-"""Deterministic count-window lowering for the DocETL adapter.
-
-Copied from ``adapters/lotus/window.py`` rather than shared with it, so the two adapters can
-change without touching each other. Fully deterministic: the runtime drives the window loop and
-this module only binds window-local inputs.
-"""
+"""Count-window lowering, copied from `adapters/lotus/window.py` rather than shared."""
 
 from __future__ import annotations
 

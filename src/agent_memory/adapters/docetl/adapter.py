@@ -1,11 +1,4 @@
-"""DocETL execution adapter: runs the runtime's logical query expressions on DocETL, one operator
-at a time, alongside the LOTUS adapter — a policy runs on either backend by swapping this one in.
-
-The engine-backed (semantic) operators are not implemented yet, so executing one raises a clear
-error naming the operator rather than failing deep inside a run. What is implemented is the
-adapter's shape — config, dispatch registry, runner handle, checkpoint fingerprint, trace hook —
-plus the engine-free operators, which bind runtime frames rather than compute on them.
-"""
+"""DocETL execution adapter: the runtime's logical query expressions, run on DocETL."""
 
 from __future__ import annotations
 
@@ -15,10 +8,11 @@ from hashlib import sha256
 from typing import Any
 
 from agent_memory.adapters.docetl.context import (
-    DEFAULT_DOCETL_MODEL,
     DocetlExecutionConfig,
     DocetlExecutionContext,
+    default_docetl_model,
 )
+from agent_memory.adapters.docetl.sem_filter import execute_sem_filter
 from agent_memory.adapters.docetl.sources import execute_log, execute_materialized_view
 from agent_memory.adapters.docetl.window import (
     execute_count_window,
@@ -38,13 +32,9 @@ Handler = Callable[[QueryExpr, Mapping[str, Any]], Any]
 
 @dataclass
 class DocetlAdapter:
-    """Execution adapter targeting DocETL's operation classes.
+    """Execution adapter that lowers each operator onto a DocETL operation class."""
 
-    Beyond `execute`, the runtime reads `maintenance_execution_fingerprint` when it saves and
-    restores checkpoints, to decide whether stored state is still valid.
-    """
-
-    model: str = DEFAULT_DOCETL_MODEL
+    model: str = field(default_factory=default_docetl_model)
     config: DocetlExecutionConfig = field(default_factory=DocetlExecutionConfig)
     pair_embedding_provider: EmbeddingProvider | None = None
     _context: DocetlExecutionContext = field(init=False, repr=False)
@@ -76,12 +66,7 @@ class DocetlAdapter:
         return sha256(payload.encode("utf-8")).hexdigest()
 
     def execute(self, query: QueryExpr, inputs: Mapping[str, Any]) -> Any:
-        """Execute one logical query expression.
-
-        The contract the runtime relies on: return a frame with exactly the planner's
-        `output_columns`, preserve the input index for row-local semantics, and never mutate
-        `inputs` — the runtime reuses those frames for other nodes.
-        """
+        """Dispatch to the registered lowering; the frame contract is `ExecutionAdapter.execute`'s."""
 
         handler = self._handlers.get(query.op)
         if handler is None:
@@ -104,8 +89,9 @@ class DocetlAdapter:
         """Return the operator registry.
 
         The backend-neutral operators are duplicated from `adapters/lotus/` rather than shared,
-        so the two adapters can change without touching each other. The engine-backed (semantic)
-        operators are not registered yet.
+        so the two adapters can change without touching each other. Engine-backed operators are
+        registered one at a time as their lowering lands, so an operator missing here raises
+        rather than returns something unvalidated.
         """
 
         return {
@@ -117,6 +103,9 @@ class DocetlAdapter:
             ),
             "process_window": lambda query, inputs: execute_process_window(
                 query, inputs, self.execute
+            ),
+            "sem_filter": lambda query, inputs: execute_sem_filter(
+                query, inputs, self.execute, self._context
             ),
         }
 

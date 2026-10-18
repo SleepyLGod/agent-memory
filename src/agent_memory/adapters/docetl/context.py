@@ -1,21 +1,29 @@
-"""DocETL execution context: the shared runner handle and its backend config.
-
-Mirrors ``adapters/lotus/context.py`` in shape: the model lives on the adapter, backend knobs
-live in a frozen config dataclass, and provider secrets stay in the environment. The engine
-handle itself is **lazy** so that constructing an adapter is free and no DocETL machinery is
-touched until an engine-backed operation actually runs.
-
-`docetl` is imported lazily on purpose: importing it at module scope would create DocETL's
-module-global disk cache and pull in the retriever dependency.
-"""
+"""DocETL execution context: the shared runner handle and its backend config."""
 
 from __future__ import annotations
 
+import os
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+# Reason: litellm reads a model string's prefix as the provider, which fixes both the endpoint and
+#   which environment variable holds the key (`litellm.utils::get_llm_provider`), so a model literal
+#   on its own cannot describe a provider — the endpoint has to move with it.
+# Required by: `DocetlAdapter.model` and `DocetlExecutionConfig.lm_api_base`, which resolve these at
+#   construction rather than at import, so one process can point them somewhere else per case.
+DOCETL_MODEL_ENV = "AGENT_MEMORY_DOCETL_MODEL"
+DOCETL_API_BASE_ENV = "AGENT_MEMORY_DOCETL_API_BASE"
+
+# what remains when the environment names nothing, and the same literal `LotusAdapter` defaults to
 DEFAULT_DOCETL_MODEL = "deepseek/deepseek-v4-pro"
+
+
+def default_docetl_model() -> str:
+    """Return the model to use: the environment's if it names one, else the literal default."""
+
+    return os.getenv(DOCETL_MODEL_ENV) or DEFAULT_DOCETL_MODEL
 
 # `DSLRunner` only needs these keys when it is used purely as a handle: `runner.run()` is never
 # called, so no pipeline output path or dataset is required.
@@ -35,12 +43,23 @@ class DocetlExecutionConfig:
     therefore set on the runner unless `enable_cache` is explicitly turned on. `skip_on_error`
     stays `False` so a failing row fails the run instead of disappearing.
 
-    The uniform op-level knobs (`timeout`, `litellm_completion_kwargs`,
-    `num_retries_on_validate_failure`, `validate`, `gleaning`) and the per-op-type field layout
-    are not exposed yet; they are wired together with the operations.
+    Both the model and `lm_api_base` are read from the environment when not passed, because a model
+    string's prefix selects the provider, and the provider decides which endpoint and which
+    credential are correct — so the two are one decision and are resolved together.
+
+    The uniform op-level knobs (`timeout`, `num_retries_on_validate_failure`, `validate`,
+    `gleaning`) and the per-op-type field layout are not exposed yet; they are wired together with
+    the operations.
     """
 
-    lm_api_base: str | None = None
+    lm_api_base: str | None = field(
+        default_factory=lambda: os.getenv(DOCETL_API_BASE_ENV)
+    )
+    # Reason: temperature and the reasoning switches are only pinnable through litellm, and DocETL
+    #   forwards exactly this key per operation (`docetl.operations.map::MapOperation.__init__`), so the
+    #   name is DocETL's rather than ours. Empty by default: a knob left unset is the adapter's choice,
+    #   not a policy's.
+    litellm_completion_kwargs: Mapping[str, Any] = field(default_factory=dict)
     enable_cache: bool = False
     skip_on_error: bool = False
     max_threads: int = 1
@@ -85,7 +104,7 @@ class DocetlExecutionContext:
     operation instances we construct ourselves.
     """
 
-    model: str = DEFAULT_DOCETL_MODEL
+    model: str = field(default_factory=default_docetl_model)
     config: DocetlExecutionConfig = field(default_factory=DocetlExecutionConfig)
     _handle: Any = field(default=None, init=False, repr=False)
 

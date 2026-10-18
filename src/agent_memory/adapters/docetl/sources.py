@@ -1,9 +1,4 @@
-"""DocETL adapter source binding helpers.
-
-Copied from ``adapters/lotus/sources.py`` rather than shared with it, so the two adapters can
-change without touching each other. This module is deterministic and has no engine dependency —
-it only binds runtime inputs.
-"""
+"""Source binding helpers, copied from `adapters/lotus/sources.py` rather than shared."""
 
 from __future__ import annotations
 
