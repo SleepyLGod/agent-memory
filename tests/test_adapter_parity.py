@@ -13,6 +13,7 @@ agrees, not that a real model answers correctly.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import json
 from typing import Any, Iterator, Mapping
 
 import pandas as pd
@@ -20,7 +21,9 @@ import pytest
 from pandas.testing import assert_frame_equal
 
 from agent_memory.adapters import DocetlAdapter, LotusAdapter
-from agent_memory.policy.logical import QueryExpr
+from agent_memory.policy.aggregates import ArrayAggregateSpec
+from agent_memory.policy.expressions import ColumnExpr
+from agent_memory.policy.logical import ColumnSpec, QueryExpr
 
 from adapter_support import (
     CannedEndpoint,
@@ -81,6 +84,219 @@ def _notes_frame() -> pd.DataFrame:
     return _frame()
 
 
+def _source(name: str, frame: pd.DataFrame) -> QueryExpr:
+    """A materialized view over `frame` that declares its columns, so schema checks can run."""
+
+    return QueryExpr(
+        op="materialized_view",
+        params={"name": name, "columns": tuple(str(c) for c in frame.columns)},
+    )
+
+
+def _relational_cases() -> list[ParityCase]:
+    """The deterministic operators: no model decides, so the frames must match exactly."""
+
+    rows = pd.DataFrame(
+        {"id": [1, 1, 2], "tag": ["a", "b", "a"], "score": [10, 20, 30]}
+    )
+    named = pd.DataFrame({"id": [1, 2], "name": ["x", "y"]})
+    other = pd.DataFrame({"id": [2, 3], "other": ["p", "q"]})
+    booleans = pd.DataFrame({"keep": [True, False], "tag": ["a", "b"]})
+    arrays = pd.DataFrame(
+        {
+            "id": [1, 2],
+            "items": [json.dumps(["a", "b"]), json.dumps(["c"])],
+            "nested": [json.dumps([["a"], ["b"]]), json.dumps([["c"]])],
+            "object": [json.dumps({"x": 1, "y": 2}), json.dumps({"x": 3, "y": 4})],
+        }
+    )
+    single_array = pd.DataFrame({"items": [json.dumps(["z"])]})
+
+    def case(
+        name: str,
+        query: QueryExpr,
+        inputs: Mapping[str, pd.DataFrame],
+        comparison: str = "exact",
+    ) -> ParityCase:
+        return ParityCase(name=name, query=query, inputs=inputs, comparison=comparison)
+
+    return [
+        case(
+            "select",
+            QueryExpr(
+                op="select",
+                inputs=(_source("rows", rows),),
+                params={"columns": ("id", "tag")},
+            ),
+            {"rows": rows},
+        ),
+        case(
+            "limit",
+            QueryExpr(op="limit", inputs=(_source("rows", rows),), params={"n": 2}),
+            {"rows": rows},
+        ),
+        case(
+            "alias",
+            QueryExpr(op="alias", inputs=(_source("rows", rows),), params={"name": "r"}),
+            {"rows": rows},
+        ),
+        case(
+            "assign scalar",
+            QueryExpr(
+                op="assign",
+                inputs=(_source("rows", rows),),
+                params={"assignments": {"label": "x"}},
+            ),
+            {"rows": rows},
+        ),
+        case(
+            "filter column",
+            QueryExpr(
+                op="filter",
+                inputs=(_source("rows", booleans),),
+                params={"predicate": ColumnExpr("keep").to_param()},
+            ),
+            {"rows": booleans},
+        ),
+        case(
+            "group_by",
+            QueryExpr(
+                op="group_by", inputs=(_source("rows", rows),), params={"keys": ("id",)}
+            ),
+            {"rows": rows},
+        ),
+        case(
+            "let",
+            QueryExpr(
+                op="let",
+                inputs=(_source("rows", rows), _source("bound", named)),
+                params={"name": "bound"},
+            ),
+            # the binding is injected by `let`, so it must not already be an input
+            {"rows": rows},
+        ),
+        case(
+            "concat",
+            QueryExpr(
+                op="concat", inputs=(_source("left", named), _source("right", named))
+            ),
+            {"left": named, "right": named},
+        ),
+        case(
+            "union",
+            QueryExpr(
+                op="union", inputs=(_source("left", named), _source("right", named))
+            ),
+            {"left": named, "right": named},
+        ),
+        case(
+            "union_by_name",
+            QueryExpr(
+                op="union_by_name",
+                inputs=(_source("left", named), _source("right", other)),
+            ),
+            {"left": named, "right": other},
+        ),
+        case(
+            "subtract",
+            QueryExpr(
+                op="subtract", inputs=(_source("left", named), _source("right", named))
+            ),
+            {"left": named, "right": named},
+        ),
+        case(
+            "join hash",
+            QueryExpr(
+                op="join",
+                inputs=(_source("left", named), _source("right", other)),
+                params={"on": ("id",), "how": "inner"},
+            ),
+            {"left": named, "right": other},
+        ),
+        case(
+            "drop_duplicates",
+            QueryExpr(
+                op="drop_duplicates",
+                inputs=(_source("rows", rows),),
+                params={"subset": ("id",)},
+            ),
+            {"rows": rows},
+        ),
+        case(
+            "array_agg",
+            QueryExpr(
+                op="array_agg",
+                inputs=(_source("rows", rows),),
+                params={"columns": ("id",), "output_col": "payload"},
+            ),
+            {"rows": rows},
+        ),
+        case(
+            "min",
+            QueryExpr(
+                op="min",
+                inputs=(_source("rows", rows),),
+                params={"columns": ("score",), "output_col": "lowest"},
+            ),
+            {"rows": rows},
+        ),
+        case(
+            "flatten",
+            QueryExpr(
+                op="flatten", inputs=(_source("rows", arrays),), params={"column": "nested"}
+            ),
+            {"rows": arrays},
+        ),
+        case(
+            "explode",
+            QueryExpr(
+                op="explode", inputs=(_source("rows", arrays),), params={"column": "items"}
+            ),
+            {"rows": arrays},
+        ),
+        case(
+            "unnest",
+            QueryExpr(
+                op="unnest",
+                inputs=(_source("rows", arrays),),
+                params={"column": "object", "fields": (("x", "x"), ("y", "y"))},
+            ),
+            {"rows": arrays},
+        ),
+        case(
+            "array_cat",
+            QueryExpr(
+                op="array_cat",
+                inputs=(
+                    _source("left", single_array),
+                    _source("right", single_array),
+                ),
+                params={"column": "items"},
+            ),
+            {"left": single_array, "right": single_array},
+        ),
+        case(
+            "agg",
+            QueryExpr(
+                op="agg",
+                inputs=(
+                    QueryExpr(
+                        op="group_by",
+                        inputs=(_source("rows", rows),),
+                        params={"keys": ("id",)},
+                    ),
+                ),
+                params={
+                    "aggregates": (
+                        ArrayAggregateSpec(columns=("tag",), output_col="tags"),
+                    )
+                },
+            ),
+            {"rows": rows},
+        ),
+    ]
+
+
 def _engine_free_cases() -> list[ParityCase]:
     """Engine-free operators: both adapters must produce identical frames."""
 
@@ -124,6 +340,7 @@ def _engine_free_cases() -> list[ParityCase]:
             inputs={"log": _frame()},
             comparison="raises",
         ),
+        *_relational_cases(),
     ]
 
 
@@ -234,6 +451,57 @@ def test_an_unusable_answer_diverges_by_design(
     assert docetl_answer.empty, list(docetl_answer.index)
 
 
+def test_sem_map_agrees_through_a_canned_endpoint() -> None:
+    """Both engines add the same column, from the same canned answer, on the same rows."""
+
+    case = ParityCase(
+        name="sem_map",
+        query=QueryExpr(
+            op="sem_map",
+            inputs=(QueryExpr(op="log"),),
+            params={
+                "instruction": "Summarise {note}",
+                "output_cols": (ColumnSpec(name="summary", description="one line"),),
+            },
+        ),
+        inputs={"log": _notes_frame()},
+        comparison="exact",
+        needs_model=True,
+    )
+
+    with canned_model(map_answers={"summary": "canned summary"}) as endpoint:
+        answers = _run(build_adapters(endpoint.base_url), case)
+
+    _assert_agreement(case, answers)
+    assert answers[0]["summary"].tolist() == ["canned summary"] * len(NOTES)
+
+
+def test_sem_flat_map_agrees_through_a_canned_endpoint() -> None:
+    """Both engines expand one input row into the same emitted rows, with the same ordinals."""
+
+    case = ParityCase(
+        name="sem_flat_map",
+        query=QueryExpr(
+            op="sem_flat_map",
+            inputs=(QueryExpr(op="log"),),
+            params={
+                "instruction": "Split {note} into entries",
+                "output_cols": (ColumnSpec(name="entry", description="one entry"),),
+                "ordinal_col": "ord",
+            },
+        ),
+        inputs={"log": _notes_frame()},
+        comparison="exact",
+        needs_model=True,
+    )
+
+    with canned_model(map_rows=({"entry": "a"}, {"entry": "b"})) as endpoint:
+        answers = _run(build_adapters(endpoint.base_url), case)
+
+    _assert_agreement(case, answers)
+    assert answers[0]["entry"].tolist()[:4] == ["a", "b", "a", "b"]
+
+
 def test_sem_filter_agrees_against_the_real_model() -> None:
     """The semantic claim: both backends keep the same rows when a real model answers."""
 
@@ -269,7 +537,12 @@ def test_every_supported_op_has_a_parity_case() -> None:
     decision rather than an oversight.
     """
 
-    covered = {case.query.op for case in _engine_free_cases()} | {"sem_filter"}
+    covered = {case.query.op for case in _engine_free_cases()} | {
+        # each of these has a canned case below, and the parity file is where the engine claim lives
+        "sem_filter",
+        "sem_map",
+        "sem_flat_map",
+    }
     excused = {
         # the window pair is only legal inside a process_window body, and is covered there
         "window_source",

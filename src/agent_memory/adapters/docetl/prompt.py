@@ -1,8 +1,4 @@
-"""Our `{column}` DSL into the Jinja DocETL renders.
-
-The context differs per operation — `input`, `left`/`right`, `inputs`
-(`docetl.operations.utils.validation::strict_render`) — so it is an argument.
-"""
+"""Translate our `{column}` DSL into the Jinja DocETL renders; the context root differs per operation."""
 
 from __future__ import annotations
 

@@ -1,9 +1,4 @@
-"""The `sem_filter` lowering: a row-local semantic predicate onto DocETL's `filter` operation.
-
-DocETL validates an operation's config itself, in the operation's own constructor, so the lowering
-synthesizes that config from a `QueryExpr` and then hands it to the operation. Each operator gets its
-own module, mirroring `adapters/lotus/`.
-"""
+"""The `sem_filter` lowering: a row-local semantic predicate onto DocETL's `filter` operation."""
 
 from __future__ import annotations
 
@@ -11,22 +6,15 @@ from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any
 
 from agent_memory.adapters.docetl.prompt import render_prompt
-from agent_memory.adapters.docetl.records import (
-    from_records,
-    to_records,
-    unused_index_key,
-)
+from agent_memory.adapters.docetl.records import from_records, to_records
+from agent_memory.adapters.docetl.reserved import INDEX_KEY, KEEP_KEY, strip
 from agent_memory.policy.logical import QueryExpr
 
 if TYPE_CHECKING:
     from agent_memory.adapters.docetl.context import DocetlExecutionContext
 
-# Reason: DocETL pops the key it tests out of every row, so the adapter needs a name that a policy
-#   column cannot collide with
-# Required by: the `filter` operation, which reads exactly this key from each row
-#   (`docetl.operations.filter::FilterOperation._handle_result`).
-FILTER_DECISION_KEY = "__agent_memory_keep__"
-
+# Based on: `docetl.operations.filter::FilterOperation._handle_result`, which reads exactly one key from
+#   each row and pops it, so the name is reserved in `records.py` rather than chosen here.
 def build_filter_config(
     query: QueryExpr,
     *,
@@ -48,7 +36,7 @@ def build_filter_config(
         "name": query.op,
         "type": "filter",
         "prompt": prompt,
-        "output": {"schema": {FILTER_DECISION_KEY: "bool"}},
+        "output": {"schema": {KEEP_KEY: "bool"}},
         "skip_on_error": bool(skip_on_error),
     }
     if litellm_completion_kwargs:
@@ -70,7 +58,7 @@ def execute_sem_filter(
     """
 
     source = execute(query.inputs[0], inputs)
-    index_key = unused_index_key(source.columns)
+    index_key = INDEX_KEY
     operation = context.build_operation("filter")(
         context.handle,
         build_filter_config(
@@ -84,4 +72,4 @@ def execute_sem_filter(
     kept, _cost = operation.execute(to_records(source, index_key=index_key))
     # usage is read from the runner's own counters, not from the cost DocETL returns here
     # (`src/agent_memory/adapters/docetl/context.py::DocetlExecutionContext.usage_snapshot`).
-    return from_records(kept, index_key=index_key, columns=source.columns)
+    return strip(from_records(kept, index_key=index_key, columns=source.columns))

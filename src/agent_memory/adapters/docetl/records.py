@@ -1,42 +1,27 @@
-"""Frame ↔ record conversion for DocETL's operators.
+"""Frame ↔ record conversion, and the check that the engine returned a record per row.
 
-DocETL's operators speak ``list[dict]``: no index, and no room for one. The frame index therefore
-travels in a reserved key inside each record, stripped again on the way back.
+DocETL's operators speak `list[dict]`, so the frame index travels in a reserved key and is restored on the
+way back; `require_one_record_per_row` is the guarantee that conversion alone cannot state.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
 import pandas as pd
 
-# Reason: DocETL's operators exchange dicts, not frames, so the index needs a key in the record
-#   (`docetl.operations.base::BaseOperation.execute`, the contract every operator implements).
-# Required by: the runtime's row-local nodes, which file results by row occurrence
-#   (`src/agent_memory/runtime/executor.py::PolicyExecutor._execute_semantic_row`).
-# Based on: the LOTUS adapter's join id columns
-#   (`src/agent_memory/adapters/lotus/relational.py::_unused_column_name`).
-INDEX_KEY_BASE = "__agent_memory_index__"
-
-
-def unused_index_key(columns: Iterable[str]) -> str:
-    """Return an index key that none of `columns` uses, so the carrier cannot overwrite data."""
-
-    taken = set(columns)
-    candidate = INDEX_KEY_BASE
-    while candidate in taken:
-        candidate = f"_{candidate}"
-    return candidate
+from agent_memory.adapters.docetl.reserved import reject_reserved
 
 
 def to_records(frame: pd.DataFrame, *, index_key: str) -> list[dict[str, Any]]:
     """Return `frame` as records, carrying the index under `index_key`.
 
-    `index_key` has to be free, which is what `unused_index_key` is for. A key taken from another
-    frame's columns is caught here rather than overwriting a real column.
+    `index_key` is one of the adapter's reserved names, and a frame carrying any of them is refused rather
+    than worked around: an injected key appears in an operation's prompt schema, so it may not vary per frame.
     """
 
+    reject_reserved(frame.columns)
     if index_key in frame.columns:
         raise ValueError(f"frame already has a column named {index_key!r}")
     if frame.columns.duplicated().any():
@@ -84,3 +69,31 @@ def from_records(
 
     # each column's inferred dtype picks its own missing marker: None, NaN or NaT
     return pd.DataFrame(rows, index=pd.Index(indexes))
+
+
+def require_one_record_per_row(
+    source: pd.DataFrame,
+    records: Sequence[Mapping[str, Any]],
+    *,
+    op: str,
+    index_key: str,
+) -> None:
+    """Raise if the engine returned a different number of records than rows it was given.
+
+    `map` drops a record whose answer fails validation and reports nothing, so this count is the only
+    evidence that a row survived. Counting records rather than emitted rows is what lets a 0..n operator
+    tell "the model emitted nothing" (a record with an empty list) from "the engine dropped the answer"
+    (no record at all).
+    """
+
+    if len(records) == len(source):
+        return
+
+    returned = {record.get(index_key) for record in records}
+    # a repeated index makes the naming ambiguous, so the count stands alone in that case
+    missing = [index for index in source.index if index not in returned]
+    detail = f"; missing {missing}" if missing and len(source) == len(set(source.index)) else ""
+    raise RuntimeError(
+        f"{op} received {len(records)} records for {len(source)} input rows: an answer failed "
+        f"validation and its row was dropped{detail}"
+    )

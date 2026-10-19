@@ -35,6 +35,29 @@ CANNED_MODEL = "openai/canned-model"
 REAL_RUN_ENV = "AGENT_MEMORY_RUN_DOCETL_E2E"
 
 
+def _canned_value(
+    schema: Mapping[str, Any],
+    key: str,
+    *,
+    keeps: bool,
+    malformed: bool,
+    answers: Mapping[str, Any],
+    rows: Sequence[Mapping[str, Any]],
+) -> Any:
+    """Return one value of the type the caller declared, so a map can be answered like a filter."""
+
+    kind = schema.get("type")
+    if malformed:
+        # parses as JSON and fails the declared type: a string where a boolean was asked for, a number
+        # where text was
+        return "maybe" if kind == "boolean" else 123
+    if kind == "boolean":
+        return keeps
+    if kind == "array":
+        return [dict(row) for row in (rows or ())]
+    return answers.get(key, "canned")
+
+
 class _CannedHandler(BaseHTTPRequestHandler):
     """Answer both protocols: LOTUS reads an `Answer:` line, DocETL reads a tool call."""
 
@@ -51,10 +74,19 @@ class _CannedHandler(BaseHTTPRequestHandler):
         )
 
         tools = body.get("tools") or []
-        if tools:
-            properties = tools[0]["function"]["parameters"]["properties"]
-            # parses as JSON, fails the declared type: a validation path without a model answering wrongly
-            answer: object = "maybe" if malformed else keeps
+        properties = tools[0]["function"]["parameters"]["properties"] if tools else {}
+        if properties:
+            arguments = {
+                key: _canned_value(
+                    schema,
+                    key,
+                    keeps=keeps,
+                    malformed=malformed,
+                    answers=server.canned_map_answers,
+                    rows=server.canned_map_rows,
+                )
+                for key, schema in properties.items()
+            }
             message: dict[str, Any] = {
                 "role": "assistant",
                 "content": None,
@@ -64,14 +96,32 @@ class _CannedHandler(BaseHTTPRequestHandler):
                         "type": "function",
                         "function": {
                             "name": tools[0]["function"]["name"],
-                            "arguments": json.dumps(
-                                {key: answer for key in properties}
-                            ),
+                            "arguments": json.dumps(arguments),
                         },
                     }
                 ],
             }
             finish = "tool_calls"
+        elif server.canned_map_rows is not None:
+            # LOTUS asks for emitted rows under a `rows` key (`lotus/structured.py::FLAT_MAP_ROWS_FIELD`)
+            message = {
+                "role": "assistant",
+                "content": json.dumps(
+                    {"rows": [dict(row) for row in server.canned_map_rows]}
+                ),
+            }
+            finish = "stop"
+        elif server.canned_map_answers:
+            values = list(server.canned_map_answers.values())
+            message = {
+                "role": "assistant",
+                "content": (
+                    str(values[0])
+                    if len(values) == 1
+                    else json.dumps(dict(server.canned_map_answers))
+                ),
+            }
+            finish = "stop"
         else:
             message = {
                 "role": "assistant",
@@ -119,8 +169,14 @@ class CannedEndpoint:
 def canned_model(
     *keep_markers: str,
     malformed_markers: Sequence[str] = (),
+    map_answers: Mapping[str, Any] | None = None,
+    map_rows: Sequence[Mapping[str, Any]] | None = None,
 ) -> Iterator[CannedEndpoint]:
     """Serve canned completions; a request carrying a keep marker is kept.
+
+    `map_answers` and `map_rows` answer a column-filling operator — a value per declared column, or the
+    rows a flat map should emit — because such a request cannot be answered with a verdict. Passing an
+    empty `map_rows` is how the "emits nothing" case is served.
 
     `OPENAI_API_KEY` is set for the duration and restored afterwards, so a free run cannot leave a
     placeholder key behind for a billed one.
@@ -132,6 +188,10 @@ def canned_model(
     server = ThreadingHTTPServer(("127.0.0.1", 0), _CannedHandler)
     server.canned_keep_markers = tuple(keep_markers)  # type: ignore[attr-defined]
     server.canned_malformed_markers = tuple(malformed_markers)  # type: ignore[attr-defined]
+    server.canned_map_answers = dict(map_answers or {})  # type: ignore[attr-defined]
+    server.canned_map_rows = (  # type: ignore[attr-defined]
+        None if map_rows is None else tuple(dict(row) for row in map_rows)
+    )
     server.canned_refuse = False  # type: ignore[attr-defined]
     server.canned_requests = []  # type: ignore[attr-defined]
     Thread(target=server.serve_forever, daemon=True).start()

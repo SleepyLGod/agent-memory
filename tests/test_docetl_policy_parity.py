@@ -11,8 +11,9 @@ This is the home for every operator's policy case: adding one means adding a `Po
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from typing import Any
 from pathlib import Path
 import pandas as pd
 from pandas.testing import assert_frame_equal
@@ -44,16 +45,45 @@ class _SemFilterNotes(Memory):
     kept = log.sem_filter(instruction=FILTER_INSTRUCTION)
 
 
+class _SummarisedNotes(Memory):
+    """A memory whose entire policy is one semantic column fill."""
+
+    log = Log({"message": "One short note the user typed."})
+
+    summarised = log.sem_map(
+        output_cols={"summary": "One line, no longer than a sentence."},
+        instruction="Summarise the note in one line: {message}",
+    )
+
+
+class _SplitNotes(Memory):
+    """A memory whose policy splits each note into numbered parts."""
+
+    log = Log({"message": "One short note the user typed."})
+
+    split = log.sem_flat_map(
+        output_cols={"part": "One clause of the note."},
+        instruction="Split the note into its clauses: {message}",
+        ordinal_col="part_number",
+    )
+
+
 @dataclass(frozen=True)
 class PolicyCase:
-    """One policy, the notes fed to it, and the notes its view must publish."""
+    """One policy, the notes fed to it, and what its view must publish."""
 
     name: str
     policy: type[Memory]
     view: str
     notes: tuple[str, ...]
+    # a note appears once per row it must produce, so a flat map lists its note twice
     expected: tuple[str, ...]
     keep_markers: tuple[str, ...]
+    expected_columns: tuple[str, ...] = ("message",)
+    map_answers: Mapping[str, Any] = field(default_factory=dict)
+    map_rows: tuple[Mapping[str, Any], ...] | None = None
+    # a real-model case is worth its cost only when a model's answer determines the exact rows
+    real: bool = True
 
 
 # the two durable notes come first, so the expected set reads straight off this tuple
@@ -96,14 +126,49 @@ def _cases() -> list[PolicyCase]:
             notes=SMALL_TALK,
             expected=(),
             keep_markers=DURABLE_MARKERS,
+            real=False,
+        ),
+        PolicyCase(
+            name="sem_map",
+            policy=_SummarisedNotes,
+            view="summarised",
+            notes=NOTES[:2],
+            expected=NOTES[:2],
+            keep_markers=(),
+            expected_columns=("message", "summary"),
+            map_answers={"summary": "canned summary"},
+            # a model's sentence is free text, so the real check for this op is its audit case
+            real=False,
+        ),
+        PolicyCase(
+            name="sem_flat_map",
+            policy=_SplitNotes,
+            view="split",
+            notes=NOTES[:2],
+            # one row per emitted entry, so each note appears twice
+            expected=(NOTES[0], NOTES[0], NOTES[1], NOTES[1]),
+            keep_markers=(),
+            expected_columns=("message", "part", "part_number"),
+            map_rows=({"part": "a"}, {"part": "b"}),
+            real=False,
         ),
     ]
 
 
 def _real_cases() -> list[PolicyCase]:
-    """The cases worth a real call: empty expectation is a publication test, covered canned."""
+    """The cases worth a real call: the verdicts decide exact rows, so a real answer is comparable."""
 
-    return [case for case in _cases() if case.expected]
+    return [case for case in _cases() if case.real and case.expected]
+
+
+def _expected_prefix(case: PolicyCase, notes: Sequence[str]) -> list[str]:
+    """Return the messages the view should hold after these notes, honouring repeated rows."""
+
+    counts: dict[str, int] = {}
+    for note in case.expected:
+        counts[note] = counts.get(note, 0) + 1
+    messages = [note for note in notes for _ in range(counts.get(note, 0))]
+    return sorted(messages)
 
 
 def _case_id(case: PolicyCase) -> str:
@@ -163,16 +228,20 @@ def _write_audit(case: PolicyCase, kept: Mapping[str, Sequence[str]]) -> None:
 
 @pytest.mark.parametrize("case", _cases(), ids=_case_id)
 def test_the_canned_endpoint_publishes_the_expected_memories(case: PolicyCase) -> None:
-    """One policy, two engines, the kept notes published as the policy's own view."""
+    """One policy, two engines, the declared view published with the rows it should hold."""
 
-    with canned_model(*case.keep_markers) as endpoint:
+    with canned_model(
+        *case.keep_markers,
+        map_answers=case.map_answers,
+        map_rows=case.map_rows,
+    ) as endpoint:
         both = _build(case, endpoint.base_url, api_key=None)
         _feed(both, case.notes)
 
     for name, memory in zip(("lotus", "docetl"), both, strict=True):
         view = _kept(memory, case.view)
-        assert list(view.columns) == ["message"], (name, list(view.columns))
-        assert _messages(memory, case.view) == sorted(case.expected), (
+        assert list(view.columns) == list(case.expected_columns), (name, list(view.columns))
+        assert _messages(memory, case.view) == _expected_prefix(case, case.notes), (
             name,
             _messages(memory, case.view),
         )
@@ -184,15 +253,15 @@ def test_the_canned_endpoint_publishes_the_expected_memories(case: PolicyCase) -
 def test_the_canned_endpoint_publishes_each_note_as_it_arrives(case: PolicyCase) -> None:
     """Incremental ingestion: the view must converge one note at a time, on both engines."""
 
-    with canned_model(*case.keep_markers) as endpoint:
+    with canned_model(
+        *case.keep_markers,
+        map_answers=case.map_answers,
+        map_rows=case.map_rows,
+    ) as endpoint:
         both = _build(case, endpoint.base_url, api_key=None)
         for position, note in enumerate(case.notes):
             _feed(both, (note,))
-            expected = sorted(
-                candidate
-                for candidate in case.notes[: position + 1]
-                if candidate in case.expected
-            )
+            expected = _expected_prefix(case, case.notes[: position + 1])
             for name, memory in zip(("lotus", "docetl"), both, strict=True):
                 assert _messages(memory, case.view) == expected, (
                     name,

@@ -7,12 +7,15 @@ from dataclasses import dataclass, field
 from hashlib import sha256
 from typing import Any
 
+from agent_memory.adapters.docetl import relational
 from agent_memory.adapters.docetl.context import (
     DocetlExecutionConfig,
     DocetlExecutionContext,
     default_docetl_model,
 )
+from agent_memory.adapters.docetl.sem_flat_map import execute_sem_flat_map
 from agent_memory.adapters.docetl.sem_filter import execute_sem_filter
+from agent_memory.adapters.docetl.sem_map import execute_sem_map
 from agent_memory.adapters.docetl.sources import execute_log, execute_materialized_view
 from agent_memory.adapters.docetl.window import (
     execute_count_window,
@@ -107,7 +110,38 @@ class DocetlAdapter:
             "sem_filter": lambda query, inputs: execute_sem_filter(
                 query, inputs, self.execute, self._context
             ),
+            "sem_map": lambda query, inputs: execute_sem_map(
+                query, inputs, self.execute, self._context
+            ),
+            "sem_flat_map": lambda query, inputs: execute_sem_flat_map(
+                query, inputs, self.execute, self._context
+            ),
+            "select": self._relational(relational.execute_select),
+            "limit": self._relational(relational.execute_limit),
+            "alias": self._relational(relational.execute_alias),
+            "assign": self._relational(relational.execute_assign),
+            "filter": self._relational(relational.execute_filter),
+            "group_by": self._relational(relational.execute_group_by),
+            "let": self._relational(relational.execute_let),
+            "concat": self._relational(relational.execute_concat),
+            "union": self._relational(relational.execute_union),
+            "union_by_name": self._relational(relational.execute_union_by_name),
+            "subtract": self._relational(relational.execute_subtract),
+            "join": self._relational(relational.execute_join),
+            "drop_duplicates": self._relational(relational.execute_drop_duplicates),
+            "array_agg": self._relational(relational.execute_array_agg),
+            "min": self._relational(relational.execute_min),
+            "flatten": self._relational(relational.execute_flatten),
+            "explode": self._relational(relational.execute_explode),
+            "unnest": self._relational(relational.execute_unnest),
+            "array_cat": self._relational(relational.execute_array_cat),
+            "agg": self._relational(relational.execute_agg),
         }
+
+    def _relational(self, run: Callable[..., Any]) -> Handler:
+        """Bind a deterministic lowering that recurses through this adapter's dispatch."""
+
+        return lambda query, inputs: run(query, inputs, self.execute)
 
     def _execute_traced(
         self,
