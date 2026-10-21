@@ -1,8 +1,7 @@
-"""The semantic lowerings: instruction translation, the config handshake, and each operator offline.
+"""Row-local lowerings: instruction translation, the config handshake, and `sem_filter`/`sem_map`/`sem_flat_map`.
 
-One group per operator — `sem_filter`, `sem_map`, `sem_flat_map` — and this is the home for the next one
-rather than a new file. No model is called: the endpoint is a loopback server reached through
-`lm_api_base`, so DocETL's own validation, parsing and record handling all run.
+No model: a loopback endpoint answers through `lm_api_base`, so DocETL's own validation, parsing and record
+handling run. An operator carrying a cross-row contract belongs in its own file — `sem_join` has one.
 """
 
 from __future__ import annotations
@@ -277,7 +276,7 @@ def _two_column_map_query() -> QueryExpr:
 
 
 def test_a_single_column_map_sends_no_descriptions_like_the_native_path() -> None:
-    """Mirror the sibling adapter's rule so both engines ask the same question about one policy.
+    """Mirror LOTUS's rule so both engines ask the same question about one policy.
 
     LOTUS lowers a one-column `sem_map` through LOTUS's native op, which takes only the instruction
     (`lotus/sem_map.py:34-39`), and sends descriptions only on its structured paths — `sem_map` with two or

@@ -21,11 +21,7 @@ def build_filter_config(
     skip_on_error: bool = False,
     litellm_completion_kwargs: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Return the DocETL `filter` config for one row-local `sem_filter` query.
-
-    The model is deliberately absent: DocETL takes it as a constructor argument, so no per-operator
-    `model` is written and every operator in a run uses the adapter's single model.
-    """
+    """Return the DocETL `filter` config for one row-local `sem_filter` query."""
 
     if query.op != "sem_filter":
         raise ValueError(f"build_filter_config got a {query.op!r} query")
@@ -50,12 +46,7 @@ def execute_sem_filter(
     execute: Callable[[QueryExpr, Mapping[str, Any]], Any],
     context: DocetlExecutionContext,
 ) -> Any:
-    """Run one row-local `sem_filter` on DocETL's `filter` operation.
-
-    The input frame is reached by executing the child query against the same inputs, which is how the
-    runtime supplies a row-local operator: one key, the parent's, holding only the rows inserted
-    under it.
-    """
+    """Run one row-local `sem_filter` on DocETL's `filter` operation."""
 
     source = execute(query.inputs[0], inputs)
     index_key = INDEX_KEY

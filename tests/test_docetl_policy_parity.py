@@ -1,11 +1,8 @@
-"""Policy-level parity: one `Memory` policy per operator shape, run through the runtime on both backends.
+"""Policy-level parity: one `Memory` per operator shape must publish the same view on both backends.
 
-Between the adapter and a policy's published view sit the declared-column check, the index check, the
-per-row cache and publication (`PolicyExecutor._execute_semantic_row`), so this asks what a *policy* makes
-of the frame — not whether the operator lowers (`test_docetl_semantic_ops.py`) or whether the engines agree at
-the operator level (`test_adapter_parity.py`).
-
-This is the home for every operator's policy case: adding one means adding a `PolicyCase`, never a file.
+Between the adapter and that view sit the declared-column check, the index check, the per-row cache and
+publication (`PolicyExecutor._execute_semantic_row`), so this asks what a *policy* makes of a frame rather
+than whether the lowering is right. Adding an operator means adding a `PolicyCase`, never a file.
 """
 
 from __future__ import annotations

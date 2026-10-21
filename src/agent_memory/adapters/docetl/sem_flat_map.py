@@ -72,8 +72,8 @@ def _expand(
 ) -> tuple[list[dict[str, Any]], list[Any]]:
     """Expand each record's list into rows, keeping the record's index value on every emitted row.
 
-    The ordinal's *name* is the policy's (`ordinal_col`); its *value* is the adapter's, assigned here so the
-    row's position among its siblings is not something a model is asked for.
+    The ordinal's *name* is the policy's (`ordinal_col`); its *value* is the adapter's, assigned here so a
+    model is never asked for a row's position among the rows emitted for one input.
     """
 
     rows: list[dict[str, Any]] = []

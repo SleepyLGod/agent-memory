@@ -1,7 +1,7 @@
-"""Tests for the frame ↔ record conversion.
+"""Frame ↔ record conversion: a row's identity survives the trip into DocETL and back.
 
-Deterministic and ungated: no engine, no network. Each test pins one way the conversion could lose,
-invent or misplace row identity, since the runtime's index contract depends on it.
+Each case pins one way the conversion could lose, invent or move that identity. No engine, no network:
+the runtime's index contract is what breaks when this is wrong.
 """
 
 from __future__ import annotations

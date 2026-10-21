@@ -1,6 +1,7 @@
-"""Contract tests for the DocETL adapter.
+"""The adapter's public shape: fingerprint, supported set, and config read from the environment.
 
-Deterministic and ungated: no LLM calls, no network, no DocETL machinery.
+No engine, no network: these cases construct an adapter and read what the runtime relies on, so a missing
+guarantee fails here rather than in the middle of a policy.
 """
 
 from __future__ import annotations
