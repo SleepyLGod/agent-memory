@@ -33,6 +33,10 @@ from agent_memory.policy.logical import QueryExpr
 from agent_memory.policy.schema import output_columns
 from agent_memory.runtime.window import over_frames
 
+# Reason: `_groups_for_aggregate` must refuse a frame `sem_groupby` grouped, and that operator is withdrawn,
+#   so its own constant is gone. Naming the column here keeps the refusal from depending on it coming back.
+GROUP_ID_COLUMN = "_agent_memory_group_id"
+
 
 def execute_select(
     query: QueryExpr,
@@ -399,6 +403,54 @@ def execute_grouped_array_agg(
     )
 
 
+def _groups_for_aggregate(
+    source: pd.DataFrame,
+) -> list[tuple[dict[str, Any], pd.DataFrame]]:
+    """Return grouped frames plus the key values an aggregate output row must preserve.
+
+    Three cases, in the order the LOTUS adapter tests them: a `group_by` frame, whose keys the lowering
+    records in `attrs`; a `sem_groupby` frame, grouped by `(*partition_by, group_id)` and refused while that
+    operator is withdrawn; and a whole frame, which is one group with no keys.
+    """
+
+    keys = tuple(str(key) for key in source.attrs.get("agent_memory_groupby_keys", ()))
+    if keys:
+        return _groups_by_keys(source, keys)
+    if GROUP_ID_COLUMN in source.columns:
+        # Reason: a `sem_groupby` frame is grouped by its cluster id, not as one row. Falling through to the
+        #   whole-frame case would publish a plausible single row, so refuse the shape until that operator
+        #   returns and the branch is implemented.
+        raise NotImplementedError(
+            "agg over a sem_groupby frame is unavailable: semantic grouping is withdrawn"
+        )
+    return [({}, source.reset_index(drop=True).copy())]
+
+
+def _groups_by_keys(
+    source: pd.DataFrame,
+    keys: Sequence[str],
+) -> list[tuple[dict[str, Any], pd.DataFrame]]:
+    """Group frames and carry the key values into aggregate output rows."""
+
+    missing = [column for column in keys if column not in source.columns]
+    if missing:
+        raise ValueError(
+            f"aggregate group key columns not found in DataFrame: {missing}"
+        )
+    if source.empty:
+        return []
+    groups: list[tuple[dict[str, Any], pd.DataFrame]] = []
+    for key, group in source.groupby(list(keys), sort=True, dropna=False):
+        key_values = key if isinstance(key, tuple) else (key,)
+        groups.append(
+            (
+                dict(zip(keys, key_values, strict=True)),
+                group.reset_index(drop=True),
+            )
+        )
+    return groups
+
+
 def execute_min(
     query: QueryExpr,
     inputs: Mapping[str, Any],
@@ -424,7 +476,7 @@ def execute_min(
             )
         rows = [
             {**key_values, output_col: _minimum_value(group, columns)}
-            for key_values, group in aggregate_groups_with_keys(source)
+            for key_values, group in _groups_for_aggregate(source)
         ]
         result = pd.DataFrame(rows, columns=[*keys, output_col])
         result[output_col] = pd.Series(
@@ -448,14 +500,23 @@ def execute_agg(
 
     group_query = query.inputs[0]
     source = execute(group_query, inputs)
-    aggregates = tuple(query.params.get("aggregates", ()))
+    aggregates: tuple[Any, ...] = tuple(query.params.get("aggregates", ()))
     if group_query.op not in {"group_by", "sem_groupby"}:
         raise ValueError("agg expects group_by or sem_groupby input")
+    if any(isinstance(aggregate, SemanticAggregateSpec) for aggregate in aggregates):
+        # Reason: a semantic aggregate needs a semantic grouping to aggregate over, and this adapter has
+        #   no `sem_groupby` lowering — failing here keeps the deterministic aggregates usable without
+        #   pretending the semantic half ran.
+        raise NotImplementedError(
+            "agg with sem_agg(...) requires sem_groupby, which this adapter does not implement yet"
+        )
     if source.empty:
         return pd.DataFrame(columns=list(output_columns(query)))
 
+    groups = _groups_for_aggregate(source)
+
     rows: list[dict[str, Any]] = []
-    for key_values, group in aggregate_groups_with_keys(source):
+    for position, (key_values, group) in enumerate(groups):
         row: dict[str, Any] = dict(key_values)
         for aggregate in aggregates:
             if isinstance(aggregate, ArrayAggregateSpec):
@@ -484,10 +545,6 @@ def execute_agg(
                     )
                 row[aggregate.output_col] = _minimum_value(group, aggregate.columns)
                 continue
-            if isinstance(aggregate, SemanticAggregateSpec):
-                raise NotImplementedError(
-                    "a semantic aggregate needs an engine, which this adapter has no lowering for"
-                )
             raise TypeError(f"Unsupported aggregate spec: {type(aggregate).__name__}")
         rows.append(row)
     result = pd.DataFrame(rows, columns=list(output_columns(query)))
@@ -1445,50 +1502,4 @@ def _json_default(value: Any) -> Any:
     return str(value)
 
 
-def aggregate_groups_with_keys(
-    source: pd.DataFrame,
-) -> list[tuple[dict[str, Any], pd.DataFrame]]:
-    """Return grouped frames plus the deterministic key values to preserve.
 
-    The semantic partition path is absent: nothing on this backend produces a group id, so a frame with no
-    grouping attrs is one whole-relation group.
-    """
-
-    keys = tuple(str(key) for key in source.attrs.get("agent_memory_groupby_keys", ()))
-    if not keys:
-        return [({}, source.reset_index(drop=True).copy())]
-    return _aggregate_groups_by_keys(
-        source, group_keys=keys, output_keys=keys, drop_columns=()
-    )
-
-
-def _aggregate_groups_by_keys(
-    source: pd.DataFrame,
-    *,
-    group_keys: Sequence[str],
-    output_keys: Sequence[str],
-    drop_columns: Sequence[str],
-) -> list[tuple[dict[str, Any], pd.DataFrame]]:
-    """Group frames and carry selected key values into aggregate output rows."""
-
-    missing = [column for column in group_keys if column not in source.columns]
-    if missing:
-        raise ValueError(
-            f"aggregate group key columns not found in DataFrame: {missing}"
-        )
-    if source.empty:
-        return []
-    groups: list[tuple[dict[str, Any], pd.DataFrame]] = []
-    for key, group in source.groupby(list(group_keys), sort=True, dropna=False):
-        key_values = key if isinstance(key, tuple) else (key,)
-        by_key = dict(zip(group_keys, key_values, strict=True))
-        output_key_values = {key_name: by_key[key_name] for key_name in output_keys}
-        groups.append(
-            (
-                output_key_values,
-                group.drop(columns=list(drop_columns), errors="ignore").reset_index(
-                    drop=True
-                ),
-            )
-        )
-    return groups
