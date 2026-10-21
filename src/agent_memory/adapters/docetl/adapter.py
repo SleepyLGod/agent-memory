@@ -15,6 +15,7 @@ from agent_memory.adapters.docetl.context import (
 )
 from agent_memory.adapters.docetl.sem_flat_map import execute_sem_flat_map
 from agent_memory.adapters.docetl.sem_filter import execute_sem_filter
+from agent_memory.adapters.docetl.sem_join import execute_sem_join
 from agent_memory.adapters.docetl.sem_map import execute_sem_map
 from agent_memory.adapters.docetl.sources import execute_log, execute_materialized_view
 from agent_memory.adapters.docetl.window import (
@@ -23,7 +24,6 @@ from agent_memory.adapters.docetl.window import (
     execute_window_source,
 )
 from agent_memory.policy.logical import QueryExpr
-from agent_memory.storage.embedding import EmbeddingProvider
 from agent_memory.tracing.semantic import (
     query_digest,
     semantic_trace_scope,
@@ -39,7 +39,6 @@ class DocetlAdapter:
 
     model: str = field(default_factory=default_docetl_model)
     config: DocetlExecutionConfig = field(default_factory=DocetlExecutionConfig)
-    pair_embedding_provider: EmbeddingProvider | None = None
     _context: DocetlExecutionContext = field(init=False, repr=False)
     _handlers: dict[str, Handler] = field(init=False, repr=False)
 
@@ -57,16 +56,15 @@ class DocetlAdapter:
         never be restored under DocETL. `backend=docetl` is what guarantees that.
         """
 
-        payload = "\n".join(
-            (
-                "backend=docetl",
-                f"model={self.model}",
-                f"skip_on_error={self.config.skip_on_error}",
-                f"enable_cache={self.config.enable_cache}",
-                f"lm_api_base={self.config.lm_api_base or ''}",
-            )
-        )
-        return sha256(payload.encode("utf-8")).hexdigest()
+        parts = [
+            "backend=docetl",
+            f"model={self.model}",
+            f"skip_on_error={self.config.skip_on_error}",
+            f"enable_cache={self.config.enable_cache}",
+            f"lm_api_base={self.config.lm_api_base or ''}",
+            f"sem_join_topk_method={self.config.sem_join_topk_method}",
+        ]
+        return sha256("\n".join(parts).encode("utf-8")).hexdigest()
 
     def execute(self, query: QueryExpr, inputs: Mapping[str, Any]) -> Any:
         """Dispatch to the registered lowering; the frame contract is `ExecutionAdapter.execute`'s."""
@@ -114,6 +112,9 @@ class DocetlAdapter:
                 query, inputs, self.execute, self._context
             ),
             "sem_flat_map": lambda query, inputs: execute_sem_flat_map(
+                query, inputs, self.execute, self._context
+            ),
+            "sem_join": lambda query, inputs: execute_sem_join(
                 query, inputs, self.execute, self._context
             ),
             "select": self._relational(relational.execute_select),

@@ -1,13 +1,9 @@
-"""Cross-adapter parity: the same logical query through both execution backends.
+"""Cross-adapter parity: the same `QueryExpr` through both backends must produce the same frame.
 
-The project defines correctness as the two adapters agreeing, so this is the only place a second,
-independently written backend checks the first. Three comparison modes: ``exact`` (no model: frames must
-match in rows, values, dtypes and index), ``identity`` (a model decides, so only the surviving rows and
-columns must agree) and ``raises`` (the operator is illegal, and both must refuse it the same way).
-
-The semantic cases point both adapters at one loopback endpoint, so their real operation classes,
-validation and record handling all run with nothing leaving the machine — which proves the plumbing
-agrees, not that a real model answers correctly.
+`exact` compares rows, values, dtypes and index (no model involved); `identity` compares only the surviving
+rows and columns (a model decides); `raises` requires both to refuse with the same exception class. The
+semantic cases share one loopback endpoint, so both engines' own validation runs — this proves the plumbing
+agrees, not that a real model answers well.
 """
 
 from __future__ import annotations
@@ -502,6 +498,49 @@ def test_sem_flat_map_agrees_through_a_canned_endpoint() -> None:
     assert answers[0]["entry"].tolist()[:4] == ["a", "b", "a", "b"]
 
 
+def test_sem_join_agrees_through_a_canned_endpoint() -> None:
+    """Both engines emit the same bag for the same keyed join, with the same suffixed columns."""
+
+    left = pd.DataFrame({"note": ["alpha left", "beta left"], "dept": ["d1", "d2"]})
+    right = pd.DataFrame({"note": ["alpha right", "beta right"], "dept": ["d1", "d1"]})
+    case = ParityCase(
+        name="sem_join",
+        query=QueryExpr(
+            op="sem_join",
+            inputs=(
+                QueryExpr(
+                    op="materialized_view",
+                    params={"name": "left", "columns": tuple(left.columns)},
+                ),
+                QueryExpr(
+                    op="materialized_view",
+                    params={"name": "right", "columns": tuple(right.columns)},
+                ),
+            ),
+            params={
+                "instruction": "the subjects match: {note:left} and {note:right}",
+                "how": "inner",
+                "on": ("dept",),
+            },
+        ),
+        inputs={"left": left, "right": right},
+        comparison="exact",
+        needs_model=True,
+    )
+
+    with canned_model(
+        "the subjects match",
+        map_answers={"join_ok": True},
+        # LOTUS reads a verdict as an `Answer:` line; DocETL reads the same marker as a kept row
+        answer_markers={"the subjects match": "join_ok"},
+    ) as endpoint:
+        answers = _run(build_adapters(endpoint.base_url), case)
+
+    _assert_agreement(case, answers)
+    assert len(answers[0]) == 2
+    assert answers[0]["dept:left"].tolist() == ["d1", "d1"]
+
+
 def test_sem_filter_agrees_against_the_real_model() -> None:
     """The semantic claim: both backends keep the same rows when a real model answers."""
 
@@ -542,6 +581,7 @@ def test_every_supported_op_has_a_parity_case() -> None:
         "sem_filter",
         "sem_map",
         "sem_flat_map",
+        "sem_join",
     }
     excused = {
         # the window pair is only legal inside a process_window body, and is covered there

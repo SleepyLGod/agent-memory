@@ -43,6 +43,7 @@ def _canned_value(
     malformed: bool,
     answers: Mapping[str, Any],
     rows: Sequence[Mapping[str, Any]],
+    raw: str = "",
 ) -> Any:
     """Return one value of the type the caller declared, so a map can be answered like a filter."""
 
@@ -51,11 +52,16 @@ def _canned_value(
         # parses as JSON and fails the declared type: a string where a boolean was asked for, a number
         # where text was
         return "maybe" if kind == "boolean" else 123
+    if key in answers:
+        # an explicit answer wins over the declared type, so a list-of-ids selection is servable too;
+        # a callable receives the request text, which lets one run answer differently per row
+        value = answers[key]
+        return value(raw) if callable(value) else value
     if kind == "boolean":
         return keeps
     if kind == "array":
         return [dict(row) for row in (rows or ())]
-    return answers.get(key, "canned")
+    return "canned"
 
 
 class _CannedHandler(BaseHTTPRequestHandler):
@@ -72,6 +78,16 @@ class _CannedHandler(BaseHTTPRequestHandler):
         malformed = server.canned_refuse or any(
             marker in raw for marker in server.canned_malformed_markers
         )
+        # a run may ask several different questions, so a marker can name which answer belongs to which
+        structured = "valid json object" in raw.lower()
+        selected = next(
+            (
+                key
+                for marker, key in server.canned_answer_markers.items()
+                if marker in raw
+            ),
+            None,
+        )
 
         tools = body.get("tools") or []
         properties = tools[0]["function"]["parameters"]["properties"] if tools else {}
@@ -84,6 +100,7 @@ class _CannedHandler(BaseHTTPRequestHandler):
                     malformed=malformed,
                     answers=server.canned_map_answers,
                     rows=server.canned_map_rows,
+                    raw=raw,
                 )
                 for key, schema in properties.items()
             }
@@ -110,6 +127,19 @@ class _CannedHandler(BaseHTTPRequestHandler):
                     {"rows": [dict(row) for row in server.canned_map_rows]}
                 ),
             }
+            finish = "stop"
+        elif selected is not None:
+            value = server.canned_map_answers[selected]
+            if structured:
+                # LOTUS's structured path validates a JSON object
+                #   (`adapters/lotus/structured.py::structured_instruction`)
+                content = json.dumps({selected: value})
+            elif isinstance(value, bool):
+                # its verdict path reads an `Answer:` line, the same shape the default branch serves
+                content = f"Answer: {value}"
+            else:
+                content = str(value)
+            message = {"role": "assistant", "content": content}
             finish = "stop"
         elif server.canned_map_answers:
             values = list(server.canned_map_answers.values())
@@ -171,12 +201,16 @@ def canned_model(
     malformed_markers: Sequence[str] = (),
     map_answers: Mapping[str, Any] | None = None,
     map_rows: Sequence[Mapping[str, Any]] | None = None,
+    answer_markers: Mapping[str, str] | None = None,
 ) -> Iterator[CannedEndpoint]:
     """Serve canned completions; a request carrying a keep marker is kept.
 
     `map_answers` and `map_rows` answer a column-filling operator — a value per declared column, or the
     rows a flat map should emit — because such a request cannot be answered with a verdict. Passing an
     empty `map_rows` is how the "emits nothing" case is served.
+
+    `answer_markers` maps a request substring to the key of the answer it should receive, so one run can
+    ask two different questions (a grouping label and an aggregate) and get the right answer to each.
 
     `OPENAI_API_KEY` is set for the duration and restored afterwards, so a free run cannot leave a
     placeholder key behind for a billed one.
@@ -189,6 +223,7 @@ def canned_model(
     server.canned_keep_markers = tuple(keep_markers)  # type: ignore[attr-defined]
     server.canned_malformed_markers = tuple(malformed_markers)  # type: ignore[attr-defined]
     server.canned_map_answers = dict(map_answers or {})  # type: ignore[attr-defined]
+    server.canned_answer_markers = dict(answer_markers or {})  # type: ignore[attr-defined]
     server.canned_map_rows = (  # type: ignore[attr-defined]
         None if map_rows is None else tuple(dict(row) for row in map_rows)
     )
@@ -257,10 +292,17 @@ def build_docetl_adapter(
     endpoint: str,
     *,
     model: str = CANNED_MODEL,
+    config: DocetlExecutionConfig | None = None,
 ) -> DocetlAdapter:
-    """The DocETL backend alone, for a suite that is not comparing engines."""
+    """The DocETL backend alone, for a suite that is not comparing engines.
 
-    return build_adapters(endpoint, model=model)[1]
+    `config` is for a test that varies a backend knob — the resolver, say — while still pointing at the
+    loopback endpoint; the caller passes `lm_api_base` itself in that case.
+    """
+
+    if config is None:
+        return build_adapters(endpoint, model=model)[1]
+    return DocetlAdapter(model=model, config=config)
 
 
 def require_real_provider(purpose: str) -> tuple[str, str]:

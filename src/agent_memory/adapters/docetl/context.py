@@ -33,6 +33,11 @@ _RUNNER_BASE_CONFIG: dict[str, Any] = {
     "pipeline": {"steps": [], "output": {"type": "memory", "path": ""}},
 }
 
+# `listwise` is the only resolver today: DocETL's verdict is a boolean, so ranking is a second call. A
+#   resolver that returns a score with the verdict would change the question put to the model; such a
+#   value belongs in this tuple, with its branch in `sem_join._cap_matches`.
+SEM_JOIN_TOPK_METHODS = ("listwise",)
+
 
 @dataclass(frozen=True)
 class DocetlExecutionConfig:
@@ -65,6 +70,7 @@ class DocetlExecutionConfig:
     max_threads: int = 1
     semantic_trace_dir: Path | str | None = None
     semantic_trace_snapshot_mode: str = "compact"
+    sem_join_topk_method: str = "listwise"
 
     def __post_init__(self) -> None:
         """Validate bounded execution settings."""
@@ -74,6 +80,11 @@ class DocetlExecutionConfig:
         if self.semantic_trace_snapshot_mode not in {"compact", "full"}:
             raise ValueError(
                 "semantic_trace_snapshot_mode must be 'compact' or 'full'"
+            )
+        if self.sem_join_topk_method not in SEM_JOIN_TOPK_METHODS:
+            raise ValueError(
+                "sem_join_topk_method must be one of: "
+                + ", ".join(SEM_JOIN_TOPK_METHODS)
             )
 
     def trace_dir(self) -> Path | str | None:

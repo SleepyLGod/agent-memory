@@ -1,8 +1,8 @@
-"""Gated real-model operator audit: are the answers right?
+"""Gated audit: does a real model produce the answers each operator can actually promise?
 
-The only suite that asserts a real model's *decisions*. One `AuditCase` per operator, each with the check
-that operator can actually promise — a verdict set for a filter, a row count for a map, an expansion for a
-flat map — and the CSVs are written before the assertions so a failure still leaves the answers to read.
+One `AuditCase` per operator — a verdict set for a filter, a row count for a map, an expansion for a flat
+map — with the CSVs written before the assertions, so a failure still leaves the answers readable. This is
+the only suite where a model's decisions, rather than our plumbing, are under test.
 """
 
 from __future__ import annotations
@@ -56,6 +56,8 @@ class AuditCase:
     frame: pd.DataFrame
     expected_columns: tuple[str, ...]
     check: Callable[[pd.DataFrame], None]
+    # an aggregate answers per group, so its rows are not the input's rows
+    index_is_input: bool = True
 
 
 def _kept_only_the_refunds(output: pd.DataFrame) -> None:
@@ -141,8 +143,71 @@ def _write_audit(case: AuditCase, output: pd.DataFrame) -> None:
     print(f"input:  {input_path}")
     print(f"output: {output_path}")
     print(f"{len(output)} rows from {len(case.frame)} input rows")
+    if not case.index_is_input:
+        print(output.to_string(index=False))
+        return
     for index, note in zip(case.frame.index, case.frame["note"], strict=True):
         print(f"  [{'present' if index in present else 'missing'}] {note}")
+
+
+JOIN_INSTRUCTION = (
+    "these two notes are about the same subject: {note:left} and {note:right}"
+)
+
+JOIN_LEFT = pd.DataFrame(
+    {
+        "note": [
+            "I would like a refund for the mug that arrived broken.",
+            "I am still waiting for the book I ordered last week.",
+        ],
+        "dept": ["refund", "delivery"],
+    }
+)
+JOIN_RIGHT = pd.DataFrame(
+    {
+        "note": [
+            "Please refund my broken mug.",
+            "My book order has not arrived yet.",
+        ],
+        "dept": ["refund", "delivery"],
+    }
+)
+
+
+def test_a_real_model_joins_the_matching_notes() -> None:
+    """The join's own claim: each same-dept pair is judged a match, and the pairs are kept apart."""
+
+    model, base_url = require_real_provider("the real-model join audit")
+    adapter = build_docetl_adapter(base_url, model=model)
+    query = QueryExpr(
+        op="sem_join",
+        inputs=(
+            QueryExpr(
+                op="materialized_view",
+                params={"name": "left", "columns": tuple(JOIN_LEFT.columns)},
+            ),
+            QueryExpr(
+                op="materialized_view",
+                params={"name": "right", "columns": tuple(JOIN_RIGHT.columns)},
+            ),
+        ),
+        params={"instruction": JOIN_INSTRUCTION, "how": "inner", "on": ("dept",)},
+    )
+
+    output = adapter.execute(query, {"left": JOIN_LEFT, "right": JOIN_RIGHT})
+
+    assert list(output.columns) == [
+        "note:left",
+        "dept:left",
+        "note:right",
+        "dept:right",
+    ]
+    assert len(output) == 2, output.to_dict("records")
+    assert output["dept:left"].tolist() == ["refund", "delivery"]
+    assert output["note:left"].notna().all()
+    assert output["note:right"].notna().all()
+    usage = adapter._context.usage_snapshot()
+    assert sum(usage.values()) > 0, usage
 
 
 @pytest.mark.parametrize("case", _cases(), ids=lambda case: case.name)
@@ -158,7 +223,8 @@ def test_the_real_model_answers_correctly(case: AuditCase) -> None:
     _write_audit(case, output)
 
     assert list(output.columns) == list(case.expected_columns), list(output.columns)
-    assert set(output.index).issubset(set(case.frame.index)), sorted(output.index)
+    if case.index_is_input:
+        assert set(output.index).issubset(set(case.frame.index)), sorted(output.index)
     case.check(output)
     # a canned answer cannot move the counters, so a non-zero total proves a request really went out
     usage = adapter._context.usage_snapshot()
