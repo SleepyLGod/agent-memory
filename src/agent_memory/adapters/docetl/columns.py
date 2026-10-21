@@ -47,12 +47,10 @@ def scalar_schema(columns: Sequence[ColumnSpec]) -> dict[str, str]:
 
 
 def rows_type(columns: Sequence[ColumnSpec]) -> str:
-    """Return the DocETL type of a list of emitted rows, which is how a 1:1 `map` produces 0..n rows.
+    """Return the DocETL type of a list of emitted rows, which is how a 1:1 `map` produces 0..n rows."""
 
-    `docetl.operations.utils.validation::convert_val` parses `list[{a: string}]` into an array whose items
-    are objects with those properties, and validates them recursively.
-    """
-
+    # `docetl.operations.utils.validation::convert_val` parses `list[{a: string}]` into an array
+    #   whose items are objects with those properties, and validates them recursively.
     fields = ", ".join(f"{column.name}: {SCALAR_TYPE}" for column in columns)
     return f"list[{{{fields}}}]"
 

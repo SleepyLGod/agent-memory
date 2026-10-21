@@ -80,10 +80,8 @@ def require_one_record_per_row(
 ) -> None:
     """Raise if the engine returned a different number of records than rows it was given.
 
-    `map` drops a record whose answer fails validation and reports nothing, so this count is the only
-    evidence that a row survived. Counting records rather than emitted rows is what lets a 0..n operator
-    tell "the model emitted nothing" (a record with an empty list) from "the engine dropped the answer"
-    (no record at all).
+    `map` drops a record whose answer fails validation and reports nothing, so this count is the
+    only evidence that a row survived.
     """
 
     if len(records) == len(source):

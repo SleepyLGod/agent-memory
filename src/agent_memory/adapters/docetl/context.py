@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 # Reason: litellm reads a model string's prefix as the provider, which fixes both the endpoint and
 #   which environment variable holds the key (`litellm.utils::get_llm_provider`), so a model literal
-#   on its own cannot describe a provider — the endpoint has to move with it.
+#   on its own cannot describe a provider, so the endpoint has to move with it.
 # Required by: `DocetlAdapter.model` and `DocetlExecutionConfig.lm_api_base`, which resolve these at
 #   construction rather than at import, so one process can point them somewhere else per case.
 DOCETL_MODEL_ENV = "AGENT_MEMORY_DOCETL_MODEL"
@@ -43,34 +43,48 @@ SEM_JOIN_TOPK_METHODS = ("listwise",)
 class DocetlExecutionConfig:
     """Backend knobs for the DocETL adapter. Deliberately **not** policy semantics.
 
-    Caching is off by default, matching the LOTUS adapter, so an answer never comes from an
-    earlier run's cache and a policy behaves the same on either backend; `bypass_cache` is
-    therefore set on the runner unless `enable_cache` is explicitly turned on. `skip_on_error`
-    stays `False` so a failing row fails the run instead of disappearing.
+    Fields are grouped by the DocETL channel each is applied through, which is the only
+    classification DocETL itself defines; each channel has its single writer on
+    `DocetlExecutionContext`:
+
+    - **runner-scoped**, applied by `runner_config`: `lm_api_base`, `enable_cache`. DocETL reads
+      these off the runner, so they have no per-operation home.
+    - **operation-scoped defaults**, applied by `with_op_defaults`: `skip_on_error`,
+      `litellm_completion_kwargs`. DocETL reads them per operation; we give every operation the
+      same value so both backends behave alike.
+    - **constructor channel**, applied by `run_operation` as `__init__` arguments: `max_threads`
+      (and `model`, which sits on the context beside it).
+    - **local**, never reaching DocETL: the trace settings and `sem_join_topk_method`.
 
     Both the model and `lm_api_base` are read from the environment when not passed, because a model
     string's prefix selects the provider, and the provider decides which endpoint and which
-    credential are correct — so the two are one decision and are resolved together.
-
-    The uniform op-level knobs (`timeout`, `num_retries_on_validate_failure`, `validate`,
-    `gleaning`) and the per-op-type field layout are not exposed yet; they are wired together with
-    the operations.
+    credential are correct, so the two are one decision and are resolved together.
     """
 
+    # --- runner-scoped: DocETL reads these off the runner, so no per-operation home exists.
     lm_api_base: str | None = field(
         default_factory=lambda: os.getenv(DOCETL_API_BASE_ENV)
     )
-    # Reason: temperature and the reasoning switches are only pinnable through litellm, and DocETL
-    #   forwards exactly this key per operation (`docetl.operations.map::MapOperation.__init__`), so the
-    #   name is DocETL's rather than ours. Empty by default: a knob left unset is the adapter's choice,
-    #   not a policy's.
-    litellm_completion_kwargs: Mapping[str, Any] = field(default_factory=dict)
+    # off by default, matching the LOTUS adapter
     enable_cache: bool = False
+
+    # --- operation-scoped defaults: merged into every op spec by `with_op_defaults`.
+    # Reason: a failing row fails the run instead of disappearing.
     skip_on_error: bool = False
+    # Parameters of one model call, e.g. `temperature`; litellm forwards them to the vendor.
+    litellm_completion_kwargs: Mapping[str, Any] = field(default_factory=dict)
+
+    # --- constructor channel: passed as `__init__` arguments by `run_operation`.
+    # Reason: DocETL updates its token counters non-atomically, so more than one thread would make
+    #   `usage_snapshot` undercount.
     max_threads: int = 1
+
+    # --- local: consumed by the adapter itself, never by DocETL.
     semantic_trace_dir: Path | str | None = None
     semantic_trace_snapshot_mode: str = "compact"
     sem_join_topk_method: str = "listwise"
+    # Not exposed yet: the uniform op-level knobs (`timeout`, `num_retries_on_validate_failure`,
+    #   `validate`, `gleaning`) and the per-op-type field layout. They are wired with the operations.
 
     def __post_init__(self) -> None:
         """Validate bounded execution settings."""
@@ -95,7 +109,7 @@ class DocetlExecutionConfig:
     def runner_config(self, model: str) -> dict[str, Any]:
         """Build the runner-level config.
 
-        Only settings that have **no** per-operation home in DocETL go here —
+        Only settings that have **no** per-operation home in DocETL go here:
         `default_lm_api_base` and `bypass_cache`. Everything else is applied per operation.
         """
 
@@ -112,7 +126,8 @@ class DocetlExecutionContext:
     """Own one `DSLRunner` as a pure handle.
 
     Never calls `runner.run()`: the handle exists only to supply `runner.api` to
-    operation instances we construct ourselves.
+    operation instances we construct ourselves. Every native binding goes through
+    `run_operation`, which is the one place the construction signature is stated.
     """
 
     model: str = field(default_factory=default_docetl_model)
@@ -130,26 +145,75 @@ class DocetlExecutionContext:
         return self._handle
 
     def build_operation(self, op_type: str) -> Any:
-        """Return the DocETL operation class for `op_type`.
+        """Return the DocETL operation class for `op_type`, without constructing it.
 
-        Uses `get_operation` directly: the runtime's operator registry is complete, whereas the
-        `Pipeline`/YAML paths do not list every operation.
+        `op_type` is resolved against DocETL's own operation registry, so any operation it registers
+        is accepted by name. To construct and run it in one step, use `run_operation`.
         """
 
+        # Reason: `get_operation` is DocETL's registry. The `Pipeline`/YAML paths resolve only a
+        #   subset of it, so they are not used here.
         from docetl.operations import get_operation
 
         return get_operation(op_type)
 
+    def with_op_defaults(self, spec: Mapping[str, Any]) -> dict[str, Any]:
+        """Apply the runner-wide defaults for operation-scoped settings to one op spec.
+
+        DocETL reads `skip_on_error` and `litellm_completion_kwargs` per operation (its op
+        schema), so this config acts as the runner-wide default for them: the single writer,
+        and a spec that already carries a value (a test pinning one) wins.
+        """
+
+        merged = dict(spec)
+        merged.setdefault("skip_on_error", self.config.skip_on_error)
+        if self.config.litellm_completion_kwargs:
+            merged.setdefault(
+                "litellm_completion_kwargs",
+                dict(self.config.litellm_completion_kwargs),
+            )
+        return merged
+
+    def run_operation(
+        self,
+        op_type: str,
+        spec: Mapping[str, Any],
+        records: Sequence[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Run one DocETL operation using DocETL's own class and `execute()`.
+
+        `op_type` is resolved against DocETL's registry (see `build_operation`); `spec` is its DocETL
+        config, while `model` and `max_threads` come from this context. Returns the records the
+        operation produced. No cost is reported: usage is read from the handle (`usage_snapshot`).
+
+        `execute()` is the step that calls the model, so this is where rows are sent and answers come
+        back. `spec` and `records` are copied per call, so a caller can reuse either one (DocETL
+        mutates only its own row copies). Runner-wide op defaults are applied by `with_op_defaults`;
+        nothing here catches, so `skip_on_error` decides raise versus drop per row.
+        """
+
+        # Construction is what binds this context to the operation: `self.handle` is the `runner` the
+        #   operation reads `runner.api` from, and `spec` is the config it validates on construction.
+        operation = self.build_operation(op_type)(
+            self.handle,
+            self.with_op_defaults(spec),
+            self.model,
+            self.config.max_threads,
+        )
+        # `execute()` returns `(output, cost)`; cost is already accumulated on the handle
+        #   (`usage_snapshot`), so it is not re-counted here.
+        output, _cost = operation.execute(list(records))
+        return output
+
     def usage_snapshot(self) -> dict[str, int]:
         """Return cumulative physical token counters held by the runner handle.
 
-        Nothing calls this yet: reporting usage per operator arrives with the engine-backed
-        operators. Without a handle no engine call can have happened, so zeros are *measured*, not
-        assumed. DocETL updates these counters non-atomically, which is why `max_threads`
-        defaults to 1.
+        Cumulative over every call made through this context, read from DocETL's own counters. No
+        engine-backed operator reports it yet, so only tests read it today.
         """
 
         if self._handle is None:
+            # No handle means no engine call can have happened, so zero is a reading, not a default.
             return {"prompt_tokens": 0, "completion_tokens": 0}
 
         usage = getattr(self._handle, "total_token_usage", None) or {}

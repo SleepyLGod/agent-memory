@@ -16,6 +16,7 @@ from agent_memory.adapters.docetl.prompt import (
     join_slot,
 )
 from agent_memory.adapters.docetl.reserved import KEEP_KEY
+from agent_memory.adapters.docetl.specs import op_config
 from agent_memory.policy.logical import QueryExpr
 from agent_memory.tracing.semantic import query_digest, write_pair_trace, write_trace_event
 
@@ -255,16 +256,8 @@ def _verify_pairs(
         params.instruction,
         left_columns=left_columns,
         right_columns=right_columns,
-        skip_on_error=context.config.skip_on_error,
-        litellm_completion_kwargs=context.config.litellm_completion_kwargs,
     )
-    operation = context.build_operation("filter")(
-        context.handle,
-        config,
-        context.model,
-        context.config.max_threads,
-    )
-    kept, _cost = operation.execute(records)
+    kept = context.run_operation("filter", config, records)
 
     matches: list[Match] = []
     for record in kept:
@@ -288,8 +281,8 @@ def _cap_matches(
 ) -> list[Match]:
     """Keep at most `k` matches per left row, ranking with a listwise call when it overflows.
 
-    `k` caps before `how` is assembled, so a capped-out right row is later emitted as a right-only row —
-    the effect the join-map relies on.
+    `k` caps before `how` is assembled, so a capped-out right row is later emitted as a right-only
+    row, which is what `planner/rules.py::rule-join-map` depends on.
     """
 
     k = params.k
@@ -318,16 +311,9 @@ def _cap_matches(
     candidates_by_left = {
         left_id: [match.right_id for match in by_left[left_id]] for left_id in overflowing
     }
-    operation = context.build_operation("map")(
-        context.handle,
-        build_topk_config(
-            params.instruction,
-            k=k,
-            skip_on_error=context.config.skip_on_error,
-            litellm_completion_kwargs=context.config.litellm_completion_kwargs,
-        ),
-        context.model,
-        context.config.max_threads,
+    topk_config = build_topk_config(
+        params.instruction,
+        k=k,
     )
 
     selected: dict[int, list[int]] = {}
@@ -348,7 +334,7 @@ def _cap_matches(
             }
             for position, left_id in enumerate(pending)
         ]
-        mapped, _cost = operation.execute(records)
+        mapped = context.run_operation("map", topk_config, records)
         answers = {int(record[GROUP_POSITION_COLUMN]): record for record in mapped}
         for position, left_id in enumerate(pending):
             try:
@@ -514,46 +500,34 @@ def build_verdict_config(
     *,
     left_columns: Sequence[str],
     right_columns: Sequence[str],
-    skip_on_error: bool = False,
-    litellm_completion_kwargs: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return the DocETL `filter` config that answers one pair at a time."""
 
-    config: dict[str, Any] = {
-        "name": "sem_join",
-        "type": "filter",
-        "prompt": build_join_prompt(
+    return op_config(
+        "sem_join",
+        "filter",
+        build_join_prompt(
             instruction,
             left_columns=left_columns,
             right_columns=right_columns,
         ),
-        "output": {"schema": {KEEP_KEY: "bool"}},
-        "skip_on_error": bool(skip_on_error),
-    }
-    if litellm_completion_kwargs:
-        config["litellm_completion_kwargs"] = dict(litellm_completion_kwargs)
-    return config
+        {KEEP_KEY: "bool"},
+    )
 
 
 def build_topk_config(
     instruction: str,
     *,
     k: int,
-    skip_on_error: bool = False,
-    litellm_completion_kwargs: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return the DocETL `map` config that ranks one left row's verified matches."""
 
-    config: dict[str, Any] = {
-        "name": "sem_join",
-        "type": "map",
-        "prompt": build_topk_prompt(instruction, k=k, ids_column=SELECTED_COLUMN),
-        "output": {"schema": {SELECTED_COLUMN: "list[string]"}},
-        "skip_on_error": bool(skip_on_error),
-    }
-    if litellm_completion_kwargs:
-        config["litellm_completion_kwargs"] = dict(litellm_completion_kwargs)
-    return config
+    return op_config(
+        "sem_join",
+        "map",
+        build_topk_prompt(instruction, k=k, ids_column=SELECTED_COLUMN),
+        {SELECTED_COLUMN: "list[string]"},
+    )
 
 
 def _write_skipped_pairs(

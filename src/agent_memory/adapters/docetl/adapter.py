@@ -67,7 +67,7 @@ class DocetlAdapter:
         return sha256("\n".join(parts).encode("utf-8")).hexdigest()
 
     def execute(self, query: QueryExpr, inputs: Mapping[str, Any]) -> Any:
-        """Dispatch to the registered lowering; the frame contract is `ExecutionAdapter.execute`'s."""
+        """Dispatch to the registered lowering. Frame in, frame out, as `ExecutionAdapter.execute` defines it."""
 
         handler = self._handlers.get(query.op)
         if handler is None:
@@ -78,22 +78,14 @@ class DocetlAdapter:
         return self._execute_traced(query, inputs, handler)
 
     def supported_ops(self) -> frozenset[str]:
-        """Return the operators this adapter can currently execute.
+        """Return the operators this adapter can currently execute."""
 
-        Introspected from the dispatch registry rather than declared separately, so it
-        cannot drift from the code.
-        """
 
         return frozenset(self._handlers)
 
     def _build_handlers(self) -> dict[str, Handler]:
-        """Return the operator registry.
+        """Return the operator registry."""
 
-        The backend-neutral operators are duplicated from `adapters/lotus/` rather than shared,
-        so the two adapters can change without touching each other. Engine-backed operators are
-        registered one at a time as their lowering lands, so an operator missing here raises
-        rather than returns something unvalidated.
-        """
 
         return {
             "log": lambda query, inputs: execute_log(inputs),

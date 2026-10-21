@@ -504,9 +504,9 @@ def execute_agg(
     if group_query.op not in {"group_by", "sem_groupby"}:
         raise ValueError("agg expects group_by or sem_groupby input")
     if any(isinstance(aggregate, SemanticAggregateSpec) for aggregate in aggregates):
-        # Reason: a semantic aggregate needs a semantic grouping to aggregate over, and this adapter has
-        #   no `sem_groupby` lowering — failing here keeps the deterministic aggregates usable without
-        #   pretending the semantic half ran.
+        # Reason: a semantic aggregate needs a semantic grouping to aggregate over, and this adapter
+        #   has no `sem_groupby` lowering. Failing here keeps the deterministic aggregates usable
+        #   without pretending the semantic half ran.
         raise NotImplementedError(
             "agg with sem_agg(...) requires sem_groupby, which this adapter does not implement yet"
         )

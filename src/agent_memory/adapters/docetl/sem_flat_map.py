@@ -16,6 +16,7 @@ from agent_memory.adapters.docetl.columns import (
 from agent_memory.adapters.docetl.prompt import render_prompt
 from agent_memory.adapters.docetl.records import require_one_record_per_row, to_records
 from agent_memory.adapters.docetl.reserved import INDEX_KEY, ROWS_KEY, strip
+from agent_memory.adapters.docetl.specs import op_config
 from agent_memory.policy.logical import ColumnSpec, QueryExpr
 
 if TYPE_CHECKING:
@@ -26,8 +27,6 @@ def build_flat_map_config(
     query: QueryExpr,
     *,
     rows_column: str,
-    skip_on_error: bool = False,
-    litellm_completion_kwargs: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return the DocETL `map` config that asks for a list of output rows."""
 
@@ -49,16 +48,7 @@ def build_flat_map_config(
     if described:
         prompt = f"{prompt}\n\n{described}"
 
-    config: dict[str, Any] = {
-        "name": query.op,
-        "type": "map",
-        "prompt": prompt,
-        "output": {"schema": {rows_column: rows_type(declared)}},
-        "skip_on_error": bool(skip_on_error),
-    }
-    if litellm_completion_kwargs:
-        config["litellm_completion_kwargs"] = dict(litellm_completion_kwargs)
-    return config
+    return op_config(query.op, "map", prompt, {rows_column: rows_type(declared)})
 
 
 def _expand(
@@ -108,18 +98,14 @@ def execute_sem_flat_map(
     source = execute(query.inputs[0], inputs)
     index_key = INDEX_KEY
     rows_column = ROWS_KEY
-    operation = context.build_operation("map")(
-        context.handle,
-        build_flat_map_config(
-            query,
-            rows_column=rows_column,
-            skip_on_error=context.config.skip_on_error,
-            litellm_completion_kwargs=context.config.litellm_completion_kwargs,
-        ),
-        context.model,
-        context.config.max_threads,
+    records = context.run_operation(
+        "map",
+        build_flat_map_config(query, rows_column=rows_column),
+        to_records(source, index_key=index_key),
     )
-    records, _cost = operation.execute(to_records(source, index_key=index_key))
+    # Reason: one input row may legitimately produce zero rows here, which is why the check below
+    #   counts records rather than emitted rows: a record holding an empty list answered, while a
+    #   missing record is one the engine dropped.
     require_one_record_per_row(source, records, op="sem_flat_map", index_key=index_key)
     ordinal_col = query.params.get("ordinal_col")
     rows, indexes = _expand(

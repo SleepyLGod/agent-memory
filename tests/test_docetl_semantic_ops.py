@@ -112,11 +112,14 @@ def test_completion_kwargs_are_forwarded_under_docetls_own_key() -> None:
 
     assert "litellm_completion_kwargs" not in build_filter_config(_filter_query())
 
-    pinned = build_filter_config(
-        _filter_query(), litellm_completion_kwargs={"temperature": 0}
+    context = DocetlExecutionContext(
+        model=DEFAULT_DOCETL_MODEL,
+        config=DocetlExecutionConfig(litellm_completion_kwargs={"temperature": 0}),
     )
+    merged = context.with_op_defaults(build_filter_config(_filter_query()))
 
-    assert pinned["litellm_completion_kwargs"] == {"temperature": 0}
+    assert merged["litellm_completion_kwargs"] == {"temperature": 0}
+    assert merged["skip_on_error"] is False
 
 
 def test_docetl_accepts_the_generated_config() -> None:

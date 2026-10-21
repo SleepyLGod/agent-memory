@@ -96,12 +96,13 @@ def build_join_prompt(
 ) -> str:
     """Return the verdict prompt: one labelled line per compared field, then the condition.
 
-    Based on: LOTUS's `join_series` + `df2text` layout (`[<label>]: «<value>»`, condition stated
-    separately). Slots are positional so a column name cannot become a Jinja expression, and the root is
-    `input` because the verdict runs as a `filter` over a one-pair frame. `sem_join` fills those keys with
-    `join_slot`, so the template and the records cannot disagree about a key's name.
+    `sem_join` fills the record keys with `join_slot`, so the template and the records cannot
+    disagree about a key's name.
     """
 
+    # Based on: LOTUS's `join_series` + `df2text` layout (`[<label>]: «<value>»`, condition stated
+    #   separately). Slots are positional so a column name cannot become a Jinja expression, and
+    #   the root is `input` because the verdict runs as a `filter` over a one-pair frame.
     context = "\n".join(
         _CONTEXT_LINE.format(label=f"[{side}] {column}", slot=join_slot(side, index))
         for side, columns in (("left", left_columns), ("right", right_columns))
@@ -124,12 +125,10 @@ def build_topk_prompt(instruction: str, *, k: int, ids_column: str) -> str:
 
 
 def lower_join_instruction(instruction: str) -> str:
-    """Return the instruction with join placeholders replaced by the column names they name.
+    """Return the instruction with join placeholders replaced by the column names they name."""
 
-    Based on: `src/agent_memory/adapters/lotus/sem_join.py::join_series`, which compares one rendered
-    value per side and therefore cannot leave a placeholder for a renderer to fill.
-    """
-
+    # Based on: `src/agent_memory/adapters/lotus/sem_join.py::join_series`, which compares one
+    #   rendered value per side and therefore cannot leave a placeholder for a renderer to fill.
     def substitute(match: re.Match[str]) -> str:
         escaped, base, _qualifier = match.group(1), match.group(2), match.group(3)
         if escaped is not None:
@@ -149,7 +148,7 @@ def join_comparison_columns(
 
     A `{column:side}` placeholder names its side and must exist there. A bare `{column}` names the side
     that owns it; when both sides own it the instruction cannot say which value it means, so both sides
-    fall back to whole-row text — the same choice `join_series` makes.
+    fall back to whole-row text, the same choice `join_series` makes.
     """
 
     left_set = {str(column) for column in left_columns}

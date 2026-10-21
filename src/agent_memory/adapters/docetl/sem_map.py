@@ -18,6 +18,7 @@ from agent_memory.adapters.docetl.records import (
     to_records,
 )
 from agent_memory.adapters.docetl.reserved import INDEX_KEY, strip
+from agent_memory.adapters.docetl.specs import op_config
 from agent_memory.policy.logical import QueryExpr
 
 if TYPE_CHECKING:
@@ -28,8 +29,6 @@ def build_map_config(
     query: QueryExpr,
     *,
     describe: bool | None = None,
-    skip_on_error: bool = False,
-    litellm_completion_kwargs: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return the DocETL `map` config for one `sem_map` query."""
 
@@ -45,16 +44,7 @@ def build_map_config(
         if described:
             prompt = f"{prompt}\n\n{described}"
 
-    config: dict[str, Any] = {
-        "name": query.op,
-        "type": "map",
-        "prompt": prompt,
-        "output": {"schema": scalar_schema(declared)},
-        "skip_on_error": bool(skip_on_error),
-    }
-    if litellm_completion_kwargs:
-        config["litellm_completion_kwargs"] = dict(litellm_completion_kwargs)
-    return config
+    return op_config(query.op, "map", prompt, scalar_schema(declared))
 
 
 def execute_sem_map(
@@ -67,17 +57,11 @@ def execute_sem_map(
 
     source = execute(query.inputs[0], inputs)
     index_key = INDEX_KEY
-    operation = context.build_operation("map")(
-        context.handle,
-        build_map_config(
-            query,
-            skip_on_error=context.config.skip_on_error,
-            litellm_completion_kwargs=context.config.litellm_completion_kwargs,
-        ),
-        context.model,
-        context.config.max_threads,
+    mapped = context.run_operation(
+        "map",
+        build_map_config(query),
+        to_records(source, index_key=index_key),
     )
-    mapped, _cost = operation.execute(to_records(source, index_key=index_key))
     require_one_record_per_row(source, mapped, op="sem_map", index_key=index_key)
     return strip(
         from_records(
