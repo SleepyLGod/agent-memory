@@ -73,12 +73,18 @@ _VERDICT_TEMPLATE = (
 # for a literal `{{` / `}}`, which DocETL then renders.
 _CONTEXT_LINE = "{label}: «{{{{ input.{slot} }}}}»"
 
-# The ranking prompt, verbatim. `candidates` is filled by DocETL, not by Python.
+# The listwise ranking prompt for one left row and its candidate right rows.
+# Based on: `adapters/lotus/sem_topk_join.py::LISTWISE_JOIN_SYSTEM_PROMPT`.
 _TOPK_TEMPLATE = (
+    "The left row to match:\n"
+    "{{{{ input.{anchor} }}}}\n"
+    "\n"
+    "These right rows already satisfy this join condition: {condition}\n"
     "{{{{ input.candidates }}}}\n"
     "\n"
-    "These are the candidates that already satisfy this semantic join condition: {condition}\n"
-    "Select at most {k} of them, best first, and put their ids in {ids_column}."
+    "Select at most {k} of them for the left row, strongest first, and put their ids in "
+    "{ids_column}. Do not select merely related candidates, and do not fill the limit "
+    "when fewer candidates match. Return an empty list when none match."
 )
 
 
@@ -114,10 +120,13 @@ def build_join_prompt(
     )
 
 
-def build_topk_prompt(instruction: str, *, k: int, ids_column: str) -> str:
+def build_topk_prompt(
+    instruction: str, *, k: int, ids_column: str, anchor_column: str
+) -> str:
     """Return the ranking prompt for one left row whose matches overflow `k`."""
 
     return _TOPK_TEMPLATE.format(
+        anchor=anchor_column,
         condition=lower_join_instruction(instruction),
         k=k,
         ids_column=ids_column,

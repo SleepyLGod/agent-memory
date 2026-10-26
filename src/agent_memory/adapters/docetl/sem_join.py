@@ -27,6 +27,8 @@ LEFT_ID_COLUMN = "left_id"
 RIGHT_ID_COLUMN = "right_id"
 GROUP_POSITION_COLUMN = "group_position"
 SELECTED_COLUMN = "selected_right_ids"
+# Required by: `_cap_matches`, which shows the ranking call the row its candidates were matched to.
+ANCHOR_COLUMN = "left_row"
 
 _HOWS = frozenset({"inner", "left", "right", "outer"})
 
@@ -303,7 +305,7 @@ def _cap_matches(
         return list(matches)
 
     overflowing = [left_id for left_id in order if len(by_left[left_id]) > k]
-    _, right_columns = join_comparison_columns(
+    left_columns, right_columns = join_comparison_columns(
         params.instruction,
         left_columns=left.columns,
         right_columns=right.columns,
@@ -327,6 +329,9 @@ def _cap_matches(
         records = [
             {
                 GROUP_POSITION_COLUMN: position,
+                # Reason: the ranking question is "which of these best matches this row", so the record
+                #   carries both sides; candidates alone leave the model ordering against nothing.
+                ANCHOR_COLUMN: _pair_text(left, left_id, left_columns),
                 "candidates": "\n".join(
                     f"{right_id}: {_pair_text(right, right_id, right_columns)}"
                     for right_id in candidates_by_left[left_id]
@@ -375,7 +380,11 @@ def _selection(
     left_id: int,
     k: int,
 ) -> list[int]:
-    """Return one anchor's chosen candidates, refusing an answer a ranking cannot use."""
+    """Return one anchor's chosen candidates, refusing only an answer a ranking cannot use.
+
+    An empty list is a decision, not a defect: the prompt allows it, and the candidates already passed
+    the verdict, so "none of these is strong enough" leaves the left row without a match.
+    """
 
     if record is None:
         raise RuntimeError(
@@ -398,11 +407,6 @@ def _selection(
             )
         if right_id not in chosen:
             chosen.append(right_id)
-    if not chosen:
-        raise RuntimeError(
-            "sem_join k selection returned no candidate; "
-            f"left row {left_id} had {len(candidates)} verified matches"
-        )
     return chosen[:k]
 
 
@@ -525,7 +529,12 @@ def build_topk_config(
     return op_config(
         "sem_join",
         "map",
-        build_topk_prompt(instruction, k=k, ids_column=SELECTED_COLUMN),
+        build_topk_prompt(
+            instruction,
+            k=k,
+            ids_column=SELECTED_COLUMN,
+            anchor_column=ANCHOR_COLUMN,
+        ),
         {SELECTED_COLUMN: "list[string]"},
     )
 

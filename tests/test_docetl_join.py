@@ -21,7 +21,7 @@ from agent_memory.adapters.docetl.prompt import (
     build_topk_prompt,
     join_comparison_columns,
 )
-from agent_memory.adapters.docetl.sem_join import SELECTED_COLUMN
+from agent_memory.adapters.docetl.sem_join import ANCHOR_COLUMN, SELECTED_COLUMN
 from agent_memory.api import Log, Memory
 from agent_memory.policy.logical import QueryExpr
 
@@ -237,19 +237,70 @@ def test_an_empty_side_is_answered_without_a_model_call() -> None:
     assert result["note:right"].isna().all()
 
 
-def test_the_ranking_prompt_leaves_candidates_to_the_renderer() -> None:
-    """`candidates` is DocETL's Jinja slot, so it must survive Python's `format` untouched."""
+def test_the_ranking_prompt_carries_both_sides_and_the_limits() -> None:
+    """Building it states both slots and the limits; sending it puts the anchor on the wire.
+
+    DocETL's own system message asks for high recall, so the user message has to say that a smaller
+    answer is legal (`sem_topk_join.py::LISTWISE_JOIN_SYSTEM_PROMPT` says the same three things).
+    """
 
     prompt = build_topk_prompt(
         "the subjects match: {note:left} and {note:right}",
         k=2,
         ids_column=SELECTED_COLUMN,
+        anchor_column=ANCHOR_COLUMN,
     )
 
-    assert prompt.startswith("{{ input.candidates }}\n")
+    assert "{{ input.left_row }}" in prompt
+    assert "{{ input.candidates }}" in prompt
     assert "Condition" not in prompt
     assert f"put their ids in {SELECTED_COLUMN}" in prompt
     assert "at most 2 of them" in prompt
+    assert "do not fill the limit" in prompt.lower()
+    assert "empty list when none match" in prompt.lower()
+    # the condition precedes the candidates, so the reader knows what the list is for
+    assert prompt.index("join condition") < prompt.index("{{ input.candidates }}")
+
+    # the wire half: the anchor is rendered per record, so the model sees the row it matches against
+    wide = pd.DataFrame({"note": ["alpha one"]})
+    rights = pd.DataFrame({"note": ["alpha two", "beta two"]})
+    query = QueryExpr(
+        op="sem_join",
+        inputs=(_source("left", wide), _source("right", rights)),
+        params={
+            "instruction": "the subjects match: {note:left} and {note:right}",
+            "k": 1,
+        },
+    )
+
+    with canned_model("", map_answers={SELECTED_COLUMN: ["0"]}) as running:
+        result = _adapter(running).execute(query, {"left": wide, "right": rights})
+
+    ranking = [body for body in running.requests if SELECTED_COLUMN in json.dumps(body)]
+    assert len(ranking) == 1
+    assert "alpha one" in json.dumps(ranking[0])
+    assert result["note:right"].tolist() == ["alpha two"]
+
+
+def test_an_empty_ranking_answer_leaves_the_left_row_unmatched() -> None:
+    """The prompt allows "none of these"; taking that answer must not be treated as a malformed one."""
+
+    wide = pd.DataFrame({"note": ["alpha one"]})
+    rights = pd.DataFrame({"note": ["alpha two", "beta two"]})
+    query = QueryExpr(
+        op="sem_join",
+        inputs=(_source("left", wide), _source("right", rights)),
+        params={
+            "instruction": "the subjects match: {note:left} and {note:right}",
+            "k": 1,
+        },
+    )
+
+    with canned_model("", map_answers={SELECTED_COLUMN: []}) as running:
+        result = _adapter(running).execute(query, {"left": wide, "right": rights})
+
+    assert list(result.columns) == ["note:left", "note:right"]
+    assert result.empty
 
 
 def test_k_keeps_at_most_k_matches_per_left_row() -> None:
@@ -298,7 +349,8 @@ def test_a_bad_ranking_answer_is_asked_again() -> None:
     """The first answer names a non-candidate, the second is valid, so the run completes.
 
     Based on: `adapters/lotus/sem_topk_listwise.py:93`, which retries a malformed listwise answer;
-    DocETL's `map` has no such loop, so the retry lives in `_cap_matches`.
+    DocETL's `map` has no such loop, so the retry lives in `_cap_matches`. Only `_cap_matches`'s
+    contribution is asserted here: the capped-out frame itself is the case above.
     """
 
     left = pd.DataFrame({"note": ["alpha"]})
@@ -319,11 +371,10 @@ def test_a_bad_ranking_answer_is_asked_again() -> None:
     ) as running:
         result = _adapter(running).execute(query, {"left": left, "right": rights})
 
+    ranking = [body for body in running.requests if SELECTED_COLUMN in json.dumps(body)]
+    assert len(ranking) == 2  # refused once, answered once
     assert result.loc[result["note:left"].notna(), "note:right"].tolist() == [
         "alpha one"
-    ]
-    assert result.loc[result["note:left"].isna(), "note:right"].tolist() == [
-        "alpha two"
     ]
 
 
