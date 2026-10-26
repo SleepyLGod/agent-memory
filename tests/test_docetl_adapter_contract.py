@@ -27,6 +27,84 @@ def test_fingerprint_is_stable_and_backend_distinct() -> None:
     assert fingerprint != DocetlAdapter(model="other/model").maintenance_execution_fingerprint
 
 
+@pytest.mark.parametrize(
+    "adapter",
+    [
+        pytest.param(DocetlAdapter(model="other/model"), id="model"),
+        pytest.param(
+            DocetlAdapter(config=DocetlExecutionConfig(skip_on_error=True)),
+            id="skip_on_error",
+        ),
+        pytest.param(
+            DocetlAdapter(config=DocetlExecutionConfig(enable_cache=True)),
+            id="enable_cache",
+        ),
+        pytest.param(
+            DocetlAdapter(config=DocetlExecutionConfig(lm_api_base="https://other.invalid/v1")),
+            id="lm_api_base",
+        ),
+        pytest.param(
+            DocetlAdapter(
+                config=DocetlExecutionConfig(
+                    litellm_completion_kwargs={"temperature": 0}
+                )
+            ),
+            id="completion_kwargs",
+        ),
+    ],
+)
+def test_a_setting_that_changes_a_decision_changes_the_fingerprint(
+    adapter: DocetlAdapter,
+) -> None:
+    """A checkpoint made under one configuration must not be restored under another."""
+
+    assert (
+        adapter.maintenance_execution_fingerprint
+        != DocetlAdapter().maintenance_execution_fingerprint
+    )
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        pytest.param(DocetlExecutionConfig(max_threads=4), id="max_threads"),
+        pytest.param(
+            DocetlExecutionConfig(semantic_trace_dir="/tmp/trace"), id="trace_dir"
+        ),
+        pytest.param(
+            DocetlExecutionConfig(semantic_trace_snapshot_mode="full"),
+            id="snapshot_mode",
+        ),
+    ],
+)
+def test_a_setting_that_only_changes_execution_keeps_the_fingerprint(
+    config: DocetlExecutionConfig,
+) -> None:
+    """Concurrency and tracing reach the same decisions, so a checkpoint stays compatible."""
+
+    assert (
+        DocetlAdapter(config=config).maintenance_execution_fingerprint
+        == DocetlAdapter().maintenance_execution_fingerprint
+    )
+
+
+def test_completion_kwargs_order_does_not_change_the_fingerprint() -> None:
+    """The same knobs written in a different order are the same settings."""
+
+    first = DocetlAdapter(
+        config=DocetlExecutionConfig(
+            litellm_completion_kwargs={"temperature": 0, "top_p": 1}
+        )
+    )
+    second = DocetlAdapter(
+        config=DocetlExecutionConfig(
+            litellm_completion_kwargs={"top_p": 1, "temperature": 0}
+        )
+    )
+
+    assert first.maintenance_execution_fingerprint == second.maintenance_execution_fingerprint
+
+
 def test_model_and_endpoint_are_read_from_the_environment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from hashlib import sha256
+import json
 from typing import Any
 
 from agent_memory.adapters.docetl import relational
@@ -50,21 +51,27 @@ class DocetlAdapter:
 
     @property
     def maintenance_execution_fingerprint(self) -> str:
-        """Identify the physical settings that can change maintained state.
+        """Identify the configuration a checkpoint was built under.
 
-        Invariants: non-empty, and **backend-distinct** so a LOTUS-produced checkpoint can
-        never be restored under DocETL. `backend=docetl` is what guarantees that.
+        Stored with the state and compared on restore: when a setting that can change a decision has
+        moved, the checkpoint is refused instead of resumed. That covers the engine, model, endpoint,
+        sampling knobs and the join resolver; concurrency and tracing only change how a decision is
+        reached and therefore not included. `backend=docetl` makes a LOTUS checkpoint never match.
         """
 
-        parts = [
-            "backend=docetl",
-            f"model={self.model}",
-            f"skip_on_error={self.config.skip_on_error}",
-            f"enable_cache={self.config.enable_cache}",
-            f"lm_api_base={self.config.lm_api_base or ''}",
-            f"sem_join_topk_method={self.config.sem_join_topk_method}",
-        ]
-        return sha256("\n".join(parts).encode("utf-8")).hexdigest()
+        settings = {
+            "backend": "docetl",
+            "model": self.model,
+            "lm_api_base": self.config.lm_api_base or "",
+            "skip_on_error": self.config.skip_on_error,
+            "enable_cache": self.config.enable_cache,
+            "sem_join_topk_method": self.config.sem_join_topk_method,
+            "litellm_completion_kwargs": dict(self.config.litellm_completion_kwargs),
+        }
+        payload = json.dumps(
+            settings, sort_keys=True, separators=(",", ":"), default=str
+        )
+        return sha256(payload.encode("utf-8")).hexdigest()
 
     def execute(self, query: QueryExpr, inputs: Mapping[str, Any]) -> Any:
         """Dispatch to the registered lowering. Frame in, frame out, as `ExecutionAdapter.execute` defines it."""
