@@ -35,6 +35,8 @@ _UNREACHABLE_BASE = "http://127.0.0.1:9/v1"
 _KEEP_MARKER = "__keep__"
 # a row carrying this gets an answer that parses as JSON and fails the declared type
 _MALFORMED_MARKER = "__malformed__"
+# 2**53 + 1, the first integer float64 cannot hold; a carried column must not round it
+_BIG = 9007199254740993
 
 
 @pytest.fixture
@@ -275,6 +277,63 @@ def test_a_single_column_map_sends_no_descriptions_like_the_native_path() -> Non
     assert "- entry: one entry" in flat["prompt"]
 
 
+def test_sem_filter_carries_a_large_integer_column_exact(
+    canned_endpoint: CannedEndpoint,
+) -> None:
+    """A filter that keeps every row must not round a carried integer via the record echo."""
+
+    frame = pd.DataFrame(
+        {
+            "note": [_KEEP_MARKER, _KEEP_MARKER],
+            "fact_id": pd.array([_BIG, pd.NA], dtype="Int64"),
+        },
+        index=[7, 8],
+    )
+
+    result = _adapter(canned_endpoint).execute(_filter_query(), {"log": frame})
+
+    assert str(result["fact_id"].dtype) == "Int64"
+    assert result["fact_id"].iloc[0] == _BIG
+    assert pd.isna(result["fact_id"].iloc[1])
+
+
+def test_sem_map_carries_a_large_integer_column_exact(
+    mapping_endpoint: CannedEndpoint,
+) -> None:
+    """Only the declared output comes from the answer; a carried column comes from the source."""
+
+    frame = pd.DataFrame(
+        {"message": ["alpha"], "fact_id": pd.array([_BIG], dtype="Int64")},
+        index=[7],
+    )
+
+    result = _adapter(mapping_endpoint).execute(_map_query(), {"log": frame})
+
+    assert list(result.columns) == ["message", "fact_id", "summary"]
+    assert str(result["fact_id"].dtype) == "Int64"
+    assert result["fact_id"].iloc[0] == _BIG
+    assert result["summary"].iloc[0] == "canned summary"
+
+
+def test_sem_flat_map_carries_a_large_integer_column_exact(
+    rows_endpoint: CannedEndpoint,
+) -> None:
+    """One input row emits two, and both copies are the source row's: exact, and still the source's
+    dtype rather than one a rebuilt row would have inferred.
+    """
+
+    frame = pd.DataFrame(
+        {"message": ["alpha"], "fact_id": pd.array([_BIG], dtype="Int64")},
+        index=[7],
+    )
+
+    result = _adapter(rows_endpoint).execute(_flat_map_query(), {"log": frame})
+
+    assert str(result["fact_id"].dtype) == "Int64"
+    assert result["fact_id"].tolist() == [_BIG, _BIG]
+    assert list(result.index) == [7, 7]
+
+
 # §2: `I` and `O` are the operator's vocabulary. `sem_filter` declares no output
 # field, so a name it has no value for is refused rather than accepted as
 # something to fill.
@@ -427,7 +486,8 @@ def test_no_injected_column_escapes(
     markers: tuple[str, ...],
     answers: dict[str, Any],
 ) -> None:
-    """Every semantic operator returns through `strip`, so no reserved key may reach a caller.
+    """No operator publishes a reserved key: the keys are consumed where the records are read, so the
+    frame a caller receives holds policy columns only.
 
     The column list is asserted too: an equality catches a *missing* column, which a disjointness check
     would happily pass.

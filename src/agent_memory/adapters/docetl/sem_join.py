@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 
 import pandas as pd
 
+from agent_memory.adapters.docetl.dtypes import carry_integer_dtypes
 from agent_memory.adapters.docetl.prompt import (
     build_join_prompt,
     build_topk_prompt,
@@ -423,20 +424,26 @@ def _assemble(
 ) -> pd.DataFrame:
     """Build the published frame, including the null rows `how` requires."""
 
-    left_names, right_names, output_columns = _published_names(left, right, id_columns)
+    left_names, right_names, output_columns, carried = _published_names(
+        left, right, id_columns
+    )
     rows = [
         _joined_row(left, right, left_id, right_id, left_names, right_names, id_columns)
         for left_id, right_id in _rows_for(how, matches, left.index, right.index)
     ]
-    return pd.DataFrame(rows, columns=output_columns)
+    frame = pd.DataFrame(rows, columns=output_columns)
+    # Reason: a frame assembled row by row infers `object` for every column that gained a null, so each
+    #   integer column is put back under a carrier that holds both: `Int64` when a null is present, the
+    #   source dtype when it is not.
+    return carry_integer_dtypes(frame, carried, op="sem_join")
 
 
 def _published_names(
     left: pd.DataFrame,
     right: pd.DataFrame,
     id_columns: tuple[str, str] | None,
-) -> tuple[dict[str, str], dict[str, str], list[str]]:
-    """Return each side's published names, then the column list the frame carries."""
+) -> tuple[dict[str, str], dict[str, str], list[str], dict[str, Any]]:
+    """Return each side's published names, the column list, and the dtype each carry came from."""
 
     # Required by: the node's declared schema, which suffixes only overlapping names
     #   (`src/agent_memory/policy/schema.py::semantic_join_columns`).
@@ -458,7 +465,14 @@ def _published_names(
             raise ValueError(
                 f"sem_join id columns conflict with output columns: {conflicts}"
             )
-    return left_names, right_names, output_columns
+    carried = {out: left[column].dtype for column, out in left_names.items()}
+    carried.update({out: right[column].dtype for column, out in right_names.items()})
+    # Requirement: the id columns are row positions, so an unmatched side leaves `pd.NA` and the
+    #   column would otherwise stay `object`. `Int64` holds both; `int64` when every row is matched.
+    if id_columns is not None:
+        for name in id_columns:
+            carried[str(name)] = "int64"
+    return left_names, right_names, output_columns, carried
 
 
 def _rows_for(

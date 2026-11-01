@@ -22,6 +22,7 @@ from agent_memory.adapters.docetl.prompt import (
     build_topk_prompt,
     compared_columns,
 )
+from agent_memory.adapters.docetl.relational import execute_join as execute_key_join
 from agent_memory.adapters.docetl.sem_join import ANCHOR_COLUMN, SELECTED_COLUMN
 from agent_memory.api import Log, Memory
 from agent_memory.policy.logical import QueryExpr
@@ -555,6 +556,8 @@ def test_id_columns_are_written_on_matched_and_unmatched_rows(
     assert result["l_id"].tolist() == [0, 0, 1]
     assert result["r_id"].iloc[:2].tolist() == [0, 1]
     assert pd.isna(result["r_id"].iloc[2])
+    assert str(result["l_id"].dtype) == "int64"
+    assert str(result["r_id"].dtype) == "Int64"
 
 
 def test_id_columns_that_shadow_an_output_column_are_refused(
@@ -747,3 +750,77 @@ def test_a_join_that_would_lose_a_row_is_refused() -> None:
 
         with pytest.raises(NotImplementedError, match="append-only"):
             memory.add({"side": "left", "key": "k", "value": 3})
+
+
+BIG = 9007199254740993
+
+
+def _join_of(
+    left: pd.DataFrame, right: pd.DataFrame, **params: object
+) -> QueryExpr:
+    """Build a key-scoped semantic join over frames chosen by the case."""
+
+    return QueryExpr(
+        op="sem_join",
+        inputs=(_source("left", left), _source("right", right)),
+        params={"instruction": "same dept: {dept:left} and {dept:right}", **params},
+    )
+
+
+def _materialized(query: QueryExpr, inputs: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """Resolve a source with no storage: the case hands the frame in by name."""
+
+    return inputs[str(query.params["name"])]
+
+
+def test_a_sem_join_keeps_an_unmatched_integer_exact(
+    endpoint: CannedEndpoint,
+) -> None:
+    """The right side loses a row, so its integer column gains a null. The nullable carrier keeps both
+    the null and the value, where the float carrier pandas would have chosen rounds 2**53 + 1.
+    """
+
+    left = pd.DataFrame({"dept": ["d1", "d2"], "tag": ["x", "y"]})
+    right = pd.DataFrame({"dept": ["d1"], "amount": [BIG]})
+
+    result = _adapter(endpoint).execute(
+        _join_of(left, right, on=("dept",), how="left"),
+        {"left": left, "right": right},
+    )
+
+    assert str(result["amount"].dtype) == "Int64"
+    assert result["amount"].iloc[0] == BIG
+    assert pd.isna(result["amount"].iloc[1])
+
+
+@pytest.mark.parametrize("how", ["inner", "left", "right", "outer"])
+def test_a_key_join_keeps_an_integer_exact(how: str) -> None:
+    """Pandas converts a carried integer to float the moment `how` can leave it unmatched, and the
+    conversion happens inside the merge. The side that can lose a row is converted first, and a column
+    that lost none comes back under the dtype it entered with.
+    """
+
+    left = pd.DataFrame({"dept": ["d1", "d2"], "rank": [1, 2]})
+    right = pd.DataFrame({"dept": ["d1", "d3"], "amount": [BIG, 7]})
+    query = QueryExpr(
+        op="join",
+        inputs=(_source("left", left), _source("right", right)),
+        params={"on": ("dept",), "how": how},
+    )
+
+    result = execute_key_join(query, {"left": left, "right": right}, _materialized)
+
+    if how in {"left", "outer"}:
+        assert str(result["amount"].dtype) == "Int64"
+        assert result["amount"].iloc[0] == BIG
+        assert result["amount"].isna().any()
+    else:
+        assert str(result["amount"].dtype) == "int64"
+        assert result["amount"].iloc[0] == BIG
+        assert not result["amount"].isna().any()
+    if how in {"right", "outer"}:
+        assert str(result["rank"].dtype) == "Int64"
+        assert result["rank"].isna().any()
+    else:
+        assert str(result["rank"].dtype) == "int64"
+        assert not result["rank"].isna().any()

@@ -10,13 +10,17 @@ import pandas as pd
 from agent_memory.adapters.docetl.columns import (
     declared_outputs,
     describe_outputs,
-    output_column_names,
     rows_type,
     selected_inputs,
 )
 from agent_memory.adapters.docetl.prompt import render_prompt
-from agent_memory.adapters.docetl.records import require_one_record_per_row, to_records
-from agent_memory.adapters.docetl.reserved import INDEX_KEY, ROWS_KEY, strip
+from agent_memory.adapters.docetl.records import (
+    publish_rows,
+    require_one_record_per_row,
+    source_positions,
+    to_records,
+)
+from agent_memory.adapters.docetl.reserved import INDEX_KEY, ROWS_KEY
 from agent_memory.adapters.docetl.specs import op_config
 from agent_memory.policy.logical import ColumnSpec, QueryExpr
 
@@ -55,39 +59,43 @@ def build_flat_map_config(
 
 
 def _expand(
+    source: pd.DataFrame,
     records: Sequence[Mapping[str, Any]],
     *,
     index_key: str,
     rows_column: str,
     declared: Sequence[ColumnSpec],
-    source_columns: Sequence[str],
     ordinal_col: str | None,
-) -> tuple[list[dict[str, Any]], list[Any]]:
-    """Expand each record's list into rows, keeping the record's index value on every emitted row.
+) -> tuple[list[int], dict[str, list[Any]]]:
+    """Expand each record's list into one row per entry, remembering which source row each came from.
 
-    The ordinal's *name* is the policy's (`ordinal_col`); its *value* is the adapter's, assigned here so a
-    model is never asked for a row's position among the rows emitted for one input.
+    `positions` has one entry per emitted row, so a record's position repeats when its list is longer
+    than one: the source row is named rather than copied, and `publish_rows` selects it. `written` holds
+    only what the model produced. The ordinal's *name* is the policy's (`ordinal_col`); its *value* is
+    the adapter's, assigned here so a model is never asked for a row's position among the rows emitted
+    for one input.
     """
 
-    rows: list[dict[str, Any]] = []
-    indexes: list[Any] = []
-    for record in records:
+    positions: list[int] = []
+    written: dict[str, list[Any]] = {column.name: [] for column in declared}
+    if ordinal_col is not None:
+        written[str(ordinal_col)] = []
+    for position, record in zip(
+        source_positions(source, records, index_key=index_key), records, strict=True
+    ):
         emitted = record.get(rows_column) or []
         if not isinstance(emitted, list):
             raise ValueError(
                 f"sem_flat_map row {record.get(index_key)!r} returned {type(emitted).__name__} where "
                 "the declared schema is a list, so DocETL's validation should have dropped it"
             )
-        base = {column: record.get(column) for column in source_columns}
         for ordinal, item in enumerate(emitted):
-            row = dict(base)
+            positions.append(position)
             for column in declared:
-                row[column.name] = item.get(column.name)
+                written[column.name].append(item.get(column.name))
             if ordinal_col is not None:
-                row[ordinal_col] = ordinal
-            rows.append(row)
-            indexes.append(record[index_key])
-    return rows, indexes
+                written[str(ordinal_col)].append(ordinal)
+    return positions, written
 
 
 def execute_sem_flat_map(
@@ -114,23 +122,16 @@ def execute_sem_flat_map(
     #   counts records rather than emitted rows: a record holding an empty list answered, while a
     #   missing record is one the engine dropped.
     require_one_record_per_row(source, records, op="sem_flat_map", index_key=index_key)
-    ordinal_col = query.params.get("ordinal_col")
-    rows, indexes = _expand(
+    positions, written = _expand(
+        source,
         records,
         index_key=index_key,
         rows_column=rows_column,
         declared=declared_outputs(query),
-        source_columns=tuple(source.columns),
-        ordinal_col=ordinal_col,
+        ordinal_col=query.params.get("ordinal_col"),
     )
-
-    columns = output_column_names(query, source.columns)
-    if ordinal_col is not None:
-        columns.append(str(ordinal_col))
 
     # Reason: the runtime files a semantic row's outputs by the input row's index, and one input row can
     #   now own several outputs, so the index is repeated rather than made unique, and `object` matches
     #   the dtype the runtime allocates for occurrence ids.
-    frame = pd.DataFrame(rows, columns=columns)
-    frame.index = pd.Index(indexes, dtype="object")
-    return strip(frame)
+    return publish_rows(source, positions, written=written, index_dtype="object")

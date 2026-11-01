@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING, Any
 from agent_memory.adapters.docetl.columns import (
     declared_outputs,
     describe_outputs,
-    output_column_names,
     scalar_schema,
     selected_inputs,
 )
@@ -18,7 +17,7 @@ from agent_memory.adapters.docetl.records import (
     require_one_record_per_row,
     to_records,
 )
-from agent_memory.adapters.docetl.reserved import INDEX_KEY, strip
+from agent_memory.adapters.docetl.reserved import INDEX_KEY
 from agent_memory.adapters.docetl.specs import op_config
 from agent_memory.policy.logical import QueryExpr
 
@@ -69,10 +68,9 @@ def execute_sem_map(
         to_records(source, index_key=index_key),
     )
     require_one_record_per_row(source, mapped, op="sem_map", index_key=index_key)
-    return strip(
-        from_records(
-            mapped,
-            index_key=index_key,
-            columns=output_column_names(query, source.columns),
-        )
+    return from_records(
+        mapped,
+        index_key=index_key,
+        source=source,
+        written=(column.name for column in declared_outputs(query)),
     )

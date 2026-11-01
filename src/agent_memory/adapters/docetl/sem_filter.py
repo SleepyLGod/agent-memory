@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any
 
 from agent_memory.adapters.docetl.prompt import render_prompt
 from agent_memory.adapters.docetl.records import from_records, to_records
-from agent_memory.adapters.docetl.reserved import INDEX_KEY, KEEP_KEY, strip
+from agent_memory.adapters.docetl.reserved import INDEX_KEY, KEEP_KEY
 from agent_memory.adapters.docetl.specs import op_config
 from agent_memory.policy.logical import QueryExpr
 
@@ -42,4 +42,4 @@ def execute_sem_filter(
         build_filter_config(query, columns=tuple(str(column) for column in source.columns)),
         to_records(source, index_key=index_key),
     )
-    return strip(from_records(kept, index_key=index_key, columns=source.columns))
+    return from_records(kept, index_key=index_key, source=source, written=())

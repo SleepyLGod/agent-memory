@@ -1,10 +1,8 @@
-"""The record keys this adapter injects, and the rules that keep them out of a caller's frame."""
+"""The record keys this adapter injects, and the check that keeps them out of a caller's frame."""
 
 from __future__ import annotations
 
 from collections.abc import Iterable
-
-import pandas as pd
 
 # Required by: the record contract (`docetl.operations.base::BaseOperation.execute`) and the runtime's
 #   row-local nodes, which file results by occurrence
@@ -28,10 +26,3 @@ def reject_reserved(columns: Iterable[str]) -> None:
     clashes = [str(column) for column in columns if str(column) in RESERVED_NAMES]
     if clashes:
         raise ValueError(f"frame uses adapter-reserved column names: {clashes}")
-
-
-def strip(frame: pd.DataFrame) -> pd.DataFrame:
-    """Return `frame` without any column this adapter injected for its own use."""
-
-    doomed = [column for column in frame.columns if column in RESERVED_NAMES]
-    return frame.drop(columns=doomed) if doomed else frame

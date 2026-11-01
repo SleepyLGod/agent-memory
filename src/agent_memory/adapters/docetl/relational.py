@@ -9,6 +9,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from agent_memory.adapters.docetl.dtypes import carry_integer_dtypes, nullable_integers
 from agent_memory.policy.aggregates import (
     ArrayAggregateSpec,
     CollectListAggregateSpec,
@@ -267,17 +268,28 @@ def execute_join(
         result = merged[merged[marker].isna()].drop(columns=[marker])
         return result.loc[:, list(left.columns)].reset_index(drop=True)
 
+    suffixes = _join_suffixes(query)
+    # Reason: pandas gives an integer column a float carrier the moment a merge can leave it missing,
+    #   and a float cannot hold an integer past 2**53. Converting the side that can lose rows before
+    #   the merge keeps the value; `carry_integer_dtypes` puts a complete column back afterwards.
+    carried = _published_dtypes(left, right, keys=keys, suffix=suffixes[0])
+    carried.update(_published_dtypes(right, left, keys=keys, suffix=suffixes[1]))
+    if how in {"right", "outer"}:
+        left = nullable_integers(left, _carried_columns(left, keys))
+    if how in {"left", "outer"}:
+        right = nullable_integers(right, _carried_columns(right, keys))
+
     merged = left.merge(
         right,
         how=how,
         on=list(keys),
-        suffixes=_join_suffixes(query),
+        suffixes=suffixes,
         sort=False,
     ).reset_index(drop=True)
     # Required by: §6, read off the frame pandas produced, because it suffixes a shared name
     #   without checking whether the suffixed label is already taken.
     require_unique_published_columns(merged.columns, op=str(query.op))
-    return merged
+    return carry_integer_dtypes(merged, carried, op=str(query.op))
 
 
 def predicate_join_row_ids(
@@ -834,6 +846,33 @@ def _join_suffixes(query: QueryExpr) -> tuple[str, str]:
     left_alias = relation_alias(query.inputs[0]) or "left"
     right_alias = relation_alias(query.inputs[1]) or "right"
     return f":{left_alias}", f":{right_alias}"
+
+
+def _carried_columns(frame: pd.DataFrame, keys: Sequence[str]) -> list[str]:
+    """Return the columns a join carries: every column but the keys it matches on.
+
+    A key cannot lose a value — a row without one does not match, rather than publishing a null.
+    """
+
+    return [str(column) for column in frame.columns if str(column) not in keys]
+
+
+def _published_dtypes(
+    frame: pd.DataFrame, other: pd.DataFrame, *, keys: Sequence[str], suffix: str
+) -> dict[str, Any]:
+    """Return each carried column's source dtype, keyed by the name the merge publishes it under.
+
+    The names are derived the way pandas derives them — a name both sides share is suffixed, unless it
+    is a join key — because the mapping has to name the columns the merge actually produced.
+    """
+
+    dtypes: dict[str, Any] = {}
+    for column in frame.columns:
+        if str(column) in keys:
+            continue
+        published = f"{column}{suffix}" if column in other.columns else str(column)
+        dtypes[published] = frame[column].dtype
+    return dtypes
 
 
 def _unused_column_name(
