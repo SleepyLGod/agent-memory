@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-import re
+from collections.abc import Callable, Sequence
 
 from agent_memory.policy.aggregates import (
     ArrayAggregateSpec,
@@ -14,6 +13,7 @@ from agent_memory.policy.aggregates import (
 )
 from agent_memory.policy.expressions import ColumnExpr, least
 from agent_memory.policy.logical import ColumnSpec, QueryExpr
+from agent_memory.policy.placeholders import Reference, Text, compose, split
 from agent_memory.policy.schema import output_columns
 
 ROW_LOCAL_UNARY_OPS = {
@@ -45,9 +45,25 @@ GROUPED_AGG_RULES = (
     "rule-all-group-optimized",
 )
 DEFAULT_GROUPED_AGG_RULE = "rule-join-map"
-PLACEHOLDER_PATTERN = re.compile(
-    r"(?<!\{)\{([A-Za-z_][A-Za-z0-9_]*)(?::(left|right))?\}(?!\})"
-)
+
+
+def _rewrite_references(
+    instruction: str,
+    replacement: Callable[[str], Sequence[Text | Reference]],
+) -> str:
+    """Rewrite each reference by name, leaving the text around it as written.
+
+    The grammar is `policy/placeholders.py`'s, so a rewrite reads an instruction the way
+    the adapter does and writes one the adapter can read back.
+    """
+
+    rewritten: list[Text | Reference] = []
+    for token in split(instruction):
+        if isinstance(token, Reference):
+            rewritten.extend(replacement(token.name))
+        else:
+            rewritten.append(token)
+    return compose(rewritten)
 
 
 class DifferentialInstructionRewriter:
@@ -94,20 +110,20 @@ class DifferentialInstructionRewriter:
         state_names = {str(column) for column in state_cols}
         raw_input_names = {str(column) for column in raw_input_cols}
 
-        def replace(match: re.Match[str]) -> str:
-            column = match.group(1)
-            side = match.group(2)
-            state_column = column if side is None else f"{column}:{side}"
-            if state_column in state_names:
-                return match.group(0)
-            if side is None and column in raw_input_names:
-                return column
+        def replacement(name: str) -> tuple[Text | Reference, ...]:
+            if name in state_names:
+                return (Reference(name),)
+            if name in raw_input_names:
+                # Reason: the raw column is not carried into the state, so the value is no
+                #   longer available; the name stays as plain words rather than a reference
+                #   that would resolve to nothing.
+                return (Text(name),)
             raise ValueError(
-                f"Cannot reaggregate instruction placeholder {{{column}}}: it is not "
+                f"Cannot reaggregate instruction placeholder {{{name}}}: it is not "
                 "present in aggregate state and is not a declared raw input column."
             )
 
-        return PLACEHOLDER_PATTERN.sub(replace, instruction)
+        return _rewrite_references(instruction, replacement)
 
     def _rewrite_placeholders(
         self,
@@ -121,23 +137,28 @@ class DifferentialInstructionRewriter:
         input_names = {str(column) for column in input_cols}
         output_names = {str(column) for column in output_cols}
 
-        def replace(match: re.Match[str]) -> str:
-            column = match.group(1)
-            side = match.group(2)
+        def replacement(name: str) -> tuple[Text | Reference, ...]:
+            head, _, _suffix = name.rpartition(":")
 
-            if side is not None:
-                return match.group(0)
-            if column in input_names:
-                return f"{{{column}:left}} and {{{column}:right}}"
-            if column in output_names:
-                return match.group(0)
+            if name in input_names:
+                return (
+                    Reference(f"{name}:left"),
+                    Text(" and "),
+                    Reference(f"{name}:right"),
+                )
+            if head and head in input_names:
+                # Reason: the author already named a side for a frame that is now joined, so
+                #   the token is written for that frame; another segment would invent a column.
+                return (Reference(name),)
+            if name in output_names:
+                return (Reference(name),)
             raise ValueError(
-                f"Cannot rewrite instruction placeholder {{{column}}}: it is not "
+                f"Cannot rewrite instruction placeholder {{{name}}}: it is not "
                 "declared as an input or output column. Use double braces like "
-                f"{{{{{column}}}}} for literal text that is not a column placeholder."
+                f"{{{{{name}}}}} for literal text that is not a column placeholder."
             )
 
-        return PLACEHOLDER_PATTERN.sub(replace, instruction)
+        return _rewrite_references(instruction, replacement)
 
 
 class DifferentialRules:

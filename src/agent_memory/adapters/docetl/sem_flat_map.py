@@ -12,6 +12,7 @@ from agent_memory.adapters.docetl.columns import (
     describe_outputs,
     output_column_names,
     rows_type,
+    selected_inputs,
 )
 from agent_memory.adapters.docetl.prompt import render_prompt
 from agent_memory.adapters.docetl.records import require_one_record_per_row, to_records
@@ -26,6 +27,7 @@ if TYPE_CHECKING:
 def build_flat_map_config(
     query: QueryExpr,
     *,
+    columns: Sequence[str],
     rows_column: str,
 ) -> dict[str, Any]:
     """Return the DocETL `map` config that asks for a list of output rows."""
@@ -44,7 +46,8 @@ def build_flat_map_config(
         "none."
     )
     described = describe_outputs(declared)
-    prompt = f"{render_prompt(instruction)}\n\n{shape}"
+    outputs = [column.name for column in declared]
+    prompt = f"{render_prompt(instruction, columns=columns, outputs=outputs)}\n\n{shape}"
     if described:
         prompt = f"{prompt}\n\n{described}"
 
@@ -100,7 +103,11 @@ def execute_sem_flat_map(
     rows_column = ROWS_KEY
     records = context.run_operation(
         "map",
-        build_flat_map_config(query, rows_column=rows_column),
+        build_flat_map_config(
+            query,
+            columns=selected_inputs(query, source.columns),
+            rows_column=rows_column,
+        ),
         to_records(source, index_key=index_key),
     )
     # Reason: one input row may legitimately produce zero rows here, which is why the check below

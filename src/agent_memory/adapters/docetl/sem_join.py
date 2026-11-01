@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, NamedTuple
 
@@ -12,12 +12,14 @@ import pandas as pd
 from agent_memory.adapters.docetl.prompt import (
     build_join_prompt,
     build_topk_prompt,
-    join_comparison_columns,
+    compared_columns,
     join_slot,
 )
 from agent_memory.adapters.docetl.reserved import KEEP_KEY
 from agent_memory.adapters.docetl.specs import op_config
 from agent_memory.policy.logical import QueryExpr
+from agent_memory.policy.placeholders import JoinScope
+from agent_memory.policy.schema import relation_alias, require_unique_published_columns
 from agent_memory.tracing.semantic import query_digest, write_pair_trace, write_trace_event
 
 if TYPE_CHECKING:
@@ -56,6 +58,16 @@ class JoinParams:
     on: tuple[Any, ...]
     k: int | None
     id_columns: tuple[str, str] | None
+    # This join's own inputs, as named by `alias(...)`; an earlier join's alias is not inherited.
+    left_alias: str | None
+    right_alias: str | None
+
+    def scope(self, left: Iterable[str], right: Iterable[str]) -> JoinScope:
+        """Return this join's scope over the two frames it compares."""
+
+        return JoinScope.of(
+            left, right, left_alias=self.left_alias, right_alias=self.right_alias
+        )
 
 
 def execute_sem_join(
@@ -150,6 +162,8 @@ def _join_params(query: QueryExpr) -> JoinParams:
         on=on,
         k=k,
         id_columns=_normalize_id_columns(query.params.get("id_columns")),
+        left_alias=relation_alias(query.inputs[0]),
+        right_alias=relation_alias(query.inputs[1]),
     )
 
 
@@ -233,10 +247,8 @@ def _verify_pairs(
 ) -> list[Match]:
     """Ask the model about each candidate pair; the verdict carries no score, so ranking is a later step."""
 
-    left_columns, right_columns = join_comparison_columns(
-        params.instruction,
-        left_columns=left.columns,
-        right_columns=right.columns,
+    scope = compared_columns(
+        params.instruction, params.scope(left.columns, right.columns)
     )
     # Reason: slots are positional, so a column name never becomes a Jinja expression.
     records = [
@@ -245,20 +257,16 @@ def _verify_pairs(
             RIGHT_ID_COLUMN: right_id,
             **{
                 join_slot("left", index): str(left.loc[left_id, column])
-                for index, column in enumerate(left_columns)
+                for index, column in enumerate(scope.left)
             },
             **{
                 join_slot("right", index): str(right.loc[right_id, column])
-                for index, column in enumerate(right_columns)
+                for index, column in enumerate(scope.right)
             },
         }
         for left_id, right_id in pairs
     ]
-    config = build_verdict_config(
-        params.instruction,
-        left_columns=left_columns,
-        right_columns=right_columns,
-    )
+    config = build_verdict_config(params.instruction, scope=scope)
     kept = context.run_operation("filter", config, records)
 
     matches: list[Match] = []
@@ -305,18 +313,13 @@ def _cap_matches(
         return list(matches)
 
     overflowing = [left_id for left_id in order if len(by_left[left_id]) > k]
-    left_columns, right_columns = join_comparison_columns(
-        params.instruction,
-        left_columns=left.columns,
-        right_columns=right.columns,
+    scope = compared_columns(
+        params.instruction, params.scope(left.columns, right.columns)
     )
     candidates_by_left = {
         left_id: [match.right_id for match in by_left[left_id]] for left_id in overflowing
     }
-    topk_config = build_topk_config(
-        params.instruction,
-        k=k,
-    )
+    topk_config = build_topk_config(params.instruction, k=k, scope=scope)
 
     selected: dict[int, list[int]] = {}
     last_error: Exception | None = None
@@ -331,9 +334,9 @@ def _cap_matches(
                 GROUP_POSITION_COLUMN: position,
                 # Reason: the ranking question is "which of these best matches this row", so the record
                 #   carries both sides; candidates alone leave the model ordering against nothing.
-                ANCHOR_COLUMN: _pair_text(left, left_id, left_columns),
+                ANCHOR_COLUMN: _pair_text(left, left_id, scope.left),
                 "candidates": "\n".join(
-                    f"{right_id}: {_pair_text(right, right_id, right_columns)}"
+                    f"{right_id}: {_pair_text(right, right_id, scope.right)}"
                     for right_id in candidates_by_left[left_id]
                 ),
             }
@@ -420,110 +423,103 @@ def _assemble(
 ) -> pd.DataFrame:
     """Build the published frame, including the null rows `how` requires."""
 
+    left_names, right_names, output_columns = _published_names(left, right, id_columns)
+    rows = [
+        _joined_row(left, right, left_id, right_id, left_names, right_names, id_columns)
+        for left_id, right_id in _rows_for(how, matches, left.index, right.index)
+    ]
+    return pd.DataFrame(rows, columns=output_columns)
+
+
+def _published_names(
+    left: pd.DataFrame,
+    right: pd.DataFrame,
+    id_columns: tuple[str, str] | None,
+) -> tuple[dict[str, str], dict[str, str], list[str]]:
+    """Return each side's published names, then the column list the frame carries."""
+
     # Required by: the node's declared schema, which suffixes only overlapping names
     #   (`src/agent_memory/policy/schema.py::semantic_join_columns`).
     overlaps = set(left.columns).intersection(right.columns)
-    left_columns = {
+    left_names = {
         column: f"{column}:left" if column in overlaps else str(column)
         for column in left.columns
     }
-    right_columns = {
+    right_names = {
         column: f"{column}:right" if column in overlaps else str(column)
         for column in right.columns
     }
-    output_columns = [*left_columns.values(), *right_columns.values()]
+    published = [*left_names.values(), *right_names.values()]
+    require_unique_published_columns(published, op="sem_join")
+    output_columns = [*published, *(id_columns or ())]
     if id_columns is not None:
-        conflicts = sorted(set(id_columns).intersection(output_columns))
+        conflicts = sorted(set(id_columns).intersection(published))
         if conflicts:
             raise ValueError(
                 f"sem_join id columns conflict with output columns: {conflicts}"
             )
-        output_columns.extend(id_columns)
+    return left_names, right_names, output_columns
 
-    rows: list[dict[str, Any]] = []
-    matched_left: set[int] = set()
-    matched_right: set[int] = set()
-    for left_id, right_id in matches:
-        matched_left.add(left_id)
-        matched_right.add(right_id)
-        row = _joined_row(left, right, left_id, right_id, left_columns, right_columns)
-        if id_columns is not None:
-            row[id_columns[0]] = left_id
-            row[id_columns[1]] = right_id
-        rows.append(row)
 
+def _rows_for(
+    how: str,
+    matches: Sequence[Pair],
+    left_index: Iterable[int],
+    right_index: Iterable[int],
+) -> list[tuple[int | None, int | None]]:
+    """Return the row pairs `how` publishes: the matches, then the rows it keeps unmatched."""
+
+    pairs: list[tuple[int | None, int | None]] = list(matches)
+    matched_left = {left_id for left_id, _ in matches}
+    matched_right = {right_id for _, right_id in matches}
     if how in {"left", "outer"}:
-        for left_id in left.index:
-            if left_id in matched_left:
-                continue
-            row: dict[str, Any] = {
-                out: left.loc[left_id, column] for column, out in left_columns.items()
-            }
-            row.update({out: pd.NA for out in right_columns.values()})
-            if id_columns is not None:
-                row[id_columns[0]] = left_id
-                row[id_columns[1]] = pd.NA
-            rows.append(row)
-
+        pairs += [(left_id, None) for left_id in left_index if left_id not in matched_left]
     if how in {"right", "outer"}:
-        for right_id in right.index:
-            if right_id in matched_right:
-                continue
-            row = {out: pd.NA for out in left_columns.values()}
-            row.update(
-                {
-                    out: right.loc[right_id, column]
-                    for column, out in right_columns.items()
-                }
-            )
-            if id_columns is not None:
-                row[id_columns[0]] = pd.NA
-                row[id_columns[1]] = right_id
-            rows.append(row)
-
-    return pd.DataFrame(rows, columns=output_columns)
+        pairs += [
+            (None, right_id) for right_id in right_index if right_id not in matched_right
+        ]
+    return pairs
 
 
 def _joined_row(
     left: pd.DataFrame,
     right: pd.DataFrame,
-    left_id: int,
-    right_id: int,
-    left_columns: Mapping[str, str],
-    right_columns: Mapping[str, str],
+    left_id: int | None,
+    right_id: int | None,
+    left_names: Mapping[str, str],
+    right_names: Mapping[str, str],
+    id_columns: tuple[str, str] | None,
 ) -> dict[str, Any]:
-    """Build one matched pair's row."""
+    """Build one row; a side with no row id contributes nulls for all of its columns."""
 
-    row = {out: left.loc[left_id, column] for column, out in left_columns.items()}
-    row.update({out: right.loc[right_id, column] for column, out in right_columns.items()})
+    row = {out: _cell(left, left_id, column) for column, out in left_names.items()}
+    row.update(
+        {out: _cell(right, right_id, column) for column, out in right_names.items()}
+    )
+    if id_columns is not None:
+        row[id_columns[0]] = left_id if left_id is not None else pd.NA
+        row[id_columns[1]] = right_id if right_id is not None else pd.NA
     return row
 
 
-def build_verdict_config(
-    instruction: str,
-    *,
-    left_columns: Sequence[str],
-    right_columns: Sequence[str],
-) -> dict[str, Any]:
+def _cell(frame: pd.DataFrame, row_id: int | None, column: str) -> Any:
+    """Return one cell, or a null for the side a `how` left unmatched."""
+
+    return pd.NA if row_id is None else frame.loc[row_id, column]
+
+
+def build_verdict_config(instruction: str, *, scope: JoinScope) -> dict[str, Any]:
     """Return the DocETL `filter` config that answers one pair at a time."""
 
     return op_config(
         "sem_join",
         "filter",
-        build_join_prompt(
-            instruction,
-            left_columns=left_columns,
-            right_columns=right_columns,
-        ),
+        build_join_prompt(instruction, scope=scope),
         {KEEP_KEY: "bool"},
     )
 
 
-def build_topk_config(
-    instruction: str,
-    *,
-    k: int,
-) -> dict[str, Any]:
+def build_topk_config(instruction: str, *, k: int, scope: JoinScope) -> dict[str, Any]:
     """Return the DocETL `map` config that ranks one left row's verified matches."""
 
     return op_config(
@@ -534,6 +530,7 @@ def build_topk_config(
             k=k,
             ids_column=SELECTED_COLUMN,
             anchor_column=ANCHOR_COLUMN,
+            scope=scope,
         ),
         {SELECTED_COLUMN: "list[string]"},
     )
@@ -576,10 +573,8 @@ def _write_pair_decisions(
 
     if not pairs:
         return
-    left_columns, right_columns = join_comparison_columns(
-        params.instruction,
-        left_columns=left.columns,
-        right_columns=right.columns,
+    scope = compared_columns(
+        params.instruction, params.scope(left.columns, right.columns)
     )
     kept = {(match.left_id, match.right_id) for match in matches}
     write_pair_trace(
@@ -590,8 +585,8 @@ def _write_pair_decisions(
                 "operator": "sem_join",
                 "left_id": left_id,
                 "right_id": right_id,
-                "left": _pair_text(left, left_id, left_columns),
-                "right": _pair_text(right, right_id, right_columns),
+                "left": _pair_text(left, left_id, scope.left),
+                "right": _pair_text(right, right_id, scope.right),
                 "parsed_output": (left_id, right_id) in kept,
             }
             for left_id, right_id in pairs

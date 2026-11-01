@@ -40,6 +40,19 @@ def output_column_names(query: QueryExpr, source_columns: Sequence[str]) -> list
     return columns
 
 
+def selected_inputs(query: QueryExpr, source_columns: Sequence[str]) -> tuple[str, ...]:
+    """Return the columns the instruction may name: `input_cols`, or the frame's when it declares none.
+
+    §2: `I` is what the operator selected, not everything the frame happens to carry, so a reference to a
+    column the policy left out is refused here instead of quietly resolved.
+    """
+
+    declared = query.params.get("input_cols")
+    if declared is not None:
+        return tuple(str(column) for column in declared)
+    return tuple(str(column) for column in source_columns)
+
+
 def scalar_schema(columns: Sequence[ColumnSpec]) -> dict[str, str]:
     """Return a DocETL `output.schema` for a row-local operator, one field per declared column."""
 

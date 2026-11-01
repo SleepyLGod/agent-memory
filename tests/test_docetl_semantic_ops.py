@@ -1,7 +1,8 @@
-"""Row-local lowerings: instruction translation, the config handshake, and `sem_filter`/`sem_map`/`sem_flat_map`.
+"""Row-local lowerings: the config handshake, and `sem_filter` / `sem_map` / `sem_flat_map` end to end.
 
-No model: a loopback endpoint answers through `lm_api_base`, so DocETL's own validation, parsing and record
-handling run. An operator carrying a cross-row contract belongs in its own file — `sem_join` has one.
+The instruction grammar is a pure function and is tested in `test_docetl_placeholders.py`. No model here: a
+loopback endpoint answers through `lm_api_base`, so DocETL's own validation, parsing and record handling
+run. An operator carrying a cross-row contract belongs in its own file, as `sem_join` has.
 """
 
 from __future__ import annotations
@@ -20,7 +21,6 @@ from agent_memory.adapters.docetl.context import (
     DocetlExecutionConfig,
     DocetlExecutionContext,
 )
-from agent_memory.adapters.docetl.prompt import render_prompt
 from agent_memory.adapters.docetl.reserved import KEEP_KEY, RESERVED_NAMES, ROWS_KEY
 from agent_memory.adapters.docetl.sem_filter import build_filter_config
 from agent_memory.adapters.docetl.sem_flat_map import build_flat_map_config
@@ -64,59 +64,16 @@ def _adapter(endpoint: CannedEndpoint) -> DocetlAdapter:
     return build_docetl_adapter(endpoint.base_url)
 
 
-@pytest.mark.parametrize(
-    ("instruction", "expected"),
-    [
-        (
-            "{message} asks about {topic}",
-            "{{ input.message }} asks about {{ input.topic }}",
-        ),
-        # a doubled brace is the escape for a literal one
-        ("{{note}} is literal, {note} is a column", "{note} is literal, {{ input.note }} is a column"),
-        # Jinja opens a construct only on a doubled brace
-        ("{note} opens with a bare {", "{{ input.note }} opens with a bare {"),
-    ],
-)
-def test_the_instruction_becomes_the_jinja_docetl_renders(
-    instruction: str, expected: str
-) -> None:
-    assert render_prompt(instruction) == expected
-
-
-@pytest.mark.parametrize(
-    ("instruction", "reason"),
-    [
-        # nothing to interpolate, so DocETL could never fill it
-        ("the message asks a question", "never interpolate"),
-        # a qualified placeholder names another row: that is a join, not this operator
-        ("{message:earlier} precedes {message:later}", "qualified"),
-    ],
-)
-def test_an_instruction_that_cannot_become_a_prompt_is_refused(
-    instruction: str, reason: str
-) -> None:
-    with pytest.raises(ValueError, match=reason):
-        render_prompt(instruction)
-
-
-def test_a_qualified_placeholder_is_a_context_root_for_an_operator_that_binds_it() -> None:
-    """`equijoin` renders against `left`/`right`, so there the qualifier names the row."""
-
-    assert render_prompt("{note:left} vs {note:right}", allow_tags=True) == (
-        "{{ left.note }} vs {{ right.note }}"
-    )
-
-
 def test_completion_kwargs_are_forwarded_under_docetls_own_key() -> None:
     """Temperature and the reasoning switches reach litellm only through this passthrough."""
 
-    assert "litellm_completion_kwargs" not in build_filter_config(_filter_query())
+    assert "litellm_completion_kwargs" not in build_filter_config(_filter_query(), columns=("note",))
 
     context = DocetlExecutionContext(
         model=DEFAULT_DOCETL_MODEL,
         config=DocetlExecutionConfig(litellm_completion_kwargs={"temperature": 0}),
     )
-    merged = context.with_op_defaults(build_filter_config(_filter_query()))
+    merged = context.with_op_defaults(build_filter_config(_filter_query(), columns=("note",)))
 
     assert merged["litellm_completion_kwargs"] == {"temperature": 0}
     assert merged["skip_on_error"] is False
@@ -126,7 +83,7 @@ def test_docetl_accepts_the_generated_config() -> None:
     """The handshake, with DocETL's own validation running inside its constructor."""
 
     context = _context()
-    config = build_filter_config(_filter_query("the note reads {note}"))
+    config = build_filter_config(_filter_query("the note reads {note}"), columns=("note",))
     operation = context.build_operation("filter")(
         context.handle, config, DEFAULT_DOCETL_MODEL, 1
     )
@@ -140,7 +97,7 @@ def test_docetl_rejects_a_malformed_config() -> None:
     """The control for the test above: construction does validate, so it cannot pass vacuously."""
 
     context = _context()
-    config = build_filter_config(_filter_query("the note reads {note}"))
+    config = build_filter_config(_filter_query("the note reads {note}"), columns=("note",))
     config["output"] = {"schema": {"keep": "bool", "also_keep": "bool"}}
     factory = context.build_operation("filter")
 
@@ -156,6 +113,27 @@ def test_sem_filter_keeps_only_the_rows_the_model_accepts(canned_endpoint: Canne
     result = _adapter(canned_endpoint).execute(_filter_query(), {"log": frame})
 
     assert list(result.columns) == ["note"]
+    assert list(result.index) == [7]
+
+
+def test_a_column_whose_name_carries_a_colon_reaches_the_prompt(
+    canned_endpoint: CannedEndpoint,
+) -> None:
+    """A join publishes `note:left` / `note:right`; a later filter names both and nothing renames them.
+
+    The marker rides on `note:right`, so a placeholder rendered empty would drop the row: the assertion
+    is that the whole name became a key, not that part of it did.
+    """
+
+    frame = pd.DataFrame(
+        {"note:left": ["alpha", "beta"], "note:right": [_KEEP_MARKER, "gamma"]},
+        index=[7, 8],
+    )
+    query = _filter_query("Does {note:right} contradict {note:left}?")
+
+    result = _adapter(canned_endpoint).execute(query, {"log": frame})
+
+    assert list(result.columns) == ["note:left", "note:right"]
     assert list(result.index) == [7]
 
 
@@ -257,8 +235,8 @@ def test_docetl_accepts_the_generated_map_and_flat_map_configs() -> None:
     factory = context.build_operation("map")
 
     for config in (
-        build_map_config(_map_query()),
-        build_flat_map_config(_flat_map_query(), rows_column=ROWS_KEY),
+        build_map_config(_map_query(), columns=("message",)),
+        build_flat_map_config(_flat_map_query(), columns=("message",), rows_column=ROWS_KEY),
     ):
         operation = factory(context.handle, config, DEFAULT_DOCETL_MODEL, 1)
         assert type(operation).__name__ == "MapOperation"
@@ -287,14 +265,61 @@ def test_a_single_column_map_sends_no_descriptions_like_the_native_path() -> Non
     one model and not the other.
     """
 
-    assert "Fill these fields" not in build_map_config(_map_query())["prompt"]
+    assert "Fill these fields" not in build_map_config(_map_query(), columns=("message",))["prompt"]
 
-    multiple = build_map_config(_two_column_map_query())
+    multiple = build_map_config(_two_column_map_query(), columns=("message",))
     assert "- summary: One line." in multiple["prompt"]
     assert "- topic: One or two words." in multiple["prompt"]
 
-    flat = build_flat_map_config(_flat_map_query(), rows_column=ROWS_KEY)
+    flat = build_flat_map_config(_flat_map_query(), columns=("message",), rows_column=ROWS_KEY)
     assert "- entry: one entry" in flat["prompt"]
+
+
+# §2: `I` and `O` are the operator's vocabulary. `sem_filter` declares no output
+# field, so a name it has no value for is refused rather than accepted as
+# something to fill.
+def test_a_filter_has_no_output_field_to_fill() -> None:
+    with pytest.raises(ValueError, match="input column"):
+        build_filter_config(_filter_query("Keep rows about {topic}"), columns=("note",))
+
+
+# §2: `sem_map` declares its outputs, so the same kind of name is a field the model
+# must fill and the instruction keeps it as written.
+def test_a_map_declares_the_fields_it_fills() -> None:
+    query = QueryExpr(
+        op="sem_map",
+        inputs=(QueryExpr(op="log"),),
+        params={
+            "instruction": "Produce {summary} about {message}",
+            "output_cols": (ColumnSpec(name="summary", description="One line."),),
+        },
+    )
+
+    assert build_map_config(query, columns=("message",))["prompt"] == (
+        "Produce {summary} about {{ input['message'] }}"
+    )
+
+
+# §2: `I` is `input_cols` when the query gives one. Only the builder can make that
+# choice: supplying every source column instead would resolve this reference.
+def test_a_builder_supplies_the_selected_inputs_not_every_column(
+    canned_endpoint: CannedEndpoint,
+) -> None:
+    frame = pd.DataFrame({"note": ["a"], "secret": ["b"]})
+    query = QueryExpr(
+        op="sem_map",
+        inputs=(QueryExpr(op="log"),),
+        params={
+            "instruction": "Summarise {secret}",
+            "input_cols": ("note",),
+            "output_cols": (ColumnSpec(name="summary", description="One line."),),
+        },
+    )
+
+    with pytest.raises(ValueError, match="input column"):
+        _adapter(canned_endpoint).execute(query, {"log": frame})
+
+    assert canned_endpoint.requests == []
 
 
 def test_sem_map_adds_the_declared_column(mapping_endpoint: CannedEndpoint) -> None:
@@ -418,6 +443,6 @@ def test_no_injected_column_escapes(
 def test_the_flat_map_asks_for_a_list_of_objects() -> None:
     """The schema string and the expansion are one mechanism, so pin the shape that makes them agree."""
 
-    config = build_flat_map_config(_flat_map_query(), rows_column=ROWS_KEY)
+    config = build_flat_map_config(_flat_map_query(), columns=("message",), rows_column=ROWS_KEY)
 
     assert config["output"]["schema"][ROWS_KEY] == "list[{entry: string}]"

@@ -1,4 +1,5 @@
-"""The `sem_join` lowering: pair generation, `how`, `k`, `id_columns`, and the assembled frame.
+"""The join lowerings: `sem_join` pair generation, `how`, `k`, `id_columns` and the assembled frame, plus the
+name the deterministic join publishes.
 
 No model: the loopback endpoint decides each pair from a marker in the request, so DocETL's `filter`
 validation and rendering still run while the deterministic half is asserted on the published frame.
@@ -19,11 +20,12 @@ from agent_memory.adapters.docetl.context import DocetlExecutionConfig
 from agent_memory.adapters.docetl.prompt import (
     build_join_prompt,
     build_topk_prompt,
-    join_comparison_columns,
+    compared_columns,
 )
 from agent_memory.adapters.docetl.sem_join import ANCHOR_COLUMN, SELECTED_COLUMN
 from agent_memory.api import Log, Memory
 from agent_memory.policy.logical import QueryExpr
+from agent_memory.policy.placeholders import JoinScope
 
 from adapter_support import (
     CannedEndpoint,
@@ -75,8 +77,7 @@ def test_the_prompt_labels_each_field_and_states_the_condition() -> None:
 
     prompt = build_join_prompt(
         "the subjects match: {note:left} and {note:right}",
-        left_columns=("note",),
-        right_columns=("note",),
+        scope=JoinScope.of(("note",), ("note",)),
     )
 
     assert prompt == (
@@ -92,45 +93,113 @@ def test_the_prompt_labels_each_field_and_states_the_condition() -> None:
 
 
 def test_a_bare_placeholder_is_resolved_by_the_side_that_owns_it() -> None:
-    left, right = join_comparison_columns(
+    scope = compared_columns(
         "{title} against {body}",
-        left_columns=("title", "shared"),
-        right_columns=("body", "shared"),
+        JoinScope.of(("title", "shared"), ("body", "shared")),
     )
 
-    assert left == ("title",)
-    assert right == ("body",)
+    assert scope.left == ("title",)
+    assert scope.right == ("body",)
 
 
-def test_an_ambiguous_bare_placeholder_falls_back_to_whole_rows() -> None:
-    """One name on both sides cannot say which value it means, so neither side is narrowed."""
+def _aliased(source: QueryExpr, name: str) -> QueryExpr:
+    return QueryExpr(op="alias", inputs=(source,), params={"name": name})
 
-    left, right = join_comparison_columns(
-        "the {note} values match",
-        left_columns=("note", "tag"),
-        right_columns=("note", "kind"),
+
+def test_an_alias_on_this_joins_input_names_the_side_it_carries(
+    endpoint: CannedEndpoint,
+) -> None:
+    """§3 ①: `earlier` is this input's alias, so `{fact:earlier}` is the left `fact`.
+
+    Only this join's own inputs are consulted, and the alias is one of their names:
+    without reading it, `earlier` would name a suffix neither side has. The alias names a
+    side for references only: a semantic join still publishes `left`/`right`.
+    """
+
+    left = pd.DataFrame({"fact": ["a"]})
+    right = pd.DataFrame({"fact": ["b"]})
+    query = QueryExpr(
+        op="sem_join",
+        inputs=(_aliased(_source("left", left), "earlier"), _source("right", right)),
+        params={"instruction": "Is {fact:earlier} older than {fact:right}?"},
     )
 
-    assert left == ("note", "tag")
-    assert right == ("note", "kind")
+    result = _adapter(endpoint).execute(query, {"left": left, "right": right})
+
+    assert len(result) == 1
+    assert list(result.columns) == ["fact:left", "fact:right"]
+    sent = json.dumps(endpoint.requests, ensure_ascii=False)
+    assert "[left] fact: \u00aba\u00bb" in sent
+    assert "[right] fact: \u00abb\u00bb" in sent
 
 
-def test_a_side_qualified_placeholder_must_exist_on_that_side() -> None:
-    with pytest.raises(ValueError, match="does not have"):
-        join_comparison_columns(
-            "{note:right} matches",
-            left_columns=("note",),
-            right_columns=("other",),
-        )
+def test_a_name_a_previous_join_published_is_read_whole(
+    endpoint: CannedEndpoint,
+) -> None:
+    """§3 ②: `earlier` is part of the column name here, not a side of this join.
+
+    The left frame is what `alias("earlier").join(...)` publishes, and this join carries
+    no alias to inherit, so the reference names that column and the left side owns it.
+    """
+
+    left = pd.DataFrame({"fact:earlier": ["a"]})
+    right = pd.DataFrame({"id": ["1"]})
+    query = QueryExpr(
+        op="sem_join",
+        inputs=(_source("left", left), _source("right", right)),
+        params={"instruction": "Is {fact:earlier} the same as {id:right}?"},
+    )
+
+    _adapter(endpoint).execute(query, {"left": left, "right": right})
+
+    sent = json.dumps(endpoint.requests, ensure_ascii=False)
+    assert "[left] fact:earlier: \u00aba\u00bb" in sent
+    assert "[right] id: \u00ab1\u00bb" in sent
 
 
-def test_an_unknown_placeholder_is_refused() -> None:
-    with pytest.raises(ValueError, match="unknown sem_join column placeholder"):
-        join_comparison_columns(
-            "{missing} matches",
-            left_columns=("note",),
-            right_columns=("note",),
-        )
+def test_a_suffixed_name_that_collides_with_a_published_name_is_refused(
+    endpoint: CannedEndpoint,
+) -> None:
+    """§6: suffixing may not overwrite a column the other side already publishes.
+
+    `note` is on both sides, so the left copy becomes `note:left`; the right side
+    already has a column of that name, and neither may be dropped.
+    """
+
+    left = pd.DataFrame({"note": ["a"]})
+    right = pd.DataFrame({"note": ["b"], "note:left": ["c"]})
+    query = QueryExpr(
+        op="sem_join",
+        inputs=(_source("left", left), _source("right", right)),
+        params={"instruction": "the notes match: {note:left} and {note:right}"},
+    )
+
+    with pytest.raises(ValueError, match="two columns"):
+        _adapter(endpoint).execute(query, {"left": left, "right": right})
+
+
+def test_a_deterministic_join_that_would_publish_one_name_twice_is_refused(
+    endpoint: CannedEndpoint,
+) -> None:
+    """§6 on the other join path: pandas suffixes `note` without looking at the other frame.
+
+    The right frame is what an earlier join published, so it already carries `note:left`;
+    suffixing the left side's `note` lands on that label, and the merge returns it twice.
+    A clash inside one frame is refused by pandas itself, so only this half is silent.
+    """
+
+    left = pd.DataFrame({"id": ["1"], "note": ["a"]})
+    right = pd.DataFrame({"id": ["1"], "note": ["c"], "note:left": ["b"]})
+    query = QueryExpr(
+        op="join",
+        inputs=(_source("left", left), _source("right", right)),
+        params={"on": ("id",), "how": "inner"},
+    )
+
+    with pytest.raises(ValueError, match="two columns"):
+        _adapter(endpoint).execute(query, {"left": left, "right": right})
+
+    assert endpoint.requests == []
 
 
 def test_an_unsupported_how_is_refused_before_any_call(
@@ -246,6 +315,7 @@ def test_the_ranking_prompt_carries_both_sides_and_the_limits() -> None:
 
     prompt = build_topk_prompt(
         "the subjects match: {note:left} and {note:right}",
+        scope=JoinScope.of(("note",), ("note",)),
         k=2,
         ids_column=SELECTED_COLUMN,
         anchor_column=ANCHOR_COLUMN,
@@ -541,6 +611,36 @@ def test_a_match_capped_out_becomes_an_unmatched_row() -> None:
     assert result.loc[result["note:left"].isna(), "note:right"].tolist() == [
         "alpha two"
     ]
+
+
+def test_a_row_local_op_after_a_self_join_can_name_a_suffixed_column() -> None:
+    """A self-join suffixes every column, and that suffix is the only way to tell the sides apart.
+
+    Downstream the column is literally `note:left`, so a semantic instruction has to be able to name
+    it. Today the placeholder grammar reads `:left` as a side qualifier and refuses it.
+    """
+
+    frame = pd.DataFrame({"note": ["alpha asks for a refund", "beta ships"]})
+    log = _source("log", frame)
+    joined = QueryExpr(
+        op="sem_join",
+        inputs=(
+            QueryExpr(op="alias", inputs=(log,), params={"name": "l"}),
+            QueryExpr(op="alias", inputs=(log,), params={"name": "r"}),
+        ),
+        params={"instruction": "{note:left} and {note:right} are different notes"},
+    )
+    query = QueryExpr(
+        op="sem_filter",
+        inputs=(joined,),
+        params={"instruction": "the left note {note:left} asks for a refund"},
+    )
+
+    with canned_model("refund") as running:
+        result = _adapter(running).execute(query, {"log": frame})
+
+    assert "note:left" in result.columns
+    assert "note:right" in result.columns
 
 
 class _JoinMemory(Memory):

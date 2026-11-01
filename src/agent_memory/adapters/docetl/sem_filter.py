@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
 from agent_memory.adapters.docetl.prompt import render_prompt
@@ -16,13 +16,13 @@ if TYPE_CHECKING:
 
 # Based on: `docetl.operations.filter::FilterOperation._handle_result`, which reads exactly one key from
 #   each row and pops it, so the name is reserved in `records.py` rather than chosen here.
-def build_filter_config(query: QueryExpr) -> dict[str, Any]:
+def build_filter_config(query: QueryExpr, *, columns: Sequence[str]) -> dict[str, Any]:
     """Return the DocETL `filter` config for one row-local `sem_filter` query."""
 
     if query.op != "sem_filter":
         raise ValueError(f"build_filter_config got a {query.op!r} query")
 
-    prompt = render_prompt(str(query.params.get("instruction") or ""))
+    prompt = render_prompt(str(query.params.get("instruction") or ""), columns=columns)
 
     return op_config(query.op, "filter", prompt, {KEEP_KEY: "bool"})
 
@@ -39,7 +39,7 @@ def execute_sem_filter(
     index_key = INDEX_KEY
     kept = context.run_operation(
         "filter",
-        build_filter_config(query),
+        build_filter_config(query, columns=tuple(str(column) for column in source.columns)),
         to_records(source, index_key=index_key),
     )
     return strip(from_records(kept, index_key=index_key, columns=source.columns))

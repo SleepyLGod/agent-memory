@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
 from agent_memory.adapters.docetl.columns import (
@@ -10,6 +10,7 @@ from agent_memory.adapters.docetl.columns import (
     describe_outputs,
     output_column_names,
     scalar_schema,
+    selected_inputs,
 )
 from agent_memory.adapters.docetl.prompt import render_prompt
 from agent_memory.adapters.docetl.records import (
@@ -28,6 +29,7 @@ if TYPE_CHECKING:
 def build_map_config(
     query: QueryExpr,
     *,
+    columns: Sequence[str],
     describe: bool | None = None,
 ) -> dict[str, Any]:
     """Return the DocETL `map` config for one `sem_map` query."""
@@ -36,7 +38,11 @@ def build_map_config(
         raise ValueError(f"build_map_config got a {query.op!r} query")
 
     declared = declared_outputs(query)
-    prompt = render_prompt(str(query.params.get("instruction") or ""))
+    prompt = render_prompt(
+        str(query.params.get("instruction") or ""),
+        columns=columns,
+        outputs=[column.name for column in declared],
+    )
     if describe is None:
         describe = len(declared) > 1
     if describe:
@@ -59,7 +65,7 @@ def execute_sem_map(
     index_key = INDEX_KEY
     mapped = context.run_operation(
         "map",
-        build_map_config(query),
+        build_map_config(query, columns=selected_inputs(query, source.columns)),
         to_records(source, index_key=index_key),
     )
     require_one_record_per_row(source, mapped, op="sem_map", index_key=index_key)

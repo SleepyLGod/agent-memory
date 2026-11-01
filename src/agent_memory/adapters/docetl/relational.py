@@ -30,7 +30,11 @@ from agent_memory.policy.expressions import (
     is_scalar,
 )
 from agent_memory.policy.logical import QueryExpr
-from agent_memory.policy.schema import output_columns
+from agent_memory.policy.schema import (
+    output_columns,
+    relation_alias,
+    require_unique_published_columns,
+)
 from agent_memory.runtime.window import over_frames
 
 # Reason: `_groups_for_aggregate` must refuse a frame `sem_groupby` grouped, and that operator is withdrawn,
@@ -263,13 +267,17 @@ def execute_join(
         result = merged[merged[marker].isna()].drop(columns=[marker])
         return result.loc[:, list(left.columns)].reset_index(drop=True)
 
-    return left.merge(
+    merged = left.merge(
         right,
         how=how,
         on=list(keys),
         suffixes=_join_suffixes(query),
         sort=False,
     ).reset_index(drop=True)
+    # Required by: §6, read off the frame pandas produced, because it suffixes a shared name
+    #   without checking whether the suffixed label is already taken.
+    require_unique_published_columns(merged.columns, op=str(query.op))
+    return merged
 
 
 def predicate_join_row_ids(
@@ -309,8 +317,8 @@ def predicate_join_row_ids(
         how="inner",
     )
 
-    left_alias = _relation_alias(query.inputs[0]) or "left"
-    right_alias = _relation_alias(query.inputs[1]) or "right"
+    left_alias = relation_alias(query.inputs[0]) or "left"
+    right_alias = relation_alias(query.inputs[1]) or "right"
     left_output = f"{left_id_column}:{left_alias}"
     right_output = f"{right_id_column}:{right_alias}"
     return tuple(
@@ -823,8 +831,8 @@ def _is_predicate_join(on: tuple[Any, ...]) -> bool:
 def _join_suffixes(query: QueryExpr) -> tuple[str, str]:
     """Return pandas merge suffixes for key joins."""
 
-    left_alias = _relation_alias(query.inputs[0]) or "left"
-    right_alias = _relation_alias(query.inputs[1]) or "right"
+    left_alias = relation_alias(query.inputs[0]) or "left"
+    right_alias = relation_alias(query.inputs[1]) or "right"
     return f":{left_alias}", f":{right_alias}"
 
 
@@ -842,15 +850,6 @@ def _unused_column_name(
     return candidate
 
 
-def _relation_alias(query: QueryExpr) -> str | None:
-    """Return relation alias name if present."""
-
-    if query.op == "alias":
-        name = query.params.get("name")
-        return str(name) if name is not None else None
-    return None
-
-
 def _execute_predicate_join(
     query: QueryExpr,
     left: Any,
@@ -864,8 +863,8 @@ def _execute_predicate_join(
     if how != "inner":
         raise NotImplementedError("predicate join currently supports only how='inner'")
 
-    left_alias = _relation_alias(query.inputs[0]) or "left"
-    right_alias = _relation_alias(query.inputs[1]) or "right"
+    left_alias = relation_alias(query.inputs[0]) or "left"
+    right_alias = relation_alias(query.inputs[1]) or "right"
     equality_pairs = _predicate_equality_pairs(
         predicates,
         left_alias=left_alias,
@@ -890,7 +889,11 @@ def _execute_predicate_join(
         joined = left_prepared.merge(right_prepared, how="cross", sort=False)
 
     mask = evaluate_predicate(BooleanExpr(op="and", operands=predicates), joined)
-    return joined.loc[mask].reset_index(drop=True)
+    result = joined.loc[mask].reset_index(drop=True)
+    # Required by: §6 as well, since every column is suffixed here, so two inputs sharing an
+    #   alias would publish each name twice.
+    require_unique_published_columns(result.columns, op=str(query.op))
+    return result
 
 
 def _rename_join_side(frame: Any, *, alias: str) -> Any:
