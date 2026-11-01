@@ -185,9 +185,10 @@ _VERDICT_TEMPLATE = (
     "Does the context satisfy this condition?"
 )
 
-# One compared column: `[left] note: «{{ input.left_0 }}»`. The quadruple braces are Python's escape
-# for a literal `{{` / `}}`, which DocETL then renders.
-_CONTEXT_LINE = "{label}: «{{{{ input.{slot} }}}}»"
+# One compared column: `[left] note: «{{ left['left_0'] }}»`. The quadruple braces are Python's
+# escape for a literal `{{` / `}}`, which DocETL then renders. The root is the side's own name,
+# because `EquijoinOperation` renders one prompt against `left` and `right` (`equijoin.py:161`).
+_CONTEXT_LINE = "{label}: «{{{{ {root}[{slot!r}] }}}}»"
 
 # The listwise ranking prompt for one left row and its candidate right rows.
 # Based on: `adapters/lotus/sem_topk_join.py::LISTWISE_JOIN_SYSTEM_PROMPT`.
@@ -215,14 +216,17 @@ def build_join_prompt(instruction: str, *, scope: JoinScope) -> str:
 
     `sem_join` fills the record keys with `join_slot`, so the template and the records cannot
     disagree about a key's name. The scope is the one `compared_columns` narrowed, so every
-    reference the condition names is among the columns it lists.
+    reference the condition names is among the columns it lists. Each line reads its own side's
+    record: the engine compares two records, not one record holding both sides.
     """
 
     # Based on: LOTUS's `join_series` + `df2text` layout (`[<label>]: «<value>»`, condition stated
     #   separately). Slots are positional so a column name cannot become a Jinja expression, and
-    #   the root is `input` because the verdict runs as a `filter` over a one-pair frame.
+    #   each root is the side it reads, which is what `equijoin` renders the prompt with.
     context = "\n".join(
-        _CONTEXT_LINE.format(label=f"[{side}] {column}", slot=join_slot(side, index))
+        _CONTEXT_LINE.format(
+            label=f"[{side}] {column}", root=side, slot=join_slot(side, index)
+        )
         for side, columns in (("left", scope.left), ("right", scope.right))
         for index, column in enumerate(columns)
     )

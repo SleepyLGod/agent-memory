@@ -11,24 +11,37 @@ from collections import Counter
 from collections.abc import Iterator
 import json
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import pandas as pd
 import pytest
 
 from agent_memory.adapters import DocetlAdapter
-from agent_memory.adapters.docetl.context import DocetlExecutionConfig
+from agent_memory.adapters.docetl.context import (
+    DocetlExecutionConfig,
+    DocetlExecutionContext,
+)
 from agent_memory.adapters.docetl.prompt import (
     build_join_prompt,
     build_topk_prompt,
     compared_columns,
 )
 from agent_memory.adapters.docetl.relational import execute_join as execute_key_join
-from agent_memory.adapters.docetl.sem_join import ANCHOR_COLUMN, SELECTED_COLUMN
+from agent_memory.adapters.docetl.sem_join import (
+    ANCHOR_COLUMN,
+    LEFT_ID_COLUMN,
+    RIGHT_ID_COLUMN,
+    SELECTED_COLUMN,
+    build_verdict_config,
+)
+from agent_memory.adapters.docetl.strict import strict_equijoin
 from agent_memory.api import Log, Memory
 from agent_memory.policy.logical import QueryExpr
 from agent_memory.policy.placeholders import JoinScope
 
 from adapter_support import (
+    CANNED_MODEL,
     CannedEndpoint,
     build_adapters,
     build_docetl_adapter,
@@ -81,10 +94,12 @@ def test_the_prompt_labels_each_field_and_states_the_condition() -> None:
         scope=JoinScope.of(("note",), ("note",)),
     )
 
+    # each line reads its own side's record, because `equijoin` renders the prompt against
+    #   `left` and `right` rather than against one record holding both
     assert prompt == (
         "Context:\n"
-        "[left] note: «{{ input.left_0 }}»\n"
-        "[right] note: «{{ input.right_0 }}»\n"
+        "[left] note: «{{ left['left_0'] }}»\n"
+        "[right] note: «{{ right['right_0'] }}»\n"
         "\n"
         "Condition: the subjects match: note and note\n"
         "Does the context satisfy this condition?"
@@ -258,6 +273,40 @@ def test_keyed_on_restricts_the_pairs_a_model_is_asked_about(
     assert len(endpoint.requests) == 2
     assert result["dept:left"].tolist() == ["d1", "d1"]
     assert result["dept:right"].tolist() == ["d1", "d1"]
+
+
+def test_a_verdict_that_is_not_a_boolean_is_refused(endpoint: CannedEndpoint) -> None:
+    """A string where a verdict belongs is a defect, not a match.
+
+    The engine returns the field unchecked (`equijoin.py:185`), so `"maybe"` would read as true and
+    publish a joined row; the pair is asked about and no verdict about it was given.
+    """
+
+    endpoint.refuse()
+
+    with pytest.raises(RuntimeError, match="not a boolean"):
+        _adapter(endpoint).execute(_join_query(), {"left": LEFT, "right": RIGHT})
+
+
+def test_identical_rows_are_matched_one_by_one(endpoint: CannedEndpoint) -> None:
+    """A bag, not a set: two equal left rows are two rows, each with its own match.
+
+    The engine keys its blocking bookkeeping by a hash of the record (`equijoin.py:49-50`), so
+    identical records are only distinguished by the id they carry.
+    """
+
+    left = pd.DataFrame({"note": ["alpha", "alpha"]})
+    right = pd.DataFrame({"note": ["alpha"]})
+    query = QueryExpr(
+        op="sem_join",
+        inputs=(_source("left", left), _source("right", right)),
+        params={"instruction": "the subjects match: {note:left} and {note:right}"},
+    )
+
+    result = _adapter(endpoint).execute(query, {"left": left, "right": right})
+
+    assert sorted(result["note:left"].tolist()) == ["alpha", "alpha"]
+    assert len(endpoint.requests) == 2
 
 
 def test_a_predicate_on_restricts_before_the_call(endpoint: CannedEndpoint) -> None:
@@ -824,3 +873,90 @@ def test_a_key_join_keeps_an_integer_exact(how: str) -> None:
     else:
         assert str(result["rank"].dtype) == "int64"
         assert not result["rank"].isna().any()
+
+
+# --------------------------------------------------- the override, against the engine's method
+
+
+def _verdict_operations(running: CannedEndpoint) -> tuple[Any, Any]:
+    """Return the engine's `equijoin` and the overridden one: one handle, one spec, two classes."""
+
+    from docetl.operations.equijoin import EquijoinOperation
+
+    context = DocetlExecutionContext(
+        model=CANNED_MODEL,
+        config=DocetlExecutionConfig(lm_api_base=running.base_url),
+    )
+    spec = build_verdict_config(
+        "the notes match: {note:left} and {note:right}",
+        scope=JoinScope.of(("note",), ("note",)),
+    )
+    override = strict_equijoin(
+        left_id_key=LEFT_ID_COLUMN, right_id_key=RIGHT_ID_COLUMN
+    )
+    return (
+        EquijoinOperation(context.handle, dict(spec), CANNED_MODEL, 1),
+        override(context.handle, dict(spec), CANNED_MODEL, 1),
+    )
+
+
+def _pair() -> tuple[dict[str, Any], dict[str, Any]]:
+    """Return the two records the verdict prompt reads: one line per side."""
+
+    return {"left_id": 0, "left_0": "same note"}, {"right_id": 3, "right_0": "same note"}
+
+
+def test_the_override_asks_the_question_the_engine_asks(
+    endpoint: CannedEndpoint,
+) -> None:
+    """Same spec, same pair: the request body and the verdict are identical, path by path.
+
+    The override rests on one claim — that only the failure paths changed — and this is where the
+    claim can be seen: the bytes sent to the model, and what came back.
+    """
+
+    engine, ours = _verdict_operations(endpoint)
+    left, right = _pair()
+    prompt = engine.config["comparison_prompt"]
+
+    expected = engine.compare_pair(prompt, CANNED_MODEL, left, right)
+    actual = ours.compare_pair(prompt, CANNED_MODEL, left, right)
+
+    assert len(endpoint.requests) == 2
+    assert endpoint.requests[0] == endpoint.requests[1]
+    assert actual == expected
+
+
+def test_a_prompt_that_will_not_render_is_a_failure_not_a_no_match(
+    endpoint: CannedEndpoint,
+) -> None:
+    """An undefined field raises where the engine logs the render error and answers `False`."""
+
+    from jinja2.exceptions import UndefinedError
+
+    engine, ours = _verdict_operations(endpoint)
+    left, right = _pair()
+    broken = "notes: {{ left['absent'] }} against {{ right['absent'] }}"
+
+    assert engine.compare_pair(broken, CANNED_MODEL, left, right) == (False, 0)
+    with pytest.raises(UndefinedError):
+        ours.compare_pair(broken, CANNED_MODEL, left, right)
+    # the failure is the renderer's, so no pair was ever sent
+    assert endpoint.requests == []
+
+
+def test_a_call_that_never_returned_is_a_failure_not_a_no_match(
+    endpoint: CannedEndpoint, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Exhausted retries arrive as `response=None`, which the engine parses into `False`."""
+
+    engine, ours = _verdict_operations(endpoint)
+    left, right = _pair()
+    prompt = engine.config["comparison_prompt"]
+    unanswered = SimpleNamespace(response=None, total_cost=0.0)
+    # one handle, so one patch reaches both operations
+    monkeypatch.setattr(engine.runner.api, "call_llm", lambda *args, **kwargs: unanswered)
+
+    assert engine.compare_pair(prompt, CANNED_MODEL, left, right) == (False, 0.0)
+    with pytest.raises(RuntimeError, match="got no answer"):
+        ours.compare_pair(prompt, CANNED_MODEL, left, right)

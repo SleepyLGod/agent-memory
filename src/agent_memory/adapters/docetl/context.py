@@ -51,7 +51,9 @@ class DocetlExecutionConfig:
       these off the runner, so they have no per-operation home.
     - **operation-scoped defaults**, applied by `with_op_defaults`: `skip_on_error`,
       `litellm_completion_kwargs`. DocETL reads them per operation; we give every operation the
-      same value so both backends behave alike.
+      same value so both backends behave alike. One exception: `skip_on_error` has no effect on
+      `filter`, because a skipped row is a row with no answer and `strict.strict_filter` ends the
+      run instead of dropping it.
     - **constructor channel**, applied by `run_operation` as `__init__` arguments: `max_threads`
       (and `model`, which sits on the context beside it).
     - **local**, never reaching DocETL: the trace settings and `sem_join_topk_method`.
@@ -163,6 +165,9 @@ class DocetlExecutionContext:
         DocETL reads `skip_on_error` and `litellm_completion_kwargs` per operation (its op
         schema), so this config acts as the runner-wide default for them: the single writer,
         and a spec that already carries a value (a test pinning one) wins.
+
+        `skip_on_error` is passed, not enforced: an operation that refuses a lost answer
+        (`strict.strict_filter`) ends the run instead of skipping the row.
         """
 
         merged = dict(spec)
@@ -174,11 +179,41 @@ class DocetlExecutionContext:
             )
         return merged
 
+    def _operation(
+        self, op_type: str, spec: Mapping[str, Any], operation_cls: Any
+    ) -> Any:
+        """Return the operation instance for one call: the one place the signature is stated.
+
+        `self.handle` is the `runner` the operation reads `runner.api` from, `spec` is the config it
+        validates on construction, and `model`/`max_threads` are this context's.
+
+        `operation_cls` must subclass the class `op_type` resolves to. The substitute is built with
+        the same four arguments and is expected to run that operation, so a class for another one
+        would be constructed into an object whose hooks nothing calls.
+        """
+
+        registered = self.build_operation(op_type)
+        if operation_cls is not None and not (
+            isinstance(operation_cls, type) and issubclass(operation_cls, registered)
+        ):
+            given = getattr(operation_cls, "__name__", type(operation_cls).__name__)
+            raise TypeError(
+                f"{op_type!r} takes a subclass of {registered.__name__}, got {given}"
+            )
+        return (operation_cls or registered)(
+            self.handle,
+            self.with_op_defaults(spec),
+            self.model,
+            self.config.max_threads,
+        )
+
     def run_operation(
         self,
         op_type: str,
         spec: Mapping[str, Any],
         records: Sequence[dict[str, Any]],
+        *,
+        operation_cls: Any = None,
     ) -> list[dict[str, Any]]:
         """Run one DocETL operation using DocETL's own class and `execute()`.
 
@@ -190,19 +225,40 @@ class DocetlExecutionContext:
         back. `spec` and `records` are copied per call, so a caller can reuse either one (DocETL
         mutates only its own row copies). Runner-wide op defaults are applied by `with_op_defaults`;
         nothing here catches, so `skip_on_error` decides raise versus drop per row.
+
+        `operation_cls` replaces the registered class with one constructed the same way (see
+        `_operation`). `strict.strict_filter` is its only user: a `filter` that also refuses a row
+        whose answer never arrived.
         """
 
-        # Construction is what binds this context to the operation: `self.handle` is the `runner` the
-        #   operation reads `runner.api` from, and `spec` is the config it validates on construction.
-        operation = self.build_operation(op_type)(
-            self.handle,
-            self.with_op_defaults(spec),
-            self.model,
-            self.config.max_threads,
-        )
-        # `execute()` returns `(output, cost)`; cost is already accumulated on the handle
-        #   (`usage_snapshot`), so it is not re-counted here.
+        # Construction is what binds this context to the operation; `execute()` returns
+        #   `(output, cost)`, and cost is already accumulated on the handle (`usage_snapshot`).
+        operation = self._operation(op_type, spec, operation_cls)
         output, _cost = operation.execute(list(records))
+        return output
+
+    def run_pair_operation(
+        self,
+        op_type: str,
+        spec: Mapping[str, Any],
+        left_records: Sequence[dict[str, Any]],
+        right_records: Sequence[dict[str, Any]],
+        *,
+        operation_cls: Any = None,
+    ) -> list[dict[str, Any]]:
+        """Run one two-input DocETL operation: `execute(left_records, right_records)`.
+
+        `equijoin` is the operation this exists for: it compares two relations rather than one
+        record list (`equijoin.py:232-234`), so it answers the pairs its blocking rule admits and
+        returns one joined record per pair the model kept. Everything else matches
+        `run_operation`: the spec, the copied inputs and the cost held by the handle.
+
+        `operation_cls` replaces the registered class on the same terms. `strict.strict_equijoin`
+        is its only user: an `equijoin` that also refuses a pair whose answer never arrived.
+        """
+
+        operation = self._operation(op_type, spec, operation_cls)
+        output, _cost = operation.execute(list(left_records), list(right_records))
         return output
 
     def usage_snapshot(self) -> dict[str, int]:

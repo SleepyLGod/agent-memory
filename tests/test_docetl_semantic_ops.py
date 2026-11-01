@@ -21,10 +21,11 @@ from agent_memory.adapters.docetl.context import (
     DocetlExecutionConfig,
     DocetlExecutionContext,
 )
-from agent_memory.adapters.docetl.reserved import KEEP_KEY, RESERVED_NAMES, ROWS_KEY
+from agent_memory.adapters.docetl.reserved import INDEX_KEY, KEEP_KEY, RESERVED_NAMES, ROWS_KEY
 from agent_memory.adapters.docetl.sem_filter import build_filter_config
 from agent_memory.adapters.docetl.sem_flat_map import build_flat_map_config
 from agent_memory.adapters.docetl.sem_map import build_map_config
+from agent_memory.adapters.docetl.strict import strict_equijoin, strict_filter
 from agent_memory.policy.logical import ColumnSpec, QueryExpr
 
 from adapter_support import CANNED_MODEL, CannedEndpoint, build_docetl_adapter, canned_model
@@ -86,13 +87,14 @@ def test_docetl_accepts_the_generated_config() -> None:
 
     context = _context()
     config = build_filter_config(_filter_query("the note reads {note}"), columns=("note",))
-    operation = context.build_operation("filter")(
+    operation = strict_filter(index_key=INDEX_KEY)(
         context.handle, config, DEFAULT_DOCETL_MODEL, 1
     )
 
-    assert type(operation).__name__ == "FilterOperation"
-    # the operation read our key out of the config, so the config reached the engine
-    assert operation._filter_key == KEEP_KEY
+    # a subclass, but the operation `sem_filter` corresponds to: `filter`'s own class is constructed
+    assert isinstance(operation, context.build_operation("filter"))
+    # the declared field is the one the model fills, so the answer lands under the adapter's key
+    assert operation.config["output"]["schema"] == {KEEP_KEY: "bool"}
 
 
 def test_docetl_rejects_a_malformed_config() -> None:
@@ -100,11 +102,23 @@ def test_docetl_rejects_a_malformed_config() -> None:
 
     context = _context()
     config = build_filter_config(_filter_query("the note reads {note}"), columns=("note",))
-    config["output"] = {"schema": {"keep": "bool", "also_keep": "bool"}}
-    factory = context.build_operation("filter")
+    # a filter takes exactly one bool key; the two-key answer a map allows is not a filter
+    config["output"] = {"schema": {KEEP_KEY: "bool", "reason": "str"}}
+    factory = strict_filter(index_key=INDEX_KEY)
 
     with pytest.raises(ValueError):
         factory(context.handle, config, DEFAULT_DOCETL_MODEL, 1)
+
+
+def test_a_class_for_another_operation_is_refused() -> None:
+    """`operation_cls` substitutes a class for the operation named, not a class of any kind."""
+
+    context = _context()
+    config = build_filter_config(_filter_query(), columns=("note",))
+    equijoin = strict_equijoin(left_id_key="left_id", right_id_key="right_id")
+
+    with pytest.raises(TypeError, match="takes a subclass of FilterOperation"):
+        context.run_operation("filter", config, [], operation_cls=equijoin)
 
 
 def test_sem_filter_keeps_only_the_rows_the_model_accepts(canned_endpoint: CannedEndpoint) -> None:
@@ -151,19 +165,33 @@ def test_sem_filter_preserves_the_index_and_hides_the_decision(
     assert result["note"].tolist() == [_KEEP_MARKER, _KEEP_MARKER]
 
 
-def test_a_row_whose_answer_fails_validation_is_dropped(canned_endpoint: CannedEndpoint) -> None:
-    """Pins the recorded divergence: a row DocETL cannot validate is dropped, not raised.
+def test_a_row_whose_answer_fails_validation_is_refused(canned_endpoint: CannedEndpoint) -> None:
+    """A filter has two outcomes, so it may not answer with the third: no answer at all.
 
-    Pinned here rather than in the real-API audit, because a real model cannot be made to answer
-    wrongly on demand.
+    DocETL drops a record whose answer fails the declared type and reports nothing, and `filter`
+    publishes only the rows it kept, so the count is not in the output. `strict_filter` counts the
+    answers the engine actually got, which is what turns a vanished row into a failure.
     """
 
     frame = pd.DataFrame({"note": [_MALFORMED_MARKER]}, index=[7])
 
-    result = _adapter(canned_endpoint).execute(_filter_query(), {"log": frame})
+    with pytest.raises(RuntimeError, match="sem_filter answered 0 of 1 rows"):
+        _adapter(canned_endpoint).execute(_filter_query(), {"log": frame})
 
-    assert list(result.columns) == ["note"]
-    assert result.empty
+
+def test_a_rejected_row_is_not_mistaken_for_a_lost_answer(
+    canned_endpoint: CannedEndpoint,
+) -> None:
+    """The count decides, not the verdict: a row the model turned down is a legal result.
+
+    The two rows differ only in why they are absent from the answer, so the raise has to name the one
+    whose answer never arrived.
+    """
+
+    frame = pd.DataFrame({"note": [_MALFORMED_MARKER, "other"]}, index=[7, 8])
+
+    with pytest.raises(RuntimeError, match=r"sem_filter answered 1 of 2 rows.*missing \[7\]"):
+        _adapter(canned_endpoint).execute(_filter_query(), {"log": frame})
 
 
 def test_a_trace_directory_receives_one_event_per_operator(tmp_path: Path) -> None:
@@ -334,10 +362,10 @@ def test_sem_flat_map_carries_a_large_integer_column_exact(
     assert list(result.index) == [7, 7]
 
 
-# §2: `I` and `O` are the operator's vocabulary. `sem_filter` declares no output
-# field, so a name it has no value for is refused rather than accepted as
-# something to fill.
-def test_a_filter_has_no_output_field_to_fill() -> None:
+# §2: `I` and `O` are the operator's vocabulary. `sem_filter`'s only output is the adapter's own
+# `keep_row`, which no policy may name, so a name it has no value for is refused rather than
+# accepted as something to fill.
+def test_a_filter_declares_no_output_the_policy_can_name() -> None:
     with pytest.raises(ValueError, match="input column"):
         build_filter_config(_filter_query("Keep rows about {topic}"), columns=("note",))
 

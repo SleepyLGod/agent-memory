@@ -16,8 +16,8 @@ from agent_memory.adapters.docetl.prompt import (
     compared_columns,
     join_slot,
 )
-from agent_memory.adapters.docetl.reserved import KEEP_KEY
 from agent_memory.adapters.docetl.specs import op_config
+from agent_memory.adapters.docetl.strict import strict_equijoin
 from agent_memory.policy.logical import QueryExpr
 from agent_memory.policy.placeholders import JoinScope
 from agent_memory.policy.schema import relation_alias, require_unique_published_columns
@@ -28,6 +28,9 @@ if TYPE_CHECKING:
 
 LEFT_ID_COLUMN = "left_id"
 RIGHT_ID_COLUMN = "right_id"
+# Required by: `_verify_pairs`, which decides the candidate pairs. The engine's blocking rule reads
+#   this field, so a pair that is not in it is never sent to the model.
+ALLOWED_RIGHT_IDS = "allowed_right_ids"
 GROUP_POSITION_COLUMN = "group_position"
 SELECTED_COLUMN = "selected_right_ids"
 # Required by: `_cap_matches`, which shows the ranking call the row its candidates were matched to.
@@ -246,41 +249,80 @@ def _verify_pairs(
     params: JoinParams,
     context: DocetlExecutionContext,
 ) -> list[Match]:
-    """Ask the model about each candidate pair; the verdict carries no score, so ranking is a later step."""
+    """Ask the engine's `equijoin` about each candidate pair; the verdict carries no score, so
+    ranking is a later step.
+
+    The engine compares two relations rather than a list of pairs (`equijoin.py:232-234`), so each
+    row is sent once and the pairs come back as the ids the joined record carries: the candidate
+    set travels as a blocking rule, which is the only channel that decides what is asked.
+    """
 
     scope = compared_columns(
         params.instruction, params.scope(left.columns, right.columns)
     )
-    # Reason: slots are positional, so a column name never becomes a Jinja expression.
-    records = [
+    allowed: dict[int, list[int]] = defaultdict(list)
+    for left_id, right_id in pairs:
+        allowed[left_id].append(right_id)
+
+    left_records = [
         {
             LEFT_ID_COLUMN: left_id,
-            RIGHT_ID_COLUMN: right_id,
-            **{
-                join_slot("left", index): str(left.loc[left_id, column])
-                for index, column in enumerate(scope.left)
-            },
-            **{
-                join_slot("right", index): str(right.loc[right_id, column])
-                for index, column in enumerate(scope.right)
-            },
+            # Reason: padded on both sides, so id 1 is not read out of the 11 in a longer id.
+            ALLOWED_RIGHT_IDS: "".join(f"|{right_id}|" for right_id in right_ids),
+            **_slots(left, left_id, "left", scope.left),
         }
-        for left_id, right_id in pairs
+        for left_id, right_ids in allowed.items()
+    ]
+    right_records = [
+        {RIGHT_ID_COLUMN: right_id, **_slots(right, right_id, "right", scope.right)}
+        for right_id in dict.fromkeys(right_id for _, right_id in pairs)
     ]
     config = build_verdict_config(params.instruction, scope=scope)
-    kept = context.run_operation("filter", config, records)
+    joined = context.run_pair_operation(
+        "equijoin",
+        config,
+        left_records,
+        right_records,
+        operation_cls=strict_equijoin(
+            left_id_key=LEFT_ID_COLUMN, right_id_key=RIGHT_ID_COLUMN
+        ),
+    )
 
-    matches: list[Match] = []
-    for record in kept:
+    asked = set(pairs)
+    kept: set[Pair] = set()
+    for record in joined:
         left_id = record.get(LEFT_ID_COLUMN)
         right_id = record.get(RIGHT_ID_COLUMN)
         if left_id is None or right_id is None:
             raise RuntimeError(
-                "sem_join lost a pair's identity; the verdict returned a row without "
-                "left_id/right_id"
+                "sem_join lost a pair's identity; the join returned a row without "
+                f"{LEFT_ID_COLUMN}/{RIGHT_ID_COLUMN}"
             )
-        matches.append(Match(int(left_id), int(right_id)))
-    return matches
+        kept.add((int(left_id), int(right_id)))
+    unexpected = kept.difference(asked)
+    if unexpected:
+        raise RuntimeError(
+            f"sem_join matched a pair it never asked about: {sorted(unexpected)}"
+        )
+    # Reason: the engine returns its own blocked-pair order, while `k` and `how` read this list as
+    #   the candidate order, so the kept pairs are put back in the order they were asked in.
+    return [
+        Match(left_id, right_id)
+        for left_id, right_id in pairs
+        if (left_id, right_id) in kept
+    ]
+
+
+def _slots(
+    frame: pd.DataFrame, row_id: int, side: str, columns: Sequence[str]
+) -> dict[str, str]:
+    """Return one row's positional slot values, which is what the prompt reads."""
+
+    row = frame.loc[row_id]
+    return {
+        join_slot(side, index): str(row[column])
+        for index, column in enumerate(columns)
+    }
 
 
 def _cap_matches(
@@ -523,13 +565,34 @@ def _cell(frame: pd.DataFrame, row_id: int | None, column: str) -> Any:
 
 
 def build_verdict_config(instruction: str, *, scope: JoinScope) -> dict[str, Any]:
-    """Return the DocETL `filter` config that answers one pair at a time."""
+    """Return the DocETL `equijoin` config that answers one pair at a time.
 
-    return op_config(
-        "sem_join",
-        "filter",
-        build_join_prompt(instruction, scope=scope),
-        {KEEP_KEY: "bool"},
+    Not `specs.op_config`: an equijoin is configured by a comparison prompt and a blocking rule,
+    not by a record prompt and an output schema (`equijoin.py:63-81`).
+    """
+
+    return {
+        "name": "sem_join",
+        "type": "equijoin",
+        "comparison_prompt": build_join_prompt(instruction, scope=scope),
+        # Required by: `equijoin`'s blocking step, which admits a pair when any condition holds
+        #   (`equijoin.py:41-45`) and runs before the first model call. One condition carrying the
+        #   candidate set is therefore the whole rule, and nothing widens it: no threshold is set,
+        #   so no similarity pass adds pairs, and no `limit_comparisons`, so none are sampled away.
+        "blocking_conditions": [_allowed_pairs_condition()],
+    }
+
+
+def _allowed_pairs_condition() -> str:
+    """Return the blocking rule that admits exactly the pairs `_verify_pairs` recorded.
+
+    `equijoin` evaluates each condition against the two records (`equijoin.py:41-45`), so a string
+    is the only channel a set of pairs can travel through.
+    """
+
+    return (
+        f"('|' + str(right[{RIGHT_ID_COLUMN!r}]) + '|') "
+        f"in left[{ALLOWED_RIGHT_IDS!r}]"
     )
 
 

@@ -427,10 +427,11 @@ def test_sem_filter_agrees_through_a_canned_endpoint(
 def test_an_unusable_answer_diverges_by_design(
     canned_endpoint: CannedEndpoint,
 ) -> None:
-    """Pins the recorded divergence: on an unusable answer LOTUS keeps the row, DocETL drops it.
+    """Pins the recorded divergence: on an unusable answer LOTUS keeps the row, DocETL refuses the run.
 
     LOTUS's parse failure falls back to keeping (``lotus.sem_ops.sem_filter::sem_filter``,
-    ``default=True``); DocETL drops a row whose answer fails the declared type.
+    ``default=True``); DocETL drops a row whose answer fails the declared type, and the adapter asks one
+    answer per row precisely so that drop is countable and raises (ADR-012).
     """
 
     case = ParityCase(
@@ -444,7 +445,8 @@ def test_an_unusable_answer_diverges_by_design(
     lotus_answer, docetl_answer = _run(build_adapters(canned_endpoint.base_url), case)
 
     assert list(lotus_answer.index) == NOTE_INDEX, list(lotus_answer.index)
-    assert docetl_answer.empty, list(docetl_answer.index)
+    # no answer survived the declared type, so the frame is never published: a refusal, not an empty frame
+    assert docetl_answer is RuntimeError, docetl_answer
 
 
 def test_sem_map_agrees_through_a_canned_endpoint() -> None:
