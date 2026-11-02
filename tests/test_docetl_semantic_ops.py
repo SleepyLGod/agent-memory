@@ -80,6 +80,10 @@ def test_completion_kwargs_are_forwarded_under_docetls_own_key() -> None:
 
     assert merged["litellm_completion_kwargs"] == {"temperature": 0}
     assert merged["skip_on_error"] is False
+    # the answer count means "one answer per row" only because neither knob reaches the spec:
+    # a cascade never calls `_handle_result` (`filter.py:130-131`), and a filter's `limit` stops the
+    # run after the rows it kept (`filter.py:99-100`)
+    assert {"cascade", "limit"}.isdisjoint(merged)
 
 
 def test_docetl_accepts_the_generated_config() -> None:
@@ -209,6 +213,37 @@ def test_a_rejected_row_is_not_mistaken_for_a_lost_answer(
 
     with pytest.raises(RuntimeError, match=r"sem_filter answered 1 of 2 rows.*missing \[7\]"):
         _adapter(canned_endpoint).execute(_filter_query(), {"log": frame})
+
+
+def test_an_answer_without_the_decision_field_is_refused() -> None:
+    """`filter.py:103` reads the decision with `bool(result.get(...))`, so its shape is ours to check.
+
+    The engine's own type gate drops such a row before `_handle_result`, which is what the count sees;
+    this asserts the second half directly, because that gate sits on a path `gleaning` and `agent` skip.
+    """
+
+    context = _context()
+    config = build_filter_config(_filter_query(), columns=("note",))
+    operation = strict_filter(index_key=INDEX_KEY)(
+        context.handle, config, DEFAULT_DOCETL_MODEL, 1
+    )
+
+    with pytest.raises(RuntimeError, match=f"without {KEEP_KEY!r}"):
+        operation._handle_result({INDEX_KEY: 7, "note": "x"})
+
+
+@pytest.mark.parametrize("answered", ["maybe", 1, None])
+def test_an_answer_that_is_not_a_boolean_is_refused(answered: Any) -> None:
+    """A present but wrong decision is not a refusal either: `bool("maybe")` reads as kept."""
+
+    context = _context()
+    config = build_filter_config(_filter_query(), columns=("note",))
+    operation = strict_filter(index_key=INDEX_KEY)(
+        context.handle, config, DEFAULT_DOCETL_MODEL, 1
+    )
+
+    with pytest.raises(RuntimeError, match="which is not a boolean"):
+        operation._handle_result({INDEX_KEY: 7, "note": "x", KEEP_KEY: answered})
 
 
 def test_a_trace_directory_receives_one_event_per_operator(tmp_path: Path) -> None:
