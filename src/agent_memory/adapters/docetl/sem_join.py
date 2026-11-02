@@ -568,18 +568,21 @@ def build_verdict_config(instruction: str, *, scope: JoinScope) -> dict[str, Any
     """Return the DocETL `equijoin` config that answers one pair at a time.
 
     Not `specs.op_config`: an equijoin is configured by a comparison prompt and a blocking rule,
-    not by a record prompt and an output schema (`equijoin.py:63-81`).
+    not by a record prompt and an output schema (`equijoin.py:63-81`). The rule is the candidate
+    set, so nothing may widen it: a non-null threshold would union the pairs it embeds above that
+    value with the condition's (`equijoin.py:418-520`), which is exactly how `on` would be
+    bypassed — 0.3.0 unions those two sources rather than intersecting them.
     """
 
     return {
         "name": "sem_join",
         "type": "equijoin",
         "comparison_prompt": build_join_prompt(instruction, scope=scope),
-        # Required by: `equijoin`'s blocking step, which admits a pair when any condition holds
-        #   (`equijoin.py:41-45`) and runs before the first model call. One condition carrying the
-        #   candidate set is therefore the whole rule, and nothing widens it: no threshold is set,
-        #   so no similarity pass adds pairs, and no `limit_comparisons`, so none are sampled away.
+        # Reason: the condition carries the candidate set; a null threshold and no
+        #   `limit_comparisons` keep `equijoin` from adding or sampling a pair (`:324`, `:418`).
         "blocking_conditions": [_allowed_pairs_condition()],
+        # Pass None: an absent threshold reads as "learn one" (`:324`).
+        "blocking_threshold": None,
     }
 
 

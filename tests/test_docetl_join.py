@@ -327,6 +327,129 @@ def test_a_predicate_on_restricts_before_the_call(endpoint: CannedEndpoint) -> N
     assert result["dept:left"].tolist() == ["d1", "d1"]
 
 
+# Omitting a blocking knob is not the same as turning blocking off: `equijoin` reads an absent
+#   threshold as "learn one" (`equijoin.py:324`), and the 100-pair branch (`:311-321`) hides that
+#   below the sizes the other cases use. So the config is checked for the keys it states, then the
+#   runtime is checked three ways -- the requests, a control, and a sentinel.
+def test_the_verdict_config_names_blocking_instead_of_omitting_it() -> None:
+    """The candidate set is the whole blocking rule, and the threshold is null on purpose.
+
+    A non-null threshold starts the embedding pass at `:418`, which unions what it embeds above the
+    value with the condition's pairs. What must stay absent is the rest: `limit_comparisons`
+    samples pairs away, and `limits` caps the matches one row may collect (`:589-595`).
+    """
+
+    config = build_verdict_config(
+        "the subjects match: {note:left} and {note:right}",
+        scope=JoinScope.of(("note",), ("note",)),
+    )
+
+    assert config["blocking_conditions"]
+    assert config["blocking_threshold"] is None
+    assert {"limit_comparisons", "limits", "cascade"}.isdisjoint(config)
+
+
+def _wide_pair() -> tuple[pd.DataFrame, pd.DataFrame, QueryExpr]:
+    """Return 11 x 11 frames and the join over them: 121 candidate pairs, and no `on`."""
+
+    left = pd.DataFrame({"note": [f"left {index}" for index in range(11)]})
+    right = pd.DataFrame({"note": [f"right {index}" for index in range(11)]})
+    query = QueryExpr(
+        op="sem_join",
+        inputs=(_source("left", left), _source("right", right)),
+        params={"instruction": "the subjects match: {note:left} and {note:right}"},
+    )
+    return left, right, query
+
+
+def test_a_join_above_a_hundred_pairs_asks_about_every_pair(
+    endpoint: CannedEndpoint,
+) -> None:
+    """No mock: 121 verdict requests, 121 rows, every left row keeping every right row.
+
+    The learning pass buys a sample of comparisons through `compare_pair` before the join, so if it
+    ran the request count would pass the pair count. Every request here is a verdict call.
+    """
+
+    left, right, query = _wide_pair()
+
+    result = _adapter(endpoint).execute(query, {"left": left, "right": right})
+
+    assert len(endpoint.requests) == 11 * 11
+    # a verdict is a chat completion; nothing else was asked of this endpoint
+    assert all("messages" in body for body in endpoint.requests)
+    assert len(result) == 11 * 11
+    assert result.groupby("note:left").size().tolist() == [11] * 11
+
+
+def test_the_engine_learns_a_threshold_when_no_condition_is_named(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The control: the same 121 pairs reach the optimizer once the condition is gone.
+
+    Without it, the case below could pass with the sentinel wired to nothing. It also states the
+    premise the requirement rests on -- `equijoin` does learn a threshold by default.
+    """
+
+    from docetl.operations.equijoin import EquijoinOperation, RuntimeBlockingOptimizer
+
+    spec = {
+        "name": "sem_join",
+        "type": "equijoin",
+        "comparison_prompt": "{{ left['left_0'] }} against {{ right['right_0'] }}",
+        "blocking_conditions": [],
+        "blocking_threshold": None,
+    }
+    left = [{"left_id": index, "left_0": "x"} for index in range(11)]
+    right = [{"right_id": index, "right_0": "y"} for index in range(11)]
+
+    def refuse_to_learn(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("the engine reached the threshold-learning pass")
+
+    monkeypatch.setattr(RuntimeBlockingOptimizer, "optimize_equijoin", refuse_to_learn)
+
+    context = DocetlExecutionContext(model=CANNED_MODEL)
+    with pytest.raises(AssertionError, match="threshold-learning"):
+        EquijoinOperation(context.handle, dict(spec), CANNED_MODEL, 1).execute(left, right)
+
+
+def test_a_join_above_a_hundred_pairs_never_learns_a_blocking_threshold(
+    endpoint: CannedEndpoint, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Neither branch that could do blocking on its own is entered, and the run is unchanged.
+
+    The learning pass (`:324`) and the embedding pass (`:418`) are each replaced by a method that
+    raises -- the second because `gen_embedding` never reaches this endpoint, so the request log
+    cannot see it. Same 121 pairs and the same counts as the case above, so neither was entered;
+    the control shows the learning sentinel does fire without the condition, so silence here is a
+    fact about the config rather than about the patch.
+    """
+
+    from docetl.operations.equijoin import RuntimeBlockingOptimizer
+
+    left, right, query = _wide_pair()
+    adapter = _adapter(endpoint)
+    # the engine reads `gen_embedding` off the runner handle (`equijoin.py:457`), so the sentinel
+    #   has to sit on that instance rather than on this adapter
+    api = adapter._context.handle.api
+
+    def refuse_to_learn(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError(
+            "sem_join left the engine to auto-learn a blocking threshold"
+        )
+
+    def refuse_to_embed(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("sem_join let the engine embed records for blocking")
+
+    monkeypatch.setattr(RuntimeBlockingOptimizer, "optimize_equijoin", refuse_to_learn)
+    monkeypatch.setattr(api, "gen_embedding", refuse_to_embed)
+
+    result = adapter.execute(query, {"left": left, "right": right})
+
+    assert len(endpoint.requests) == 11 * 11
+    assert len(result) == 11 * 11
+
+
 def test_how_left_adds_a_null_row_for_an_unmatched_left(
     endpoint: CannedEndpoint,
 ) -> None:
