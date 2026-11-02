@@ -139,8 +139,8 @@ For detailed expression signatures, see
 | `sem_map(input_cols=None, output_cols=..., instruction=...)` | One generated result per input row; preserve other source columns |
 | `sem_flat_map(input_cols=None, output_cols=..., instruction=..., ordinal_col=None)` | Zero or more results per input row, retaining source context |
 | `sem_join(other, instruction=..., how="inner", on=None, k=None)` | Match rows across two relations |
-| `sem_groupby(input_cols=..., instruction=..., partition_by=None, labels=None, label_col="_label", membership=None)` | Group by a semantic criterion; close with an aggregate |
-| `sem_agg(input_cols=None, output_cols=None, instruction=...)` | Synthesize an aggregate result over the relation or each group |
+| `sem_groupby(input_cols=None, instruction=..., C=None, membership="single", partition_by=None, S=None)` | Return original rows plus record/group IDs; readable without an aggregate |
+| `sem_agg(input_cols=None, output_cols=None, instruction=..., S=None)` | Synthesize an aggregate result over the relation or each group; nonempty S is not implemented |
 | `sem_topk(instruction, k)` | Rank and retain up to `k` rows |
 
 Map and flat-map outputs replace same-named generated columns rather than
@@ -150,9 +150,11 @@ column name distinct from the source and generated columns. A source row
 that emits no records contributes no output rows.
 
 Column descriptions in `output_cols` guide generation; they are not Python
-dtype declarations. For `sem_agg`, omitted `input_cols` selects all columns
-except the internal semantic-group identifier. Omitted `output_cols` reuses
-the selected input names for the aggregate result. Explicit names make the
+dtype declarations. New fallback and independent-grouping paths resolve omitted
+`input_cols` to business columns, excluding known system fields and generated
+record/group IDs. Explicit inputs are respected. Legacy paths retain their old
+input resolution. Omitted `output_cols` reuses selected input names (excluding
+group keys on the independent grouped path). Explicit names make the
 result schema easier to use downstream. Row-frame `sem_agg` requires explicit
 `output_cols`.
 
@@ -170,16 +172,20 @@ direct semantic-join view maintenance.
 Its available ranking algorithms are execution choices. Do not assume a
 general incremental top-k maintenance rule for an arbitrary public view.
 
-Semantic grouping requires `input_cols`, a sequence of column names. It can
-use exact `partition_by` keys (one name or a sequence) before applying its
-instruction. With `labels`, a mapping of label names to descriptions,
-grouping assigns one of the declared label
-names to `label_col`. Without labels, matching discovers groups.
-`membership="exclusive"` constrains join-map matching to at most one existing
-target; `None` does not impose that extra restriction. The name
-`"overlapping"` is reserved but is not implemented by the current executor.
-See the aggregation guide before choosing output columns or combining semantic
-and deterministic aggregates.
+Semantic grouping uses exact `partition_by` keys (one name or a sequence) before
+applying its instruction. `single` requires exactly one group per record;
+`multiple` permits one or more, with no duplicate record/group pairs. It does not
+generate labels or descriptions; `labels` and `label_col` are removed parameters.
+Positive integer C is a per-partition target with at most C nonempty groups;
+nonempty partitions smaller than C fail before any model call. Empty input stays
+empty. Boolean C and nonempty S are rejected.
+
+Temporary compatibility: `membership="exclusive"` selects the old fused path
+and constrains join-map matching to at most one existing target; `None` selects
+that path without the extra restriction. Neither accepts nonempty C. Old
+`"overlapping"` is still unsupported; it is not an alias for new `"multiple"`.
+See [independent grouping](../independent-semantic-grouping.md) for scope
+propagation, fallback and the compatibility exit condition.
 
 ## Aggregates and arrays
 
