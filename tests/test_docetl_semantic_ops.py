@@ -121,6 +121,23 @@ def test_a_class_for_another_operation_is_refused() -> None:
         context.run_operation("filter", config, [], operation_cls=equijoin)
 
 
+def test_an_operation_cost_reaches_the_handle() -> None:
+    """`execute()` returns cost and nothing outside adds it, so the context does, as `runner.py:617` does."""
+
+    from docetl.operations.filter import FilterOperation
+
+    class PricedFilter(FilterOperation):
+        def execute(self, *args: Any, **kwargs: Any) -> Any:
+            return [], 2.5
+
+    context = _context()
+    config = build_filter_config(_filter_query(), columns=("note",))
+    context.run_operation("filter", config, [], operation_cls=PricedFilter)
+    context.run_operation("filter", config, [], operation_cls=PricedFilter)
+
+    assert context.handle.total_cost == 5.0
+
+
 def test_sem_filter_keeps_only_the_rows_the_model_accepts(canned_endpoint: CannedEndpoint) -> None:
     """End to end: our lowering, DocETL's operation, a real request, no model."""
 

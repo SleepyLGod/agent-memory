@@ -960,3 +960,22 @@ def test_a_call_that_never_returned_is_a_failure_not_a_no_match(
     assert engine.compare_pair(prompt, CANNED_MODEL, left, right) == (False, 0.0)
     with pytest.raises(RuntimeError, match="got no answer"):
         ours.compare_pair(prompt, CANNED_MODEL, left, right)
+
+
+def test_a_pair_operation_cost_reaches_the_handle() -> None:
+    """`execute(left, right)` returns cost too, and this path adds it the way the row path does."""
+
+    from docetl.operations.equijoin import EquijoinOperation
+
+    class PricedEquijoin(EquijoinOperation):
+        def execute(self, *args: Any, **kwargs: Any) -> Any:
+            return [], 3.5
+
+    context = DocetlExecutionContext()
+    spec = build_verdict_config(
+        "the notes match: {note:left} and {note:right}",
+        scope=JoinScope.of(("note",), ("note",)),
+    )
+    context.run_pair_operation("equijoin", spec, [], [], operation_cls=PricedEquijoin)
+
+    assert context.handle.total_cost == 3.5

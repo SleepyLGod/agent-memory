@@ -207,6 +207,16 @@ class DocetlExecutionContext:
             self.config.max_threads,
         )
 
+    def _add_cost(self, cost: float) -> None:
+        """Add one operation's returned cost to the handle.
+
+        `execute()` returns `(output, cost)` and nothing outside adds it: DocETL does so in
+        `runner._run_operation` (`runner.py:617`), the path a direct call replaces. A context that
+        skipped this would spend money the handle never records.
+        """
+
+        self.handle.total_cost += cost
+
     def run_operation(
         self,
         op_type: str,
@@ -219,7 +229,8 @@ class DocetlExecutionContext:
 
         `op_type` is resolved against DocETL's registry (see `build_operation`); `spec` is its DocETL
         config, while `model` and `max_threads` come from this context. Returns the records the
-        operation produced. No cost is reported: usage is read from the handle (`usage_snapshot`).
+        operation produced, and adds its cost to the handle, which is also where `usage_snapshot`
+        reads the tokens.
 
         `execute()` is the step that calls the model, so this is where rows are sent and answers come
         back. `spec` and `records` are copied per call, so a caller can reuse either one (DocETL
@@ -232,9 +243,10 @@ class DocetlExecutionContext:
         """
 
         # Construction is what binds this context to the operation; `execute()` returns
-        #   `(output, cost)`, and cost is already accumulated on the handle (`usage_snapshot`).
+        #   `(output, cost)`, and the cost is ours to add (`_add_cost`).
         operation = self._operation(op_type, spec, operation_cls)
-        output, _cost = operation.execute(list(records))
+        output, cost = operation.execute(list(records))
+        self._add_cost(cost)
         return output
 
     def run_pair_operation(
@@ -251,14 +263,15 @@ class DocetlExecutionContext:
         `equijoin` is the operation this exists for: it compares two relations rather than one
         record list (`equijoin.py:232-234`), so it answers the pairs its blocking rule admits and
         returns one joined record per pair the model kept. Everything else matches
-        `run_operation`: the spec, the copied inputs and the cost held by the handle.
+        `run_operation`: the spec, the copied inputs and the cost added to the handle.
 
         `operation_cls` replaces the registered class on the same terms. `strict.strict_equijoin`
         is its only user: an `equijoin` that also refuses a pair whose answer never arrived.
         """
 
         operation = self._operation(op_type, spec, operation_cls)
-        output, _cost = operation.execute(list(left_records), list(right_records))
+        output, cost = operation.execute(list(left_records), list(right_records))
+        self._add_cost(cost)
         return output
 
     def usage_snapshot(self) -> dict[str, int]:
