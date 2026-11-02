@@ -180,6 +180,7 @@ class ClaudeMemory(Memory):
         # Membership is intentionally unspecified, so rule-join-map preserves the
         # current multi-target matching behavior for Claude topics.
         .sem_groupby(
+            membership=None,
             input_cols=["name", "description", "type"],
             instruction=_GROUP_INSTRUCTION,
             # Future single-target experiment:

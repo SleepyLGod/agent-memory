@@ -204,6 +204,8 @@ def output_columns(
                 f"column: {ordinal_col!r}"
             )
         return _append_unique(columns, (str(ordinal_col),))
+    if query.op == "sem_groupby" and query.params.get("independent"):
+        return tuple(query.params["columns"])
     if query.op in {
         "count_window",
         "sem_filter",

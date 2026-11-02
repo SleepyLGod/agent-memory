@@ -34,6 +34,19 @@ from agent_memory.policy.schema import output_columns
 from agent_memory.runtime.window import over_frames
 
 JSON_OBJECT_RESPONSE_FORMAT = {"type": "json_object"}
+# Previous LOTUS output-format blocks, retained for comparison only.
+# Leaf:
+# "Follow the following format.\n\nContext: relevant facts from multiple documents\n\n"
+# "Instruction: the instruction provided by the user\n\nAnswer: Write your answer\n\n---\n\n"
+# Merge:
+# "Follow the following format.\n\nContext: relevant facts from multiple sources\n\n"
+# "Instruction: the instruction provided by the user\n\nAnswer: Write your answer\n\n---\n\n"
+# Replaced because models could reproduce this input template in the result.
+AGGREGATE_OUTPUT_CONTRACT = (
+    "The Context and Instruction sections below provide the input and task.\n"
+    "Return only the result requested by the instruction, in the requested format.\n"
+    "Do not reproduce the input template as part of the result.\n\n---\n\n"
+)
 
 
 @dataclass(frozen=True)
@@ -67,6 +80,13 @@ def execute_sem_agg(
         return execute_over_sem_agg(query, inputs, execute, context)
 
     source = execute(query.inputs[0], inputs)
+    if (
+        query.params.get("maintenance_rule") == "agg-fallback"
+        and query.inputs[0].op != "group_by"
+    ):
+        source = source.copy()
+        source.attrs["agent_memory_explicit_grouping"] = True
+        source.attrs["agent_memory_groupby_keys"] = ()
     input_cols = aggregate_input_columns(source, query.params.get("input_cols"))
     output_cols = aggregate_output_columns(query, input_cols)
     if len(output_cols) == 1:
@@ -274,10 +294,9 @@ def execute_native_sem_agg_group(
     input_cols: Sequence[str],
     config: LotusExecutionConfig | None = None,
 ) -> str:
-    """Aggregate one group into one native LOTUS string answer."""
+    """Aggregate one group with the shared LOTUS-style output contract."""
 
     import lotus
-    from lotus.sem_ops.sem_agg import sem_agg
 
     config = config or LotusExecutionConfig()
     docs = aggregate_group_text(group, input_cols)
@@ -286,16 +305,17 @@ def execute_native_sem_agg_group(
         "safe_mode": config.sem_agg_safe_mode,
         "progress_bar_desc": config.sem_agg_progress_bar_desc,
     }
-    output = sem_agg(
+    output, _retry_result = _execute_lotus_style_sem_agg(
         docs,
         lotus.settings.lm,
         instruction,
         [0] * len(docs),
+        response_format=None,
+        final_model_kwargs=None,
+        lotus_native_spacing=True,
         **kwargs,
     )
-    if not output.outputs:
-        return ""
-    return str(output.outputs[0])
+    return output
 
 
 def execute_structured_sem_agg(
@@ -955,6 +975,7 @@ def _execute_lotus_style_sem_agg(
     structured_output_cols: Sequence[ColumnSpec] | None = None,
     structured_parse_retries: int = 0,
     failure_extra_by_index: Mapping[int, Mapping[str, Any]] | None = None,
+    lotus_native_spacing: bool = False,
 ) -> tuple[str, StructuredLMRetryResult | None]:
     """Execute LOTUS-style aggregation and expose final structured retry metadata."""
 
@@ -977,9 +998,13 @@ def _execute_lotus_style_sem_agg(
         context_str = ""
         batch = []
         template = (
-            leaf_instruction_template(user_instruction)
+            leaf_instruction_template(
+                user_instruction, lotus_native_spacing=lotus_native_spacing
+            )
             if tree_level == 0
-            else node_instruction_template(user_instruction)
+            else node_instruction_template(
+                user_instruction, lotus_native_spacing=lotus_native_spacing
+            )
         )
         template_tokens = model.count_tokens(template)
         budget = model.max_ctx_len - model.max_tokens - template_tokens
@@ -1118,7 +1143,7 @@ def leaf_instruction_template(
     *,
     lotus_native_spacing: bool = False,
 ) -> str:
-    """Return the LOTUS leaf-level semantic aggregation prompt template."""
+    """Retain LOTUS leaf instructions with an explicit result-only boundary."""
 
     instruction_prefix = "Instruction:  " if lotus_native_spacing else "Instruction: "
     return (
@@ -1126,8 +1151,7 @@ def leaf_instruction_template(
         "Remember that your job is to answer the user's instruction by combining all relevant information from all provided documents, into a single coherent answer.\n"
         "Do NOT copy the format of the sources! Instead output your answer in a coherent, well-structured manner that best answers the user instruction.\n"
         "You have limited space to provide your answer, so be concise and to the point.\n\n---\n\n"
-        "Follow the following format.\n\nContext: relevant facts from multiple documents\n\n"
-        "Instruction: the instruction provided by the user\n\nAnswer: Write your answer\n\n---\n\n"
+        f"{AGGREGATE_OUTPUT_CONTRACT}"
         "Context: {{docs_str}}\n\n"
         f"{instruction_prefix}{user_instruction}\n\nAnswer:\n"
     )
@@ -1138,7 +1162,7 @@ def node_instruction_template(
     *,
     lotus_native_spacing: bool = False,
 ) -> str:
-    """Return the LOTUS intermediate-node semantic aggregation prompt template."""
+    """Retain LOTUS merge instructions with an explicit result-only boundary."""
 
     instruction_prefix = "Instruction:  " if lotus_native_spacing else "Instruction: "
     return (
@@ -1150,8 +1174,7 @@ def node_instruction_template(
         "Do NOT copy the format of the sources, instead output your answer in a coherent, well-structured manner that best answers the user instruction.\n"
         "You have limited space to provide your answer, so be concise and to the point.\n"
         "You may need to draw connections between sources to provide a complete answer.\n\n---\n\n"
-        "Follow the following format.\n\nContext: relevant facts from multiple sources\n\n"
-        "Instruction: the instruction provided by the user\n\nAnswer: Write your answer\n\n---\n\n"
+        f"{AGGREGATE_OUTPUT_CONTRACT}"
         "Context: {{docs_str}}\n\n"
         f"{instruction_prefix}{user_instruction}\n\nAnswer:\n"
     )
@@ -1248,7 +1271,10 @@ def aggregate_groups_with_keys(
             output_keys=deterministic_keys,
             drop_columns=(),
         )
-    if GROUP_ID_COLUMN not in source.columns:
+    if (
+        source.attrs.get("agent_memory_explicit_grouping")
+        or GROUP_ID_COLUMN not in source.columns
+    ):
         return [({}, source.reset_index(drop=True).copy())]
     return _aggregate_groups_by_keys(
         source,

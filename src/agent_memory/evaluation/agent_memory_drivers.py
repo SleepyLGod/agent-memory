@@ -127,7 +127,7 @@ def inventory_operator_semantic_pair_sites(
         pending.extend(query.inputs)
         if query.op not in operators:
             continue
-        if query.op == "sem_groupby" and query.params.get("labels"):
+        if query.op == "sem_groupby" and query.params.get("independent"):
             continue
         site_id = semantic_pair_site_id(query)
         contract = semantic_pair_site_contract(query)

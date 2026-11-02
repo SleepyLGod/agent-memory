@@ -106,6 +106,7 @@ class _DifferentialAuditMemory(am.Memory):
             instruction="Extract zero or more durable memory facts from {message}.",
         )
         .sem_groupby(
+            membership=None,
             input_cols=["name", "body"],
             instruction="Rows describe the same durable memory topic.",
         )
@@ -503,6 +504,7 @@ def test_sem_groupby_sem_agg_real_lotus_audit() -> None:
     query = (
         _view("source")
         .sem_groupby(
+            membership=None,
             input_cols=["name", "description"],
             instruction="Rows refer to the same durable topic when their {name} and {description} describe the same memory.",
         )
@@ -543,6 +545,7 @@ def test_sem_groupby_pairwise_provider_prompt_real_lotus_audit(
         }
     )
     query = _view("source").sem_groupby(
+        membership=None,
         input_cols=["name", "description"],
         instruction=(
             "Rows belong together when {name} and {description} identify the "
@@ -601,38 +604,11 @@ def test_differential_q_prime_real_lotus_audit() -> None:
     )
 
 
-def test_sem_groupby_labels_real_lotus_audit() -> None:
-    _require_real_lotus()
-    adapter = LotusAdapter()
-    source = pd.DataFrame(
-        {
-            "title": [
-                "Distributed cache invalidation",
-                "Transformer benchmark suite",
-                "Museum visitor interviews",
-            ],
-            "abstract": [
-                "A systems paper about cache consistency and database-backed infrastructure.",
-                "A machine learning paper evaluating transformer models on benchmark datasets.",
-                "A user study paper about how museum visitors interact with audio guides.",
-            ],
-        }
-    )
-    query = _view("source").sem_groupby(
-        input_cols=["title", "abstract"],
-        instruction="Assign each paper to the best matching research area.",
-        labels={
-            "systems": "Systems, infrastructure, distributed systems, and databases.",
-            "ml": "Machine learning models, training, evaluation, and datasets.",
-            "hci": "Human-computer interaction, user studies, and interaction design.",
-            "other": "Papers that do not fit the other declared labels.",
-        },
-    )
-
-    result = adapter.execute(query.expr, {"source": source})
-
-    assert "_label" in result.columns
-    assert GROUP_ID_COLUMN in result.columns
-    assert len(result) == len(source)
-    assert set(result["_label"]).issubset({"systems", "ml", "hci", "other"})
-    _write_audit("sem_groupby_labels", {"source": source}, result)
+def test_sem_groupby_labels_are_rejected_before_execution() -> None:
+    with pytest.raises(TypeError, match="unexpected keyword argument 'labels'"):
+        _view("source").sem_groupby(
+            membership=None,
+            input_cols=["title", "abstract"],
+            instruction="Assign each paper to the best matching research area.",
+            labels={"systems": "Systems and databases."},
+        )

@@ -147,9 +147,13 @@ class DifferentialRules:
         self,
         *,
         grouped_agg_rule: str = DEFAULT_GROUPED_AGG_RULE,
+        sem_agg_rule: str | None = None,
     ) -> None:
         """Configure differential rule strategy experiments."""
 
+        if sem_agg_rule not in {None, "agg-fallback"}:
+            raise ValueError("sem_agg_rule must be None or agg-fallback")
+        self.sem_agg_rule = sem_agg_rule
         if grouped_agg_rule not in GROUPED_AGG_RULES:
             raise ValueError(
                 "grouped_agg_rule must be one of: " + ", ".join(GROUPED_AGG_RULES)

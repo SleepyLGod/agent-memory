@@ -203,7 +203,7 @@ class PolicyExecutor:
                 updates[node_id] = NodeOutputUpdate.between(old_state, old_state.copy())
                 continue
 
-            if node.execution_kind == "deterministic":
+            if node.execution_kind in {"deterministic", "semantic_fallback"}:
                 next_state = self._execute_deterministic(node_id, staged_node_state)
             elif node.execution_kind == "algebraic_state":
                 next_state = self._execute_algebraic_state(
@@ -646,8 +646,12 @@ class PolicyExecutor:
         )
 
     def query_output_columns(self, query: QueryExpr) -> list[str]:
-        """Infer output columns, resolving public materialized-view leaves."""
+        """Infer output columns, resolving compiled public-view schemas."""
 
+        for name, view in self.spec.views.items():
+            if query == view.query:
+                node = self.policy.nodes[self.policy.view_outputs[name]]
+                return list(node.output_columns)
         if query.op == "materialized_view" and "columns" not in query.params:
             name = str(query.params["name"])
             if name not in self.spec.views:

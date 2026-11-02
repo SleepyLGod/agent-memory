@@ -77,7 +77,6 @@ from agent_memory.adapters.lotus.sem_filter import (
 )
 import agent_memory.adapters.lotus.sem_groupby as sem_groupby_module
 from agent_memory.adapters.lotus.sem_groupby import (
-    assign_declared_labels,
     assign_semantic_group_ids,
     evaluate_group_matches,
     lower_pairwise_grouping_instruction,
@@ -545,6 +544,7 @@ def test_topics_expression_uses_chain_groupby_then_aggregation() -> None:
 
 def test_grouped_relation_sem_agg_returns_normal_relation() -> None:
     grouped = am.Log().sem_groupby(
+        membership=None,
         input_cols=["topic_name"],
         instruction="Rows whose {topic_name} values refer to the same durable memory topic belong in one group.",
     )
@@ -566,6 +566,7 @@ def test_grouped_relation_sem_agg_returns_normal_relation() -> None:
 def test_sem_groupby_membership_contract_is_optional_and_validated() -> None:
     log = am.Log({"topic_name": "Topic name."})
     unspecified = log.sem_groupby(
+        membership=None,
         input_cols=["topic_name"],
         instruction="Group matching topics.",
     )
@@ -644,6 +645,7 @@ def test_min_public_api_supports_global_grouped_and_mixed_aggregation() -> None:
     assert output_columns(mixed.expr) == ("group", "minimum", "values")
 
     semantic_grouped = log.sem_groupby(
+        membership=None,
         input_cols=["group"],
         instruction="Rows have the same {group}.",
     )
@@ -720,6 +722,7 @@ def test_sem_groupby_agg_preserves_optional_partition_by_schema() -> None:
         }
     )
     aggregated = log.sem_groupby(
+        membership=None,
         input_cols=["name"],
         partition_by="group_id",
         instruction="Rows refer to the same entity.",
@@ -739,6 +742,7 @@ def test_sem_groupby_agg_preserves_optional_partition_by_schema() -> None:
 
 def test_sem_groupby_array_agg_public_api_is_not_supported() -> None:
     grouped = am.Log({"name": "Entity name."}).sem_groupby(
+        membership=None,
         input_cols=["name"],
         instruction="Rows refer to the same entity.",
     )
@@ -749,6 +753,7 @@ def test_sem_groupby_array_agg_public_api_is_not_supported() -> None:
 
 def test_sem_groupby_agg_rejects_array_only_specs() -> None:
     grouped = am.Log({"name": "Entity name."}).sem_groupby(
+        membership=None,
         input_cols=["name"],
         instruction="Rows refer to the same entity.",
     )
@@ -785,43 +790,27 @@ def test_aggregate_spec_normalization_rejects_duplicate_outputs() -> None:
         )
 
 
-def test_sem_groupby_accepts_declared_labels() -> None:
-    grouped = am.Log().sem_groupby(
-        input_cols=["title", "abstract"],
-        instruction="Assign each paper to the best matching research area.",
-        labels={
-            "systems": "Systems and databases.",
-            "ml": "Machine learning.",
-        },
-    )
-
-    labels = grouped.expr.params["labels"]
-
-    assert grouped.expr.params["label_col"] == "_label"
-    assert tuple(label.name for label in labels) == ("systems", "ml")
-    assert tuple(label.description for label in labels) == (
-        "Systems and databases.",
-        "Machine learning.",
-    )
-
-
-def test_sem_groupby_accepts_explicit_label_column() -> None:
-    grouped = am.Log().sem_groupby(
-        input_cols=["title"],
-        instruction="Assign each paper to a label.",
-        labels={"systems": "Systems papers."},
-        label_col="paper_area",
-    )
-
-    assert grouped.expr.params["label_col"] == "paper_area"
-
-
-def test_sem_groupby_rejects_empty_labels() -> None:
-    with pytest.raises(ValueError, match="labels cannot be empty"):
+@pytest.mark.parametrize("membership", [None, "exclusive"])
+@pytest.mark.parametrize(
+    ("keyword", "value"),
+    [
+        ("labels", {"systems": "Systems papers."}),
+        ("labels", {}),
+        ("labels", None),
+        ("label_col", "paper_area"),
+    ],
+)
+def test_sem_groupby_rejects_removed_label_arguments(
+    membership: str | None,
+    keyword: str,
+    value: Any,
+) -> None:
+    with pytest.raises(TypeError, match=f"unexpected keyword argument '{keyword}'"):
         am.Log().sem_groupby(
+            membership=membership,
             input_cols=["title"],
-            instruction="Assign each paper to a label.",
-            labels={},
+            instruction="Group papers about the same topic.",
+            **{keyword: value},
         )
 
 
@@ -1399,6 +1388,7 @@ def test_differential_instruction_rewriter_ignores_non_column_braces() -> None:
 
 def test_differential_rules_reject_unsupported_operators() -> None:
     grouped = am.Log().sem_groupby(
+        membership=None,
         input_cols=["topic_name"],
         instruction="Rows whose {topic_name} values refer to the same durable memory topic belong in one group.",
     )
@@ -1963,6 +1953,7 @@ def test_join_map_composes_partitioned_semantic_grouping_with_exact_keys() -> No
         {"group_id": "Partition.", "name": "Name.", "body": "Evidence."}
     )
     direct = log.sem_groupby(
+        membership=None,
         input_cols=["name"],
         partition_by="group_id",
         instruction="Rows with {name} refer to the same entity.",
@@ -2194,6 +2185,7 @@ def test_changed_aware_partitioned_grouping_uses_partition_and_group_id() -> Non
     query = (
         am.Log({"group_id": "Partition.", "name": "Name.", "body": "Body."})
         .sem_groupby(
+            membership=None,
             input_cols=["name"],
             partition_by="group_id",
             instruction="Rows with {name} refer to the same entity.",
@@ -2305,6 +2297,7 @@ def test_join_map_merges_multiple_changed_groups_into_one_selected_target(
 
     log = am.Log({"name": "Name.", "body": "Body."})
     view = log.sem_groupby(
+        membership=None,
         input_cols=["name"],
         instruction="Rows with {name} refer to the same entity.",
     ).sem_agg(
@@ -6848,88 +6841,12 @@ def test_sem_groupby_pairwise_default_can_be_overridden(
     assert captured["default"] is True
 
 
-def test_sem_groupby_declared_labels_assign_label_column_and_group_ids(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    source = pd.DataFrame(
-        {
-            "title": ["Fast storage", "Transformer evals"],
-            "abstract": ["Database cache design.", "Model benchmark study."],
-        }
-    )
-
-    class Executor:
-        def __init__(self, obj: pd.DataFrame) -> None:
-            self.obj = obj
-
-        def __call__(self, **kwargs: Any) -> StructuredGenerationResult:
-            assert kwargs["input_cols"] == ("title", "abstract")
-            assert kwargs["output_cols"] == (ColumnSpec("_label", "One of: systems, ml."),)
-            assert "Do not invent labels" in kwargs["instruction"]
-            return StructuredGenerationResult(
-                parsed_outputs=[{"_label": "systems"}, {"_label": "ml"}],
-                raw_outputs=['{"_label":"systems"}', '{"_label":"ml"}'],
-                explanations=[None, None],
-            )
-
-    monkeypatch.setattr(sem_groupby_module, "StructuredLMExecutor", Executor)
-
-    result = assign_declared_labels(
-        source,
-        input_cols=("title", "abstract"),
-        labels=(
-            ColumnSpec("systems", "Systems and databases."),
-            ColumnSpec("ml", "Machine learning."),
-        ),
-        label_col="_label",
-        instruction="Assign each paper to the best matching research area.",
-    )
-
-    assert list(result["_label"]) == ["systems", "ml"]
-    assert list(result[GROUP_ID_COLUMN]) == [0, 1]
-    assert result.attrs["agent_memory_groupby_labels"] == ("systems", "ml")
-    assert result.attrs["agent_memory_groupby_label_col"] == "_label"
-
-
-def test_sem_groupby_declared_labels_reject_invalid_label(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    source = pd.DataFrame({"title": ["Unknown paper"]})
-
-    class Executor:
-        def __init__(self, obj: pd.DataFrame) -> None:
-            self.obj = obj
-
-        def __call__(self, **kwargs: Any) -> StructuredGenerationResult:
-            return StructuredGenerationResult(
-                parsed_outputs=[{"_label": "other"}],
-                raw_outputs=['{"_label":"other"}'],
-                explanations=[None],
-            )
-
-    monkeypatch.setattr(sem_groupby_module, "StructuredLMExecutor", Executor)
-
-    with pytest.raises(ValueError, match="declare an 'other' label explicitly"):
-        assign_declared_labels(
-            source,
-            input_cols=("title",),
-            labels=(ColumnSpec("systems", "Systems and databases."),),
-            label_col="_label",
-            instruction="Assign each paper to the best matching research area.",
-        )
-
-
-def test_sem_groupby_declared_labels_reject_label_col_collision() -> None:
-    source = pd.DataFrame({"title": ["Fast storage"], "_label": ["existing"]})
-
-    with pytest.raises(ValueError, match="already exists"):
-        assign_declared_labels(
-            source,
-            input_cols=("title",),
-            labels=(ColumnSpec("systems", "Systems and databases."),),
-            label_col="_label",
-            instruction="Assign each paper to the best matching research area.",
-        )
+@pytest.mark.parametrize(
+    "name",
+    ["assign_declared_labels", "labeled_groupby_instruction", "validate_label_col"],
+)
+def test_sem_groupby_declared_label_helpers_are_removed(name: str) -> None:
+    assert not hasattr(sem_groupby_module, name)
 
 
 def test_sem_agg_resolves_input_columns_and_builds_structured_instruction() -> None:
@@ -8304,6 +8221,7 @@ def test_sem_groupby_sem_agg_real_lotus_e2e() -> None:
     source = Relation(QueryExpr(op="materialized_view", params={"name": "source"}))
     query = (
         source.sem_groupby(
+            membership=None,
             input_cols=["name", "description"],
             instruction="Rows refer to the same durable topic when their {name} and {description} describe the same memory.",
         )

@@ -26,7 +26,9 @@ from agent_memory.adapters.lotus.prompt_batching import (
     PromptBatchItem,
     PromptBatchRequest,
     PromptBatching,
+    _incomplete,
     run_prompt_batches,
+    validate_structured_output_transport,
 )
 from agent_memory.tracing.semantic import (
     trace_scope_value,
@@ -207,6 +209,7 @@ def structured_instruction(
     *,
     shape: Literal["object", "array"],
     require_explanation: bool = False,
+    format_example: Mapping[str, StructuredScalar] | None = None,
 ) -> str:
     """Append a structured JSON output contract to an operator instruction."""
 
@@ -221,10 +224,14 @@ def structured_instruction(
 
     field_text = ", ".join(fields)
     schema_text = json.dumps(schema, ensure_ascii=False)
-    object_example = json.dumps(
-        {column.name: "string" for column in output_cols},
-        ensure_ascii=False,
-    )
+    example = {column.name: "string" for column in output_cols}
+    if format_example is not None:
+        if set(format_example) != set(example) or any(
+            not _is_json_scalar(value) for value in format_example.values()
+        ):
+            raise ValueError("format_example must match the output fields with scalar values")
+        example = dict(format_example)
+    object_example = json.dumps(example, ensure_ascii=False)
     scalar_contract = (
         "Each field value must be a JSON scalar (string, number, boolean, or null) "
         "that follows the instruction and field description. Use JSON null for "
@@ -242,7 +249,7 @@ def structured_instruction(
         )
 
     rows_example = json.dumps(
-        {FLAT_MAP_ROWS_FIELD: [{column.name: "string" for column in output_cols}]},
+        {FLAT_MAP_ROWS_FIELD: [example]},
         ensure_ascii=False,
     )
     return (
@@ -485,6 +492,7 @@ class StructuredLMExecutor:
         operator: str = "sem_map",
         prompt_batching: PromptBatching | None = None,
         structured_output_transport: str = "chat-json-object",
+        format_example: Mapping[str, StructuredScalar] | None = None,
     ) -> StructuredGenerationResult:
         """Run a structured LOTUS-backed LM batch and parse JSON outputs."""
 
@@ -526,6 +534,7 @@ class StructuredLMExecutor:
             output_cols,
             shape=shape,
             require_explanation=require_explanation and shape == "object",
+            format_example=format_example,
         )
         docs = task_instructions.df2multimodal_info(self._obj, list(input_cols))
 
@@ -554,6 +563,19 @@ class StructuredLMExecutor:
             for doc in docs
         ]
 
+        if operator == "sem_groupby":
+            limit = lotus.settings.lm.max_ctx_len
+            reserve = max(
+                int(getattr(lotus.settings.lm, "max_tokens", 512) or 512),
+                structured_max_tokens,
+            )
+            if any(
+                lotus.settings.lm.count_tokens(prompt) + reserve > limit
+                for prompt in prompts
+            ):
+                raise ValueError(
+                    "semantic grouping partition exceeds the model context limit"
+                )
         if safe_mode:
             estimated_cost = sum(lotus.settings.lm.count_tokens(prompt) for prompt in prompts)
             show_safe_mode(estimated_cost, len(prompts))
@@ -611,11 +633,25 @@ class StructuredLMExecutor:
                 raw_output_attempts=execution.raw_output_attempts,
             )
 
+        validate_structured_output_transport(structured_output_transport)
+        response_format: dict[str, Any] = {"type": "json_object"}
+        if structured_output_transport == "responses-json-schema":
+            response_format = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "semantic_output",
+                    "schema": _structured_output_schema(
+                        output_cols,
+                        shape=shape,
+                        require_explanation=require_explanation and shape == "object",
+                    ),
+                },
+            }
         lm_kwargs: dict[str, Any] = {
             "progress_bar_desc": progress_bar_desc,
             "max_tokens": max_tokens,
             **dict(model_kwargs),
-            "response_format": {"type": "json_object"},
+            "response_format": response_format,
         }
         retry_result = execute_structured_lm_retry_result(
             lotus.settings.lm,
@@ -850,9 +886,10 @@ def _parse_structured_prompt_batch(
     )
 
 
-def _structured_batch_schema(
+def _structured_output_schema(
     output_cols: Sequence[ColumnSpec], *, shape: str, require_explanation: bool
 ) -> dict[str, Any]:
+    """Describe one structured result for direct and prompt-batched requests."""
     fields: dict[str, Any] = {
         column.name: {"type": ["string", "number", "boolean", "null"]}
         for column in output_cols
@@ -872,6 +909,15 @@ def _structured_batch_schema(
             "required": ["rows"],
             "additionalProperties": False,
         }
+    return output
+
+
+def _structured_batch_schema(
+    output_cols: Sequence[ColumnSpec], *, shape: str, require_explanation: bool
+) -> dict[str, Any]:
+    output = _structured_output_schema(
+        output_cols, shape=shape, require_explanation=require_explanation
+    )
     return {
         "type": "object",
         "properties": {
@@ -984,6 +1030,27 @@ def execute_structured_lm_with_retries(
     return list(result.raw_outputs)
 
 
+def _complete_structured_outputs(
+    output: Any, expected: int, *, operator: str
+) -> list[str]:
+    """Validate physical response completeness before parsing or retrying rows."""
+    raw_outputs = list(output.outputs)
+    if len(raw_outputs) != expected:
+        raise ValueError(
+            f"{operator} expected {expected} outputs, got {len(raw_outputs)}"
+        )
+    metadata = getattr(output, "response_metadata", None)
+    if metadata is not None:
+        if len(metadata) != expected:
+            raise ValueError(
+                f"{operator} expected {expected} response metadata entries, got {len(metadata)}"
+            )
+        for completion in metadata:
+            if _incomplete(completion):
+                raise ValueError(f"incomplete structured response: {completion}")
+    return raw_outputs
+
+
 def execute_structured_lm_retry_result(
     model: Any,
     prompts: Sequence[Any],
@@ -1002,9 +1069,7 @@ def execute_structured_lm_retry_result(
     from lotus.types import LMOutput
 
     output: LMOutput = model(prompts, **dict(lm_kwargs))
-    raw_outputs = list(output.outputs)
-    if output_validator is not None and len(raw_outputs) != len(prompts):
-        raise ValueError(f"{operator} expected {len(prompts)} outputs, got {raw_outputs!r}")
+    raw_outputs = _complete_structured_outputs(output, len(prompts), operator=operator)
     raw_output_attempts = [[raw_output] for raw_output in raw_outputs]
     invalid = invalid_structured_output_indices(
         raw_outputs,
@@ -1025,12 +1090,10 @@ def execute_structured_lm_retry_result(
             f"{lm_kwargs.get('progress_bar_desc', 'Structured generation')} retry"
         )
         retry_output: LMOutput = model(retry_prompts, **retry_kwargs)
-        if output_validator is not None and len(retry_output.outputs) != len(invalid):
-            raise ValueError(
-                f"{operator} expected {len(invalid)} retry outputs, "
-                f"got {retry_output.outputs!r}"
-            )
-        for index, raw_output in zip(invalid, retry_output.outputs):
+        retry_outputs = _complete_structured_outputs(
+            retry_output, len(invalid), operator=operator
+        )
+        for index, raw_output in zip(invalid, retry_outputs, strict=True):
             raw_outputs[index] = raw_output
             raw_output_attempts[index].append(raw_output)
         retries_left -= 1
