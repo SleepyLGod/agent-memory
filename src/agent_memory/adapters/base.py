@@ -16,5 +16,9 @@ class ExecutionAdapter(Protocol):
     """
 
     def execute(self, query: QueryExpr, inputs: Mapping[str, Any]) -> Any:
-        """Execute a logical query expression against runtime inputs."""
+        """Execute a logical query expression against runtime inputs.
+
+        Return a frame with exactly the planner's `output_columns`, keep the input index for row-local
+        semantics, and never mutate `inputs` — the runtime reuses those frames for other nodes.
+        """
         ...
