@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Literal, cast, overload
 
 if TYPE_CHECKING:
     from .grouping import SemanticGroupedRelation
@@ -634,6 +634,42 @@ class Relation(RelationHandle):
         if ordinal_col is not None:
             params["ordinal_col"] = str(ordinal_col)
         return self._derive("sem_flat_map", **params)
+
+    @overload
+    def sem_groupby(
+        self,
+        *,
+        input_cols: Sequence[str] | None = None,
+        instruction: str,
+        C: int | None = None,
+        membership: Literal["single", "multiple"] = "single",
+        partition_by: str | Sequence[str] | None = None,
+        S: object = None,
+    ) -> "SemanticGroupedRelation": ...
+
+    @overload
+    def sem_groupby(
+        self,
+        *,
+        input_cols: Sequence[str] | None = None,
+        instruction: str,
+        C: int | None = None,
+        membership: Literal["exclusive", "overlapping"] | None,
+        partition_by: str | Sequence[str] | None = None,
+        S: object = None,
+    ) -> "GroupedRelation": ...
+
+    @overload
+    def sem_groupby(
+        self,
+        *,
+        input_cols: Sequence[str] | None = None,
+        instruction: str,
+        C: int | None = None,
+        membership: str | None,
+        partition_by: str | Sequence[str] | None = None,
+        S: object = None,
+    ) -> "GroupedRelation | SemanticGroupedRelation": ...
 
     def sem_groupby(
         self,

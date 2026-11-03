@@ -4,7 +4,7 @@ from dataclasses import replace
 from hashlib import sha256
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, assert_type
 
 import pandas as pd
 import pytest
@@ -848,7 +848,7 @@ def test_zep_run_closes_factory_when_storage_provenance_fails(
 @pytest.mark.parametrize("membership", ("single", "multiple"))
 @pytest.mark.parametrize("mode", ("search-filter", "proxy-only"))
 def test_pair_profiles_reject_independent_grouping(
-    membership: str, mode: str
+    membership: Literal["single", "multiple"], mode: str
 ) -> None:
     import agent_memory as am
 
@@ -885,6 +885,27 @@ def test_pair_profiles_reject_independent_grouping(
             operators=("sem_groupby",),
             embedding=SEMANTIC_PAIR_BGE_M3,
         )
+
+
+def test_sem_groupby_return_types_follow_membership() -> None:
+    import agent_memory as am
+    from agent_memory.policy.grouping import SemanticGroupedRelation
+    from agent_memory.policy.relation import GroupedRelation
+
+    source = am.Source({"message": "Text."})
+    assert_type(source.sem_groupby(instruction="Group topics."), SemanticGroupedRelation)
+    assert_type(
+        source.sem_groupby(instruction="Group topics.", membership="multiple"),
+        SemanticGroupedRelation,
+    )
+    assert_type(
+        source.sem_groupby(instruction="Group topics.", membership=None),
+        GroupedRelation,
+    )
+    assert_type(
+        source.sem_groupby(instruction="Group topics.", membership="exclusive"),
+        GroupedRelation,
+    )
 
 
 def test_pair_inventory_keeps_legacy_groups_and_independent_group_inputs() -> None:
