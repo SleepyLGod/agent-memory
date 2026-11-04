@@ -233,10 +233,9 @@ class LotusExecutionContext:
             )
 
             lm_class = deepseek_responses_lm_class(LM)
-        base_lm = (
-            provider_usage_tracing_lm_class(lm_class)(**lm_kwargs, trace_dir=trace_dir)
-            if trace_dir is not None or self.config.prompt_batching is not None
-            else lm_class(**lm_kwargs)
+        # Completion status is a correctness boundary even with tracing disabled.
+        base_lm = provider_usage_tracing_lm_class(lm_class)(
+            **lm_kwargs, trace_dir=trace_dir
         )
         lm = TracedLM(base_lm, trace_dir) if trace_dir is not None else base_lm
         self._lm = lm

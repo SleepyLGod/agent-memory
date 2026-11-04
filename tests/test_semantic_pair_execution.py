@@ -30,7 +30,7 @@ from agent_memory.adapters.lotus.sem_join import (
     execute_sem_join,
     semantic_join_pair_candidates,
 )
-from agent_memory.policy.logical import ColumnSpec, QueryExpr
+from agent_memory.policy.logical import QueryExpr
 from agent_memory.planner import PolicyDifferentiator
 from agent_memory.runtime import MemoryRuntime
 from agent_memory.storage import EmbeddingSpec
@@ -1531,34 +1531,13 @@ def test_partitioned_sem_groupby_search_filter_stays_within_each_partition(
     assert [event["total_pair_count"] for event in candidate_events] == [1, 1]
 
 
-def test_declared_label_sem_groupby_rejects_pair_profile() -> None:
-    query = QueryExpr(
-        op="sem_groupby",
-        inputs=(QueryExpr(op="materialized_view", params={"name": "rows"}),),
-        params={
-            "input_cols": ("topic",),
-            "instruction": "Assign a label.",
-            "labels": (ColumnSpec("work", "Work topics."),),
-        },
-    )
-    context = FakeContext(
-        LotusExecutionConfig(
-            semantic_pair_profiles={
-                query_digest(query): _operator_pair_profile(
-                    direction="symmetric",
-                    min_similarity=0.8,
-                )
-            }
-        ),
-        FakeEmbeddingProvider({}),
-    )
-
-    with pytest.raises(ValueError, match="only to open-ended pairwise sem_groupby"):
-        execute_sem_groupby(
-            query,
-            {"rows": pd.DataFrame({"topic": ["alpha"]})},
-            lambda expression, inputs: inputs[str(expression.params["name"])],
-            context,
+def test_pairwise_sem_groupby_rejects_removed_labels_argument() -> None:
+    with pytest.raises(TypeError, match="unexpected keyword argument 'labels'"):
+        am.Log({"topic": "Topic."}).sem_groupby(
+            membership="exclusive",
+            input_cols=["topic"],
+            instruction="Group the same topic.",
+            labels={"work": "Work topics."},
         )
 
 

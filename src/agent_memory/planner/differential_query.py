@@ -33,6 +33,13 @@ class QueryDifferentiator:
 
         return self._rules.grouped_agg_rule
 
+    def groupby_join_instruction(self, query: QueryExpr) -> str:
+        """Bind the configured grouping-to-join rewrite into a maintenance plan."""
+        return self._instruction_rewriter.groupby_to_join(
+            str(query.params["instruction"]),
+            input_cols=tuple(query.params["input_cols"]),
+        )
+
     def differentiate(
         self,
         view: MemoryView,

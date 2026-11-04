@@ -34,6 +34,19 @@ from agent_memory.policy.schema import output_columns
 from agent_memory.runtime.window import over_frames
 
 JSON_OBJECT_RESPONSE_FORMAT = {"type": "json_object"}
+# Previous LOTUS output-format blocks, retained for comparison only.
+# Leaf:
+# "Follow the following format.\n\nContext: relevant facts from multiple documents\n\n"
+# "Instruction: the instruction provided by the user\n\nAnswer: Write your answer\n\n---\n\n"
+# Merge:
+# "Follow the following format.\n\nContext: relevant facts from multiple sources\n\n"
+# "Instruction: the instruction provided by the user\n\nAnswer: Write your answer\n\n---\n\n"
+# Replaced because models could reproduce this input template in the result.
+AGGREGATE_OUTPUT_CONTRACT = (
+    "The Context and Instruction sections below provide the input and task.\n"
+    "Return only the result requested by the instruction, in the requested format.\n"
+    "Do not reproduce the input template as part of the result.\n\n---\n\n"
+)
 
 
 @dataclass(frozen=True)
@@ -67,6 +80,13 @@ def execute_sem_agg(
         return execute_over_sem_agg(query, inputs, execute, context)
 
     source = execute(query.inputs[0], inputs)
+    if (
+        query.params.get("maintenance_rule") == "agg-fallback"
+        and query.inputs[0].op != "group_by"
+    ):
+        source = source.copy()
+        source.attrs["agent_memory_explicit_grouping"] = True
+        source.attrs["agent_memory_groupby_keys"] = ()
     input_cols = aggregate_input_columns(source, query.params.get("input_cols"))
     output_cols = aggregate_output_columns(query, input_cols)
     if len(output_cols) == 1:
@@ -207,16 +227,31 @@ def execute_native_sem_agg_groups(
     groups: Sequence[pd.DataFrame],
     input_cols: Sequence[str],
     config: LotusExecutionConfig,
+    *,
+    documents: Sequence[list[str]] | None = None,
 ) -> list[str]:
     """Aggregate independent groups with the configured physical dispatch."""
 
     prompt_batching = _prompt_batching(config)
+    if prompt_batching is None and (config.sem_agg_dispatch == "sequential" or len(groups) < 2):
+        return [
+            execute_native_sem_agg_group(
+                query, group, input_cols, config,
+                **({"documents": documents[index]} if documents is not None else {}),
+            )
+            for index, group in enumerate(groups)
+        ]
+    documents = (
+        documents
+        if documents is not None
+        else [aggregate_group_text(group, input_cols) for group in groups]
+    )
     if prompt_batching is not None:
         import lotus
 
         output_col = aggregate_output_columns(query, input_cols)[0]
         result = execute_batch_prompted_sem_agg(
-            [aggregate_group_text(group, input_cols) for group in groups],
+            documents,
             instruction=aggregate_instruction(query, input_cols),
             output_cols=(output_col,),
             model=lotus.settings.lm,
@@ -228,7 +263,12 @@ def execute_native_sem_agg_groups(
             trace_dir=config.trace_dir(),
         )
         outputs = [str(values[output_col.name]) for values in result.outputs]
-        for group_index, (group, output, raw_output_attempts, repair_method) in enumerate(
+        for group_index, (
+            group,
+            output,
+            raw_output_attempts,
+            repair_method,
+        ) in enumerate(
             zip(
                 groups,
                 outputs,
@@ -250,17 +290,11 @@ def execute_native_sem_agg_groups(
                 syntax_repair_method=repair_method,
             )
         return outputs
-    if config.sem_agg_dispatch == "sequential" or len(groups) < 2:
-        return [
-            execute_native_sem_agg_group(query, group, input_cols, config)
-            for group in groups
-        ]
-
     import lotus
 
     instruction = aggregate_instruction(query, input_cols)
     executions = _execute_independent_sem_agg_groups(
-        [aggregate_group_text(group, input_cols) for group in groups],
+        documents,
         lotus.settings.lm,
         instruction,
         config=config,
@@ -273,29 +307,33 @@ def execute_native_sem_agg_group(
     group: pd.DataFrame,
     input_cols: Sequence[str],
     config: LotusExecutionConfig | None = None,
+    *,
+    documents: list[str] | None = None,
 ) -> str:
-    """Aggregate one group into one native LOTUS string answer."""
+    """Aggregate one group with the shared LOTUS-style output contract."""
 
     import lotus
-    from lotus.sem_ops.sem_agg import sem_agg
 
     config = config or LotusExecutionConfig()
-    docs = aggregate_group_text(group, input_cols)
+    docs = (
+        documents if documents is not None else aggregate_group_text(group, input_cols)
+    )
     instruction = aggregate_instruction(query, input_cols)
     kwargs: dict[str, Any] = {
         "safe_mode": config.sem_agg_safe_mode,
         "progress_bar_desc": config.sem_agg_progress_bar_desc,
     }
-    output = sem_agg(
+    output, _retry_result = _execute_lotus_style_sem_agg(
         docs,
         lotus.settings.lm,
         instruction,
         [0] * len(docs),
+        response_format=None,
+        final_model_kwargs=None,
+        lotus_native_spacing=True,
         **kwargs,
     )
-    if not output.outputs:
-        return ""
-    return str(output.outputs[0])
+    return output
 
 
 def execute_structured_sem_agg(
@@ -339,16 +377,31 @@ def execute_structured_sem_agg_groups(
     input_cols: Sequence[str],
     output_cols: Sequence[ColumnSpec],
     config: LotusExecutionConfig,
+    *,
+    documents: Sequence[list[str]] | None = None,
 ) -> list[Mapping[str, Any]]:
     """Aggregate independent groups into declared structured fields."""
 
     prompt_batching = _prompt_batching(config)
+    if prompt_batching is None and (config.sem_agg_dispatch == "sequential" or len(groups) < 2):
+        return [
+            execute_structured_sem_agg_group(
+                query, group, input_cols, output_cols, config, group_index=index,
+                **({"documents": documents[index]} if documents is not None else {}),
+            )
+            for index, group in enumerate(groups)
+        ]
+    documents = (
+        documents
+        if documents is not None
+        else [aggregate_group_text(group, input_cols) for group in groups]
+    )
     if prompt_batching is not None:
         import lotus
 
         instruction = aggregate_instruction(query, input_cols)
         result = execute_batch_prompted_sem_agg(
-            [aggregate_group_text(group, input_cols) for group in groups],
+            documents,
             instruction=instruction,
             output_cols=output_cols,
             model=lotus.settings.lm,
@@ -380,24 +433,11 @@ def execute_structured_sem_agg_groups(
                 syntax_repair_method=repair_method,
             )
         return parsed_outputs
-    if config.sem_agg_dispatch == "sequential" or len(groups) < 2:
-        return [
-            execute_structured_sem_agg_group(
-                query,
-                group,
-                input_cols,
-                output_cols,
-                config,
-                group_index=group_index,
-            )
-            for group_index, group in enumerate(groups)
-        ]
-
     import lotus
 
     instruction = structured_aggregate_instruction(query, input_cols, output_cols)
     executions = _execute_independent_sem_agg_groups(
-        [aggregate_group_text(group, input_cols) for group in groups],
+        documents,
         lotus.settings.lm,
         instruction,
         config=config,
@@ -438,6 +478,7 @@ def execute_structured_sem_agg_group(
     config: LotusExecutionConfig,
     *,
     group_index: int = 0,
+    documents: list[str] | None = None,
 ) -> Mapping[str, Any]:
     """Aggregate one group into declared structured fields."""
 
@@ -449,6 +490,7 @@ def execute_structured_sem_agg_group(
         output_cols,
         config,
         group_index=group_index,
+        **({"documents": documents} if documents is not None else {}),
     )
     execution = _SemAggExecution(
         raw_output=str(retry_result.raw_outputs[0]),
@@ -543,12 +585,15 @@ def execute_lotus_style_structured_sem_agg_group(
     config: LotusExecutionConfig,
     *,
     group_index: int = 0,
+    documents: list[str] | None = None,
 ) -> StructuredLMRetryResult:
     """Run a LOTUS-main-style hierarchical aggregate with final JSON output."""
 
     import lotus
 
-    docs = aggregate_group_text(group, input_cols)
+    docs = (
+        documents if documents is not None else aggregate_group_text(group, input_cols)
+    )
     instruction = structured_aggregate_instruction(query, input_cols, output_cols)
     return lotus_style_structured_sem_agg(
         docs,
@@ -661,10 +706,7 @@ def write_sem_agg_audit(
         "parse_error": parse_error,
         "failure_artifact": "" if failure_artifact is None else str(failure_artifact),
     }
-    if (
-        config.sem_agg_dispatch != "sequential"
-        or config.prompt_batching is not None
-    ):
+    if config.sem_agg_dispatch != "sequential" or config.prompt_batching is not None:
         audit_row.update(
             {
                 "dispatch": config.sem_agg_dispatch,
@@ -955,6 +997,7 @@ def _execute_lotus_style_sem_agg(
     structured_output_cols: Sequence[ColumnSpec] | None = None,
     structured_parse_retries: int = 0,
     failure_extra_by_index: Mapping[int, Mapping[str, Any]] | None = None,
+    lotus_native_spacing: bool = False,
 ) -> tuple[str, StructuredLMRetryResult | None]:
     """Execute LOTUS-style aggregation and expose final structured retry metadata."""
 
@@ -977,9 +1020,13 @@ def _execute_lotus_style_sem_agg(
         context_str = ""
         batch = []
         template = (
-            leaf_instruction_template(user_instruction)
+            leaf_instruction_template(
+                user_instruction, lotus_native_spacing=lotus_native_spacing
+            )
             if tree_level == 0
-            else node_instruction_template(user_instruction)
+            else node_instruction_template(
+                user_instruction, lotus_native_spacing=lotus_native_spacing
+            )
         )
         template_tokens = model.count_tokens(template)
         budget = model.max_ctx_len - model.max_tokens - template_tokens
@@ -1118,7 +1165,7 @@ def leaf_instruction_template(
     *,
     lotus_native_spacing: bool = False,
 ) -> str:
-    """Return the LOTUS leaf-level semantic aggregation prompt template."""
+    """Retain LOTUS leaf instructions with an explicit result-only boundary."""
 
     instruction_prefix = "Instruction:  " if lotus_native_spacing else "Instruction: "
     return (
@@ -1126,8 +1173,7 @@ def leaf_instruction_template(
         "Remember that your job is to answer the user's instruction by combining all relevant information from all provided documents, into a single coherent answer.\n"
         "Do NOT copy the format of the sources! Instead output your answer in a coherent, well-structured manner that best answers the user instruction.\n"
         "You have limited space to provide your answer, so be concise and to the point.\n\n---\n\n"
-        "Follow the following format.\n\nContext: relevant facts from multiple documents\n\n"
-        "Instruction: the instruction provided by the user\n\nAnswer: Write your answer\n\n---\n\n"
+        f"{AGGREGATE_OUTPUT_CONTRACT}"
         "Context: {{docs_str}}\n\n"
         f"{instruction_prefix}{user_instruction}\n\nAnswer:\n"
     )
@@ -1138,7 +1184,7 @@ def node_instruction_template(
     *,
     lotus_native_spacing: bool = False,
 ) -> str:
-    """Return the LOTUS intermediate-node semantic aggregation prompt template."""
+    """Retain LOTUS merge instructions with an explicit result-only boundary."""
 
     instruction_prefix = "Instruction:  " if lotus_native_spacing else "Instruction: "
     return (
@@ -1150,8 +1196,7 @@ def node_instruction_template(
         "Do NOT copy the format of the sources, instead output your answer in a coherent, well-structured manner that best answers the user instruction.\n"
         "You have limited space to provide your answer, so be concise and to the point.\n"
         "You may need to draw connections between sources to provide a complete answer.\n\n---\n\n"
-        "Follow the following format.\n\nContext: relevant facts from multiple sources\n\n"
-        "Instruction: the instruction provided by the user\n\nAnswer: Write your answer\n\n---\n\n"
+        f"{AGGREGATE_OUTPUT_CONTRACT}"
         "Context: {{docs_str}}\n\n"
         f"{instruction_prefix}{user_instruction}\n\nAnswer:\n"
     )
@@ -1248,7 +1293,10 @@ def aggregate_groups_with_keys(
             output_keys=deterministic_keys,
             drop_columns=(),
         )
-    if GROUP_ID_COLUMN not in source.columns:
+    if (
+        source.attrs.get("agent_memory_explicit_grouping")
+        or GROUP_ID_COLUMN not in source.columns
+    ):
         return [({}, source.reset_index(drop=True).copy())]
     return _aggregate_groups_by_keys(
         source,

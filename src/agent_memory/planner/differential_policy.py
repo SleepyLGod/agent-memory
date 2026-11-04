@@ -80,6 +80,10 @@ class PolicyDifferentiator:
             rules=rules,
             instruction_rewriter=instruction_rewriter,
         )
+        self._sem_agg_rule = None if rules is None else rules.sem_agg_rule
+        self._sem_groupby_rule = (
+            "group-fallback" if rules is None else rules.sem_groupby_rule
+        )
 
     def differentiate(
         self,
@@ -97,7 +101,9 @@ class PolicyDifferentiator:
             view_outputs,
             sink_outputs,
             fingerprint,
-        ) = _DifferentialPolicyBuilder(self._query_differentiator).build(
+        ) = _DifferentialPolicyBuilder(
+            self._query_differentiator, self._sem_agg_rule, self._sem_groupby_rule
+        ).build(
             spec,
             view_execution_order=view_order,
             statements=statements,
@@ -127,8 +133,15 @@ class PolicyDifferentiator:
 class _DifferentialPolicyBuilder:
     """Build structurally shared nodes for one logical memory policy."""
 
-    def __init__(self, query_differentiator: QueryDifferentiator) -> None:
+    def __init__(
+        self,
+        query_differentiator: QueryDifferentiator,
+        sem_agg_rule: str | None = None,
+        sem_groupby_rule: str = "group-fallback",
+    ) -> None:
         self._query_differentiator = query_differentiator
+        self._sem_agg_rule = sem_agg_rule
+        self._sem_groupby_rule = sem_groupby_rule
         self._nodes: dict[str, DifferentialNode] = {}
         self._node_queries: dict[str, QueryExpr] = {}
         self._query_nodes: dict[QueryExpr, str] = {}
@@ -216,6 +229,72 @@ class _DifferentialPolicyBuilder:
             raise NotImplementedError(
                 "Search is retrieval-only and cannot be maintained as a view or storage sink"
             )
+        independent = query.op == "sem_groupby" and query.params.get("independent")
+        fallback = query.params.get("maintenance_rule") == "agg-fallback" or (
+            query.op == "sem_agg"
+            and self._sem_agg_rule in {"agg-fallback", "agg-composable"}
+            and query.inputs[0].op not in _GROUP_CARRIERS | {"over"}
+        )
+        if independent or fallback:
+            from agent_memory.policy.grouping import normalize_fallback
+
+            grouped = query.inputs[0]
+            carrier = fallback and grouped.op == "group_by"
+            parent = self._compile_query(
+                grouped.inputs[0] if carrier else grouped, spec=spec
+            )
+            leaf = self._node_leaf(parent)
+            local_input = (
+                QueryExpr(op="group_by", inputs=(leaf,), params=grouped.params)
+                if carrier
+                else leaf
+            )
+            local = QueryExpr(op=query.op, inputs=(local_input,), params=query.params)
+            if fallback:
+                local = normalize_fallback(local)
+            rule = self._sem_groupby_rule if independent else self._sem_agg_rule
+            composable = rule in {"group-composable", "agg-composable"}
+            maintenance = None
+            if composable:
+                if local.op == "agg" and not all(
+                    isinstance(spec, SemanticAggregateSpec)
+                    for spec in local.params["aggregates"]
+                ):
+                    raise NotImplementedError(
+                        "composable agg requires semantic aggregate specs only"
+                    )
+                params = {**local.params, "maintenance_rule": rule}
+                if independent:
+                    params["join_instruction"] = (
+                        self._query_differentiator.groupby_join_instruction(local)
+                    )
+                local = QueryExpr(
+                    op=local.op,
+                    inputs=local.inputs,
+                    params=params,
+                )
+                maintenance = QueryExpr(
+                    op="semantic_composable_update",
+                    inputs=(local,),
+                    params={
+                        "rule": rule,
+                        "parent": parent,
+                        "previous": self._node_id(query),
+                    },
+                )
+            return self._register(
+                query,
+                DifferentialNode(
+                    node_id=self._node_id(query),
+                    query=local,
+                    input_node_ids=(parent,),
+                    execution_kind="semantic_composable"
+                    if composable
+                    else "semantic_fallback",
+                    maintenance_query=maintenance,
+                    output_columns=output_columns(local),
+                ),
+            )
         if query.op in _GROUP_CARRIERS | {"count_window", "over", "window_source"}:
             raise ValueError(
                 f"QueryExpr op {query.op!r} is an internal carrier and cannot be materialized alone"
@@ -245,6 +324,10 @@ class _DifferentialPolicyBuilder:
         input_node_ids = tuple(
             self._compile_query(input_query, spec=spec) for input_query in query.inputs
         )
+        if query.op == "sem_join" and any(
+            self._has_fallback(parent) for parent in input_node_ids
+        ):
+            raise NotImplementedError("sem_join cannot consume fallback retractions")
         local_query = self._bind_direct_inputs(query, input_node_ids)
         execution_kind = (
             "semantic_row" if query.op in _ROW_LOCAL_SEMANTIC_OPS else "deterministic"
@@ -290,6 +373,13 @@ class _DifferentialPolicyBuilder:
             maintenance_query=maintenance_query,
         )
         return self._register(query, node)
+
+    def _has_fallback(self, node_id: str) -> bool:
+        node = self._nodes[node_id]
+        return node.execution_kind in {
+            "semantic_fallback",
+            "semantic_composable",
+        } or any(self._has_fallback(parent) for parent in node.input_node_ids)
 
     def _compile_algebraic_aggregate(
         self,
@@ -395,6 +485,8 @@ class _DifferentialPolicyBuilder:
 
         over_query = query.inputs[0]
         source_node_id = self._compile_query(over_query.inputs[0], spec=spec)
+        if self._has_fallback(source_node_id):
+            raise NotImplementedError("over-window cannot consume fallback retractions")
         local_over = QueryExpr(
             op="over",
             inputs=(self._node_leaf(source_node_id),),
@@ -425,6 +517,8 @@ class _DifferentialPolicyBuilder:
                 "process_window callback may only reference its provided window relation"
             )
         source_node_id = self._compile_query(window_query.inputs[0], spec=spec)
+        if self._has_fallback(source_node_id):
+            raise NotImplementedError("count-window cannot consume fallback retractions")
         local_window = QueryExpr(
             op="count_window",
             inputs=(self._node_leaf(source_node_id),),
@@ -606,7 +700,7 @@ class _DifferentialPolicyBuilder:
             query=local_query,
             input_node_ids=input_node_ids,
             execution_kind=execution_kind,
-            output_columns=output_columns(query),
+            output_columns=output_columns(local_query),
             maintenance_query=maintenance_query,
         )
 

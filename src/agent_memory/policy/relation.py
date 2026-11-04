@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, Literal, cast, overload
+
+if TYPE_CHECKING:
+    from .grouping import SemanticGroupedRelation
 
 from .aggregates import (
     AggregateSpec,
@@ -72,18 +75,6 @@ def _normalize_output_cols(output_cols: ColumnOutput | None) -> tuple[ColumnSpec
             ColumnSpec(name=name, description=desc) for name, desc in output_cols.items()
         )
     return tuple(ColumnSpec(name=name) for name in output_cols)
-
-
-def _normalize_group_labels(
-    labels: Mapping[str, str] | None,
-) -> tuple[ColumnSpec, ...] | None:
-    """Normalize optional closed-world group labels into ColumnSpec tuples."""
-
-    if labels is None:
-        return None
-    if not labels:
-        raise ValueError("sem_groupby labels cannot be empty")
-    return tuple(ColumnSpec(name=name, description=desc) for name, desc in labels.items())
 
 
 def _normalize_sem_groupby_membership(membership: str | None) -> str | None:
@@ -235,6 +226,11 @@ class RelationHandle:
     def __init__(self, expr: QueryExpr) -> None:
         self.expr = expr
 
+    def _require_ungrouped(self, op: str) -> None:
+        """Reject operations without a defined membership-scope contract."""
+        if "grouping" in self.expr.params:
+            raise NotImplementedError(f"{op} does not preserve semantic grouping yet")
+
 
 class Relation(RelationHandle):
     """DataFrame-like chain handle for policy authoring.
@@ -272,6 +268,7 @@ class Relation(RelationHandle):
 
         from .retrieval import normalize_search
 
+        self._require_ungrouped("search")
         if not isinstance(query, UserQuery):
             raise TypeError("search query must be UserQuery")
         if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
@@ -541,6 +538,7 @@ class Relation(RelationHandle):
     ) -> "WindowedRelation":
         """Assign relation rows to completed count windows."""
 
+        self._require_ungrouped("count_window")
         if trigger is not None:
             raise NotImplementedError("count_window currently supports only trigger=None")
         if isinstance(size, bool) or not isinstance(size, int):
@@ -566,6 +564,7 @@ class Relation(RelationHandle):
     def over(self, *, rows: tuple[int, int]) -> "OverRelation":
         """Create a row-preserving over-window handle."""
 
+        self._require_ungrouped("over")
         if (
             not isinstance(rows, tuple)
             or len(rows) != 2
@@ -636,25 +635,73 @@ class Relation(RelationHandle):
             params["ordinal_col"] = str(ordinal_col)
         return self._derive("sem_flat_map", **params)
 
+    @overload
     def sem_groupby(
         self,
         *,
-        input_cols: Sequence[str],
+        input_cols: Sequence[str] | None = None,
         instruction: str,
+        C: int | None = None,
+        membership: Literal["single", "multiple"] = "single",
         partition_by: str | Sequence[str] | None = None,
-        labels: Mapping[str, str] | None = None,
-        label_col: str = "_label",
-        membership: str | None = None,
-    ) -> "GroupedRelation":
+        S: object = None,
+    ) -> "SemanticGroupedRelation": ...
+
+    @overload
+    def sem_groupby(
+        self,
+        *,
+        input_cols: Sequence[str] | None = None,
+        instruction: str,
+        C: int | None = None,
+        membership: Literal["exclusive", "overlapping"] | None,
+        partition_by: str | Sequence[str] | None = None,
+        S: object = None,
+    ) -> "GroupedRelation": ...
+
+    @overload
+    def sem_groupby(
+        self,
+        *,
+        input_cols: Sequence[str] | None = None,
+        instruction: str,
+        C: int | None = None,
+        membership: str | None,
+        partition_by: str | Sequence[str] | None = None,
+        S: object = None,
+    ) -> "GroupedRelation | SemanticGroupedRelation": ...
+
+    def sem_groupby(
+        self,
+        *,
+        input_cols: Sequence[str] | None = None,
+        instruction: str,
+        C: int | None = None,
+        membership: str | None = "single",
+        partition_by: str | Sequence[str] | None = None,
+        S: object = None,
+    ) -> "GroupedRelation | SemanticGroupedRelation":
         """Create a grouped semantic relation expression."""
 
+        self._require_ungrouped("sem_groupby")
+        if S is not None:
+            raise NotImplementedError("sem_groupby currently requires S=None")
+        if C is not None and (type(C) is not int or C < 1):
+            raise ValueError("sem_groupby C must be a positive integer or None")
+        if membership in {"single", "multiple"}:
+            from .grouping import make_semantic_groups
+
+            return make_semantic_groups(
+                self, input_cols=input_cols, instruction=instruction,
+                partition_by=partition_by, membership=membership, C=C,
+            )
+        if C is not None:
+            raise NotImplementedError("C is not supported by legacy semantic grouping")
         normalized_partition_by = _normalize_partition_by(partition_by)
         normalized_membership = _normalize_sem_groupby_membership(membership)
         params: dict[str, Any] = {
             "input_cols": _normalize_input_cols(input_cols),
             "instruction": instruction,
-            "labels": _normalize_group_labels(labels),
-            "label_col": label_col,
         }
         if normalized_partition_by is not None:
             params["partition_by"] = normalized_partition_by
@@ -710,9 +757,12 @@ class Relation(RelationHandle):
         input_cols: ColumnInput = None,
         output_cols: ColumnOutput | None = None,
         instruction: str,
+        S: object = None,
     ) -> "Relation":
         """Aggregate this whole relation into semantic output columns."""
 
+        if S is not None:
+            raise NotImplementedError("sem_agg auxiliary state is not implemented")
         return self._derive(
             "sem_agg",
             input_cols=_normalize_input_cols(input_cols),
@@ -779,9 +829,12 @@ class GroupedRelation(RelationHandle):
         input_cols: ColumnInput = None,
         output_cols: ColumnOutput | None = None,
         instruction: str,
+        S: object = None,
     ) -> Relation:
         """Aggregate each semantic group into output columns."""
 
+        if S is not None:
+            raise NotImplementedError("sem_agg auxiliary state is not implemented")
         return Relation(
             QueryExpr(
                 op="sem_agg",

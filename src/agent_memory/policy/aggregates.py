@@ -83,9 +83,12 @@ def sem_agg(
     input_cols: Sequence[str] | None = None,
     output_cols: ColumnOutput,
     instruction: str,
+    S: object = None,
 ) -> SemanticAggregateSpec:
     """Declare a semantic aggregate function for grouped ``agg(...)``."""
 
+    if S is not None:
+        raise NotImplementedError("sem_agg auxiliary state is not implemented")
     normalized_output = _normalize_output_cols(output_cols)
     if not normalized_output:
         raise ValueError("sem_agg aggregate spec requires output_cols")

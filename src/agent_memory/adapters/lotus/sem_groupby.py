@@ -20,8 +20,7 @@ from agent_memory.adapters.lotus.pair_execution import (
 )
 from agent_memory.adapters.lotus.sem_join import row_text_series
 from agent_memory.adapters.lotus.prompt_batching import PromptBatching
-from agent_memory.adapters.lotus.structured import StructuredLMExecutor
-from agent_memory.policy.logical import ColumnSpec, QueryExpr
+from agent_memory.policy.logical import QueryExpr
 from agent_memory.storage.embedding import EmbeddingProvider
 from agent_memory.tracing.semantic import (
     query_digest,
@@ -43,6 +42,9 @@ def execute_sem_groupby(
 ) -> Any:
     """Assign deterministic semantic group ids to rows."""
 
+    if query.params.get("independent"):
+        from .membership import execute_memberships
+        return execute_memberships(query, execute(query.inputs[0], inputs), context)
     membership = query.params.get("membership")
     if membership == "overlapping":
         raise NotImplementedError(
@@ -52,13 +54,8 @@ def execute_sem_groupby(
         raise ValueError(f"Unsupported sem_groupby membership: {membership!r}")
     input_cols = tuple(str(column) for column in query.params["input_cols"])
     partition_by = tuple(str(column) for column in query.params.get("partition_by", ()))
-    labels = tuple(query.params.get("labels") or ())
     digest = query_digest(query)
     profile = context.config.semantic_pair_profiles.get(digest)
-    if labels and profile is not None:
-        raise ValueError(
-            "semantic pair profiles apply only to open-ended pairwise sem_groupby"
-        )
     if profile is not None and profile.mode in {"search-filter", "proxy-only"}:
         if profile.direction != "symmetric":
             raise ValueError(
@@ -76,8 +73,6 @@ def execute_sem_groupby(
             source,
             input_cols=input_cols,
             partition_by=partition_by,
-            labels=labels,
-            label_col=str(query.params.get("label_col", "_label")),
             instruction=str(query.params["instruction"]),
             default=context.config.sem_groupby_default,
             pair_batch_size=context.config.sem_groupby_pair_batch_size,
@@ -91,17 +86,6 @@ def execute_sem_groupby(
             structured_parse_retries=context.config.structured_parse_retries,
             structured_max_tokens=context.config.structured_max_tokens,
         )
-    if labels:
-        return assign_declared_labels(
-            source,
-            input_cols=input_cols,
-            labels=labels,
-            label_col=str(query.params.get("label_col", "_label")),
-            instruction=str(query.params["instruction"]),
-            prompt_batching=context.config.prompt_batching,
-            structured_output_transport=context.config.structured_output_transport,
-        )
-
     unique_rows, row_to_unique = exact_unique_key_rows(source, input_cols)
     matched_pairs = evaluate_group_matches(
         unique_rows,
@@ -146,8 +130,6 @@ def execute_partitioned_sem_groupby(
     *,
     input_cols: Sequence[str],
     partition_by: Sequence[str],
-    labels: Sequence[ColumnSpec],
-    label_col: str,
     instruction: str,
     default: bool,
     pair_batch_size: int | None,
@@ -165,8 +147,6 @@ def execute_partitioned_sem_groupby(
 
     if source.empty:
         result = source.copy()
-        if labels:
-            result[label_col] = []
         result[GROUP_ID_COLUMN] = []
         result.attrs["agent_memory_groupby_input_cols"] = tuple(input_cols)
         result.attrs["agent_memory_sem_groupby_partition_by"] = tuple(partition_by)
@@ -176,40 +156,29 @@ def execute_partitioned_sem_groupby(
     next_group_id = 0
     grouped = source.groupby(list(partition_by), sort=False, dropna=False)
     for _partition_key, partition in grouped:
-        if labels:
-            result = assign_declared_labels(
-                partition,
-                input_cols=input_cols,
-                labels=labels,
-                label_col=label_col,
-                instruction=instruction,
-                prompt_batching=prompt_batching,
-                structured_output_transport=structured_output_transport,
-            )
-        else:
-            unique_rows, row_to_unique = exact_unique_key_rows(partition, input_cols)
-            matched_pairs = evaluate_group_matches(
-                unique_rows,
-                input_cols=input_cols,
-                instruction=instruction,
-                default=default,
-                pair_batch_size=pair_batch_size,
-                pair_batch_retries=pair_batch_retries,
-                trace_dir=trace_dir,
-                query_digest_value=query_digest_value,
-                profile=profile,
-                embedding_provider=embedding_provider,
-                prompt_batching=prompt_batching,
-                structured_output_transport=structured_output_transport,
-                structured_parse_retries=structured_parse_retries,
-                structured_max_tokens=structured_max_tokens,
-            )
-            result = assign_semantic_group_ids(
-                partition,
-                input_cols=input_cols,
-                matched_unique_pairs=matched_pairs,
-                row_to_unique=row_to_unique,
-            )
+        unique_rows, row_to_unique = exact_unique_key_rows(partition, input_cols)
+        matched_pairs = evaluate_group_matches(
+            unique_rows,
+            input_cols=input_cols,
+            instruction=instruction,
+            default=default,
+            pair_batch_size=pair_batch_size,
+            pair_batch_retries=pair_batch_retries,
+            trace_dir=trace_dir,
+            query_digest_value=query_digest_value,
+            profile=profile,
+            embedding_provider=embedding_provider,
+            prompt_batching=prompt_batching,
+            structured_output_transport=structured_output_transport,
+            structured_parse_retries=structured_parse_retries,
+            structured_max_tokens=structured_max_tokens,
+        )
+        result = assign_semantic_group_ids(
+            partition,
+            input_cols=input_cols,
+            matched_unique_pairs=matched_pairs,
+            row_to_unique=row_to_unique,
+        )
         if not result.empty:
             result[GROUP_ID_COLUMN] = result[GROUP_ID_COLUMN].astype(int) + next_group_id
             next_group_id = int(result[GROUP_ID_COLUMN].max()) + 1
@@ -218,9 +187,6 @@ def execute_partitioned_sem_groupby(
     combined = pd.concat(parts).sort_index().reset_index(drop=True)
     combined.attrs["agent_memory_groupby_input_cols"] = tuple(input_cols)
     combined.attrs["agent_memory_sem_groupby_partition_by"] = tuple(partition_by)
-    if labels:
-        combined.attrs["agent_memory_groupby_labels"] = tuple(label.name for label in labels)
-        combined.attrs["agent_memory_groupby_label_col"] = label_col
     write_compact_operator_trace(
         trace_dir,
         operator="sem_groupby",
@@ -234,96 +200,6 @@ def execute_partitioned_sem_groupby(
         },
     )
     return combined
-
-
-def assign_declared_labels(
-    source: pd.DataFrame,
-    *,
-    input_cols: Sequence[str],
-    labels: Sequence[ColumnSpec],
-    label_col: str,
-    instruction: str,
-    prompt_batching: PromptBatching | None = None,
-    structured_output_transport: str = "chat-json-object",
-) -> pd.DataFrame:
-    """Assign rows to declared closed-world labels with LOTUS structured output."""
-
-    validate_groupby_input_cols(source, input_cols)
-    validate_label_col(source, label_col)
-
-    label_names = tuple(label.name for label in labels)
-    if len(set(label_names)) != len(label_names):
-        raise ValueError(f"sem_groupby labels must be unique: {label_names}")
-
-    if source.empty:
-        result = source.copy()
-        result[label_col] = []
-        result[GROUP_ID_COLUMN] = []
-        result.attrs["agent_memory_groupby_input_cols"] = tuple(input_cols)
-        result.attrs["agent_memory_groupby_labels"] = label_names
-        result.attrs["agent_memory_groupby_label_col"] = label_col
-        return result
-
-    label_instruction = labeled_groupby_instruction(instruction, labels, label_col)
-    executor = StructuredLMExecutor(source)
-    generation = executor(
-        input_cols=tuple(input_cols),
-        output_cols=(ColumnSpec(label_col, f"One of: {', '.join(label_names)}."),),
-        instruction=label_instruction,
-        shape="object",
-        system_prompt=None,
-        examples=None,
-        strategy=None,
-        safe_mode=False,
-        return_explanations=False,
-        progress_bar_desc="Grouping labels",
-        model_kwargs={},
-        operator="sem_groupby",
-        prompt_batching=prompt_batching,
-        structured_output_transport=structured_output_transport,
-    )
-
-    label_to_group = {name: index for index, name in enumerate(label_names)}
-    assigned_labels = [
-        str(output[label_col])
-        for output in generation.parsed_outputs
-    ]
-    invalid = sorted({label for label in assigned_labels if label not in label_to_group})
-    if invalid:
-        raise ValueError(
-            "sem_groupby label output must be one of declared labels; "
-            f"got {invalid}. If you want an 'other' bucket, declare an "
-            "'other' label explicitly."
-        )
-
-    result = source.copy()
-    result[label_col] = assigned_labels
-    result[GROUP_ID_COLUMN] = [label_to_group[label] for label in assigned_labels]
-    result.attrs["agent_memory_groupby_input_cols"] = tuple(input_cols)
-    result.attrs["agent_memory_groupby_labels"] = label_names
-    result.attrs["agent_memory_groupby_label_col"] = label_col
-    return result
-
-
-def labeled_groupby_instruction(
-    instruction: str,
-    labels: Sequence[ColumnSpec],
-    label_col: str,
-) -> str:
-    """Append the closed-world label set to a semantic groupby instruction."""
-
-    label_lines = "\n".join(
-        f"- {label.name}: {label.description or label.name}"
-        for label in labels
-    )
-    return (
-        f"{instruction}\n\n"
-        f"Assign each row to exactly one declared label and put it in {label_col}.\n"
-        "Declared labels:\n"
-        f"{label_lines}\n"
-        "Return only one of the declared label names. Do not invent labels. "
-        "If an 'other' bucket is needed, it must be declared as a label."
-    )
 
 
 def validate_groupby_input_cols(source: pd.DataFrame, input_cols: Sequence[str]) -> None:
@@ -340,17 +216,6 @@ def validate_partition_by(source: pd.DataFrame, partition_by: Sequence[str]) -> 
     missing = [column for column in partition_by if column not in source.columns]
     if missing:
         raise ValueError(f"sem_groupby partition_by columns not found in DataFrame: {missing}")
-
-
-def validate_label_col(source: pd.DataFrame, label_col: str) -> None:
-    """Raise when the declared label output column cannot be written safely."""
-
-    if not label_col:
-        raise ValueError("sem_groupby label_col cannot be empty")
-    if label_col in source.columns:
-        raise ValueError(
-            f"sem_groupby label_col {label_col!r} already exists in the DataFrame"
-        )
 
 
 def assign_semantic_group_ids(

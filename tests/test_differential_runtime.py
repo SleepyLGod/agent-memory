@@ -163,6 +163,7 @@ def test_policy_compiler_fuses_semantic_grouped_aggregate_pattern() -> None:
     class GroupedMemory(am.Memory):
         log = am.Log({"name": "Name.", "body": "Body."})
         topics = log.sem_groupby(
+            membership=None,
             input_cols=["name"],
             instruction="Rows with the same {name} describe one topic.",
         ).sem_agg(
@@ -239,6 +240,7 @@ def test_policy_fingerprint_includes_the_selected_rule() -> None:
     class GroupedMemory(am.Memory):
         log = am.Log({"name": "Name.", "body": "Body."})
         topics = log.sem_groupby(
+            membership=None,
             input_cols=["name"],
             instruction="Rows with the same {name} describe one topic.",
         ).sem_agg(
@@ -359,10 +361,81 @@ class _SemanticAggregateAdapter(LotusAdapter):
         return pd.DataFrame(rows, columns=output_names)
 
 
+@pytest.mark.parametrize("transform", ("filter", "assign", "join", "union", "aggregate"))
+def test_inferred_fallback_schema_reaches_downstream_nodes(transform: str) -> None:
+    source = am.Source({"value": "Text."}, system_columns=True)
+    summary = source.sem_agg(instruction="Summarize values.")
+    filtered = summary.filter(summary.col("value") != "")
+    views = {
+        "filter": filtered,
+        "assign": filtered.assign(kind="summary"),
+        "join": filtered.alias("summary").join(
+            source.select(["value"]), on="value", how="left"
+        ),
+        "union": filtered.union(summary),
+        "aggregate": filtered.sem_agg(instruction="Summarize again."),
+    }
+    rules = DifferentialRules(sem_agg_rule="agg-fallback")
+    adapter = _SemanticAggregateAdapter()
+    flow = am.SemanticDataflow(
+        source=source, views={"result": views[transform]}, adapter=adapter, rules=rules
+    )
+    policy = flow._executor.policy
+    expected_columns = ("value", "kind") if transform == "assign" else ("value",)
+    result_node = policy.nodes[policy.view_outputs["result"]]
+    assert result_node.output_columns == expected_columns
+    assert tuple(flow.view("result").columns) == expected_columns
+    aggregates = [node for node in policy.nodes.values() if node.query.op == "sem_agg"]
+    assert len(aggregates) == (2 if transform == "aggregate" else 1)
+    for node in aggregates:
+        assert node.execution_kind == "semantic_fallback"
+        assert node.query.params["input_cols"] == ("value",)
+        assert tuple(col.name for col in node.query.params["output_cols"]) == ("value",)
+    assert summary.expr.params["input_cols"] is None
+    assert summary.expr.params["output_cols"] is None
+
+    for index, value in enumerate(("first", "second")):
+        adapter.root_queries.clear()
+        flow.apply(pd.DataFrame({
+            "value": [value],
+            "_row_id": [f"r{index}"],
+            "_added_at": [index],
+            "_add_seq": [index],
+        }))
+        assert flow.view("result")["value"].tolist() == [
+            "first" if index == 0 else "first | second"
+        ]
+        assert tuple(flow.view("result").columns) == expected_columns
+        calls = sum(query.op == "sem_agg" for query in adapter.root_queries)
+        assert calls == len(aggregates)
+    restored = am.SemanticDataflow(
+        source=source,
+        views={"result": views[transform]},
+        adapter=_SemanticAggregateAdapter(),
+        rules=rules,
+    )
+    restored.restore_state(flow.snapshot_state())
+    pd.testing.assert_frame_equal(restored.view("result"), flow.view("result"))
+
+
+def test_default_semantic_aggregation_still_requires_explicit_inputs() -> None:
+    source = am.Source({"value": "Text."}, system_columns=True)
+    summary = source.sem_agg(output_cols=["summary"], instruction="Summarize.")
+    with pytest.raises(
+        NotImplementedError,
+        match="standalone sem_agg compressed-state differential requires explicit input_cols",
+    ):
+        am.SemanticDataflow(
+            source=source, views={"summary": summary}, adapter=_SemanticAggregateAdapter()
+        )
+    assert summary.expr.params["input_cols"] is None
+
+
 class _SemanticAggregateMemory(am.Memory):
     log = am.Log({"key": "Group key.", "value": "Numeric value."})
     _minimum = log.group_by("key").min(column="value", output_col="value")
     _summary_state = _minimum.sem_groupby(
+        membership=None,
         input_cols=["key"],
         instruction="Rows with the same {key} belong together.",
     ).sem_agg(
@@ -380,6 +453,7 @@ class _RetractOnlySemanticAggregateMemory(am.Memory):
         instruction="Keep {value} when it is at least five."
     )
     summaries = _accepted.sem_groupby(
+        membership=None,
         input_cols=["key"],
         instruction="Rows with the same {key} belong together.",
     ).sem_agg(
@@ -587,6 +661,7 @@ def test_runtime_v1_restore_preserves_the_policy_grouped_rule() -> None:
     class GroupedMemory(am.Memory):
         log = am.Log({"name": "Name.", "body": "Body."})
         topics = log.sem_groupby(
+            membership=None,
             input_cols=["name"],
             instruction="Rows with the same {name} describe one topic.",
         ).sem_agg(

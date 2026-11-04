@@ -8,6 +8,7 @@ from typing import Any
 from agent_memory.adapters.lotus.context import LotusExecutionContext
 from agent_memory.adapters.lotus.structured import normalize_strategy
 from agent_memory.adapters.lotus.sem_topk_listwise import execute_listwise_topk
+from agent_memory.adapters.lotus.ranking_validation import checked_ranking_models
 from agent_memory.policy.logical import QueryExpr
 from agent_memory.tracing.semantic import write_compact_operator_trace
 
@@ -61,16 +62,17 @@ def execute_sem_topk(
         lotus_method = LOTUS_PAIRWISE_METHODS.get(config.sem_topk_method)
         if lotus_method is None:
             raise ValueError(f"Unsupported sem_topk method {config.sem_topk_method!r}")
-        result = source.sem_topk(
-            instruction,
-            K=query.params["k"],
-            method=lotus_method,
-            strategy=normalize_strategy(config.sem_topk_strategy),
-            cascade_threshold=config.sem_topk_cascade_threshold,
-            return_stats=config.sem_topk_return_stats,
-            safe_mode=config.sem_topk_safe_mode,
-            return_explanations=config.sem_topk_return_explanations,
-        )
+        with checked_ranking_models(config.sem_topk_strategy):
+            result = source.sem_topk(
+                instruction,
+                K=query.params["k"],
+                method=lotus_method,
+                strategy=normalize_strategy(config.sem_topk_strategy),
+                cascade_threshold=config.sem_topk_cascade_threshold,
+                return_stats=config.sem_topk_return_stats,
+                safe_mode=config.sem_topk_safe_mode,
+                return_explanations=config.sem_topk_return_explanations,
+            )
         method_payload = {"candidate_count": len(source)}
     write_compact_operator_trace(
         config.trace_dir(),
