@@ -1,7 +1,151 @@
-# Independent semantic grouping (phase one)
+# Independent semantic grouping and composable maintenance
 
-New `sem_groupby` calls produce a readable membership relation. They use full
-recomputation on changed input, not an agent or a composable maintenance rule.
+New `sem_groupby` calls produce a readable membership relation. By default they
+use full recomputation on changed input. Composable maintenance is an explicit
+rule choice; neither path uses an agent or auxiliary semantic state.
+
+## Phase two: explicit composable rules
+
+Stage two is implemented and locally validated. On 2026-11-04 the complete
+offline suite passed 2,074 tests with 19 skipped; Ruff, configured Pyright and
+diff checks passed. Expanding Pyright to the new modules, examples and tests
+found test-only typing errors; those were corrected and all 67 focused cases
+passed again. These files are now included in the configured CI type-check set.
+The full run reported the existing LOTUS/Pydantic deprecation and a cost-estimate
+warning from the fake-model cache test. Local validation used Python 3.12;
+Python 3.13 remains a CI check. No live model was called for this closeout.
+
+```python
+rules = DifferentialRules(
+    sem_agg_rule="agg-composable",
+    sem_groupby_rule="group-composable",
+)
+```
+
+Pass `rules` to `SemanticDataflow` or `Memory`. Existing defaults and the four
+legacy fused grouped-aggregation rules are unchanged. Numeric count/sum/avg
+still use signed algebraic state. Mixing relational and semantic descriptors in
+one composable aggregate remains unsupported; this new descriptor path requires
+semantic descriptors only. Existing legacy mixed-aggregate policies are unchanged.
+
+Aggregation combines each affected group's previous result with its newly
+inserted raw rows, keeping their respective field names and duplicates. It does
+not first summarize the delta. Unchanged groups make no model calls. A group
+with retractions is recomputed from its current input; an empty group disappears.
+
+Grouping first groups the delta, then matches individual new records against
+old records within the same partition. Single uses top-1 matching (listwise by
+default); multiple uses pairwise matching. The deterministic merge writes matches
+into old groups. Unmatched members form new groups according to their local
+memberships: if r1 matches G but r2/r3 do not, only r1 enters G and r2/r3 form H.
+Shared members never merge old groups, and only duplicate record/group pairs
+are removed. Different occurrences of identical text remain different records.
+
+Old group IDs survive insert-only updates. New IDs use the runtime's staged
+identity allocator, so rollback and restoration do not require another counter.
+A partition containing retractions is fully regrouped with new group identities;
+other partitions continue incrementally. This is not an algorithm for semantic
+reassignment, nor a source-delete API.
+
+The first batch of each partition uses the existing C contract. Later local
+delta grouping uses C=None; the final partition must have no more than C groups.
+Exceeding C fails atomically rather than merging groups or silently regrouping.
+
+The rules reuse existing prompts and parsers. They are explicitly selected
+execution strategies, not guarantees that every instruction is composable.
+Grouping may inspect all historical members for matching, and the runtime still
+diffs complete results; this implementation is not overall O(delta).
+
+### Review repairs
+
+Partition lookup uses relational values, not their JSON spelling: `1` and `1.0`
+refer to the same partition, and missing keys share one bucket. This applies to
+both grouping and aggregation. JSON remains an identity serialization format,
+not an equality test. Regressions cover composite keys, missing values, C-limit
+rollback, previous aggregate reuse, and downstream fallback when the runtime
+emits dtype-related replacement rows.
+
+The configured grouping-to-join instruction rewriter runs during compilation.
+Its result is stored in the maintenance plan and fingerprint; execution does not
+create a fresh default rewriter. Different conditions cannot silently share a
+restored snapshot. Existing legacy rewrite hooks and rules are unchanged.
+
+### Separate Claude experiment
+
+`examples/claude/composable_memory.py` defines `ComposableClaudeMemory`; the built-in
+`ClaudeMemory` baseline is not changed. The experiment reuses the baseline's
+extraction subtree and instructions, selects independent multiple membership,
+and is run with both composable rules. Multiple membership is an explicit
+experimental choice, not a claim of equivalence to legacy `membership=None`.
+
+The gated `examples/claude/composable_smoke.py` accepts `--run --case topics` or
+`--run --case update`, plus a new `--output` directory. It uses DeepSeek Flash,
+zero retries, no local response cache, and full traces. Inputs are synthetic,
+not benchmark examples. No external memory store is needed.
+
+On 2026-11-04, the topics case issued 18 provider requests and returned three
+topics/catalog entries after three writes. Allergy and vegetarian preference
+remained separate topics. The update case issued 9 requests: an Atlas deadline
+update matched its existing group, aggregated the previous result with the new
+candidate, and retained one topic with the Monday date instead of Friday. Both
+plans contained two composable nodes. Retrieval was executed in both cases;
+the single-topic update needed no ranking model calls.
+
+These runs do not establish general quality. In the topics case, one existing
+LOTUS top-k comparison exhausted the 2048-token budget, returned empty text,
+and the installed parser selected its default preference. All three rows were
+returned, but that ranking is not validated. In the update case, generated memory
+also asserted an external hard commitment absent from the input; this unsupported
+detail was carried forward. Neither the retrieval adapter nor the baseline
+instructions were patched to hide these observations.
+
+Raw evidence: `/private/tmp/claude-composable-review-20261104/` and
+`/private/tmp/claude-composable-update-20261104/`, each with `report.json` and
+`trace/events.jsonl`. A successful runner status means execution completed,
+not that every generated assertion or ranking was correct.
+
+### Strict top-k follow-up
+
+The smoke runner now explicitly disables thinking; Claude instructions, logical
+queries, and the LOTUS ranking prompts/algorithms are unchanged. Pairwise ranking
+validates completion status and response count using the shared structured-path
+validator, then requires a valid Document 1/2 choice before LOTUS parses it.
+ZS_COT requires its explicit final Answer choice. Truncation and invalid choices
+raise without retry, guessed selections, output repair, or fallback. Listwise
+ranking also checks completeness before its existing configured parse retries.
+No new retry policy is introduced.
+
+The scoped LM guard restores the original main/helper models on both success
+and failure. It follows LOTUS's existing non-thread-safe global-settings contract;
+it does not make concurrent configuration safe. Validated operator cache entries
+use a separate namespace so old unchecked rankings cannot bypass validation;
+the underlying LM cache and valid operator-cache reuse remain available. Provider
+completion metadata is retained even when tracing is disabled.
+
+Offline follow-up: 971 tests passed, four live-only cases skipped; Ruff, configured
+Pyright, and diff checks passed. Additional Pyright covered the guard and smoke
+runner. Tests exercise actual LOTUS naive/quick/heap sorters with fake physical
+provider responses, invalid/truncated/cached answers, response counts, model
+restoration, and valid ranking output. No mock result measures model quality.
+
+Two bounded Flash reruns made 28 provider requests (18 topics, 10 update), all
+with thinking disabled and normal stop status. All four top-k comparisons
+returned legal choices; the three topics comparisons each used three completion
+tokens. The update case nevertheless returned False for matching the new Atlas
+deadline to its old record, leaving two topics with conflicting dates. This is
+an observed semantic matching failure, not a truncated or illegally parsed
+ranking. No instruction/query change or deduplication workaround was applied.
+One run does not establish that disabling thinking caused the mismatch.
+
+Evidence: `/private/tmp/claude-topk-strict-topics-20261104/` and
+`/private/tmp/claude-topk-strict-update-20261104/`. The original runs above are
+historical runs, not overwritten reruns. At stage-two closeout, these temporary
+directories and the two original Claude trace directories were no longer
+available. The counts and observations above record the earlier inspection,
+not a fresh audit of accessible artifacts. The gated runner remains available
+for an explicitly authorized repeat; no traces were reconstructed or fabricated.
+
+## Default fallback contract
 
 ```python
 from agent_memory import Source, SemanticDataflow
