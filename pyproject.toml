@@ -52,6 +52,12 @@ target-version = "py312"
 [tool.pyright]
 pythonVersion = "3.12"
 include = [
+    "src/agent_memory/adapters/lotus/composable.py",
+    "src/agent_memory/adapters/lotus/ranking_validation.py",
+    "examples/claude/composable_memory.py",
+    "examples/claude/composable_smoke.py",
+    "tests/test_composable.py",
+    "tests/test_ranking_validation.py",
     "src/agent_memory/evaluation/agent_memory_drivers.py",
     "src/agent_memory/evaluation/artifacts.py",
     "src/agent_memory/evaluation/bundle.py",

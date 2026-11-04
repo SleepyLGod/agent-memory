@@ -1030,7 +1030,7 @@ def execute_structured_lm_with_retries(
     return list(result.raw_outputs)
 
 
-def _complete_structured_outputs(
+def complete_lm_outputs(
     output: Any, expected: int, *, operator: str
 ) -> list[str]:
     """Validate physical response completeness before parsing or retrying rows."""
@@ -1047,7 +1047,7 @@ def _complete_structured_outputs(
             )
         for completion in metadata:
             if _incomplete(completion):
-                raise ValueError(f"incomplete structured response: {completion}")
+                raise ValueError(f"incomplete structured response ({operator}): {completion}")
     return raw_outputs
 
 
@@ -1069,7 +1069,7 @@ def execute_structured_lm_retry_result(
     from lotus.types import LMOutput
 
     output: LMOutput = model(prompts, **dict(lm_kwargs))
-    raw_outputs = _complete_structured_outputs(output, len(prompts), operator=operator)
+    raw_outputs = complete_lm_outputs(output, len(prompts), operator=operator)
     raw_output_attempts = [[raw_output] for raw_output in raw_outputs]
     invalid = invalid_structured_output_indices(
         raw_outputs,
@@ -1090,7 +1090,7 @@ def execute_structured_lm_retry_result(
             f"{lm_kwargs.get('progress_bar_desc', 'Structured generation')} retry"
         )
         retry_output: LMOutput = model(retry_prompts, **retry_kwargs)
-        retry_outputs = _complete_structured_outputs(
+        retry_outputs = complete_lm_outputs(
             retry_output, len(invalid), operator=operator
         )
         for index, raw_output in zip(invalid, retry_outputs, strict=True):
