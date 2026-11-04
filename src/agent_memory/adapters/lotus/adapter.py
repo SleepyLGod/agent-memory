@@ -142,6 +142,10 @@ class LotusAdapter:
         """Execute a logical query expression through LOTUS."""
 
         match query.op:
+            case "semantic_composable_update":
+                from .composable import execute_composable
+
+                return self._execute_traced_semantic(query, inputs, execute_composable)
             case "log":
                 return execute_log(inputs)
             case "materialized_view":

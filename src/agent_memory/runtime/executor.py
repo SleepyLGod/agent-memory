@@ -205,6 +205,25 @@ class PolicyExecutor:
 
             if node.execution_kind in {"deterministic", "semantic_fallback"}:
                 next_state = self._execute_deterministic(node_id, staged_node_state)
+            elif node.execution_kind == "semantic_composable":
+                if node.maintenance_query is None:
+                    raise RuntimeError("composable node requires a maintenance plan")
+                parent_id = node.input_node_ids[0]
+                update = parent_updates[0]
+                next_state = self.adapter.execute(
+                    node.maintenance_query,
+                    {
+                        parent_id: update.output_rows,
+                        node_id: old_state,
+                        f"{parent_id}__inserted": update.inserted_rows,
+                        f"{parent_id}__retracted": update.retracted_rows,
+                        "__group_generation": (
+                            allocate(node_id)
+                            if node.query.op == "sem_groupby"
+                            else None
+                        ),
+                    },
+                )
             elif node.execution_kind == "algebraic_state":
                 next_state = self._execute_algebraic_state(
                     node_id,
@@ -303,9 +322,7 @@ class PolicyExecutor:
             "next_occurrence": self._next_occurrence,
         }
         if adapter_execution_fingerprint:
-            snapshot["adapter_execution_fingerprint"] = (
-                adapter_execution_fingerprint
-            )
+            snapshot["adapter_execution_fingerprint"] = adapter_execution_fingerprint
         if self.storage is not None:
             commit = self._require_storage_commit()
             if commit.is_initial:
@@ -960,12 +977,19 @@ class PolicyExecutor:
             if name in self.spec.views:
                 return QueryExpr(
                     op="materialized_view",
-                    params={"name": name, "columns": self.query_output_columns(self.spec.views[name].query)},
+                    params={
+                        "name": name,
+                        "columns": self.query_output_columns(
+                            self.spec.views[name].query
+                        ),
+                    },
                 )
             return query
         return QueryExpr(
             op=query.op,
-            inputs=tuple(self._bind_materialized_columns(item) for item in query.inputs),
+            inputs=tuple(
+                self._bind_materialized_columns(item) for item in query.inputs
+            ),
             params=query.params,
         )
 

@@ -148,11 +148,15 @@ class DifferentialRules:
         *,
         grouped_agg_rule: str = DEFAULT_GROUPED_AGG_RULE,
         sem_agg_rule: str | None = None,
+        sem_groupby_rule: str = "group-fallback",
     ) -> None:
         """Configure differential rule strategy experiments."""
 
-        if sem_agg_rule not in {None, "agg-fallback"}:
-            raise ValueError("sem_agg_rule must be None or agg-fallback")
+        if sem_agg_rule not in {None, "agg-fallback", "agg-composable"}:
+            raise ValueError("unknown sem_agg_rule")
+        if sem_groupby_rule not in {"group-fallback", "group-composable"}:
+            raise ValueError("unknown sem_groupby_rule")
+        self.sem_groupby_rule = sem_groupby_rule
         self.sem_agg_rule = sem_agg_rule
         if grouped_agg_rule not in GROUPED_AGG_RULES:
             raise ValueError(
@@ -800,7 +804,10 @@ class DifferentialRules:
             joined: QueryExpr = QueryExpr(
                 op="join",
                 inputs=(changed_aggregate, current_view),
-                params={"on": tuple(str(key) for key in groupby.params["keys"]), "how": "outer"},
+                params={
+                    "on": tuple(str(key) for key in groupby.params["keys"]),
+                    "how": "outer",
+                },
             )
         else:
             raise TypeError(f"Unsupported grouped aggregate input: {groupby.op}")
@@ -1378,7 +1385,10 @@ class DifferentialRules:
             joined = QueryExpr(
                 op="join",
                 inputs=(changed_aggregate, current_view),
-                params={"on": tuple(str(key) for key in groupby.params["keys"]), "how": "outer"},
+                params={
+                    "on": tuple(str(key) for key in groupby.params["keys"]),
+                    "how": "outer",
+                },
             )
         else:
             joined = QueryExpr(

@@ -81,6 +81,9 @@ class PolicyDifferentiator:
             instruction_rewriter=instruction_rewriter,
         )
         self._sem_agg_rule = None if rules is None else rules.sem_agg_rule
+        self._sem_groupby_rule = (
+            "group-fallback" if rules is None else rules.sem_groupby_rule
+        )
 
     def differentiate(
         self,
@@ -99,7 +102,7 @@ class PolicyDifferentiator:
             sink_outputs,
             fingerprint,
         ) = _DifferentialPolicyBuilder(
-            self._query_differentiator, self._sem_agg_rule
+            self._query_differentiator, self._sem_agg_rule, self._sem_groupby_rule
         ).build(
             spec,
             view_execution_order=view_order,
@@ -131,10 +134,14 @@ class _DifferentialPolicyBuilder:
     """Build structurally shared nodes for one logical memory policy."""
 
     def __init__(
-        self, query_differentiator: QueryDifferentiator, sem_agg_rule: str | None = None
+        self,
+        query_differentiator: QueryDifferentiator,
+        sem_agg_rule: str | None = None,
+        sem_groupby_rule: str = "group-fallback",
     ) -> None:
         self._query_differentiator = query_differentiator
         self._sem_agg_rule = sem_agg_rule
+        self._sem_groupby_rule = sem_groupby_rule
         self._nodes: dict[str, DifferentialNode] = {}
         self._node_queries: dict[str, QueryExpr] = {}
         self._query_nodes: dict[QueryExpr, str] = {}
@@ -225,7 +232,7 @@ class _DifferentialPolicyBuilder:
         independent = query.op == "sem_groupby" and query.params.get("independent")
         fallback = query.params.get("maintenance_rule") == "agg-fallback" or (
             query.op == "sem_agg"
-            and self._sem_agg_rule == "agg-fallback"
+            and self._sem_agg_rule in {"agg-fallback", "agg-composable"}
             and query.inputs[0].op not in _GROUP_CARRIERS | {"over"}
         )
         if independent or fallback:
@@ -242,18 +249,49 @@ class _DifferentialPolicyBuilder:
                 if carrier
                 else leaf
             )
-            local = QueryExpr(
-                op=query.op, inputs=(local_input,), params=query.params
-            )
+            local = QueryExpr(op=query.op, inputs=(local_input,), params=query.params)
             if fallback:
                 local = normalize_fallback(local)
+            rule = self._sem_groupby_rule if independent else self._sem_agg_rule
+            composable = rule in {"group-composable", "agg-composable"}
+            maintenance = None
+            if composable:
+                if local.op == "agg" and not all(
+                    isinstance(spec, SemanticAggregateSpec)
+                    for spec in local.params["aggregates"]
+                ):
+                    raise NotImplementedError(
+                        "composable agg requires semantic aggregate specs only"
+                    )
+                params = {**local.params, "maintenance_rule": rule}
+                if independent:
+                    params["join_instruction"] = (
+                        self._query_differentiator.groupby_join_instruction(local)
+                    )
+                local = QueryExpr(
+                    op=local.op,
+                    inputs=local.inputs,
+                    params=params,
+                )
+                maintenance = QueryExpr(
+                    op="semantic_composable_update",
+                    inputs=(local,),
+                    params={
+                        "rule": rule,
+                        "parent": parent,
+                        "previous": self._node_id(query),
+                    },
+                )
             return self._register(
                 query,
                 DifferentialNode(
                     node_id=self._node_id(query),
                     query=local,
                     input_node_ids=(parent,),
-                    execution_kind="semantic_fallback",
+                    execution_kind="semantic_composable"
+                    if composable
+                    else "semantic_fallback",
+                    maintenance_query=maintenance,
                     output_columns=output_columns(local),
                 ),
             )
@@ -338,9 +376,10 @@ class _DifferentialPolicyBuilder:
 
     def _has_fallback(self, node_id: str) -> bool:
         node = self._nodes[node_id]
-        return node.execution_kind == "semantic_fallback" or any(
-            self._has_fallback(parent) for parent in node.input_node_ids
-        )
+        return node.execution_kind in {
+            "semantic_fallback",
+            "semantic_composable",
+        } or any(self._has_fallback(parent) for parent in node.input_node_ids)
 
     def _compile_algebraic_aggregate(
         self,
