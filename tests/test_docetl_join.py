@@ -86,6 +86,20 @@ def _adapter(running: CannedEndpoint) -> DocetlAdapter:
     return build_docetl_adapter(running.base_url)
 
 
+def test_exact_join_does_not_round_large_keys(endpoint: CannedEndpoint) -> None:
+    first = 2**53
+    left = pd.DataFrame({"id": [first + 1], "weight": [0.5]})
+    right = pd.DataFrame({"id": [first, first + 1], "weight": [0.5, 0.5]})
+    query = QueryExpr(
+        op="sem_join",
+        inputs=(_source("left", left), _source("right", right)),
+        params={"instruction": "Compare {id:left} and {id:right}", "on": ["id"]},
+    )
+    result = _adapter(endpoint).execute(query, {"left": left, "right": right})
+    assert result["id:right"].tolist() == [first + 1]
+    assert f"[left] id: «{first + 1}»" in json.dumps(endpoint.requests, ensure_ascii=False)
+
+
 def test_the_prompt_labels_each_field_and_states_the_condition() -> None:
     """The whole verdict template, in order: context lines, a blank line, condition, question."""
 

@@ -7,7 +7,7 @@ so a change to one is visible from the other.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 
 from agent_memory.policy.logical import ColumnSpec, QueryExpr
 
@@ -59,12 +59,12 @@ def scalar_schema(columns: Sequence[ColumnSpec]) -> dict[str, str]:
     return {column.name: SCALAR_TYPE for column in columns}
 
 
-def rows_type(columns: Sequence[ColumnSpec]) -> str:
+def rows_type(names: Iterable[str]) -> str:
     """Return the DocETL type of a list of emitted rows, which is how a 1:1 `map` produces 0..n rows."""
 
     # `docetl.operations.utils.validation::convert_val` parses `list[{a: string}]` into an array
     #   whose items are objects with those properties, and validates them recursively.
-    fields = ", ".join(f"{column.name}: {SCALAR_TYPE}" for column in columns)
+    fields = ", ".join(f"{name}: {SCALAR_TYPE}" for name in names)
     return f"list[{{{fields}}}]"
 
 

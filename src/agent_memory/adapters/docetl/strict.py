@@ -49,8 +49,7 @@ def strict_filter(*, index_key: str) -> Callable[..., Any]:
 
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             super().__init__(*args, **kwargs)
-            self._answered = 0
-            self._answered_labels: set[Any] = set()
+            self._answered_positions: set[int] = set()
 
         def _handle_result(self, result: dict[str, Any]) -> tuple[dict | None, bool]:
             # `self._filter_key` is the field the engine itself pops (`filter.py:103-104`), so checking
@@ -66,15 +65,16 @@ def strict_filter(*, index_key: str) -> Callable[..., Any]:
                     f"{self.config['name']} answered row {result.get(index_key)} with {answered!r}, "
                     "which is not a boolean"
                 )
-            self._answered += 1
-            self._answered_labels.add(result[index_key])
+            position = result[index_key]
+            if type(position) is not int or position in self._answered_positions:
+                raise RuntimeError(f"{self.config['name']} answered invalid or duplicate row {position!r}")
+            self._answered_positions.add(position)
             return super()._handle_result(result)
 
         def execute(
             self, input_data: list[dict], is_build: bool = False
         ) -> tuple[list[dict], float]:
-            self._answered = 0
-            self._answered_labels = set()
+            self._answered_positions.clear()
             kept, cost = super().execute(input_data, is_build=is_build)
             self._require_an_answer_per_row(input_data)
             return kept, cost
@@ -82,20 +82,14 @@ def strict_filter(*, index_key: str) -> Callable[..., Any]:
         def _require_an_answer_per_row(self, input_data: list[dict]) -> None:
             """Raise unless every record produced exactly one boolean answer, naming the rows."""
 
-            labels = [record[index_key] for record in input_data]
-            if self._answered == len(labels):
+            expected = {record[index_key] for record in input_data}
+            if self._answered_positions == expected:
                 return
 
-            # a repeated index makes the naming ambiguous, so the count stands alone in that case
-            unique = len(set(labels)) == len(labels)
-            missing = (
-                [label for label in labels if label not in self._answered_labels]
-                if unique
-                else []
-            )
+            missing = sorted(expected - self._answered_positions)
             detail = f"; missing {missing}" if missing else ""
             raise RuntimeError(
-                f"{self.config['name']} answered {self._answered} of {len(labels)} rows: a filter "
+                f"{self.config['name']} answered {len(self._answered_positions)} of {len(input_data)} rows: a filter "
                 f"needs exactly one boolean answer per row{detail}"
             )
 

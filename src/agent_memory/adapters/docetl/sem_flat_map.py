@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+import re
 from typing import TYPE_CHECKING, Any
 
 import pandas as pd
@@ -13,7 +14,7 @@ from agent_memory.adapters.docetl.columns import (
     rows_type,
     selected_inputs,
 )
-from agent_memory.adapters.docetl.prompt import render_prompt
+from agent_memory.adapters.docetl.prompt import _verbatim, render_prompt
 from agent_memory.adapters.docetl.records import (
     publish_rows,
     require_one_record_per_row,
@@ -22,7 +23,7 @@ from agent_memory.adapters.docetl.records import (
 )
 from agent_memory.adapters.docetl.reserved import INDEX_KEY, ROWS_KEY
 from agent_memory.adapters.docetl.specs import op_config
-from agent_memory.policy.logical import ColumnSpec, QueryExpr
+from agent_memory.policy.logical import QueryExpr
 
 if TYPE_CHECKING:
     from agent_memory.adapters.docetl.context import DocetlExecutionContext
@@ -36,6 +37,13 @@ def build_flat_map_config(
 ) -> dict[str, Any]:
     """Return the DocETL `map` config that asks for a list of output rows."""
 
+    config, _ = _prepare_flat_map(query, columns, rows_column)
+    return config
+
+
+def _prepare_flat_map(
+    query: QueryExpr, columns: Sequence[str], rows_column: str
+) -> tuple[dict[str, Any], dict[str, str]]:
     if query.op != "sem_flat_map":
         raise ValueError(f"build_flat_map_config got a {query.op!r} query")
 
@@ -51,11 +59,19 @@ def build_flat_map_config(
     )
     described = describe_outputs(declared)
     outputs = [column.name for column in declared]
+    if len(set(outputs)) != len(outputs):
+        raise ValueError("sem_flat_map requires distinct output column names")
+    # DocETL lowercases the nested type and treats commas and colons as separators.
+    use_slots = any(not re.fullmatch(r"[a-z_][a-z0-9_]*", name) for name in outputs)
+    fields = {name: f"f{i}" if use_slots else name for i, name in enumerate(outputs)}
     prompt = f"{render_prompt(instruction, columns=columns, outputs=outputs)}\n\n{shape}"
     if described:
-        prompt = f"{prompt}\n\n{described}"
+        prompt += "\n\n" + _verbatim(described, before_a_brace=False)
+    if use_slots:
+        mapping = "\n".join(f"- {key}: {name}" for name, key in fields.items())
+        prompt += "\n\nReturn each field under its schema key:\n" + _verbatim(mapping, before_a_brace=False)
 
-    return op_config(query.op, "map", prompt, {rows_column: rows_type(declared)})
+    return op_config(query.op, "map", prompt, {rows_column: rows_type(fields.values())}), fields
 
 
 def _expand(
@@ -64,7 +80,7 @@ def _expand(
     *,
     index_key: str,
     rows_column: str,
-    declared: Sequence[ColumnSpec],
+    fields: Mapping[str, str],
     ordinal_col: str | None,
 ) -> tuple[list[int], dict[str, list[Any]]]:
     """Expand each record's list into one row per entry, remembering which source row each came from.
@@ -77,22 +93,26 @@ def _expand(
     """
 
     positions: list[int] = []
-    written: dict[str, list[Any]] = {column.name: [] for column in declared}
+    written: dict[str, list[Any]] = {name: [] for name in fields}
     if ordinal_col is not None:
         written[str(ordinal_col)] = []
     for position, record in zip(
         source_positions(source, records, index_key=index_key), records, strict=True
     ):
-        emitted = record.get(rows_column) or []
+        emitted = record[rows_column]
         if not isinstance(emitted, list):
             raise ValueError(
                 f"sem_flat_map row {record.get(index_key)!r} returned {type(emitted).__name__} where "
                 "the declared schema is a list, so DocETL's validation should have dropped it"
             )
         for ordinal, item in enumerate(emitted):
+            if not isinstance(item, Mapping):
+                raise ValueError(f"sem_flat_map row {position} entry {ordinal} must be an object")
             positions.append(position)
-            for column in declared:
-                written[column.name].append(item.get(column.name))
+            for name, key in fields.items():
+                if key not in item:
+                    raise KeyError(f"sem_flat_map row {position} entry {ordinal} is missing field {name!r}")
+                written[name].append(item[key])
             if ordinal_col is not None:
                 written[str(ordinal_col)].append(ordinal)
     return positions, written
@@ -109,13 +129,10 @@ def execute_sem_flat_map(
     source = execute(query.inputs[0], inputs)
     index_key = INDEX_KEY
     rows_column = ROWS_KEY
+    config, fields = _prepare_flat_map(query, selected_inputs(query, source.columns), rows_column)
     records = context.run_operation(
         "map",
-        build_flat_map_config(
-            query,
-            columns=selected_inputs(query, source.columns),
-            rows_column=rows_column,
-        ),
+        config,
         to_records(source, index_key=index_key),
     )
     # Reason: one input row may legitimately produce zero rows here, which is why the check below
@@ -127,7 +144,7 @@ def execute_sem_flat_map(
         records,
         index_key=index_key,
         rows_column=rows_column,
-        declared=declared_outputs(query),
+        fields=fields,
         ordinal_col=query.params.get("ordinal_col"),
     )
 

@@ -203,11 +203,11 @@ def _candidate_pairs(
             raise ValueError(f"sem_join on columns not found on both sides: {missing}")
         right_by_key: dict[tuple[Any, ...], list[int]] = defaultdict(list)
         for right_id in right.index:
-            right_by_key[_key(right.loc[right_id], exact_keys)].append(right_id)
+            right_by_key[_key(right, right_id, exact_keys)].append(right_id)
         return [
             (left_id, right_id)
             for left_id in left.index
-            for right_id in right_by_key.get(_key(left.loc[left_id], exact_keys), ())
+            for right_id in right_by_key.get(_key(left, left_id, exact_keys), ())
         ]
 
     # Reason: without `on` every pair is a candidate. One call each, which is why `on` exists.
@@ -216,10 +216,10 @@ def _candidate_pairs(
     ]
 
 
-def _key(row: pd.Series, columns: Sequence[str]) -> tuple[Any, ...]:
+def _key(frame: pd.DataFrame, row_id: int, columns: Sequence[str]) -> tuple[Any, ...]:
     """Return one row's exact-key tuple, refusing values a dict cannot key on."""
 
-    key = tuple(row[column] for column in columns)
+    key = tuple(frame.at[row_id, column] for column in columns)
     try:
         hash(key)
     except TypeError as error:
@@ -236,10 +236,9 @@ def _pair_text(
 ) -> str:
     """Render one side: the raw cell for one column, `column: value` lines for several."""
 
-    row = frame.loc[row_id]
     if len(columns) == 1:
-        return str(row[columns[0]])
-    return "\n".join(f"{column}: {row[column]}" for column in columns)
+        return str(frame.at[row_id, columns[0]])
+    return "\n".join(f"{column}: {frame.at[row_id, column]}" for column in columns)
 
 
 def _verify_pairs(
@@ -318,9 +317,8 @@ def _slots(
 ) -> dict[str, str]:
     """Return one row's positional slot values, which is what the prompt reads."""
 
-    row = frame.loc[row_id]
     return {
-        join_slot(side, index): str(row[column])
+        join_slot(side, index): str(frame.at[row_id, column])
         for index, column in enumerate(columns)
     }
 

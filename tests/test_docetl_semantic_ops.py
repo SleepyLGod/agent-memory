@@ -23,7 +23,7 @@ from agent_memory.adapters.docetl.context import (
 )
 from agent_memory.adapters.docetl.reserved import INDEX_KEY, KEEP_KEY, RESERVED_NAMES, ROWS_KEY
 from agent_memory.adapters.docetl.sem_filter import build_filter_config
-from agent_memory.adapters.docetl.sem_flat_map import build_flat_map_config
+from agent_memory.adapters.docetl.sem_flat_map import _expand, build_flat_map_config
 from agent_memory.adapters.docetl.sem_map import build_map_config
 from agent_memory.adapters.docetl.strict import strict_equijoin, strict_filter
 from agent_memory.policy.logical import ColumnSpec, QueryExpr
@@ -153,6 +153,30 @@ def test_sem_filter_keeps_only_the_rows_the_model_accepts(canned_endpoint: Canne
     assert list(result.index) == [7]
 
 
+def test_filter_with_duplicate_index_keeps_the_accepted_occurrence(
+    canned_endpoint: CannedEndpoint,
+) -> None:
+    frame = pd.DataFrame({"note": ["other", _KEEP_MARKER]}, index=[7, 7])
+    result = _adapter(canned_endpoint).execute(_filter_query(), {"log": frame})
+    pd.testing.assert_frame_equal(result, frame.iloc[[1]])
+
+
+def test_flat_map_preserves_distinct_public_field_names() -> None:
+    frame = pd.DataFrame({"message": ["alpha"]}, index=[9])
+    names = ("FactID", "factid", "a:b", "f0")
+    query = QueryExpr(
+        op="sem_flat_map",
+        inputs=(QueryExpr(op="log"),),
+        params={"instruction": "Read {message}", "output_cols": tuple(ColumnSpec(n) for n in names)},
+    )
+    with canned_model(map_rows=({"f0": "F-42", "f1": "B", "f2": "C", "f3": "D"},)) as endpoint:
+        result = _adapter(endpoint).execute(query, {"log": frame})
+    sent = json.dumps(endpoint.requests, ensure_ascii=False)
+    for index, name in enumerate(names):
+        assert f"- f{index}: {name}" in sent
+    assert result.loc[9, list(names)].tolist() == ["F-42", "B", "C", "D"]
+
+
 def test_a_column_whose_name_carries_a_colon_reaches_the_prompt(
     canned_endpoint: CannedEndpoint,
 ) -> None:
@@ -172,6 +196,25 @@ def test_a_column_whose_name_carries_a_colon_reaches_the_prompt(
 
     assert list(result.columns) == ["note:left", "note:right"]
     assert list(result.index) == [7]
+
+
+@pytest.mark.parametrize("payload", [{}, {ROWS_KEY: None}, {ROWS_KEY: [{}]}, {ROWS_KEY: ["x"]}])
+def test_a_malformed_flat_map_result_is_not_an_empty_answer(payload: dict) -> None:
+    with pytest.raises((KeyError, ValueError)):
+        _expand(
+            pd.DataFrame({"note": ["x"]}), [{INDEX_KEY: 0, **payload}],
+            index_key=INDEX_KEY, rows_column=ROWS_KEY, fields={"FactID": "f0"}, ordinal_col=None,
+        )
+
+
+def test_a_duplicate_rejected_filter_decision_is_not_an_answer_for_another_row() -> None:
+    operation = strict_filter(index_key=INDEX_KEY)(
+        _context().handle, build_filter_config(_filter_query(), columns=("note",)),
+        DEFAULT_DOCETL_MODEL, 1,
+    )
+    operation._handle_result({INDEX_KEY: 0, KEEP_KEY: False})
+    with pytest.raises(RuntimeError, match="duplicate row"):
+        operation._handle_result({INDEX_KEY: 0, KEEP_KEY: False})
 
 
 def test_sem_filter_preserves_the_index_and_hides_the_decision(
@@ -211,7 +254,7 @@ def test_a_rejected_row_is_not_mistaken_for_a_lost_answer(
 
     frame = pd.DataFrame({"note": [_MALFORMED_MARKER, "other"]}, index=[7, 8])
 
-    with pytest.raises(RuntimeError, match=r"sem_filter answered 1 of 2 rows.*missing \[7\]"):
+    with pytest.raises(RuntimeError, match=r"sem_filter answered 1 of 2 rows.*missing \[0\]"):
         _adapter(canned_endpoint).execute(_filter_query(), {"log": frame})
 
 

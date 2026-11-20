@@ -32,6 +32,11 @@ def test_index_survives_the_round_trip() -> None:
     assert restored["message"].tolist() == ["a", "b"]
 
 
+def test_positions_survive_when_the_frame_has_no_columns() -> None:
+    source = pd.DataFrame(index=pd.Index([7, 7], name="occurrence"))
+    pd.testing.assert_frame_equal(_round_trip(source), source)
+
+
 def test_duplicate_index_values_survive() -> None:
     """The runtime groups output rows by index occurrence, so duplicates are legitimate."""
 
@@ -54,9 +59,9 @@ def test_a_dropped_row_leaves_a_subset_of_the_input_index() -> None:
 
 
 def test_a_reordered_record_carries_its_own_index() -> None:
-    """The reason the index travels in the record: position is not identity."""
+    """Returned records can change order without losing their source occurrence."""
 
-    source = pd.DataFrame({"message": ["a", "b", "c"]}, index=[10, 11, 12])
+    source = pd.DataFrame({"message": ["a", "b", "c"]}, index=[10, 11, 10])
     key = INDEX_KEY
 
     restored = from_records(
@@ -66,7 +71,21 @@ def test_a_reordered_record_carries_its_own_index() -> None:
         written=(),
     )
 
-    assert list(zip(restored.index, restored["message"])) == [(12, "c"), (11, "b"), (10, "a")]
+    pd.testing.assert_frame_equal(restored, source.iloc[::-1])
+
+
+@pytest.mark.parametrize("bad_position", [False, 0.0, "0", -1, 2])
+def test_an_invalid_source_position_is_refused(bad_position: object) -> None:
+    source = pd.DataFrame({"message": ["a", "b"]}, index=[7, 7])
+    with pytest.raises((ValueError, KeyError), match="source position"):
+        from_records([{INDEX_KEY: bad_position}], index_key=INDEX_KEY, source=source, written=())
+
+
+def test_equal_record_counts_do_not_hide_a_repeated_occurrence() -> None:
+    source = pd.DataFrame({"message": ["a", "b"]}, index=[7, 7])
+    record = to_records(source, index_key=INDEX_KEY)[0]
+    with pytest.raises(ValueError, match="duplicate source position"):
+        from_records([record, record], index_key=INDEX_KEY, source=source, written=())
 
 
 def test_missing_values_become_none_in_records() -> None:

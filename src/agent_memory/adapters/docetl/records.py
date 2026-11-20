@@ -1,12 +1,11 @@
 """The frame ↔ record boundary, and the rules T5-T7 that keep row identity and answer intact across it.
 
-DocETL's operators speak `list[dict]`, so the frame index travels in a reserved key and is restored on the
-way back. A record is the engine's copy of the input, not the input — a value that passed through a float
+DocETL's operators speak `list[dict]`, so each record carries its source position in a reserved key.
+A record is the engine's copy of the input, not the input — a value that passed through a float
 comes back rounded — so a record is read for two things only: the row's reserved index key, and the
 columns an operator declared. Stated once, cited by label below and from `dtypes.py`:
 
-  T5  the row index is carried like a column: kept under the source index's dtype, and a float-coerced
-      integer index is refused, because a label that lost its digits cannot name its row
+  T5  select by source position, not index label: two distinct rows may have the same label
   T6  a declared output the engine did not produce raises: a missing output is a contract violation,
       not a null
   T7  no records still yields the published columns with the carried dtypes, not a bare column list
@@ -18,8 +17,8 @@ drops an answer that fails validation and says nothing, so the count is the only
 
 from __future__ import annotations
 
-from collections import deque
 from collections.abc import Iterable, Mapping, Sequence
+from numbers import Integral
 from typing import Any
 
 import pandas as pd
@@ -28,7 +27,7 @@ from agent_memory.adapters.docetl.reserved import reject_reserved
 
 
 def to_records(frame: pd.DataFrame, *, index_key: str) -> list[dict[str, Any]]:
-    """Return `frame` as records, carrying the index under `index_key`.
+    """Return `frame` as records, carrying each row's position under `index_key`.
 
     `index_key` is one of the adapter's reserved names, and a frame carrying any of them is refused rather
     than worked around: an injected key appears in an operation's prompt schema, so it may not vary per frame.
@@ -40,6 +39,9 @@ def to_records(frame: pd.DataFrame, *, index_key: str) -> list[dict[str, Any]]:
     if frame.columns.duplicated().any():
         # a dict holds one value per key, so a repeated column name would be dropped silently
         raise ValueError("frame has duplicate column names, which records cannot represent")
+    if len(frame.columns) == 0:
+        # itertuples(index=False) emits nothing for a frame containing only an index.
+        return [{index_key: position} for position in range(len(frame))]
 
     projected = frame.astype(object)
     # prompts and JSON have no NaN or NaT, so missing values become None
@@ -49,8 +51,8 @@ def to_records(frame: pd.DataFrame, *, index_key: str) -> list[dict[str, Any]]:
         dict(zip(columns, row, strict=True))
         for row in clean.itertuples(index=False, name=None)
     ]
-    for record, index in zip(records, frame.index, strict=True):
-        record[index_key] = index
+    for position, record in enumerate(records):
+        record[index_key] = position
     return records
 
 
@@ -105,38 +107,25 @@ def publish_rows(
 def source_positions(
     source: pd.DataFrame, records: Sequence[Mapping[str, Any]], *, index_key: str
 ) -> list[int]:
-    """Return each record's position in `source`, in record order.
+    """Verify the returned source positions, preserving the engine's record order."""
 
-    T5: the label decides the row, a float label for an integer index is refused, and a repeated label
-    fills in source order. Public because `sem_flat_map` names source rows one per emitted entry — a list
-    of positions — before handing them to `publish_rows`.
-    """
-
-    available: dict[Any, deque[int]] = {}
-    for position, label in enumerate(source.index):
-        available.setdefault(label, deque()).append(position)
-
-    integer_index = pd.api.types.is_integer_dtype(source.index.dtype)
+    seen: set[int] = set()
     positions: list[int] = []
     for position, record in enumerate(records):
         if index_key not in record:
             raise KeyError(
                 f"record {position} is missing {index_key!r}: the operator dropped row identity"
             )
-        label = record[index_key]
-        if integer_index and isinstance(label, float):
-            # Requirement: the row index is carried like a column. A float label cannot name the row it
-            #   was taken from: `9007199254740993` reads back `9007199254740992`.
-            raise ValueError(
-                f"{index_key} came back as a float ({label!r}) for an integer index"
-            )
-        candidates = available.get(label)
-        if not candidates:
-            raise KeyError(
-                f"record {position} carries {label!r}, which is not a row of the source: an operator "
-                "may not invent a row"
-            )
-        positions.append(candidates.popleft())
+        value = record[index_key]
+        if isinstance(value, bool) or not isinstance(value, Integral):
+            raise ValueError(f"record {position} has non-integer source position {value!r}")
+        row = int(value)
+        if not 0 <= row < len(source):
+            raise KeyError(f"record {position} carries unknown source position {row}")
+        if row in seen:
+            raise ValueError(f"duplicate source position {row}")
+        seen.add(row)
+        positions.append(row)
     return positions
 
 
@@ -170,9 +159,8 @@ def require_one_record_per_row(
         return
 
     returned = {record.get(index_key) for record in records}
-    # a repeated index makes the naming ambiguous, so the count stands alone in that case
-    missing = [index for index in source.index if index not in returned]
-    detail = f"; missing {missing}" if missing and len(source) == len(set(source.index)) else ""
+    missing = [position for position in range(len(source)) if position not in returned]
+    detail = f"; missing {missing}" if missing else ""
     raise RuntimeError(
         f"{op} received {len(records)} records for {len(source)} input rows: an answer failed "
         f"validation and its row was dropped{detail}"
