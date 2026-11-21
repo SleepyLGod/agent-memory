@@ -129,11 +129,12 @@ def execute_sem_flat_map(
     source = execute(query.inputs[0], inputs)
     index_key = INDEX_KEY
     rows_column = ROWS_KEY
-    config, fields = _prepare_flat_map(query, selected_inputs(query, source.columns), rows_column)
+    columns = selected_inputs(query, source.columns)
+    config, fields = _prepare_flat_map(query, columns, rows_column)
     records = context.run_operation(
         "map",
         config,
-        to_records(source, index_key=index_key),
+        to_records(source, index_key=index_key, selected=columns),
     )
     # Reason: one input row may legitimately produce zero rows here, which is why the check below
     #   counts records rather than emitted rows: a record holding an empty list answered, while a

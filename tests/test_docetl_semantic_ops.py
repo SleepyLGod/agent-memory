@@ -353,6 +353,42 @@ def _flat_map_query() -> QueryExpr:
     )
 
 
+@pytest.mark.parametrize("op", ["sem_map", "sem_flat_map"])
+@pytest.mark.parametrize("selection", [None, ("message",), ()])
+def test_only_selected_values_reach_the_model(
+    op: str, selection: tuple[str, ...] | None, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base = _map_query() if op == "sem_map" else _flat_map_query()
+    query = QueryExpr(op=op, inputs=base.inputs, params={
+        **base.params, "input_cols": selection, "instruction": "Generate an entry",
+    })
+    frame = pd.DataFrame({"message": ["shown-A", "shown-B"], "extra": ["extra-A", "extra-B"]}, index=[7, 7])
+    run = DocetlExecutionContext.run_operation
+
+    def checked_run(context: DocetlExecutionContext, kind: str, config: dict, records: list) -> list:
+        expected = set(frame.columns if selection is None else selection) | {INDEX_KEY}
+        assert [set(record) for record in records] == [expected, expected]
+        assert [record[INDEX_KEY] for record in records] == [0, 1]
+        return run(context, kind, config, records)
+
+    monkeypatch.setattr(DocetlExecutionContext, "run_operation", checked_run)
+    with canned_model(
+        map_answers={"summary": "answer"} if op == "sem_map" else None,
+        map_rows=({"entry": "answer"},) if op == "sem_flat_map" else None,
+    ) as endpoint:
+        result = _adapter(endpoint).execute(query, {"log": frame})
+    assert list(result.index) == [7, 7]
+    assert result["extra"].tolist() == frame["extra"].tolist()
+    assert result["summary" if op == "sem_map" else "entry"].tolist() == ["answer", "answer"]
+    assert endpoint.requests
+    messages = json.dumps([req["messages"] for req in endpoint.requests])
+    assert INDEX_KEY not in messages
+    for value in frame["message"]:
+        assert (value in messages) == (selection != ())
+    for value in frame["extra"]:
+        assert (value in messages) == (selection is None)
+
+
 def test_docetl_accepts_the_generated_map_and_flat_map_configs() -> None:
     """A scalar schema and a `list[{...}]` schema both survive DocETL's own validation."""
 

@@ -175,7 +175,9 @@ def test_a_brace_pair_that_is_not_a_name_is_refused(
 # template: the literal run is wrapped, so the renderer shows it instead of compiling
 # it. The empty column set keeps the data block out, leaving only the wrapper.
 def test_a_doubled_brace_shows_two_braces() -> None:
-    assert render_input("{{{{note}}}}", columns=()) == "{% raw %}{{note}}{% endraw %}"
+    from jinja2 import Template
+
+    assert Template(render_input("{{{{note}}}}", columns=())).render() == "{{note}}"
 
 
 # §7: a raw block ends at the first terminator Jinja recognises

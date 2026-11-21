@@ -70,6 +70,9 @@ def render_prompt(
         outputs=_unique(outputs),
     )
     prompt = _render_row(resolved)
+    if not names:
+        # A constant template must render literally: DocETL otherwise appends the input record.
+        return "{{ '' }}" + prompt
     named = {token.name for token in resolved if isinstance(token, Value)}
     unreferenced = [name for name in names if name not in named]
     if not unreferenced:

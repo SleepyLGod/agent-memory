@@ -11,7 +11,7 @@ from agent_memory.adapters.docetl.columns import (
     scalar_schema,
     selected_inputs,
 )
-from agent_memory.adapters.docetl.prompt import render_prompt
+from agent_memory.adapters.docetl.prompt import _verbatim, render_prompt
 from agent_memory.adapters.docetl.records import (
     from_records,
     require_one_record_per_row,
@@ -47,7 +47,7 @@ def build_map_config(
     if describe:
         described = describe_outputs(declared)
         if described:
-            prompt = f"{prompt}\n\n{described}"
+            prompt += "\n\n" + _verbatim(described, before_a_brace=False)
 
     return op_config(query.op, "map", prompt, scalar_schema(declared))
 
@@ -62,10 +62,11 @@ def execute_sem_map(
 
     source = execute(query.inputs[0], inputs)
     index_key = INDEX_KEY
+    columns = selected_inputs(query, source.columns)
     mapped = context.run_operation(
         "map",
-        build_map_config(query, columns=selected_inputs(query, source.columns)),
-        to_records(source, index_key=index_key),
+        build_map_config(query, columns=columns),
+        to_records(source, index_key=index_key, selected=columns),
     )
     require_one_record_per_row(source, mapped, op="sem_map", index_key=index_key)
     return from_records(

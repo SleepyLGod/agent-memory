@@ -26,7 +26,9 @@ import pandas as pd
 from agent_memory.adapters.docetl.reserved import reject_reserved
 
 
-def to_records(frame: pd.DataFrame, *, index_key: str) -> list[dict[str, Any]]:
+def to_records(
+    frame: pd.DataFrame, *, index_key: str, selected: Sequence[str] | None = None
+) -> list[dict[str, Any]]:
     """Return `frame` as records, carrying each row's position under `index_key`.
 
     `index_key` is one of the adapter's reserved names, and a frame carrying any of them is refused rather
@@ -39,6 +41,8 @@ def to_records(frame: pd.DataFrame, *, index_key: str) -> list[dict[str, Any]]:
     if frame.columns.duplicated().any():
         # a dict holds one value per key, so a repeated column name would be dropped silently
         raise ValueError("frame has duplicate column names, which records cannot represent")
+    if selected is not None:
+        frame = frame.loc[:, list(selected)]
     if len(frame.columns) == 0:
         # itertuples(index=False) emits nothing for a frame containing only an index.
         return [{index_key: position} for position in range(len(frame))]
