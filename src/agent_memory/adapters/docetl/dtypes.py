@@ -14,9 +14,8 @@ nullable dtypes hold both. Stated once, cited by label below and from `records.p
 T5-T7 belong to the record boundary and are stated in `records.py`.
 
 `nullable_integers` satisfies T2 before a merge that will introduce missing values; `carry_integer_dtypes`
-enforces T1-T4 after a rebuild. Both belong to a rebuild that cannot select its rows from the source — the
-two joins. An operator that can select does so in `records.publish_rows`, where T1 holds by construction
-and needs neither.
+checks integer columns after a relational merge. Joins with known source positions instead use
+`take_join_rows`, which gathers the original columns without inferring their types from row dicts.
 """
 
 from __future__ import annotations
@@ -54,6 +53,15 @@ def nullable_integers(frame: pd.DataFrame, columns: Iterable[str]) -> pd.DataFra
         if nullable is not None:
             result[column] = result[column].astype(nullable)
     return result
+
+
+def take_join_rows(source: pd.DataFrame, positions: pd.Index) -> pd.DataFrame:
+    """Gather original rows; -1 denotes a missing side of an outer join."""
+    if -1 not in positions:
+        return source.iloc[positions].reset_index(drop=True)
+    framed = nullable_integers(source, source.columns)
+    framed.index = pd.RangeIndex(len(source))
+    return framed.reindex(positions).reset_index(drop=True)
 
 
 def carry_integer_dtypes(

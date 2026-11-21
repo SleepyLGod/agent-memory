@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 
 import pandas as pd
 
-from agent_memory.adapters.docetl.dtypes import carry_integer_dtypes
+from agent_memory.adapters.docetl.dtypes import take_join_rows
 from agent_memory.adapters.docetl.prompt import (
     build_join_prompt,
     build_topk_prompt,
@@ -464,26 +464,29 @@ def _assemble(
 ) -> pd.DataFrame:
     """Build the published frame, including the null rows `how` requires."""
 
-    left_names, right_names, output_columns, carried = _published_names(
-        left, right, id_columns
-    )
-    rows = [
-        _joined_row(left, right, left_id, right_id, left_names, right_names, id_columns)
-        for left_id, right_id in _rows_for(how, matches, left.index, right.index)
+    left_names, right_names = _published_names(left, right, id_columns)
+    pairs = _rows_for(how, matches, left.index, right.index)
+    positions = [
+        pd.Index([p[side] if p[side] is not None else -1 for p in pairs], dtype="int64")
+        for side in (0, 1)
     ]
-    frame = pd.DataFrame(rows, columns=output_columns)
-    # Reason: a frame assembled row by row infers `object` for every column that gained a null, so each
-    #   integer column is put back under a carrier that holds both: `Int64` when a null is present, the
-    #   source dtype when it is not.
-    return carry_integer_dtypes(frame, carried, op="sem_join")
+    result = pd.concat([
+        take_join_rows(left, positions[0]).rename(columns=left_names),
+        take_join_rows(right, positions[1]).rename(columns=right_names),
+    ], axis=1)
+    if id_columns:
+        for name, ids in zip(id_columns, positions, strict=True):
+            values = pd.Series(ids)
+            result[name] = values.astype("Int64").mask(values == -1) if -1 in ids else values
+    return result
 
 
 def _published_names(
     left: pd.DataFrame,
     right: pd.DataFrame,
     id_columns: tuple[str, str] | None,
-) -> tuple[dict[str, str], dict[str, str], list[str], dict[str, Any]]:
-    """Return each side's published names, the column list, and the dtype each carry came from."""
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Return each side's published names after checking for collisions."""
 
     # Required by: the node's declared schema, which suffixes only overlapping names
     #   (`src/agent_memory/policy/schema.py::semantic_join_columns`).
@@ -498,21 +501,13 @@ def _published_names(
     }
     published = [*left_names.values(), *right_names.values()]
     require_unique_published_columns(published, op="sem_join")
-    output_columns = [*published, *(id_columns or ())]
     if id_columns is not None:
         conflicts = sorted(set(id_columns).intersection(published))
         if conflicts:
             raise ValueError(
                 f"sem_join id columns conflict with output columns: {conflicts}"
             )
-    carried = {out: left[column].dtype for column, out in left_names.items()}
-    carried.update({out: right[column].dtype for column, out in right_names.items()})
-    # Requirement: the id columns are row positions, so an unmatched side leaves `pd.NA` and the
-    #   column would otherwise stay `object`. `Int64` holds both; `int64` when every row is matched.
-    if id_columns is not None:
-        for name in id_columns:
-            carried[str(name)] = "int64"
-    return left_names, right_names, output_columns, carried
+    return left_names, right_names
 
 
 def _rows_for(
@@ -533,33 +528,6 @@ def _rows_for(
             (None, right_id) for right_id in right_index if right_id not in matched_right
         ]
     return pairs
-
-
-def _joined_row(
-    left: pd.DataFrame,
-    right: pd.DataFrame,
-    left_id: int | None,
-    right_id: int | None,
-    left_names: Mapping[str, str],
-    right_names: Mapping[str, str],
-    id_columns: tuple[str, str] | None,
-) -> dict[str, Any]:
-    """Build one row; a side with no row id contributes nulls for all of its columns."""
-
-    row = {out: _cell(left, left_id, column) for column, out in left_names.items()}
-    row.update(
-        {out: _cell(right, right_id, column) for column, out in right_names.items()}
-    )
-    if id_columns is not None:
-        row[id_columns[0]] = left_id if left_id is not None else pd.NA
-        row[id_columns[1]] = right_id if right_id is not None else pd.NA
-    return row
-
-
-def _cell(frame: pd.DataFrame, row_id: int | None, column: str) -> Any:
-    """Return one cell, or a null for the side a `how` left unmatched."""
-
-    return pd.NA if row_id is None else frame.loc[row_id, column]
 
 
 def build_verdict_config(instruction: str, *, scope: JoinScope) -> dict[str, Any]:

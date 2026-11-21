@@ -33,6 +33,7 @@ from agent_memory.adapters.docetl.sem_join import (
     LEFT_ID_COLUMN,
     RIGHT_ID_COLUMN,
     SELECTED_COLUMN,
+    _assemble,
     build_verdict_config,
 )
 from agent_memory.adapters.docetl.strict import strict_equijoin
@@ -957,6 +958,79 @@ def _materialized(query: QueryExpr, inputs: dict[str, pd.DataFrame]) -> pd.DataF
     """Resolve a source with no storage: the case hands the frame in by name."""
 
     return inputs[str(query.params["name"])]
+
+
+@pytest.mark.parametrize("how", ["inner", "left", "right", "outer"])
+@pytest.mark.parametrize("matches", [[], [(0, 0), (0, 1), (1, 1)]])
+def test_match_positions_publish_original_columns(how: str, matches: list[tuple[int, int]]) -> None:
+    left = pd.DataFrame({"id": pd.Series([BIG, None], dtype=object)})
+    right = pd.DataFrame({"n": pd.Series([3, 4, 5], dtype="uint32")})
+    result = _assemble(left, right, matches, how=how, id_columns=("L", "R"))
+    expected = list(matches)
+    if how in ("left", "outer"):
+        expected.extend((i, None) for i in left.index if i not in {pos for pos, _ in matches})
+    if how in ("right", "outer"):
+        expected.extend((None, i) for i in right.index if not any(r == i for _, r in matches))
+    assert result.columns.tolist() == ["id", "n", "L", "R"]
+    assert str(result["id"].dtype) == "object"
+    assert str(result["n"].dtype) == ("UInt32" if any(r is None for _, r in expected) else "uint32")
+    assert len(result) == len(expected)
+    for i, (left_pos, right_pos) in enumerate(expected):
+        assert pd.isna(result.at[i, "L"]) if left_pos is None else result.at[i, "L"] == left_pos
+        assert pd.isna(result.at[i, "R"]) if right_pos is None else result.at[i, "R"] == right_pos
+        assert pd.isna(result.at[i, "id"]) if left_pos != 0 else int(result.at[i, "id"]) == BIG
+        assert pd.isna(result.at[i, "n"]) if right_pos is None else int(result.at[i, "n"]) == right_pos + 3
+
+
+@pytest.mark.parametrize("how", ["inner", "left", "right", "outer", "left_anti"])
+def test_mixed_integer_join_keys_are_exact(how: str) -> None:
+    top = 2**64 - 1
+    left = pd.DataFrame({"id": pd.Series([-1, BIG, BIG, BIG + 4], dtype="int64"), "bucket": "a"})
+    right = pd.DataFrame({"id": pd.Series([BIG-1, BIG-1, BIG, BIG, top], dtype="uint64"), "bucket": "a"})
+    query = QueryExpr(op="join", inputs=(_source("left", left), _source("right", right)),
+                      params={"on": ("id", "bucket"), "how": how})
+    result = execute_key_join(query, {"left": left, "right": right}, _materialized)
+    common = [BIG] * 4
+    expected = {"inner": common, "left": [-1, *common, BIG+4],
+                "right": [BIG-1, BIG-1, *common, top],
+                "outer": [-1, BIG-1, BIG-1, *common, BIG+4, top], "left_anti": [-1, BIG+4]}
+    assert result.columns.tolist() == ["id", "bucket"]
+    assert [int(x) for x in result["id"]] == expected[how]
+    assert left["id"].dtype == "int64" and right["id"].dtype == "uint64"
+
+
+@pytest.mark.parametrize("empty", ["left", "right", "both"])
+def test_empty_join_sides_keep_their_columns(empty: str) -> None:
+    left = pd.DataFrame({"id": pd.Series([BIG], dtype="Int64")}, index=[0])
+    right = pd.DataFrame({"id": pd.Series([2**64 - 1], dtype="uint64")})
+    if empty != "right":
+        left = left.iloc[:0]
+    if empty != "left":
+        right = right.iloc[:0]
+    semantic = _assemble(left, right, [], how="outer", id_columns=("L", "R"))
+    assert semantic.columns.tolist() == ["id:left", "id:right", "L", "R"]
+    assert len(semantic) == len(left) + len(right)
+    assert str(semantic["id:left"].dtype) == "Int64"
+    assert str(semantic["id:right"].dtype) == ("UInt64" if len(left) else "uint64")
+    query = QueryExpr(op="join", inputs=(_source("left", left), _source("right", right)),
+                      params={"on": ("id",), "how": "outer"})
+    actual = execute_key_join(query, {"left": left, "right": right}, _materialized)
+    assert [int(x) for x in actual["id"]] == [int(x) for x in [*left["id"], *right["id"]]]
+
+
+def test_mixed_keys_respect_all_components_and_original_payloads() -> None:
+    left = pd.DataFrame({"k": pd.array([BIG, BIG], dtype="UInt64"), "bucket": ["a", "b"], "tag": ["x", "y"]}, index=[7, 7])
+    right = pd.DataFrame({"k": pd.array([BIG, BIG-1], dtype="Int64"), "bucket": ["a", "b"], "tag": ["p", "q"]}, index=[4, 4])
+
+    def joined(how: str) -> pd.DataFrame:
+        q = QueryExpr(op="join", inputs=(_source("left", left), _source("right", right)),
+                      params={"on": ("bucket", "k"), "how": how})
+        return execute_key_join(q, {"left": left, "right": right}, _materialized)
+
+    inner = joined("inner")
+    assert inner.columns.tolist() == ["k", "bucket", "tag:left", "tag:right"]
+    assert inner.iloc[0].tolist() == [BIG, "a", "x", "p"] and len(inner) == 1
+    pd.testing.assert_frame_equal(joined("left_anti"), left.iloc[[1]].reset_index(drop=True))
 
 
 def test_a_sem_join_keeps_an_unmatched_integer_exact(

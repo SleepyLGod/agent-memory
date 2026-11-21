@@ -4,17 +4,18 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 import json
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import pandas as pd
 
-from agent_memory.adapters.docetl.dtypes import carry_integer_dtypes, nullable_integers
+from agent_memory.adapters.docetl.dtypes import carry_integer_dtypes, nullable_integers, take_join_rows
 from agent_memory.policy.aggregates import (
     ArrayAggregateSpec,
     CollectListAggregateSpec,
     MinAggregateSpec,
     SemanticAggregateSpec,
+    is_algebraic_aggregate_spec,
 )
 from agent_memory.policy.expressions import (
     ArithmeticExpr,
@@ -31,6 +32,12 @@ from agent_memory.policy.expressions import (
     is_scalar,
 )
 from agent_memory.policy.logical import QueryExpr
+from agent_memory.adapters.frame_values import (
+    exact_series,
+    expand_arrays,
+    expand_structs,
+    numeric_comparison_key,
+)
 from agent_memory.policy.schema import (
     output_columns,
     relation_alias,
@@ -41,6 +48,7 @@ from agent_memory.runtime.window import over_frames
 # Reason: `_groups_for_aggregate` must refuse a frame `sem_groupby` grouped, and that operator is withdrawn,
 #   so its own constant is gone. Naming the column here keeps the refusal from depending on it coming back.
 GROUP_ID_COLUMN = "_agent_memory_group_id"
+_JoinHow = Literal["inner", "left", "right", "outer", "left_anti"]
 
 
 def execute_select(
@@ -221,9 +229,11 @@ def execute_subtract(
     if right.empty:
         return left.copy().reset_index(drop=True)
 
-    marker = "_agent_memory_subtract_marker"
+    marker = _unused_column_name(left, right, base="_agent_memory_subtract_marker")
     right_unique = right.drop_duplicates()
-    merged = left.merge(right_unique.assign(**{marker: True}), how="left")
+    merged = left.merge(
+        right_unique.assign(**{marker: True}), how="left", on=list(left.columns), sort=False
+    )
     result = merged[merged[marker].isna()].drop(columns=[marker])
     return result.loc[:, list(left.columns)].reset_index(drop=True)
 
@@ -237,15 +247,14 @@ def execute_join(
 
     left, right = _execute_binary_inputs(query, inputs, execute)
     on = tuple(query.params["on"])
-    how = str(query.params.get("how", "inner"))
-    _require_supported_join_how(how)
+    how = _validated_join_how(str(query.params.get("how", "inner")))
 
     if _is_predicate_join(on):
         return _execute_predicate_join(
             query,
             left,
             right,
-            predicates=tuple(expr_from_param(predicate) for predicate in on),
+            predicates=on,
             how=how,
         )
 
@@ -254,11 +263,21 @@ def execute_join(
     _require_non_null_join_keys(left, keys, side="left")
     _require_non_null_join_keys(right, keys, side="right")
 
+    mixed = {
+        k for k in keys
+        if pd.api.types.is_integer_dtype(left[k].dtype)
+        and pd.api.types.is_integer_dtype(right[k].dtype)
+        and pd.api.types.is_unsigned_integer_dtype(left[k].dtype)
+        != pd.api.types.is_unsigned_integer_dtype(right[k].dtype)
+    }
+    if mixed:
+        return _join_mixed_integer_keys(query, left, right, keys, mixed, how)
+
     if how == "left_anti":
         if right.empty:
             return left.copy().reset_index(drop=True)
         right_keys = right.loc[:, list(keys)].drop_duplicates()
-        marker = "_agent_memory_left_anti_marker"
+        marker = _unused_column_name(left, right, base="_agent_memory_left_anti_marker")
         merged = left.merge(
             right_keys.assign(**{marker: True}),
             how="left",
@@ -290,6 +309,50 @@ def execute_join(
     #   without checking whether the suffixed label is already taken.
     require_unique_published_columns(merged.columns, op=str(query.op))
     return carry_integer_dtypes(merged, carried, op=str(query.op))
+
+
+def _join_mixed_integer_keys(
+    query: QueryExpr, left: pd.DataFrame, right: pd.DataFrame,
+    keys: tuple[str, ...], mixed: set[str], how: _JoinHow,
+) -> pd.DataFrame:
+    """Match exact comparison keys, then gather the business columns by source position."""
+
+    def key_table(frame: pd.DataFrame, position: str) -> pd.DataFrame:
+        # A separate namespace: numbered keys and position tags cannot collide with user columns.
+        table = pd.DataFrame({
+            i: frame[k].astype(object) if k in mixed else frame[k]
+            for i, k in enumerate(keys)
+        })
+        table[position] = pd.array(range(len(frame)), dtype="Int64")
+        return table
+
+    on = list(range(len(keys)))
+    lhs, rhs = key_table(left, "L"), key_table(right, "R")
+    if how == "left_anti":
+        rhs = rhs.drop_duplicates(subset=on)
+    pairs = lhs.merge(rhs, on=on, how="left" if how == "left_anti" else how, sort=False)
+    if how == "left_anti":
+        return left.iloc[pairs.loc[pairs["R"].isna(), "L"].to_numpy(dtype=int)].reset_index(drop=True)
+
+    li = pd.Index(pairs["L"].fillna(-1), dtype="int64")
+    ri = pd.Index(pairs["R"].fillna(-1), dtype="int64")
+    a, b = take_join_rows(left, li), take_join_rows(right, ri)
+    for i, key in enumerate(keys):
+        if key not in mixed:
+            a[key] = pairs[i].array
+        elif how == "right" or (-1 in li and -1 not in ri):
+            a[key] = b[key].array
+        elif -1 in li:
+            # A full join may carry both negative integers and values too large for int64.
+            a[key] = a[key].astype(object).where(li != -1, b[key].astype(object))
+    shared = set(left.columns).intersection(right.columns).difference(keys)
+    ls, rs = _join_suffixes(query)
+    result = pd.concat([
+        a.rename(columns={k: f"{k}{ls}" for k in shared}),
+        b.drop(columns=list(keys)).rename(columns={k: f"{k}{rs}" for k in shared}),
+    ], axis=1)
+    require_unique_published_columns(tuple(result.columns), op=str(query.op))
+    return result
 
 
 def predicate_join_row_ids(
@@ -325,7 +388,7 @@ def predicate_join_row_ids(
         query,
         left_with_ids,
         right_with_ids,
-        predicates=tuple(expr_from_param(predicate) for predicate in predicates),
+        predicates=predicates,
         how="inner",
     )
 
@@ -519,8 +582,12 @@ def execute_agg(
     """Execute grouped aggregate specs over one grouped input."""
 
     group_query = query.inputs[0]
-    source = execute(group_query, inputs)
     aggregates: tuple[Any, ...] = tuple(query.params.get("aggregates", ()))
+    for spec in aggregates:
+        if is_algebraic_aggregate_spec(spec):
+            raise NotImplementedError(
+                f"DocETL adapter does not implement {type(spec).__name__} in agg"
+            )
     if group_query.op not in {"group_by", "sem_groupby"}:
         raise ValueError("agg expects group_by or sem_groupby input")
     if any(isinstance(aggregate, SemanticAggregateSpec) for aggregate in aggregates):
@@ -530,6 +597,7 @@ def execute_agg(
         raise NotImplementedError(
             "agg with sem_agg(...) requires sem_groupby, which this adapter does not implement yet"
         )
+    source = execute(group_query, inputs)
     if source.empty:
         return pd.DataFrame(columns=list(output_columns(query)))
 
@@ -610,7 +678,7 @@ def execute_over_array_agg(
             f"over array_agg emit columns not found in DataFrame: {missing_emit}"
         )
 
-    rows: list[dict[str, Any]] = []
+    values: list[str] = []
     for frame in over_frames(emit_source, frame_source, over_query.params):
         value = json.dumps(
             _strict_json_records(frame.frame, columns),
@@ -618,10 +686,10 @@ def execute_over_array_agg(
             default=_json_default,
             allow_nan=False,
         )
-        row = frame.emit_row.loc[list(emit_columns)].to_dict()
-        row[output_col] = value
-        rows.append(row)
-    return pd.DataFrame(rows, columns=[*emit_columns, output_col])
+        values.append(value)
+    result = emit_source.loc[:, list(emit_columns)].reset_index(drop=True)
+    result[output_col] = pd.Series(values, dtype=object)
+    return result
 
 
 def execute_array_cat(
@@ -695,14 +763,8 @@ def execute_explode(
     if output_col is not None and output_column in source.columns:
         raise ValueError(f"explode output column already exists: {output_column!r}")
 
-    output_rows: list[dict[str, Any]] = []
-    for _, row in source.iterrows():
-        elements = _load_optional_json_array(row[column], op="explode", column=column)
-        for element in elements:
-            output_row = row.to_dict()
-            output_row[output_column] = element
-            output_rows.append(output_row)
-    return pd.DataFrame(output_rows, columns=list(output_columns(query)))
+    arrays = (_load_optional_json_array(v, op="explode", column=column) for v in source[column])
+    return expand_arrays(source, arrays, output_column).reindex(columns=output_columns(query))
 
 
 def execute_unnest(
@@ -729,18 +791,8 @@ def execute_unnest(
             f"unnest output columns conflict with existing columns: {conflicts}"
         )
 
-    output_rows: list[dict[str, Any]] = []
-    for _, row in source.iterrows():
-        value = _load_json_object(row[column], op="unnest", column=column)
-        output_row = {name: row[name] for name in parent_columns}
-        for field, output in fields:
-            if field not in value:
-                raise ValueError(
-                    f"unnest field {field!r} not found in object column {column!r}"
-                )
-            output_row[output] = value[field]
-        output_rows.append(output_row)
-    return pd.DataFrame(output_rows, columns=expected_columns)
+    objects = (_load_json_object(v, op="unnest", column=column) for v in source[column])
+    return expand_structs(source, column, objects, fields).reindex(columns=expected_columns)
 
 
 def _execute_binary_inputs(
@@ -825,13 +877,11 @@ def _align_columns_by_name(
     return aligned.loc[:, list(columns)].copy()
 
 
-def _require_supported_join_how(how: str) -> None:
-    """Require a pandas relational join mode supported by the public API."""
-
-    if how not in {"inner", "left", "right", "outer", "left_anti"}:
-        raise ValueError(
-            "join how must be one of: inner, left, right, outer, left_anti"
-        )
+def _validated_join_how(how: str) -> _JoinHow:
+    """Return the validated public join mode."""
+    if how in ("inner", "left", "right", "outer", "left_anti"):
+        return how
+    raise ValueError("join how must be one of: inner, left, right, outer, left_anti")
 
 
 def _is_predicate_join(on: tuple[Any, ...]) -> bool:
@@ -894,7 +944,7 @@ def _execute_predicate_join(
     left: Any,
     right: Any,
     *,
-    predicates: tuple[Expr, ...],
+    predicates: tuple[Any, ...],
     how: str,
 ) -> Any:
     """Execute an inner predicate join with optional equi-join pruning."""
@@ -904,19 +954,27 @@ def _execute_predicate_join(
 
     left_alias = relation_alias(query.inputs[0]) or "left"
     right_alias = relation_alias(query.inputs[1]) or "right"
-    equality_pairs = _predicate_equality_pairs(
-        predicates,
-        left_alias=left_alias,
-        right_alias=right_alias,
-        left_columns=tuple(str(column) for column in left.columns),
-        right_columns=tuple(str(column) for column in right.columns),
-    )
+    sides = ((left_alias, left.columns), (right_alias, right.columns))
+    bound = tuple(expr_from_param(_bind_join_columns(p, sides)) for p in predicates)
 
     left_prepared = _rename_join_side(left, alias=left_alias)
     right_prepared = _rename_join_side(right, alias=right_alias)
-    if equality_pairs:
-        left_on = [f"{left_col}:{left_alias}" for left_col, _ in equality_pairs]
-        right_on = [f"{right_col}:{right_alias}" for _, right_col in equality_pairs]
+    pairs = _predicate_equality_pairs(bound, left_prepared.columns, right_prepared.columns)
+    if pairs:
+        left_on, right_on = [], []
+        temporary = []
+        for lk, rk in pairs:
+            if left_prepared[lk].dtype != right_prepared[rk].dtype:
+                # Match native scalar values without coercing either published column.
+                key = _unused_column_name(
+                    left_prepared, right_prepared, base=f"_key_{len(temporary)}"
+                )
+                left_prepared[key] = left_prepared[lk].astype(object)
+                right_prepared[key] = right_prepared[rk].astype(object)
+                temporary.append(key)
+                lk = rk = key
+            left_on.append(lk)
+            right_on.append(rk)
         joined = left_prepared.merge(
             right_prepared,
             how="inner",
@@ -924,10 +982,12 @@ def _execute_predicate_join(
             right_on=right_on,
             sort=False,
         )
+        if temporary:
+            joined = joined.drop(columns=temporary)
     else:
         joined = left_prepared.merge(right_prepared, how="cross", sort=False)
 
-    mask = evaluate_predicate(BooleanExpr(op="and", operands=predicates), joined)
+    mask = evaluate_predicate(BooleanExpr(op="and", operands=bound), joined)
     result = joined.loc[mask].reset_index(drop=True)
     # Required by: §6 as well, since every column is suffixed here, so two inputs sharing an
     #   alias would publish each name twice.
@@ -942,67 +1002,49 @@ def _rename_join_side(frame: Any, *, alias: str) -> Any:
     return frame.rename(columns=renamed).copy()
 
 
+def _bind_join_columns(value: Any, sides: tuple[tuple[str, pd.Index], ...]) -> Any:
+    """Qualify column references before either pruning pairs or testing the predicate."""
+
+    if isinstance(value, (tuple, list)):
+        return tuple(_bind_join_columns(item, sides) for item in value)
+    if not isinstance(value, Mapping):
+        return value
+    if value.get("kind") != "column":
+        return {k: _bind_join_columns(v, sides) for k, v in value.items()}
+    name, qualifier = value["name"], value.get("qualifier")
+    matches = [alias for alias, cols in sides if name in cols and qualifier in (None, alias)]
+    if len(matches) > 1:
+        raise ValueError(f"Ambiguous join column {name!r}; qualify it with an alias")
+    if not matches:
+        if qualifier is None:
+            # A caller may also reference a published name literally, e.g. "id:left".
+            raw, sep, suffix = name.rpartition(":")
+            for alias, cols in sides:
+                if sep and suffix == alias and raw in cols:
+                    return {**value, "name": raw, "qualifier": alias}
+        raise ValueError(f"Column {name!r} not found in join inputs for qualifier {qualifier!r}")
+    return {**value, "qualifier": matches[0]}
+
+
 def _predicate_equality_pairs(
-    predicates: tuple[Expr, ...],
-    *,
-    left_alias: str,
-    right_alias: str,
-    left_columns: tuple[str, ...],
-    right_columns: tuple[str, ...],
-) -> tuple[tuple[str, str], ...]:
-    """Extract left/right column equality pairs usable as merge keys."""
+    predicates: tuple[Expr, ...], left_columns: pd.Index, right_columns: pd.Index
+) -> list[tuple[str, str]]:
+    """Return opposite-side equality keys from conjunctive predicates."""
 
     pairs: list[tuple[str, str]] = []
-    for predicate in predicates:
-        if not isinstance(predicate, ComparisonExpr) or predicate.op != "eq":
-            continue
-        left_side = _predicate_column_side(
-            predicate.left,
-            left_alias=left_alias,
-            right_alias=right_alias,
-            left_columns=left_columns,
-            right_columns=right_columns,
-        )
-        right_side = _predicate_column_side(
-            predicate.right,
-            left_alias=left_alias,
-            right_alias=right_alias,
-            left_columns=left_columns,
-            right_columns=right_columns,
-        )
-        if left_side is None or right_side is None or left_side[0] == right_side[0]:
-            continue
-        if left_side[0] == "left":
-            pairs.append((left_side[1], right_side[1]))
-        else:
-            pairs.append((right_side[1], left_side[1]))
-    return tuple(pairs)
-
-
-def _predicate_column_side(
-    expr: Expr,
-    *,
-    left_alias: str,
-    right_alias: str,
-    left_columns: tuple[str, ...],
-    right_columns: tuple[str, ...],
-) -> tuple[str, str] | None:
-    """Return which join side a column expression references."""
-
-    if not isinstance(expr, ColumnExpr):
-        return None
-    if expr.qualifier == left_alias:
-        return "left", expr.name
-    if expr.qualifier == right_alias:
-        return "right", expr.name
-    if expr.qualifier is None:
-        in_left = expr.name in left_columns
-        in_right = expr.name in right_columns
-        if in_left and not in_right:
-            return "left", expr.name
-        if in_right and not in_left:
-            return "right", expr.name
-    return None
+    for p in predicates:
+        if isinstance(p, BooleanExpr) and p.op == "and":
+            pairs.extend(_predicate_equality_pairs(p.operands, left_columns, right_columns))
+        elif isinstance(p, ComparisonExpr) and p.op == "eq":
+            a, b = p.left, p.right
+            if not isinstance(a, ColumnExpr) or not isinstance(b, ColumnExpr):
+                continue
+            lk, rk = f"{a.name}:{a.qualifier}", f"{b.name}:{b.qualifier}"
+            if lk in right_columns and rk in left_columns:
+                lk, rk = rk, lk
+            if lk in left_columns and rk in right_columns:
+                pairs.append((lk, rk))
+    return pairs
 
 
 def evaluate_predicate(expr: Expr, frame: Any) -> Any:
@@ -1278,12 +1320,12 @@ def _evaluate_least(expr: LeastExpr, frame: Any) -> pd.Series:
             values.append(None)
             continue
         try:
-            values.append(min(candidates))
+            values.append(min(candidates, key=numeric_comparison_key))
         except TypeError as exc:
             raise TypeError(
                 f"least operands are not mutually comparable at row position {position}"
             ) from exc
-    return pd.Series(values, index=frame.index)
+    return exact_series(values, index=frame.index)
 
 
 def _is_null_scalar(value: Any) -> bool:

@@ -6,10 +6,14 @@ guarantee fails here rather than in the middle of a policy.
 
 from __future__ import annotations
 
+import pandas as pd
 import pytest
+
+import agent_memory as am
 
 from agent_memory.adapters import DocetlAdapter, LotusAdapter
 from agent_memory.adapters.docetl import DocetlExecutionConfig
+from agent_memory.policy.aggregates import AlgebraicAggregateSpec
 from agent_memory.adapters.docetl.context import (
     DEFAULT_DOCETL_MODEL,
     DOCETL_API_BASE_ENV,
@@ -25,6 +29,33 @@ def test_fingerprint_is_stable_and_backend_distinct() -> None:
     assert fingerprint == DocetlAdapter().maintenance_execution_fingerprint
     assert fingerprint != LotusAdapter().maintenance_execution_fingerprint
     assert fingerprint != DocetlAdapter(model="other/model").maintenance_execution_fingerprint
+
+
+@pytest.mark.parametrize("grouped", [True, False])
+@pytest.mark.parametrize("rows", [[], [7]])
+@pytest.mark.parametrize("spec", [
+    am.count(output_col="n"),
+    am.sum(column="v", output_col="total"),
+    am.avg(column="v", output_col="mean"),
+])
+def test_unsupported_numeric_aggregate_is_independent_of_input(
+    grouped: bool, rows: list[int], spec: AlgebraicAggregateSpec
+) -> None:
+    log = am.Log({"g": "group", "v": "amount"})
+    query = (log.group_by("g") if grouped else log).agg(spec)
+    frame = pd.DataFrame({"g": ["x"] * len(rows), "v": rows})
+    with pytest.raises(NotImplementedError, match=type(spec).__name__):
+        DocetlAdapter().execute(query.expr, {"log": frame})
+
+
+def test_supported_grouped_min_still_handles_empty_and_populated_frames() -> None:
+    log = am.Log({"g": "group", "v": "amount"})
+    query = log.group_by("g").agg(am.min(column="v", output_col="lowest"))
+    frame = pd.DataFrame({"g": ["x", "x"], "v": [7, 3]})
+    adapter = DocetlAdapter()
+    empty = adapter.execute(query.expr, {"log": frame.iloc[:0]})
+    assert empty.empty and list(empty.columns) == ["g", "lowest"]
+    assert adapter.execute(query.expr, {"log": frame}).to_dict("records") == [{"g": "x", "lowest": 3}]
 
 
 @pytest.mark.parametrize(
