@@ -38,6 +38,10 @@ from agent_memory.policy.expressions import (
     is_scalar,
 )
 from agent_memory.policy.logical import QueryExpr
+from agent_memory.adapters.frame_join import (
+    join_mixed_integer_keys,
+    mixed_integer_keys,
+)
 from agent_memory.adapters.frame_values import (
     exact_series,
     expand_arrays,
@@ -260,6 +264,10 @@ def execute_join(
     _require_join_keys(left, right, keys)
     _require_non_null_join_keys(left, keys, side="left")
     _require_non_null_join_keys(right, keys, side="right")
+
+    mixed = mixed_integer_keys(left, right, keys)
+    if mixed:
+        return join_mixed_integer_keys(left, right, keys, mixed, how, _join_suffixes(query))
 
     if how == "left_anti":
         if right.empty:

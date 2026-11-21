@@ -10,6 +10,7 @@ from agent_memory.adapters.docetl import relational as docetl
 from agent_memory.adapters.lotus import relational as lotus
 from agent_memory.policy.expressions import ColumnExpr
 from agent_memory.policy.logical import QueryExpr
+from agent_memory.policy.relation import Relation
 
 
 @pytest.fixture(params=[LotusAdapter, DocetlAdapter])
@@ -21,6 +22,51 @@ def source(name: str, frame: pd.DataFrame) -> QueryExpr:
     return QueryExpr(
         op="materialized_view", params={"name": name, "columns": tuple(frame)}
     )
+
+
+@pytest.mark.parametrize("offset, count", [(0, 0), (1, 4)])
+def test_duplicate_mixed_integer_keys(
+    adapter: LotusAdapter | DocetlAdapter, offset: int, count: int
+) -> None:
+    big = 2**53
+    lf = pd.DataFrame({"id": pd.array([big + 1] * 2, dtype="int64")})
+    rf = pd.DataFrame({"id": pd.array([big + offset] * 2, dtype="uint64")})
+    left, right = Relation(source("l", lf)), Relation(source("r", rf))
+    result = adapter.execute(left.join(right, on="id").expr, {"l": lf, "r": rf})
+    assert result["id"].tolist() == [big + 1] * count
+
+
+@pytest.mark.parametrize(
+    "how, expected",
+    [
+        ("inner", [(7, "a")]),
+        ("left", [(-1, "a"), (7, "b"), (7, "a")]),
+        ("right", [(7, "a"), (2**64 - 1, "a")]),
+        ("outer", [(-1, "a"), (7, "a"), (7, "b"), (2**64 - 1, "a")]),
+        ("left_anti", [(-1, "a"), (7, "b")]),
+    ],
+)
+def test_mixed_composite_keys_keep_source_values(
+    adapter: LotusAdapter | DocetlAdapter, how: str, expected: list[tuple[int, str]]
+) -> None:
+    lf = pd.DataFrame(
+        {"id": pd.array([-1, 7, 7], dtype="Int64"), "bucket": ["a", "b", "a"]},
+        index=[4, 4, 4],
+    )
+    rf = pd.DataFrame(
+        {"id": pd.array([7, 2**64 - 1], dtype="UInt64"), "bucket": ["a", "a"]},
+        index=[5, 5],
+    )
+    q = QueryExpr(
+        op="join",
+        inputs=(source("l", lf), source("r", rf)),
+        params={"on": ("id", "bucket"), "how": how},
+    )
+    result = adapter.execute(q, {"l": lf, "r": rf})
+    assert result.columns.tolist() == ["id", "bucket"]
+    assert [
+        (int(k), v) for k, v in result.itertuples(index=False, name=None)
+    ] == expected
 
 
 @pytest.mark.parametrize("aliases", [False, True])

@@ -1,4 +1,4 @@
-"""Deterministic relational lowerings, copied from `adapters/lotus/relational.py` rather than shared."""
+"""Deterministic relational operations for the DocETL adapter."""
 
 from __future__ import annotations
 
@@ -9,7 +9,12 @@ from typing import Any, Literal
 import numpy as np
 import pandas as pd
 
-from agent_memory.adapters.docetl.dtypes import carry_integer_dtypes, nullable_integers, take_join_rows
+from agent_memory.adapters.docetl.dtypes import carry_integer_dtypes
+from agent_memory.adapters.frame_join import (
+    join_mixed_integer_keys,
+    mixed_integer_keys,
+    nullable_integers,
+)
 from agent_memory.policy.aggregates import (
     ArrayAggregateSpec,
     CollectListAggregateSpec,
@@ -263,15 +268,9 @@ def execute_join(
     _require_non_null_join_keys(left, keys, side="left")
     _require_non_null_join_keys(right, keys, side="right")
 
-    mixed = {
-        k for k in keys
-        if pd.api.types.is_integer_dtype(left[k].dtype)
-        and pd.api.types.is_integer_dtype(right[k].dtype)
-        and pd.api.types.is_unsigned_integer_dtype(left[k].dtype)
-        != pd.api.types.is_unsigned_integer_dtype(right[k].dtype)
-    }
+    mixed = mixed_integer_keys(left, right, keys)
     if mixed:
-        return _join_mixed_integer_keys(query, left, right, keys, mixed, how)
+        return join_mixed_integer_keys(left, right, keys, mixed, how, _join_suffixes(query))
 
     if how == "left_anti":
         if right.empty:
@@ -309,50 +308,6 @@ def execute_join(
     #   without checking whether the suffixed label is already taken.
     require_unique_published_columns(merged.columns, op=str(query.op))
     return carry_integer_dtypes(merged, carried, op=str(query.op))
-
-
-def _join_mixed_integer_keys(
-    query: QueryExpr, left: pd.DataFrame, right: pd.DataFrame,
-    keys: tuple[str, ...], mixed: set[str], how: _JoinHow,
-) -> pd.DataFrame:
-    """Match exact comparison keys, then gather the business columns by source position."""
-
-    def key_table(frame: pd.DataFrame, position: str) -> pd.DataFrame:
-        # A separate namespace: numbered keys and position tags cannot collide with user columns.
-        table = pd.DataFrame({
-            i: frame[k].astype(object) if k in mixed else frame[k]
-            for i, k in enumerate(keys)
-        })
-        table[position] = pd.array(range(len(frame)), dtype="Int64")
-        return table
-
-    on = list(range(len(keys)))
-    lhs, rhs = key_table(left, "L"), key_table(right, "R")
-    if how == "left_anti":
-        rhs = rhs.drop_duplicates(subset=on)
-    pairs = lhs.merge(rhs, on=on, how="left" if how == "left_anti" else how, sort=False)
-    if how == "left_anti":
-        return left.iloc[pairs.loc[pairs["R"].isna(), "L"].to_numpy(dtype=int)].reset_index(drop=True)
-
-    li = pd.Index(pairs["L"].fillna(-1), dtype="int64")
-    ri = pd.Index(pairs["R"].fillna(-1), dtype="int64")
-    a, b = take_join_rows(left, li), take_join_rows(right, ri)
-    for i, key in enumerate(keys):
-        if key not in mixed:
-            a[key] = pairs[i].array
-        elif how == "right" or (-1 in li and -1 not in ri):
-            a[key] = b[key].array
-        elif -1 in li:
-            # A full join may carry both negative integers and values too large for int64.
-            a[key] = a[key].astype(object).where(li != -1, b[key].astype(object))
-    shared = set(left.columns).intersection(right.columns).difference(keys)
-    ls, rs = _join_suffixes(query)
-    result = pd.concat([
-        a.rename(columns={k: f"{k}{ls}" for k in shared}),
-        b.drop(columns=list(keys)).rename(columns={k: f"{k}{rs}" for k in shared}),
-    ], axis=1)
-    require_unique_published_columns(tuple(result.columns), op=str(query.op))
-    return result
 
 
 def predicate_join_row_ids(

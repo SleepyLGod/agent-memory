@@ -20,48 +20,17 @@ checks integer columns after a relational merge. Joins with known source positio
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 from numbers import Integral
 from typing import Any
 
 import pandas as pd
 
-# A table, not a derivation: `to_numpy_dtype` and `numpy_dtype` disagree across pandas releases, and a
-#   wrong guess here is silent.
-_NULLABLE = {
-    "int8": "Int8",
-    "int16": "Int16",
-    "int32": "Int32",
-    "int64": "Int64",
-    "uint8": "UInt8",
-    "uint16": "UInt16",
-    "uint32": "UInt32",
-    "uint64": "UInt64",
-}
-
-
-def nullable_integers(frame: pd.DataFrame, columns: Iterable[str]) -> pd.DataFrame:
-    """Return `frame` with the integer columns among `columns` re-typed to their nullable twin.
-
-    Satisfies T2 before a `merge` that can introduce missing values, so nothing in the merge needs to
-    choose `float64`.
-    """
-
-    result = frame.copy()
-    for column in columns:
-        nullable = _NULLABLE.get(str(result[column].dtype))
-        if nullable is not None:
-            result[column] = result[column].astype(nullable)
-    return result
-
-
-def take_join_rows(source: pd.DataFrame, positions: pd.Index) -> pd.DataFrame:
-    """Gather original rows; -1 denotes a missing side of an outer join."""
-    if -1 not in positions:
-        return source.iloc[positions].reset_index(drop=True)
-    framed = nullable_integers(source, source.columns)
-    framed.index = pd.RangeIndex(len(source))
-    return framed.reindex(positions).reset_index(drop=True)
+from agent_memory.adapters.frame_join import (
+    NULLABLE_INTEGER_DTYPES,
+    nullable_integers as nullable_integers,
+    take_join_rows as take_join_rows,
+)
 
 
 def carry_integer_dtypes(
@@ -78,10 +47,10 @@ def carry_integer_dtypes(
     for column, source_dtype in source_dtypes.items():
         if column not in carried.columns:
             continue
-        nullable = _NULLABLE.get(str(source_dtype))
+        nullable = NULLABLE_INTEGER_DTYPES.get(str(source_dtype))
         if nullable is None:
             # Reason: a source that is already nullable (`Int64`, `UInt64`, ...) is an integer source
-            #   too, and `_NULLABLE` has no entry for it. Its own name is the target it returns to.
+            #   too. Its own name is the target it returns to.
             if not pd.api.types.is_integer_dtype(source_dtype):
                 continue
             nullable = str(source_dtype)
