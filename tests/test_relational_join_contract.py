@@ -24,6 +24,27 @@ def source(name: str, frame: pd.DataFrame) -> QueryExpr:
     )
 
 
+def test_predicate_join_uses_complete_alias(
+    adapter: LotusAdapter | DocetlAdapter,
+) -> None:
+    lf, rf = pd.DataFrame({"id": [7, 8]}), pd.DataFrame({"key": [8]})
+    left = Relation(source("l", lf)).alias("team:primary")
+    right = Relation(source("r", rf)).alias("other")
+    for ref in (ColumnExpr("id:team:primary"), left.col("id")):
+        result = adapter.execute(
+            left.join(right, on=ref == right.col("key")).expr, {"l": lf, "r": rf}
+        )
+        pd.testing.assert_frame_equal(
+            result, pd.DataFrame({"id:team:primary": [8], "key:other": [8]})
+        )
+    rf = pd.DataFrame({"id:team": [8]})
+    right = Relation(source("r", rf)).alias("primary")
+    with pytest.raises(ValueError, match="(?i)ambiguous.*id:team:primary"):
+        adapter.execute(
+            left.join(right, on=ColumnExpr("id:team:primary") == 8).expr, {"l": lf, "r": rf}
+        )
+
+
 @pytest.mark.parametrize("offset, count", [(0, 0), (1, 4)])
 def test_duplicate_mixed_integer_keys(
     adapter: LotusAdapter | DocetlAdapter, offset: int, count: int

@@ -39,6 +39,7 @@ from agent_memory.policy.expressions import (
 )
 from agent_memory.policy.logical import QueryExpr
 from agent_memory.adapters.frame_join import (
+    bind_join_columns,
     join_mixed_integer_keys,
     mixed_integer_keys,
 )
@@ -976,7 +977,7 @@ def _execute_predicate_join(
     left_alias = _relation_alias(query.inputs[0]) or "left"
     right_alias = _relation_alias(query.inputs[1]) or "right"
     sides = ((left_alias, left.columns), (right_alias, right.columns))
-    bound = tuple(expr_from_param(_bind_join_columns(p, sides)) for p in predicates)
+    bound = tuple(expr_from_param(bind_join_columns(p, sides)) for p in predicates)
 
     left_prepared = _rename_join_side(left, alias=left_alias)
     right_prepared = _rename_join_side(right, alias=right_alias)
@@ -1017,30 +1018,6 @@ def _rename_join_side(frame: Any, *, alias: str) -> Any:
 
     renamed = {column: f"{column}:{alias}" for column in frame.columns}
     return frame.rename(columns=renamed).copy()
-
-
-def _bind_join_columns(value: Any, sides: tuple[tuple[str, pd.Index], ...]) -> Any:
-    """Qualify column references before either pruning pairs or testing the predicate."""
-
-    if isinstance(value, (tuple, list)):
-        return tuple(_bind_join_columns(item, sides) for item in value)
-    if not isinstance(value, Mapping):
-        return value
-    if value.get("kind") != "column":
-        return {k: _bind_join_columns(v, sides) for k, v in value.items()}
-    name, qualifier = value["name"], value.get("qualifier")
-    matches = [alias for alias, cols in sides if name in cols and qualifier in (None, alias)]
-    if len(matches) > 1:
-        raise ValueError(f"Ambiguous join column {name!r}; qualify it with an alias")
-    if not matches:
-        if qualifier is None:
-            # A caller may also reference a published name literally, e.g. "id:left".
-            raw, sep, suffix = name.rpartition(":")
-            for alias, cols in sides:
-                if sep and suffix == alias and raw in cols:
-                    return {**value, "name": raw, "qualifier": alias}
-        raise ValueError(f"Column {name!r} not found in join inputs for qualifier {qualifier!r}")
-    return {**value, "qualifier": matches[0]}
 
 
 def _predicate_equality_pairs(

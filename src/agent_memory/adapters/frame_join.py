@@ -1,6 +1,7 @@
 """Shared dataframe helpers for relational joins."""
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
+from typing import Any
 
 import pandas as pd
 
@@ -103,3 +104,34 @@ def join_mixed_integer_keys(
     )
     require_unique_published_columns(tuple(result.columns), op="join")
     return result
+
+
+def bind_join_columns(value: Any, sides: tuple[tuple[str, pd.Index], ...]) -> Any:
+    """Qualify column references before either pruning pairs or testing the predicate."""
+
+    if isinstance(value, (tuple, list)):
+        return tuple(bind_join_columns(item, sides) for item in value)
+    if not isinstance(value, Mapping):
+        return value
+    if value.get("kind") != "column":
+        return {k: bind_join_columns(v, sides) for k, v in value.items()}
+    name, qualifier = value["name"], value.get("qualifier")
+    matches = [
+        (name, alias)
+        for alias, cols in sides
+        if name in cols and qualifier in (None, alias)
+    ]
+    if not matches and qualifier is None:
+        # A literal published name can contain colons in both its column and its alias.
+        for alias, cols in sides:
+            suffix = f":{alias}"
+            if name.endswith(suffix) and (raw := name.removesuffix(suffix)) in cols:
+                matches.append((raw, alias))
+    if len(matches) > 1:
+        raise ValueError(f"Ambiguous join column {name!r}; qualify it with an alias")
+    if not matches:
+        raise ValueError(
+            f"Column {name!r} not found in join inputs for qualifier {qualifier!r}"
+        )
+    raw, alias = matches[0]
+    return {**value, "name": raw, "qualifier": alias}
