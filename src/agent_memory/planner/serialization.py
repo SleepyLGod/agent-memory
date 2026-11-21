@@ -25,11 +25,14 @@ def stable_value(value: Any) -> Any:
     """Convert immutable query values into deterministic JSON data."""
 
     if isinstance(value, QueryExpr):
-        return {
+        node = {
             "op": value.op,
             "inputs": [stable_value(item) for item in value.inputs],
             "params": stable_value(value.params),
         }
+        if value.assignment_order:
+            node["assignment_order"] = list(value.assignment_order)
+        return node
     if isinstance(value, Mapping):
         return {
             str(key): stable_value(item)

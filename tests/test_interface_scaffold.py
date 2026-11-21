@@ -963,6 +963,22 @@ def test_process_window_builder_infers_join_suffix_columns() -> None:
     )
 
 
+# §6: suffixing may not republish a name a frame already carries. The left frame is what
+# an earlier join published, so its `name:left` is taken and `name` would suffix onto it.
+def test_a_join_that_would_publish_one_name_twice_is_refused() -> None:
+    earlier = am.Log(
+        {
+            "id": "Message id.",
+            "name": "Name.",
+            "name:left": "What an earlier join published.",
+        }
+    )
+    later = am.Log({"id": "Message id.", "name": "Name."})
+
+    with pytest.raises(ValueError, match="two columns"):
+        output_columns(earlier.join(later, on="id").expr)
+
+
 def test_process_window_builder_infers_sem_join_suffix_columns() -> None:
     log = am.Log(
         {
@@ -1384,8 +1400,46 @@ def test_differential_instruction_rewriter_rewrites_state_reaggregation_placehol
         )
 
 
-def test_differential_instruction_rewriter_ignores_non_column_braces() -> None:
-    instruction = "Keep {{name}} and {not a column} untouched, rewrite {name}."
+def test_differential_instruction_rewriter_refuses_a_non_column_brace() -> None:
+    """The rewriter reads the same grammar as the renderer, so it refuses what it refuses."""
+
+    with pytest.raises(ValueError, match="not a column"):
+        DifferentialInstructionRewriter().groupby_to_join(
+            "Keep {not a column} as written, rewrite {name}.",
+            input_cols=("name",),
+        )
+
+
+def test_differential_instruction_rewriter_qualifies_a_name_that_carries_a_segment() -> None:
+    """A whole column name is qualified like any other: here `fact:left` is a name."""
+
+    rewritten = DifferentialInstructionRewriter().agg_to_map(
+        "Compare {fact:left} with {fact}.",
+        input_cols=("fact", "fact:left"),
+        output_cols=(),
+    )
+
+    assert rewritten == (
+        "Compare {fact:left:left} and {fact:left:right} with "
+        "{fact:left} and {fact:right}."
+    )
+
+
+def test_differential_instruction_rewriter_keeps_literal_text_literal() -> None:
+    """A brace written as text comes back as text, doubled so it reads as text again."""
+
+    rewritten = DifferentialInstructionRewriter().groupby_to_join(
+        "Quote {{x}} and a lone } then {name}.",
+        input_cols=("name",),
+    )
+
+    assert rewritten == (
+        "Quote {{x}} and a lone }} then {name:left} and {name:right}."
+    )
+
+
+def test_differential_instruction_rewriter_keeps_an_escaped_brace_literal() -> None:
+    instruction = "Keep {{name}} and rewrite {name}."
 
     rewritten = DifferentialInstructionRewriter().groupby_to_join(
         instruction,
@@ -1393,7 +1447,6 @@ def test_differential_instruction_rewriter_ignores_non_column_braces() -> None:
     )
 
     assert "{{name}}" in rewritten
-    assert "{not a column}" in rewritten
     assert "{name:left} and {name:right}" in rewritten
 
 

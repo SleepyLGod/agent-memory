@@ -614,7 +614,11 @@ class Relation(RelationHandle):
         instruction: str,
         ordinal_col: str | None = None,
     ) -> "Relation":
-        """Add columns while allowing one input row to emit many output rows."""
+        """Add columns while allowing one input row to emit many output rows.
+
+        `ordinal_col`, when given, is filled by the backend: it numbers the rows one input row emitted, so
+        the instruction must not ask a model for it.
+        """
 
         normalized_output_cols = _normalize_output_cols(output_cols)
         if ordinal_col is not None:

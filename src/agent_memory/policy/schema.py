@@ -240,6 +240,29 @@ def output_columns(
     raise NotImplementedError(f"Cannot infer output columns for QueryExpr op {query.op!r}.")
 
 
+def require_unique_published_columns(
+    columns: Sequence[str],
+    *,
+    op: str,
+) -> tuple[str, ...]:
+    """Return `columns`, refusing a join that would publish one name twice (§6).
+
+    Suffixing can land on a label the other side already has, either because a frame
+    carries an earlier join's `name:left` or because a key keeps its plain name. One
+    column is never dropped, so the join is refused rather than repeating a label, or,
+    worse, letting one of the two answer a later reference.
+    """
+
+    published = tuple(str(column) for column in columns)
+    repeated = sorted({column for column in published if published.count(column) > 1})
+    if repeated:
+        raise ValueError(
+            f"{op} would publish a suffixed name as two columns: {repeated}; "
+            "suffixing a shared name may not overwrite a column the other side has"
+        )
+    return published
+
+
 def join_output_columns(
     query: QueryExpr,
     *,
@@ -258,8 +281,8 @@ def join_output_columns(
         window_source_columns=window_source_columns,
     )
     keys = _join_key_columns(query.params["on"])
-    left_alias = _relation_alias(query.inputs[0])
-    right_alias = _relation_alias(query.inputs[1])
+    left_alias = relation_alias(query.inputs[0])
+    right_alias = relation_alias(query.inputs[1])
     overlapping = set(left_columns).intersection(right_columns).difference(keys)
     predicate_join = not keys
 
@@ -284,7 +307,7 @@ def join_output_columns(
                 should_suffix=predicate_join or column in overlapping,
             )
         )
-    return tuple(columns)
+    return require_unique_published_columns(columns, op="join")
 
 
 def semantic_join_columns(
@@ -309,9 +332,10 @@ def semantic_join_columns(
         columns.append(f"{column}:left" if column in overlapping else column)
     for column in right_columns:
         columns.append(f"{column}:right" if column in overlapping else column)
-    for column in query.params.get("id_columns", ()):
-        columns.append(str(column))
-    return tuple(columns)
+    # the suffixing is what this rule is about; an id column is checked against the published
+    # set by the executor that appends it
+    published = require_unique_published_columns(columns, op="sem_join")
+    return (*published, *(str(column) for column in query.params.get("id_columns", ())))
 
 
 def _column_names(columns: object) -> tuple[str, ...]:
@@ -374,8 +398,12 @@ def _join_key_columns(on: object) -> tuple[str, ...]:
     return ()
 
 
-def _relation_alias(query: QueryExpr) -> str | None:
-    """Return a relation alias name if present."""
+def relation_alias(query: QueryExpr) -> str | None:
+    """Return the alias a `QueryExpr` carries, or None when it is not an alias marker.
+
+    One reader for both halves of the join naming: the plan-time suffixes here and the
+    prompts an adapter builds from the same expression.
+    """
 
     if query.op == "alias":
         name = query.params.get("name")

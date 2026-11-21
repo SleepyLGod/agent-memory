@@ -32,6 +32,7 @@ from agent_memory.adapters.lotus.structured import (
 from agent_memory.policy.logical import ColumnSpec, QueryExpr
 from agent_memory.policy.schema import output_columns
 from agent_memory.runtime.window import over_frames
+from agent_memory.adapters.frame_values import exact_series
 
 JSON_OBJECT_RESPONSE_FORMAT = {"type": "json_object"}
 
@@ -116,13 +117,11 @@ def execute_over_sem_agg(
         if isinstance(frame_source_query, QueryExpr)
         else emit_source
     )
-    rows: list[dict[str, Any]] = []
+    columns: dict[str, list[Any]] = {column.name: [] for column in output_cols}
     for frame in over_frames(emit_source, frame_source, over_query.params):
-        row = frame.emit_row.loc[list(emit_columns)].to_dict()
         if frame.frame.empty:
-            for column in output_cols:
-                row[column.name] = None
-            rows.append(row)
+            for values in columns.values():
+                values.append(None)
             continue
 
         input_cols = aggregate_input_columns(
@@ -144,14 +143,12 @@ def execute_over_sem_agg(
                 output_cols,
                 context.config,
             )
-        values = result.iloc[0].to_dict() if not result.empty else {}
-        for column in output_cols:
-            row[column.name] = values.get(column.name)
-        rows.append(row)
-    return pd.DataFrame(
-        rows,
-        columns=[*emit_columns, *(column.name for column in output_cols)],
-    )
+        for name, values in columns.items():
+            values.append(result[name].iat[0] if not result.empty and name in result else None)
+    output = emit_source.loc[:, list(emit_columns)].reset_index(drop=True)
+    for name, values in columns.items():
+        output[name] = exact_series(values)
+    return output
 
 
 def execute_native_sem_agg(

@@ -203,13 +203,13 @@ def test_aggregate_plan_fingerprint_is_stable_and_builtin_defaults_are_pinned() 
     )
     assert (
         am.ClaudeMemory.differentiate_policy().fingerprint
-        == "625a53555e82e283d04576eacf7e937c590b546a485bcccc6224d3b8c4dae5fe"
+        == "a9a0baba0d84c36c52d23e6660e350c6ed7ceb6cc781159744a944e961123499"
     )
     assert (
         am.ZepMemory.differentiate_policy().fingerprint
-        == "9d1cb107ef677e9624dffeb22399dd6edd7eb6d058e4a37da26c61c2a8e64059"
+        == "6d44dbec28313b49a6ffe8cac7084fa3d07a29fdbba8551804a8781543933ec0"
     )
     assert (
         am.Mem0Memory.differentiate_policy().fingerprint
-        == "d904fdb2fbd64ffdbaef65de51fb7f366c29b7ebbd05ba5194e909725b7f2d28"
+        == "2d1fc2286b50dd11c028f3a35f0a0850bd02c5bb41565ddd6ecd9fe4add9f26f"
     )

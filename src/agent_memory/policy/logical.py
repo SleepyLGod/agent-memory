@@ -69,13 +69,19 @@ class QueryExpr:
     op: str
     inputs: tuple["QueryExpr", ...] = ()
     params: Mapping[str, Any] = field(default_factory=dict)
+    assignment_order: tuple[str, ...] = field(default=(), init=False, repr=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "inputs", tuple(self.inputs))
         object.__setattr__(self, "params", _freeze_param(self.params))
+        if self.op == "assign":
+            assignments = self.params.get("assignments")
+            if isinstance(assignments, Mapping) and len(assignments) > 1:
+                # Later assignments can read columns written by earlier ones.
+                object.__setattr__(self, "assignment_order", tuple(assignments))
 
     def __hash__(self) -> int:
-        return hash((self.op, self.inputs, _hashable_param(self.params)))
+        return hash((self.op, self.inputs, _hashable_param(self.params), self.assignment_order))
 
 
 @dataclass(frozen=True)

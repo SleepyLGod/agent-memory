@@ -34,7 +34,6 @@ class OverFrame:
     """One over-window frame for an emitted source row."""
 
     emit_position: int
-    emit_row: pd.Series
     frame: pd.DataFrame
 
 
@@ -124,7 +123,7 @@ def over_frames(
         return []
     positions = _emit_positions(emit, source)
     frames: list[OverFrame] = []
-    for emit_index, source_position in enumerate(positions):
+    for source_position in positions:
         frame_start = max(0, source_position + start_offset)
         frame_end = min(len(source), source_position + end_offset + 1)
         if frame_end < frame_start:
@@ -132,7 +131,6 @@ def over_frames(
         frames.append(
             OverFrame(
                 emit_position=source_position,
-                emit_row=emit.iloc[emit_index].copy(),
                 frame=source.iloc[frame_start:frame_end].reset_index(drop=True).copy(),
             )
         )
@@ -165,8 +163,8 @@ def _frames_equal_by_value(left: pd.DataFrame, right: pd.DataFrame) -> bool:
         return False
     for row_index in range(len(left)):
         for column in left.columns:
-            if _normalize_cell(left.iloc[row_index][column]) != _normalize_cell(
-                right.iloc[row_index][column]
+            if _normalize_cell(left[column].iat[row_index]) != _normalize_cell(
+                right[column].iat[row_index]
             ):
                 return False
     return True
