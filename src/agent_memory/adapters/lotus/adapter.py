@@ -142,6 +142,14 @@ class LotusAdapter:
         """Execute a logical query expression through LOTUS."""
 
         match query.op:
+            case "semantic_stateful_update":
+                from .stateful import execute_stateful
+
+                return self._execute_traced_semantic(query, inputs, execute_stateful)
+            case "semantic_stateful_finalize":
+                from .stateful import finalize_stateful
+
+                return finalize_stateful(query, inputs, self.execute)
             case "semantic_composable_update":
                 from .composable import execute_composable
 

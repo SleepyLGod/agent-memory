@@ -2,6 +2,8 @@
 
 from .api import CountRefresh, Memory, Message
 from .dataflow import SemanticDataflow, Source
+from .maintenance import MaintenancePlan
+from .planning import plan_maintenance
 from .memories import (
     ClaudeMemory,
     Mem0Memory,
@@ -47,6 +49,8 @@ __all__ = [
     "Mem0Memory",
     "Mem0MemoryEnhanced",
     "Memory",
+    "MaintenancePlan",
+    "plan_maintenance",
     "Message",
     "RRF",
     "Relation",

@@ -36,7 +36,8 @@ class QueryDifferentiator:
     def groupby_join_instruction(self, query: QueryExpr) -> str:
         """Bind the configured grouping-to-join rewrite into a maintenance plan."""
         return self._instruction_rewriter.groupby_to_join(
-            str(query.params["instruction"]),
+            "The two records share a group under this criterion:\n"
+            + str(query.params["instruction"]),
             input_cols=tuple(query.params["input_cols"]),
         )
 

@@ -22,6 +22,7 @@ from agent_memory.adapters.lotus.sem_agg_batch_prompting import (
 from agent_memory.adapters.lotus.prompt_batching import PromptBatching
 from agent_memory.adapters.lotus.structured import (
     StructuredLMRetryResult,
+    complete_lm_outputs,
     escape_structured_formatter_placeholders,
     execute_structured_lm_retry_result,
     parse_structured_object_json,
@@ -783,12 +784,9 @@ def _execute_independent_sem_agg_groups(
                 regular_prompts,
                 progress_bar_desc=config.sem_agg_progress_bar_desc,
             )
-            raw_outputs = [str(value) for value in regular_output.outputs]
-            if len(raw_outputs) != len(regular_prompts):
-                raise ValueError(
-                    "sem_agg provider batch returned an unexpected number of "
-                    f"outputs: expected {len(regular_prompts)}, got {len(raw_outputs)}"
-                )
+            raw_outputs = complete_lm_outputs(
+                regular_output, len(regular_prompts), operator="sem_agg"
+            )
             outputs_by_group: dict[int, list[str]] = {
                 group_index: [""] * count
                 for group_index, count in regular_counts.items()
@@ -1098,7 +1096,7 @@ def _execute_lotus_style_sem_agg(
                 progress_bar_desc=progress_bar_desc,
                 **model_kwargs,
             )
-            summaries = [str(output) for output in lm_output.outputs]
+            summaries = complete_lm_outputs(lm_output, len(batch), operator="sem_agg")
         doc_list = summaries
         current_partition_ids = new_partition_ids
         lotus.logger.debug(f"Model outputs from tree level {tree_level}: {summaries}")

@@ -32,7 +32,11 @@ def output_columns(
             str(column)
             for column in query.params.get("columns", window_source_columns or ())
         )
-    if query.op == "materialized_view":
+    if query.op in {
+        "materialized_view",
+        "semantic_stateful_update",
+        "semantic_stateful_finalize",
+    }:
         return tuple(str(column) for column in query.params.get("columns", ()))
     if query.op == "search":
         source_columns = output_columns(

@@ -7,6 +7,7 @@ import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
+from typing import TYPE_CHECKING
 from agent_memory.policy.aggregates import SemanticAggregateSpec
 from agent_memory.policy.logical import MemorySpec, MemoryView, QueryExpr
 from agent_memory.policy.retrieval import RetrievalQuery
@@ -26,6 +27,9 @@ from agent_memory.planner.rules import (
     DifferentialRules,
 )
 from agent_memory.storage.statements import StatementSet
+
+if TYPE_CHECKING:
+    from agent_memory.maintenance import MaintenancePlan
 
 _GROUP_CARRIERS = {"group_by", "sem_groupby"}
 _ROW_LOCAL_SEMANTIC_OPS = {"sem_filter", "sem_map", "sem_flat_map"}
@@ -84,6 +88,7 @@ class PolicyDifferentiator:
         self._sem_groupby_rule = (
             "group-fallback" if rules is None else rules.sem_groupby_rule
         )
+        self._maintenance_plans = () if rules is None else rules.maintenance_plans
 
     def differentiate(
         self,
@@ -102,7 +107,10 @@ class PolicyDifferentiator:
             sink_outputs,
             fingerprint,
         ) = _DifferentialPolicyBuilder(
-            self._query_differentiator, self._sem_agg_rule, self._sem_groupby_rule
+            self._query_differentiator,
+            self._sem_agg_rule,
+            self._sem_groupby_rule,
+            self._maintenance_plans,
         ).build(
             spec,
             view_execution_order=view_order,
@@ -138,10 +146,13 @@ class _DifferentialPolicyBuilder:
         query_differentiator: QueryDifferentiator,
         sem_agg_rule: str | None = None,
         sem_groupby_rule: str = "group-fallback",
+        maintenance_plans: tuple[MaintenancePlan, ...] = (),
     ) -> None:
         self._query_differentiator = query_differentiator
         self._sem_agg_rule = sem_agg_rule
         self._sem_groupby_rule = sem_groupby_rule
+        self._maintenance_plans = {plan.key: plan for plan in maintenance_plans}
+        self._used_plans: set[tuple[str, int]] = set()
         self._nodes: dict[str, DifferentialNode] = {}
         self._node_queries: dict[str, QueryExpr] = {}
         self._query_nodes: dict[QueryExpr, str] = {}
@@ -170,6 +181,7 @@ class _DifferentialPolicyBuilder:
         self._execution_order = []
         self._view_nodes = {}
         self._sink_nodes = {}
+        self._used_plans = set()
 
         for view_name in view_execution_order:
             self._view_nodes[view_name] = self._compile_query(
@@ -184,6 +196,8 @@ class _DifferentialPolicyBuilder:
                     spec=spec,
                 )
 
+        if set(self._maintenance_plans) != self._used_plans:
+            raise ValueError("maintenance plan target is not present in this policy")
         fingerprint = _plan_fingerprint(
             self._nodes,
             self._execution_order,
@@ -229,11 +243,40 @@ class _DifferentialPolicyBuilder:
             raise NotImplementedError(
                 "Search is retrieval-only and cannot be maintained as a view or storage sink"
             )
+        from agent_memory.maintenance import target_key
+
+        binding_key = target_key(query) if self._maintenance_plans else None
+        bound = (
+            {
+                index: plan
+                for (key, index), plan in self._maintenance_plans.items()
+                if key == binding_key
+            }
+            if self._maintenance_plans
+            else {}
+        )
+        if bound:
+            self._used_plans.update(plan.key for plan in bound.values())
+            task_count = len(query.params["aggregates"]) if query.op == "agg" else 1
+            if set(bound) != set(range(task_count)):
+                raise NotImplementedError(
+                    "bind a plan for every semantic aggregate descriptor"
+                )
+            if len({plan.rule for plan in bound.values()}) != 1:
+                raise NotImplementedError(
+                    "aggregate descriptors must use the same maintenance rule"
+                )
+            if bound[0].rule.endswith("-state"):
+                return self._compile_stateful(query, spec=spec, plans=bound)
         independent = query.op == "sem_groupby" and query.params.get("independent")
-        fallback = query.params.get("maintenance_rule") == "agg-fallback" or (
-            query.op == "sem_agg"
-            and self._sem_agg_rule in {"agg-fallback", "agg-composable"}
-            and query.inputs[0].op not in _GROUP_CARRIERS | {"over"}
+        fallback = (
+            (bool(bound) and not independent)
+            or query.params.get("maintenance_rule") == "agg-fallback"
+            or (
+                query.op == "sem_agg"
+                and self._sem_agg_rule in {"agg-fallback", "agg-composable"}
+                and query.inputs[0].op not in _GROUP_CARRIERS | {"over"}
+            )
         )
         if independent or fallback:
             from agent_memory.policy.grouping import normalize_fallback
@@ -252,7 +295,22 @@ class _DifferentialPolicyBuilder:
             local = QueryExpr(op=query.op, inputs=(local_input,), params=query.params)
             if fallback:
                 local = normalize_fallback(local)
-            rule = self._sem_groupby_rule if independent else self._sem_agg_rule
+            rule = (
+                bound[0].rule
+                if bound
+                else (self._sem_groupby_rule if independent else self._sem_agg_rule)
+            )
+            if bound:
+                local = QueryExpr(
+                    op=local.op,
+                    inputs=local.inputs,
+                    params={
+                        **local.params,
+                        "maintenance_config": tuple(
+                            bound[i].to_dict() for i in sorted(bound)
+                        ),
+                    },
+                )
             composable = rule in {"group-composable", "agg-composable"}
             maintenance = None
             if composable:
@@ -379,7 +437,82 @@ class _DifferentialPolicyBuilder:
         return node.execution_kind in {
             "semantic_fallback",
             "semantic_composable",
+            "semantic_stateful",
         } or any(self._has_fallback(parent) for parent in node.input_node_ids)
+
+    def _compile_stateful(
+        self, query: QueryExpr, *, spec: MemorySpec, plans: Mapping[int, MaintenancePlan]
+    ) -> str:
+        """Separate private result/state from the published user relation."""
+        from agent_memory.policy.grouping import normalize_fallback
+
+        grouped = query.inputs[0]
+        carrier = grouped.op == "group_by"
+        parent = self._compile_query(
+            grouped.inputs[0] if carrier else grouped, spec=spec
+        )
+        leaf = self._node_leaf(parent)
+        local_input = (
+            QueryExpr(op="group_by", inputs=(leaf,), params=grouped.params)
+            if carrier
+            else leaf
+        )
+        local = normalize_fallback(
+            QueryExpr(op=query.op, inputs=(local_input,), params=query.params)
+        )
+        configs = tuple(plans[i].to_dict() for i in sorted(plans))
+        state_columns = ("_scope", "_slot", "_result", "_state")
+        state_query = QueryExpr(
+            op="semantic_stateful_update",
+            inputs=(local,),
+            params={
+                "plans": configs,
+                "columns": state_columns,
+            },
+        )
+        state_id = self._node_id(state_query)
+        maintenance = QueryExpr(
+            op=state_query.op,
+            inputs=(local,),
+            params={
+                **state_query.params,
+                "parent": parent,
+                "previous": state_id,
+            },
+        )
+        if state_query not in self._query_nodes:
+            self._register(
+                state_query,
+                DifferentialNode(
+                    node_id=state_id,
+                    query=state_query,
+                    input_node_ids=(parent,),
+                    execution_kind="semantic_stateful",
+                    output_columns=state_columns,
+                    maintenance_query=maintenance,
+                ),
+            )
+        grouping = query.op == "sem_groupby"
+        final = QueryExpr(
+            op="semantic_stateful_finalize",
+            inputs=(self._node_leaf(state_id), leaf)
+            if grouping
+            else (self._node_leaf(state_id),),
+            params={
+                "columns": output_columns(local),
+                "grouping": grouping,
+                "group_keys": tuple(grouped.params["keys"]) if carrier else (),
+            },
+        )
+        return self._register(
+            query,
+            self._make_node(
+                query=query,
+                local_query=final,
+                input_node_ids=(state_id, parent) if grouping else (state_id,),
+                execution_kind="deterministic",
+            ),
+        )
 
     def _compile_algebraic_aggregate(
         self,

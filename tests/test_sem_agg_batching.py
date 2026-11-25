@@ -69,16 +69,21 @@ class _BudgetModel(_RecordingModel):
         return 100 if "oversized" in text else 4
 
 
-def _run_local_aggregate(path: str, documents: list[str], model: _RecordingModel) -> None:
+def _run_local_aggregate(
+    path: str, documents: list[str], model: _RecordingModel, *, structured: bool = False,
+) -> None:
+    output_cols = (ColumnSpec("summary"),) if structured else None
     if path == "independent":
         _execute_independent_sem_agg_groups(
             [documents], model, "Summarize.", config=LotusExecutionConfig(),
+            output_cols=output_cols,
         )
     else:
         _execute_lotus_style_sem_agg(
             documents, model, "Summarize.", [0] * len(documents),
             safe_mode=False, progress_bar_desc="Test", response_format=None,
             final_model_kwargs=None,
+            structured_output_cols=output_cols,
         )
 
 
@@ -98,6 +103,46 @@ def test_local_aggregate_rejects_oversized_summary_at_next_level(path: str) -> N
     model = _BudgetModel(outputs=[("oversized", "summary")])
     with pytest.raises(ValueError, match="sem_agg document does not fit"):
         _run_local_aggregate(path, ["one", "two", "three"], model)
+    assert len(model.calls) == 1
+    assert len(model.calls[0][0]) == 2
+
+
+@pytest.mark.parametrize("path", ["independent", "lotus-style"])
+@pytest.mark.parametrize("documents", [["one"], ["one", "two", "three"]])
+@pytest.mark.parametrize("failure", ["truncated", "count"])
+@pytest.mark.parametrize("structured", [False, True])
+def test_local_aggregate_stops_before_using_incomplete_output(
+    path: str, documents: list[str], failure: str, structured: bool,
+) -> None:
+    class IncompleteModel(_BudgetModel):
+        def __call__(self, prompts: list[Any], **kwargs: Any) -> Any:
+            output = super().__call__(prompts, **kwargs)
+            if failure == "count":
+                output.outputs = []
+            else:
+                output.response_metadata = [{"finish_reason": "length"}] * len(prompts)
+            return output
+
+    model = IncompleteModel()
+    with pytest.raises(ValueError, match="incomplete structured response|expected .* outputs"):
+        _run_local_aggregate(path, documents, model, structured=structured)
+    assert len(model.calls) == 1
+
+
+def test_cross_group_batch_rejects_one_truncated_response() -> None:
+    class IncompleteModel(_RecordingModel):
+        def __call__(self, prompts: list[Any], **kwargs: Any) -> Any:
+            output = super().__call__(prompts, **kwargs)
+            output.response_metadata = [
+                {"finish_reason": "stop"}, {"finish_reason": "length"},
+            ]
+            return output
+
+    model = IncompleteModel()
+    with pytest.raises(ValueError, match="incomplete structured response"):
+        _execute_independent_sem_agg_groups(
+            [["alpha"], ["beta"]], model, "Summarize.", config=LotusExecutionConfig(),
+        )
     assert len(model.calls) == 1
     assert len(model.calls[0][0]) == 2
 

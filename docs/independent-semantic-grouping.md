@@ -4,6 +4,10 @@ New `sem_groupby` calls produce a readable membership relation. By default they
 use full recomputation on changed input. Composable maintenance is an explicit
 rule choice; neither path uses an agent or auxiliary semantic state.
 
+Explicit Agent planning and the additional `agg-state`/`group-state` paths are
+documented separately in [stage-three state maintenance](stateful-semantic-maintenance.md).
+They do not change the fallback or composable defaults described here.
+
 ## Phase two: explicit composable rules
 
 Stage two is implemented and locally validated. On 2026-11-04 the complete
@@ -65,10 +69,13 @@ not an equality test. Regressions cover composite keys, missing values, C-limit
 rollback, previous aggregate reuse, and downstream fallback when the runtime
 emits dtype-related replacement rows.
 
-The configured grouping-to-join instruction rewriter runs during compilation.
-Its result is stored in the maintenance plan and fingerprint; execution does not
-create a fresh default rewriter. Different conditions cannot silently share a
-restored snapshot. Existing legacy rewrite hooks and rules are unchanged.
+For independent composable grouping, compilation wraps the original criterion
+with "The two records share a group under this criterion" before applying the
+configured grouping-to-join instruction rewriter. This supplies the comparison
+action without changing the user's grouping criterion. The result is stored in
+the maintenance plan and fingerprint; execution does not create a fresh default
+rewriter. Different conditions cannot silently share a restored snapshot.
+Existing legacy rewrite hooks and rules are unchanged.
 
 ### Separate Claude experiment
 
@@ -242,8 +249,9 @@ zero rows with the complete schema. Multiple membership does not require each
 record to join C groups. C participates in the plan fingerprint and every fallback.
 
 The operator reuses the LOTUS default system formatter and existing structured
-executor. It preserves the user instruction and adds only record numbering,
-coverage, membership and target-count constraints. The model returns integer
+executor. It preserves the user instruction, explicitly asks to group records
+under that criterion, and adds record numbering, coverage, membership and
+target-count constraints. The model returns integer
 memberships, not original text or descriptions:
 
 ```json
@@ -268,7 +276,8 @@ Count/over windows also cannot consume fallback retractions. The grouping
 contract, resolved inputs and selected rule participate in plan fingerprints;
 incompatible snapshots (including pre-repair new-path plans) are rejected rather
 than silently migrated.
-Source deletion, state-assisted maintenance and agent planning are out of scope.
+Source deletion remains out of scope. State-assisted maintenance and explicit Agent
+planning are separate opt-in paths described in the stage-three document above.
 
 The regression examples are synthetic contract tests, not a benchmark. Offline
 mock tests establish execution and validation behavior, not semantic accuracy.

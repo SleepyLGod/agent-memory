@@ -62,6 +62,7 @@ class LotusExecutionConfig:
     # Fixed per-request ceiling for structured output, independent of task count.
     structured_max_tokens: int = DEFAULT_STRUCTURED_MAX_TOKENS
     structured_parse_retries: int = DEFAULT_STRUCTURED_PARSE_RETRIES
+    maintenance_parse_retries: int = 0
     semantic_trace_dir: Path | str | None = None
     semantic_trace_snapshot_mode: str = "compact"
     semantic_pair_profiles: Mapping[str, SemanticPairExecutionProfile] = field(

@@ -12,11 +12,13 @@ from typing import Any, Literal, TypeAlias
 from uuid import uuid4
 
 import pandas as pd
+from jsonschema.exceptions import ValidationError
 from lotus.cache import operator_cache
 
 from agent_memory.adapters.lotus.context import (
     DEFAULT_STRUCTURED_MAX_TOKENS,
     DEFAULT_STRUCTURED_PARSE_RETRIES,
+    LotusExecutionConfig,
 )
 from agent_memory.adapters.lotus.json_output import (
     load_structured_json_with_syntax_repair,
@@ -493,6 +495,7 @@ class StructuredLMExecutor:
         prompt_batching: PromptBatching | None = None,
         structured_output_transport: str = "chat-json-object",
         format_example: Mapping[str, StructuredScalar] | None = None,
+        output_validator: Callable[[str], None] | None = None,
     ) -> StructuredGenerationResult:
         """Run a structured LOTUS-backed LM batch and parse JSON outputs."""
 
@@ -583,6 +586,8 @@ class StructuredLMExecutor:
         current_max_tokens = int(getattr(lotus.settings.lm, "max_tokens", 512) or 512)
         max_tokens = max(current_max_tokens, structured_max_tokens)
         if prompt_batching is not None:
+            if output_validator is not None:
+                raise ValueError("Custom output validation requires individual prompts")
             execution = _execute_structured_prompt_batches(
                 prompts,
                 model=lotus.settings.lm,
@@ -662,6 +667,7 @@ class StructuredLMExecutor:
             require_explanation=require_explanation and shape == "object",
             operator=operator,
             max_retries=structured_parse_retries,
+            output_validator=output_validator,
         )
         audit_rows = structured_generation_audit_rows(
             source=self._obj,
@@ -685,6 +691,8 @@ class StructuredLMExecutor:
             snapshots={"input": self._obj.loc[:, list(input_cols)].copy()},
         )
         if retry_result.invalid_indices:
+            if output_validator is not None:
+                output_validator(retry_result.raw_outputs[retry_result.invalid_indices[0]])
             raise_structured_lm_retry_error(
                 retry_result,
                 output_cols=output_cols,
@@ -1051,6 +1059,90 @@ def complete_lm_outputs(
     return raw_outputs
 
 
+def execute_schema_lm(
+    *,
+    context: Mapping[str, Any],
+    instruction: str,
+    requirements: str,
+    schema: Mapping[str, Any],
+    config: LotusExecutionConfig,
+    operator: str,
+    examples: Sequence[tuple[Mapping[str, Any], Mapping[str, Any]]] = (),
+    validate_output: Callable[[dict[str, Any]], None] | None = None,
+    max_retries: int = 0,
+) -> dict[str, Any]:
+    """Run a typed JSON task using the configured strict validation retries.
+
+    This explicit-schema path does not change the existing scalar formatter.
+    Callers configure the LM and supply only the inputs allowed by their rule.
+    """
+    import lotus
+    from lotus.templates import task_instructions
+    from agent_memory.maintenance import validate_json
+    from agent_memory.planner.serialization import stable_value
+    from .json_output import strict_json_loads
+    from .relational import _json_default
+
+    model = lotus.settings.lm
+    if model is None:
+        raise ValueError("explicit-schema execution requires a configured model")
+    schema = stable_value(schema)
+    task = (
+        instruction
+        + "\n\nOperator requirements:\n"
+        + requirements
+        + "\n\nReturn only a JSON object matching the response schema.\n\nResponse schema:\n"
+        + json.dumps(schema, ensure_ascii=False)
+    )
+    messages = task_instructions.map_formatter(
+        model,
+        {"text": json.dumps(
+            context, ensure_ascii=False, allow_nan=False, default=_json_default
+        )},
+        task,
+        examples_multimodal_data=[
+            {"text": json.dumps(
+                c, ensure_ascii=False, allow_nan=False, default=_json_default
+            )} for c, _ in examples
+        ]
+        or None,
+        examples_answer=[json.dumps(a, ensure_ascii=False) for _, a in examples]
+        or None,
+    )
+    max_tokens = max(int(model.max_tokens or 512), config.structured_max_tokens)
+    if model.count_tokens(messages) + max_tokens > model.max_ctx_len:
+        raise ValueError(f"{operator} exceeds the model context limit")
+    response_format = {"type": "json_object"}
+    if config.structured_output_transport == "responses-json-schema":
+        response_format = {
+            "type": "json_schema",
+            "json_schema": {"name": "maintenance_output", "schema": schema},
+        }
+    parsed: dict[str, Any] = {}
+
+    def validate(raw: str) -> None:
+        nonlocal parsed
+        value = strict_json_loads(raw)
+        validate_json(value, schema)
+        if not isinstance(value, dict):
+            raise ValueError("maintenance response must be a JSON object")
+        if validate_output is not None:
+            validate_output(value)
+        parsed = value
+
+    result = execute_structured_lm_retry_result(
+        model, [messages],
+        lm_kwargs={"progress_bar_desc": operator, "max_tokens": max_tokens,
+                   "response_format": response_format},
+        output_cols=(), shape="object", require_explanation=False,
+        operator=operator, max_retries=max_retries,
+        output_validator=validate,
+    )
+    if result.invalid_indices:
+        validate(result.raw_outputs[0])
+    return parsed
+
+
 def execute_structured_lm_retry_result(
     model: Any,
     prompts: Sequence[Any],
@@ -1325,7 +1417,7 @@ def structured_parse_error(
             require_explanation=require_explanation,
             operator=operator,
         )
-    except ValueError as error:
+    except (ValueError, ValidationError) as error:
         return str(error)
     return "structured output unexpectedly parsed successfully"
 
@@ -1353,7 +1445,7 @@ def invalid_structured_output_indices(
                 require_explanation=require_explanation,
                 operator=operator,
             )
-        except ValueError:
+        except (ValueError, ValidationError):
             invalid.append(index)
     return invalid
 

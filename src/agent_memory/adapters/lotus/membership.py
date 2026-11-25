@@ -9,6 +9,7 @@ import pandas as pd
 from agent_memory.policy.grouping import GROUP_ID, RECORD_ID
 from agent_memory.policy.logical import ColumnSpec, QueryExpr
 from .context import LotusExecutionContext
+from .json_output import strict_json_loads
 from .structured import StructuredLMExecutor
 
 
@@ -104,12 +105,21 @@ def execute_memberships(
                 f"The target number of groups is {C}. Aim for {C} groups; "
                 "fewer nonempty groups are allowed, but do not exceed the target. "
             )
+        def validate_output(raw: str) -> None:
+            value = strict_json_loads(raw)
+            if not isinstance(value, dict) or set(value) != {"rows"} or not isinstance(value["rows"], list):
+                raise ValueError("grouping requires a JSON object with a rows array")
+            if any(not isinstance(row, dict) or set(row) != {"record", "group"} for row in value["rows"]):
+                raise ValueError("grouping rows require only record and group fields")
+            validate_memberships(value["rows"], len(part), query.params["membership"], C)
+
         generated = StructuredLMExecutor(payload)(
             input_cols=("records",),
             output_cols=output,
             shape="array",
             instruction=(
-                str(query.params["instruction"]).replace("{", "{{").replace("}", "}}")
+                "Group the input records according to this criterion:\n"
+                + str(query.params["instruction"]).replace("{", "{{").replace("}", "}}")
                 + "\n\n" + constraints + "\nInput records: {records}"
             ),
             format_example={"record": 0, "group": 0},
@@ -119,7 +129,9 @@ def execute_memberships(
             structured_parse_retries=context.config.structured_parse_retries,
             structured_output_transport=context.config.structured_output_transport,
             operator="sem_groupby",
+            output_validator=validate_output,
         )
+        # Cached generations skip the request validator; validate before materializing too.
         positions, numbers = validate_memberships(
             generated.parsed_outputs[0], len(part), query.params["membership"], C
         )

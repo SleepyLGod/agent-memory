@@ -128,6 +128,14 @@ class MemoryRuntime:
                 raise NotImplementedError(
                     "schema-v1 checkpoints cannot be restored with storage"
                 )
+            if any(
+                node.execution_kind == "semantic_stateful"
+                or "maintenance_config" in node.query.params
+                for node in self.policy.nodes.values()
+            ):
+                raise ValueError(
+                    "schema-v1 checkpoints cannot restore bound maintenance plans"
+                )
             legacy_policy = differentiate_legacy_policy(
                 self.policy.spec,
                 grouped_agg_rule=self.policy.grouped_agg_rule,

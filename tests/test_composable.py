@@ -116,6 +116,7 @@ def test_group_incremental_numeric_and_restore(
     assert flow.view("metrics").n.sum() == len(new)
     assert len(aggregates) == (4 if membership == "multiple" else 3)
     assert list(joins[0][0].columns) == ["message", "amount"]
+    assert joins[0][3] == "The two records share a group under this criterion:\nGroup issues"
     restored = create()
     restored.restore_state(flow.snapshot_state())
     batch = pd.DataFrame({"message": ["quality"], "amount": [8]})

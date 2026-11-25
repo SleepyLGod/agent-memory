@@ -56,6 +56,7 @@ def fake_model(monkeypatch):
                             group=("shipping", "quality").index(label),
                         )
                     )
+            kwargs["output_validator"](json.dumps({"rows": rows}))
             return SimpleNamespace(parsed_outputs=[rows])
 
     monkeypatch.setattr(impl, "StructuredLMExecutor", Fake)
@@ -1037,7 +1038,7 @@ def test_low_level_model_response_through_real_parser_and_adapters(
     user_prompt = "\n".join(
         message["content"] for message in prompt if message["role"] == "user"
     )
-    assert instruction in user_prompt
+    assert f"Group the input records according to this criterion:\n{instruction}" in user_prompt
     assert ("exactly one" if membership == "single" else "one or more") in user_prompt
     assert '{"rows": [{"record": 0, "group": 0}]}' in user_prompt
     assert '"record": "string"' not in user_prompt
