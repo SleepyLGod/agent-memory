@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 
-from agent_memory.tracing.semantic import write_provider_usage_trace
+from agent_memory.tracing.semantic import normalized_provider_usage, write_provider_usage_trace
 
 LOGGER = logging.getLogger(__name__)
 
@@ -21,6 +22,14 @@ SAFE_PROVIDER_KWARGS = {
 }
 
 
+@dataclass
+class ProviderCallUsage:
+    """Actual uncached response usage and confirmed local cache hits for one call."""
+
+    completion_tokens: list[int | None] = field(default_factory=list)
+    cache_hits: int = 0
+
+
 class ProviderUsageTracingMixin:
     """Mixin that preserves provider usage payloads in trace artifacts."""
 
@@ -32,14 +41,21 @@ class ProviderUsageTracingMixin:
     ) -> None:
         self._provider_usage_trace_dir = trace_dir
         self._completion_metadata: list[dict[str, Any]] = []
+        self.last_call_usage = ProviderCallUsage()
+        self._call_prompt_count: int | None = None
         super().__init__(*args, **kwargs)
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         """Keep completion metadata aligned with outputs, including cache hits."""
 
         self._completion_metadata = []
+        self.last_call_usage = ProviderCallUsage()
+        self._call_prompt_count = len(args[0] if args else kwargs["messages"])
         parent: Any = super()
-        output = parent.__call__(*args, **kwargs)
+        try:
+            output = parent.__call__(*args, **kwargs)
+        finally:
+            self._call_prompt_count = None
         output.response_metadata = tuple(self._completion_metadata)
         return output
 
@@ -72,12 +88,22 @@ class ProviderUsageTracingMixin:
         """Call LOTUS normally, then trace raw provider usage from responses."""
 
         parent: Any = super()
+        if self._call_prompt_count is not None:
+            self.last_call_usage.cache_hits = self._call_prompt_count - len(uncached_data)
+        offset = len(self.last_call_usage.completion_tokens)
+        self.last_call_usage.completion_tokens.extend([None] * len(uncached_data))
         responses = parent._process_uncached_messages(
             uncached_data,
             all_kwargs,
             show_progress_bar,
             progress_bar_desc,
         )
+        for index, response in enumerate(responses):
+            tokens = normalized_provider_usage(getattr(response, "usage", None))[
+                "provider_completion_tokens"
+            ]
+            if type(tokens) is int:
+                self.last_call_usage.completion_tokens[offset + index] = tokens
         try:
             write_provider_usage_trace(
                 self._provider_usage_trace_dir,

@@ -20,6 +20,7 @@ import pytest
 
 from agent_memory.adapters.lotus import deepseek_responses_lm as adapter
 from agent_memory.adapters.lotus.request_hook import request_scope
+from agent_memory.adapters.lotus.provider_usage_lm import provider_usage_tracing_lm_class
 
 
 SCHEMA = {
@@ -601,7 +602,9 @@ def test_partial_failures_preserve_all_usage_and_successful_cache_entries(
     client.handler = handler
     monkeypatch.setattr(adapter, "OpenAI", lambda **_: client)
     monkeypatch.setattr(lotus.settings, "enable_cache", cache_enabled)
-    lm = _lm(num_retries=2)
+    lm = provider_usage_tracing_lm_class(adapter.deepseek_responses_lm_class(LM))(
+        model=MODEL, cache=InMemoryCache(max_size=64), num_retries=2,
+    )
     results = _process(lm, count=3)
     assert isinstance(results[failure_index], OpenAIError)
     assert len(results) == 3
@@ -619,6 +622,10 @@ def test_partial_failures_preserve_all_usage_and_successful_cache_entries(
     assert len(client.calls) == 3
     assert lm.stats.physical_usage.total_tokens == (57 if native_failure else 38)
     assert lm.stats.virtual_usage.total_tokens == (57 if native_failure else 38)
+    assert lm.last_call_usage.completion_tokens == [
+        None if index == failure_index and not native_failure else 7
+        for index in range(3)
+    ]
     client.handler = lambda p: _native(p["input"][0]["content"])
     client.calls.clear()
     assert lm(
@@ -626,6 +633,8 @@ def test_partial_failures_preserve_all_usage_and_successful_cache_entries(
     ).outputs == ["0", "1", "2"]
     assert len(client.calls) == (1 if cache_enabled else 3)
     assert lm.stats.cache_hits == (2 if cache_enabled else 0)
+    assert lm.last_call_usage.completion_tokens == [7] * (1 if cache_enabled else 3)
+    assert lm.last_call_usage.cache_hits == (2 if cache_enabled else 0)
 
 
 @pytest.mark.parametrize(

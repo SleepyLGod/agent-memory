@@ -207,5 +207,6 @@ Run `test_agent_state_plan_and_rendered_prompts` with pytest `-s` to export the
 actual rendered Agent and operator messages to its printed temporary directory.
 These are scripted offline fixtures, not provider traces or model-quality results.
 These engineering checks do not measure semantic quality or token savings.
-Real-data experiments require a separate model configuration and call budget.
+Real-data experiments require a separate model configuration and call budget;
+see the [maintenance experiment runner](../tools/evaluation/README.md#agent-designed-state-poc).
 Feedback optimization and automatic schema migration are not implemented.
