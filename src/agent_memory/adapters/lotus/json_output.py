@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 import heapq
 from itertools import count
@@ -11,6 +11,7 @@ import re
 from typing import Any, Generic, TypeVar
 
 import json5
+from jsonschema.exceptions import ValidationError
 
 
 JSON_REPAIR_VERSION = "bounded-json-v2"
@@ -24,6 +25,40 @@ _TOKEN = re.compile(
     r"|true|false|null|[{}\[\],:]"
 )
 ResultT = TypeVar("ResultT")
+SCHEMA_JSON_PARSER_VERSION = "schema-json-properties-envelope-v1"
+
+
+@dataclass(frozen=True)
+class SchemaJsonResult:
+    """A validated response with its original text and envelope provenance."""
+
+    value: Any
+    raw_output: str
+    unwrapped_properties: bool
+
+
+def parse_schema_json(raw_output: str, schema: Mapping[str, Any]) -> SchemaJsonResult:
+    """Validate strict JSON, optionally removing one sole properties envelope."""
+    from agent_memory.maintenance import validate_json
+
+    text, _ = _strip_fence(raw_output.strip())
+    value = strict_json_loads(text)
+    try:
+        validate_json(value, schema)
+    except ValidationError as original_error:
+        if not (
+            isinstance(value, dict)
+            and set(value) == {"properties"}
+            and isinstance(value["properties"], dict)
+        ):
+            raise ValueError(original_error.message) from original_error
+        inner = value["properties"]
+        try:
+            validate_json(inner, schema)
+        except ValidationError as error:
+            raise ValueError(error.message) from error
+        return SchemaJsonResult(inner, raw_output, True)
+    return SchemaJsonResult(value, raw_output, False)
 
 
 @dataclass(frozen=True)
