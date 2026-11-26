@@ -628,6 +628,47 @@ def test_grouped_relation_agg_accepts_public_aggregate_specs() -> None:
     )
 
 
+@pytest.mark.parametrize("input_cols", [None, ["tenant", "message"]])
+def test_grouped_sem_agg_default_outputs_exclude_keys(input_cols) -> None:
+    source = am.Source({"tenant": "Scope", "message": "Text"})
+    query = source.group_by("tenant").sem_agg(
+        input_cols=input_cols, instruction="Summarize"
+    )
+    assert tuple(col.name for col in query.expr.params["output_cols"]) == ("message",)
+    assert output_columns(query.expr) == ("tenant", "message")
+
+
+@pytest.mark.parametrize("descriptor", [False, True])
+@pytest.mark.parametrize("outputs", [["tenant", "answer"], {"tenant": "Scope"}])
+def test_grouped_sem_agg_rejects_model_generated_keys(descriptor, outputs) -> None:
+    grouped = am.Source({"tenant": "Scope", "message": "Text"}).group_by("tenant")
+    with pytest.raises(ValueError, match="group.*key"):
+        if descriptor:
+            grouped.agg(am.sem_agg(output_cols=outputs, instruction="Summarize"))
+        else:
+            grouped.sem_agg(output_cols=outputs, instruction="Summarize")
+
+
+def test_grouped_sem_agg_requires_a_non_key_default_output() -> None:
+    grouped = am.Source({"tenant": "Scope"}).group_by("tenant")
+    with pytest.raises(ValueError, match="non-key output"):
+        grouped.sem_agg(instruction="Summarize")
+
+
+def test_legacy_sem_groupby_still_generates_semantic_keys() -> None:
+    source = am.Source({"name": "Name", "body": "Text"})
+    grouped = source.sem_groupby(
+        membership=None, input_cols=["name"], instruction="Group names"
+    )
+    direct = grouped.sem_agg(
+        input_cols=["name", "body"], output_cols=["name", "body"], instruction="Merge"
+    )
+    descriptor = grouped.agg(
+        am.sem_agg(input_cols=["name", "body"], output_cols=["name", "body"], instruction="Merge")
+    )
+    assert output_columns(direct.expr) == output_columns(descriptor.expr) == ("name", "body")
+
+
 def test_min_public_api_supports_global_grouped_and_mixed_aggregation() -> None:
     log = am.Log({"group": "Group.", "value": "Value."})
 

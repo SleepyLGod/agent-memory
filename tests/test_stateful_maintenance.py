@@ -393,6 +393,37 @@ def test_two_operator_plans_preserve_raw_instructions_and_binding(lm: Any) -> No
     assert len(lm.calls) == 2  # binding and compilation do not call the Agent
 
 
+@pytest.mark.parametrize("descriptor", [False, True])
+def test_grouped_default_result_fields_and_per_group_state(lm: Any, descriptor: bool) -> None:
+    source = am.Source({"tenant": "Scope", "message": "Text"})
+    grouped = source.group_by("tenant")
+    query = (
+        grouped.agg(am.sem_agg(output_cols=["message"], instruction="Summarize"))
+        if descriptor else grouped.sem_agg(instruction="Summarize")
+    )
+    lm.handler = lambda payload: state_plan(query).to_dict()
+    plan = am.plan_maintenance(query, adapter=LotusAdapter())
+    assert request_payload(lm.calls[0])["Output columns"] == ["message"]
+
+    def response(payload: dict) -> dict:
+        previous = payload["Previous state"]
+        count = (previous["count"] if previous else 0) + len(payload["New inputs"])
+        return {"result": {"message": f"summary-{count}"}, "state": {"count": count}}
+
+    lm.handler = response
+    flow = make_flow(source, {"out": query}, (plan,))
+    for tenant, message in [("a", "first"), ("b", "second"), ("a", "new")]:
+        flow.apply(pd.DataFrame({"tenant": [tenant], "message": [message]}))
+    assert flow.view("out").set_index("tenant").message.to_dict() == {
+        "a": "summary-2", "b": "summary-1",
+    }
+    payload = request_payload(lm.calls[-1])
+    assert payload["Previous state"] == {"count": 1}
+    assert payload["Previous result"] == {"message": "summary-1"}
+    schema = json.loads(lm.calls[-1][0][0][-1]["content"].split("Response schema:\n", 1)[1])
+    assert list(schema["properties"]["result"]["properties"]) == ["message"]
+
+
 def test_planning_preserves_declared_output_meaning(lm: Any) -> None:
     source = am.Source({"message": "Original message", "tenant": "Partition"})
     query = source.group_by("tenant").sem_agg(

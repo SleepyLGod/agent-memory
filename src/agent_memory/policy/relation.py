@@ -823,6 +823,14 @@ class GroupedRelation(RelationHandle):
     It becomes a normal Relation after applying a supported aggregate.
     """
 
+    def _check_semantic_outputs(self, outputs: Sequence[ColumnSpec]) -> None:
+        if self.expr.op == "group_by":
+            conflicts = sorted(
+                set(self.expr.params["keys"]).intersection(col.name for col in outputs)
+            )
+            if conflicts:
+                raise ValueError(f"aggregate output columns conflict with group keys: {conflicts}")
+
     def sem_agg(
         self,
         *,
@@ -835,13 +843,26 @@ class GroupedRelation(RelationHandle):
 
         if S is not None:
             raise NotImplementedError("sem_agg auxiliary state is not implemented")
+        outputs = _normalize_output_cols(output_cols)
+        if self.expr.op == "group_by":
+            if outputs is None:
+                selected = (
+                    output_columns(self.expr.inputs[0]) if input_cols is None else input_cols
+                )
+                outputs = tuple(
+                    ColumnSpec(name=col) for col in selected
+                    if col not in self.expr.params["keys"]
+                )
+            if not outputs:
+                raise ValueError("sem_agg requires at least one non-key output column")
+            self._check_semantic_outputs(outputs)
         return Relation(
             QueryExpr(
                 op="sem_agg",
                 inputs=(self.expr,),
                 params={
                     "input_cols": _normalize_input_cols(input_cols),
-                    "output_cols": _normalize_output_cols(output_cols),
+                    "output_cols": outputs,
                     "instruction": instruction,
                 },
             )
@@ -959,6 +980,10 @@ class GroupedRelation(RelationHandle):
                 source_columns=output_columns(self.expr.inputs[0]),
                 group_keys=keys,
             )
+        else:
+            for spec in specs:
+                if isinstance(spec, SemanticAggregateSpec):
+                    self._check_semantic_outputs(spec.output_cols)
         return Relation(
             QueryExpr(
                 op="agg",

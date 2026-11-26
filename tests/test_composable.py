@@ -77,6 +77,41 @@ def test_heterogeneous_documents_and_restore(aggregates):
     assert "first" not in " ".join(docs)
 
 
+@pytest.mark.parametrize("rule", ["agg-composable", "agg-fallback"])
+@pytest.mark.parametrize("descriptor", [False, True])
+def test_group_keys_remain_program_owned_with_real_aggregate(monkeypatch, rule, descriptor):
+    import lotus
+    from test_sem_agg_batching import _RecordingModel
+
+    model = _RecordingModel()
+    monkeypatch.setattr(LotusExecutionContext, "configure", lambda self: None)
+    monkeypatch.setattr(lotus.settings, "lm", model)
+    source = am.Source({"tenant": "Scope", "message": "Text"})
+    grouped = source.group_by("tenant")
+    query = (
+        grouped.agg(am.sem_agg(
+            input_cols=["tenant", "message"], output_cols=["message"], instruction="Summarize"
+        ))
+        if descriptor else grouped.sem_agg(instruction="Summarize")
+    )
+    plan = am.MaintenancePlan.bind(query, {
+        "rule": rule, "state_schema": None, "maintenance_instruction": None,
+        "rationale": "Offline fixture",
+    })
+    flow = am.SemanticDataflow(
+        source=source, views={"out": query}, adapter=LotusAdapter(),
+        rules=DifferentialRules(maintenance_plans=(plan,)),
+    )
+    for tenant, message in [("a", "first"), ("b", "second"), ("a", "new")]:
+        flow.apply(pd.DataFrame({"tenant": [tenant], "message": [message]}))
+    result = flow.view("out").set_index("tenant")
+    assert result.message.to_dict() == {"a": "summary", "b": "summary"}
+    if rule == "agg-composable":
+        last_prompt = str(model.calls[-1][0])
+        assert "summary" in last_prompt and "new" in last_prompt
+        assert "first" not in last_prompt and "second" not in last_prompt
+
+
 @pytest.mark.parametrize("membership", ["single", "multiple"])
 @pytest.mark.parametrize("descriptor", [False, True])
 def test_group_incremental_numeric_and_restore(
