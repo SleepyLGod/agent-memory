@@ -142,6 +142,64 @@ def test_validated_operator_cache_is_reused(provider):
     assert provider["calls"] == calls
 
 
+@pytest.mark.parametrize("method", ["pairwise-naive", "pairwise-quick", "pairwise-heap"])
+@pytest.mark.parametrize("choice", [1, 2])
+def test_final_choice_spacing_keeps_actual_sort_order(provider, monkeypatch, method, choice):
+    import numpy as np
+
+    monkeypatch.setattr(np.random, "randint", lambda low, high: low)
+    config = LotusExecutionConfig(
+        sem_topk_method=method, sem_topk_strategy="ZS_COT", lm_enable_cache=False
+    )
+    context = LotusExecutionContext("gpt-4o-mini", config=config)
+    prefix = f"Answer: Document {3 - choice} is less relevant.\nFinal Answer: "
+    provider["text"] = prefix + f"Document {choice}"
+    expected = rank(context)
+    provider["text"] = prefix + f"Document  {choice}"
+    pd.testing.assert_frame_equal(rank(context), expected)
+
+
+@pytest.mark.parametrize("model_name", ["lm", "helper_lm"])
+def test_choice_normalization_preserves_raw_response_and_metadata(monkeypatch, model_name):
+    text = "Answer: Document 1 is less relevant.\nFinal Answer: Document\t 2"
+    raw = SimpleNamespace(
+        outputs=[text], response_metadata=[{"finish_reason": "stop"}],
+        logprobs=[["original tokens"]],
+    )
+    monkeypatch.setattr(lotus.settings, model_name, lambda *args, **kwargs: raw)
+    with checked_ranking_models("ZS_COT"):
+        output = getattr(lotus.settings, model_name)([[]])
+    assert raw.outputs == [text]
+    assert output.outputs == [text.replace("Document\t 2", "Document 2")]
+    assert output.response_metadata == raw.response_metadata
+    assert output.logprobs == raw.logprobs
+
+
+def test_previous_validated_operator_cache_is_not_reused(provider, monkeypatch):
+    from agent_memory.adapters.lotus.ranking_validation import _CheckedRankingLM, _RankingCache
+
+    context = LotusExecutionContext(
+        "gpt-4o-mini", config=LotusExecutionConfig(lm_enable_cache=True)
+    )
+    with monkeypatch.context() as legacy:
+        legacy.setattr(
+            _RankingCache, "get", lambda self, key: self._cache.get(f"validated-topk-v1:{key}")
+        )
+        legacy.setattr(
+            _RankingCache, "insert",
+            lambda self, key, value: self._cache.insert(f"validated-topk-v1:{key}", value),
+        )
+        rank(context)
+
+    def fresh_ranking(*args, **kwargs):
+        raise ValueError("fresh ranking")
+
+    # A stale final ranking must not bypass the new response adapter.
+    monkeypatch.setattr(_CheckedRankingLM, "__call__", fresh_ranking)
+    with pytest.raises(ValueError, match="fresh ranking"):
+        rank(context)
+
+
 def test_unchecked_operator_cache_cannot_hide_bad_cached_response(provider):
     provider["text"] = "Document 3"
     context = LotusExecutionContext(

@@ -2,26 +2,28 @@
 
 from collections.abc import Iterator
 from contextlib import contextmanager
+from copy import copy
 import re
 from typing import Any
 
 from .structured import complete_lm_outputs, normalize_strategy
 
 
-def validate_pairwise_answer(answer: str, *, explanation: bool) -> None:
-    """Accept the requested choice format, never guess from arbitrary digits."""
+def validate_pairwise_answer(answer: str, *, explanation: bool) -> str:
+    """Validate the final choice and spell its label consistently for LOTUS."""
     if not isinstance(answer, str):
         raise ValueError("sem_topk comparison must return text")
     if explanation:
-        valid = re.search(r"\bAnswer:\s*Document\s+[12]\s*\Z", answer, re.IGNORECASE)
+        valid = re.search(r"\bAnswer:\s*(Document\s+([12]))\s*\Z", answer, re.IGNORECASE)
     else:
         valid = re.fullmatch(
-            r"\s*(?:Answer:\s*)?Document\s+[12]\s*", answer, re.IGNORECASE
+            r"\s*(?:Answer:\s*)?(Document\s+([12]))\s*", answer, re.IGNORECASE
         )
     if valid is None:
         raise ValueError(
             "sem_topk comparison requires a final Document 1 or Document 2"
         )
+    return answer[:valid.start(1)] + f"Document {valid.group(2)}" + answer[valid.end(1):]
 
 
 class _RankingCache:
@@ -31,14 +33,14 @@ class _RankingCache:
         self._cache = cache
 
     def get(self, key: str) -> Any:
-        return self._cache.get(f"validated-topk-v1:{key}")
+        return self._cache.get(f"validated-topk-v2:{key}")
 
     def insert(self, key: str, value: Any) -> None:
-        self._cache.insert(f"validated-topk-v1:{key}", value)
+        self._cache.insert(f"validated-topk-v2:{key}", value)
 
 
 class _CheckedRankingLM:
-    """Delegate inference unchanged and reject invalid comparisons before parsing."""
+    """Adapt final choice labels without changing cached or recorded responses."""
 
     def __init__(self, model: Any, *, explanation: bool) -> None:
         self._model = model
@@ -48,9 +50,14 @@ class _CheckedRankingLM:
 
     def __call__(self, messages: list[Any], *args: Any, **kwargs: Any) -> Any:
         output = self._model(messages, *args, **kwargs)
-        for answer in complete_lm_outputs(output, len(messages), operator="sem_topk"):
+        answers = complete_lm_outputs(output, len(messages), operator="sem_topk")
+        normalized = [
             validate_pairwise_answer(answer, explanation=self._explanation)
-        return output
+            for answer in answers
+        ]
+        parsed_output = copy(output)
+        parsed_output.outputs = normalized
+        return parsed_output
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._model, name)
