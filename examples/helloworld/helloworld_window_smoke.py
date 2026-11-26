@@ -117,6 +117,7 @@ class WindowGlobalAfterMemory(am.Memory):
             instruction="Extract candidate memory topics from {conversation_records}.",
         )
         .sem_groupby(
+            membership=None,
             input_cols=["name", "body"],
             instruction="Rows belong together when they describe the same durable memory topic.",
         )

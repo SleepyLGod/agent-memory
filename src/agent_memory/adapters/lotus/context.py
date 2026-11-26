@@ -62,6 +62,7 @@ class LotusExecutionConfig:
     # Fixed per-request ceiling for structured output, independent of task count.
     structured_max_tokens: int = DEFAULT_STRUCTURED_MAX_TOKENS
     structured_parse_retries: int = DEFAULT_STRUCTURED_PARSE_RETRIES
+    maintenance_parse_retries: int = 0
     semantic_trace_dir: Path | str | None = None
     semantic_trace_snapshot_mode: str = "compact"
     semantic_pair_profiles: Mapping[str, SemanticPairExecutionProfile] = field(
@@ -233,10 +234,9 @@ class LotusExecutionContext:
             )
 
             lm_class = deepseek_responses_lm_class(LM)
-        base_lm = (
-            provider_usage_tracing_lm_class(lm_class)(**lm_kwargs, trace_dir=trace_dir)
-            if trace_dir is not None or self.config.prompt_batching is not None
-            else lm_class(**lm_kwargs)
+        # Completion status is a correctness boundary even with tracing disabled.
+        base_lm = provider_usage_tracing_lm_class(lm_class)(
+            **lm_kwargs, trace_dir=trace_dir
         )
         lm = TracedLM(base_lm, trace_dir) if trace_dir is not None else base_lm
         self._lm = lm

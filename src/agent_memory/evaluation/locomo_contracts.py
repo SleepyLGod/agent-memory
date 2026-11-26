@@ -7,6 +7,10 @@ import json
 import re
 from typing import Any, Mapping
 
+from agent_memory.adapters.lotus.json_output import (
+    SCHEMA_JSON_PARSER_VERSION,
+    parse_schema_json,
+)
 from agent_memory.evaluation.harness import (
     GradeContract,
     GradeResult,
@@ -20,6 +24,8 @@ from agent_memory.evaluation.zep.answering import (
     ANSWER_PROMPT_DIGEST,
     GENERATION_MAX_TOKENS,
     ZEP_JUDGE_PROMPT_DIGEST,
+    ZEP_JUDGE_RESPONSE_SCHEMA,
+    _validate_judge_response,
     build_locomo_answer_messages,
     build_locomo_zep_judge_messages,
 )
@@ -29,6 +35,9 @@ LOCOMO_OFFICIAL_SCORER_DIGEST = sha256(
     b"locomo_answer_score:category-1-5:v1"
 ).hexdigest()
 LOCOMO_ANSWER_PARSER_ID = "locomo-structured-or-raw-text:v1"
+LOCOMO_JUDGE_SCORER_DIGEST = sha256(
+    f"{ZEP_JUDGE_PROMPT_DIGEST}:{SCHEMA_JSON_PARSER_VERSION}".encode()
+).hexdigest()
 
 
 def _parse_json_object(response: str) -> Mapping[str, Any]:
@@ -55,15 +64,15 @@ def _parse_answer(response: str) -> str:
     return raw
 
 
-def _parse_zep_judge(response: str) -> Mapping[str, str]:
-    parsed = _parse_json_object(response)
-    label = str(parsed.get("label", "")).strip().upper()
-    reasoning = parsed.get("reasoning")
-    if label not in {"CORRECT", "WRONG"}:
-        raise ValueError(f"Zep judge returned invalid label: {label!r}")
-    if not isinstance(reasoning, str) or not reasoning.strip():
-        raise ValueError("Zep judge requires non-empty reasoning")
-    return {"label": label, "reasoning": reasoning.strip()}
+def _parse_zep_judge(response: str) -> Mapping[str, Any]:
+    result = parse_schema_json(response, ZEP_JUDGE_RESPONSE_SCHEMA)
+    parsed = result.value
+    _validate_judge_response(parsed)
+    return {
+        "label": parsed["label"], "reasoning": parsed["reasoning"].strip(),
+        "raw_response": result.raw_output,
+        "unwrapped_properties": result.unwrapped_properties,
+    }
 
 
 def _answer_prompt(question: BenchmarkQuestion, context: str) -> ModelPrompt:
@@ -141,6 +150,9 @@ def locomo_task_contract(
                 "category": int(question.category),
                 "reasoning": reasoning,
                 "judge_model_id": judge_model_id,
+                "raw_response": result["raw_response"],
+                "unwrapped_properties": result["unwrapped_properties"],
+                "parser_version": SCHEMA_JSON_PARSER_VERSION,
             },
         )
 
@@ -158,7 +170,7 @@ def locomo_task_contract(
         additional_graders=(
             GradeContract(
                 scorer_id=judge_scorer_id,
-                scorer_digest=ZEP_JUDGE_PROMPT_DIGEST,
+                scorer_digest=LOCOMO_JUDGE_SCORER_DIGEST,
                 judge_plan=_zep_judge_plan,
                 judge_reducer=reduce_zep_judge,
                 applies_to=lambda question: int(question.category) in {1, 2, 3, 4},

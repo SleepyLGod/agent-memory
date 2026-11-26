@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 import re
+from typing import TYPE_CHECKING
 
 from agent_memory.policy.aggregates import (
     ArrayAggregateSpec,
@@ -15,6 +16,9 @@ from agent_memory.policy.aggregates import (
 from agent_memory.policy.expressions import ColumnExpr, least
 from agent_memory.policy.logical import ColumnSpec, QueryExpr
 from agent_memory.policy.schema import output_columns
+
+if TYPE_CHECKING:
+    from agent_memory.maintenance import MaintenancePlan
 
 ROW_LOCAL_UNARY_OPS = {
     "select",
@@ -147,9 +151,29 @@ class DifferentialRules:
         self,
         *,
         grouped_agg_rule: str = DEFAULT_GROUPED_AGG_RULE,
+        sem_agg_rule: str | None = None,
+        sem_groupby_rule: str = "group-fallback",
+        maintenance_plans: Sequence[MaintenancePlan] = (),
     ) -> None:
         """Configure differential rule strategy experiments."""
 
+        if sem_agg_rule not in {None, "agg-fallback", "agg-composable"}:
+            raise ValueError("unknown sem_agg_rule")
+        if sem_groupby_rule not in {"group-fallback", "group-composable"}:
+            raise ValueError("unknown sem_groupby_rule")
+        self.sem_groupby_rule = sem_groupby_rule
+        self.sem_agg_rule = sem_agg_rule
+        from agent_memory.maintenance import MaintenancePlan
+
+        self.maintenance_plans = tuple(maintenance_plans)
+        if not all(
+            isinstance(plan, MaintenancePlan) for plan in self.maintenance_plans
+        ):
+            raise TypeError("maintenance_plans must contain MaintenancePlan objects")
+        if len({plan.key for plan in self.maintenance_plans}) != len(
+            self.maintenance_plans
+        ):
+            raise ValueError("duplicate maintenance target binding")
         if grouped_agg_rule not in GROUPED_AGG_RULES:
             raise ValueError(
                 "grouped_agg_rule must be one of: " + ", ".join(GROUPED_AGG_RULES)
@@ -796,7 +820,10 @@ class DifferentialRules:
             joined: QueryExpr = QueryExpr(
                 op="join",
                 inputs=(changed_aggregate, current_view),
-                params={"on": tuple(str(key) for key in groupby.params["keys"]), "how": "outer"},
+                params={
+                    "on": tuple(str(key) for key in groupby.params["keys"]),
+                    "how": "outer",
+                },
             )
         else:
             raise TypeError(f"Unsupported grouped aggregate input: {groupby.op}")
@@ -1374,7 +1401,10 @@ class DifferentialRules:
             joined = QueryExpr(
                 op="join",
                 inputs=(changed_aggregate, current_view),
-                params={"on": tuple(str(key) for key in groupby.params["keys"]), "how": "outer"},
+                params={
+                    "on": tuple(str(key) for key in groupby.params["keys"]),
+                    "how": "outer",
+                },
             )
         else:
             joined = QueryExpr(

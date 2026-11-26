@@ -298,7 +298,7 @@ def write_provider_usage_trace(
             event["provider_request"] = _compact_payload(
                 {str(key): _json_safe(value) for key, value in request_metadata.items()}
             )
-        event.update(_normalized_provider_usage(usage, raw_usage))
+        event.update(normalized_provider_usage(usage))
         if raw_usage is not None:
             event["provider_raw_usage_path"] = _write_json_artifact(
                 root / TRACE_OUTPUTS_DIR,
@@ -546,9 +546,10 @@ def _usage_payload(usage: Any) -> Any:
     return _json_safe(usage)
 
 
-def _normalized_provider_usage(usage: Any, raw_usage: Any) -> dict[str, Any]:
+def normalized_provider_usage(usage: Any) -> dict[str, Any]:
     """Return best-effort provider usage fields without inferring missing values."""
 
+    raw_usage = _usage_payload(usage)
     return {
         "provider_prompt_tokens": _usage_value(usage, raw_usage, "prompt_tokens"),
         "provider_completion_tokens": _usage_value(

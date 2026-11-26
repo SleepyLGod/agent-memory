@@ -32,7 +32,11 @@ def output_columns(
             str(column)
             for column in query.params.get("columns", window_source_columns or ())
         )
-    if query.op == "materialized_view":
+    if query.op in {
+        "materialized_view",
+        "semantic_stateful_update",
+        "semantic_stateful_finalize",
+    }:
         return tuple(str(column) for column in query.params.get("columns", ()))
     if query.op == "search":
         source_columns = output_columns(
@@ -204,6 +208,8 @@ def output_columns(
                 f"column: {ordinal_col!r}"
             )
         return _append_unique(columns, (str(ordinal_col),))
+    if query.op == "sem_groupby" and query.params.get("independent"):
+        return tuple(query.params["columns"])
     if query.op in {
         "count_window",
         "sem_filter",

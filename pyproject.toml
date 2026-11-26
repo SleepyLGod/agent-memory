@@ -10,6 +10,7 @@ requires-python = ">=3.12"
 dependencies = [
     "dspy>=3.2.0",
     "json5>=0.14.0",
+    "jsonschema>=4.0",
     "lotus-ai==1.1.4",
     "nltk>=3.9.1",
     "pandas>=2.3.3",
@@ -52,6 +53,16 @@ target-version = "py312"
 [tool.pyright]
 pythonVersion = "3.12"
 include = [
+    "src/agent_memory/maintenance.py",
+    "src/agent_memory/planning.py",
+    "src/agent_memory/adapters/lotus/stateful.py",
+    "tests/test_stateful_maintenance.py",
+    "src/agent_memory/adapters/lotus/composable.py",
+    "src/agent_memory/adapters/lotus/ranking_validation.py",
+    "examples/claude/composable_memory.py",
+    "examples/claude/composable_smoke.py",
+    "tests/test_composable.py",
+    "tests/test_ranking_validation.py",
     "src/agent_memory/evaluation/agent_memory_drivers.py",
     "src/agent_memory/evaluation/artifacts.py",
     "src/agent_memory/evaluation/bundle.py",

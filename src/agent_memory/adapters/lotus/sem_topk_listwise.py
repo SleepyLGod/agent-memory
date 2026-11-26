@@ -7,6 +7,7 @@ import json
 import pandas as pd
 
 from agent_memory.adapters.lotus.context import LotusExecutionContext
+from agent_memory.adapters.lotus.structured import complete_lm_outputs
 
 LISTWISE_MAX_TOKENS = 1024
 LISTWISE_TOPK_CONTRACT = "listwise:v1"
@@ -97,8 +98,7 @@ def execute_listwise_topk(
             max_tokens=LISTWISE_MAX_TOKENS,
             response_format={"type": "json_object"},
         )
-        raw_outputs = list(getattr(output, "outputs", ()))
-        raw_output = "" if not raw_outputs else str(raw_outputs[0])
+        raw_output = complete_lm_outputs(output, 1, operator="sem_topk")[0]
         try:
             selected_ids = _parse_selected_ids(
                 raw_output,

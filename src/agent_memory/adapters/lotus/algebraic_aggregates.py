@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from numbers import Number
 from typing import Any
@@ -189,6 +190,8 @@ def _update_state(
     if not group_keys and not states:
         states[()] = _empty_accumulator(layout, key_values={})
 
+    if not inserted.empty and not retracted.empty:
+        inserted, retracted = _cancel_opposite_contributions(inserted, retracted, layout)
     _apply_rows(states, inserted, layout, sign=1)
     _apply_rows(states, retracted, layout, sign=-1)
 
@@ -212,6 +215,46 @@ def _update_state(
     if not group_keys and not rows:
         rows.append(_empty_accumulator(layout, key_values={}))
     return pd.DataFrame(rows, columns=state_columns)
+
+
+def _cancel_opposite_contributions(
+    inserted: pd.DataFrame,
+    retracted: pd.DataFrame,
+    layout: Mapping[str, Any],
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Cancel equal numeric contributions without changing surviving rows."""
+
+    numeric_columns = tuple(str(state["input_col"]) for state in layout["numeric_states"])
+    columns = list(dict.fromkeys((*layout["group_keys"], *numeric_columns)))
+    keys: list[list[tuple[Any, ...]]] = []
+    for frame in (inserted, retracted):
+        if not columns:
+            keys.append([()] * len(frame))
+            continue
+        frame_keys: list[tuple[Any, ...]] = []
+        for record in frame.loc[:, columns].to_dict(orient="records"):
+            # Validate even contributions that will cancel before touching sums.
+            for column in numeric_columns:
+                value = record[column]
+                if not _is_null(value):
+                    _require_numeric(value, column=column)
+            frame_keys.append(_group_key(record, columns))
+        keys.append(frame_keys)
+
+    remaining: list[pd.DataFrame] = []
+    for frame, frame_keys, opposite_keys in (
+        (inserted, keys[0], keys[1]),
+        (retracted, keys[1], keys[0]),
+    ):
+        counts = Counter(opposite_keys)
+        positions: list[int] = []
+        for position, key in enumerate(frame_keys):
+            if counts[key] > 0:
+                counts[key] -= 1
+            else:
+                positions.append(position)
+        remaining.append(frame.iloc[positions])
+    return remaining[0], remaining[1]
 
 
 def _apply_rows(

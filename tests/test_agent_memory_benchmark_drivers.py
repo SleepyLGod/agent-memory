@@ -4,7 +4,7 @@ from dataclasses import replace
 from hashlib import sha256
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, assert_type
 
 import pandas as pd
 import pytest
@@ -15,6 +15,7 @@ from agent_memory.adapters.lotus.pair_execution import (
     PAIR_RIGHT_ID_COLUMN,
     PAIR_RIGHT_TEXT_COLUMN,
     SemanticPairExecutionProfile,
+    semantic_pair_site_id,
 )
 from agent_memory.adapters.lotus.prompt_batching import PromptBatching
 from agent_memory.evaluation.agent_memory_drivers import (
@@ -40,7 +41,11 @@ from agent_memory.evaluation.types import (
 )
 from agent_memory.policy.retrieval import RetrievalResult
 from agent_memory.storage.embedding import EmbeddingSpec
-from agent_memory.tracing.semantic import semantic_trace_scope, write_trace_event
+from agent_memory.tracing.semantic import (
+    query_digest,
+    semantic_trace_scope,
+    write_trace_event,
+)
 
 
 class _Memory:
@@ -838,6 +843,125 @@ def test_zep_run_closes_factory_when_storage_provenance_fails(
         )
 
     assert captured["closed"] is True
+
+
+@pytest.mark.parametrize("membership", ("single", "multiple"))
+@pytest.mark.parametrize("mode", ("search-filter", "proxy-only"))
+def test_pair_profiles_reject_independent_grouping(
+    membership: Literal["single", "multiple"], mode: str
+) -> None:
+    import agent_memory as am
+
+    source = am.Source({"message": "Text."})
+    groups = source.sem_groupby(instruction="Group topics.", membership=membership, C=2)
+    policy = am.SemanticDataflow(
+        source=source, views={"groups": groups}
+    )._executor.policy
+    node = policy.nodes[policy.view_outputs["groups"]]
+
+    assert inventory_operator_semantic_pair_sites(
+        policy, operators=("sem_groupby",)
+    ) == {}
+    with pytest.raises(ValueError, match="found no eligible sem_groupby queries"):
+        build_operator_semantic_pair_profiles(
+            policy,
+            mode=mode,
+            operators=("sem_groupby",),
+            embedding=SEMANTIC_PAIR_BGE_M3,
+            top_k=None,
+            min_similarity=0.5,
+        )
+    with pytest.raises(ValueError, match="site bindings not found in policy"):
+        build_site_semantic_pair_profiles(
+            policy,
+            bindings=(
+                SemanticPairSiteBinding(
+                    site_id=semantic_pair_site_id(node.query),
+                    mode=mode,
+                    top_k=None,
+                    min_similarity=0.5,
+                ),
+            ),
+            operators=("sem_groupby",),
+            embedding=SEMANTIC_PAIR_BGE_M3,
+        )
+
+
+def test_sem_groupby_return_types_follow_membership() -> None:
+    import agent_memory as am
+    from agent_memory.policy.grouping import SemanticGroupedRelation
+    from agent_memory.policy.relation import GroupedRelation
+
+    source = am.Source({"message": "Text."})
+    assert_type(source.sem_groupby(instruction="Group topics."), SemanticGroupedRelation)
+    assert_type(
+        source.sem_groupby(instruction="Group topics.", membership="multiple"),
+        SemanticGroupedRelation,
+    )
+    assert_type(
+        source.sem_groupby(instruction="Group topics.", membership=None),
+        GroupedRelation,
+    )
+    assert_type(
+        source.sem_groupby(instruction="Group topics.", membership="exclusive"),
+        GroupedRelation,
+    )
+
+
+def test_pair_inventory_keeps_legacy_groups_and_independent_group_inputs() -> None:
+    import agent_memory as am
+
+    source = am.Source({"message": "Text."})
+    instruction = "Group the same {message} topic."
+    legacy = source.sem_groupby(
+        input_cols=["message"], instruction=instruction, membership="exclusive"
+    ).sem_agg(
+        input_cols=["message"], output_cols=["message"], instruction="Summarize."
+    )
+    independent = source.sem_groupby(input_cols=["message"], instruction=instruction)
+    joined = source.sem_join(source, instruction="{message:left} matches {message:right}.")
+    joined_groups = joined.sem_groupby(instruction="Group matched topics.")
+    policy = am.SemanticDataflow(
+        source=source,
+        views={"legacy": legacy, "independent": independent, "joined": joined_groups},
+    )._executor.policy
+    operators = ("sem_groupby", "sem_join")
+    sites = inventory_operator_semantic_pair_sites(policy, operators=operators)
+    independent_digests = {
+        query_digest(node.query)
+        for node in policy.nodes.values()
+        if node.query.params.get("independent")
+    }
+    assert {site.operator for site in sites.values()} == set(operators)
+    site_digests = {digest for site in sites.values() for digest in site.query_digests}
+    assert site_digests.isdisjoint(independent_digests)
+    legacy_query = policy.nodes[policy.view_outputs["legacy"]].query.inputs[0]
+    assert query_digest(legacy_query) in site_digests
+    joined_query = next(
+        node.query for node in policy.nodes.values() if node.query.op == "sem_join"
+    )
+    assert query_digest(joined_query) in site_digests
+    profiles = build_operator_semantic_pair_profiles(
+        policy,
+        mode="proxy-only",
+        operators=operators,
+        embedding=SEMANTIC_PAIR_BGE_M3,
+        top_k=None,
+        min_similarity=0.5,
+    )
+    assert set(profiles) == site_digests
+    bound, _ = build_site_semantic_pair_profiles(
+        policy,
+        bindings=tuple(
+            SemanticPairSiteBinding(
+                site_id=site_id, mode="proxy-only", top_k=None, min_similarity=0.5
+            )
+            for site_id in sites
+        ),
+        operators=operators,
+        embedding=SEMANTIC_PAIR_BGE_M3,
+    )
+    assert bound == profiles
 
 
 @pytest.mark.parametrize("mode", ("search-filter", "proxy-only"))

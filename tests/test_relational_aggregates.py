@@ -192,6 +192,7 @@ def test_aggregate_authoring_rejects_invalid_columns_and_output_collisions() -> 
 def test_sem_groupby_rejects_numeric_aggregates_without_changing_semantic_agg() -> None:
     rows = am.Log({"text": "Text."})
     grouped = rows.sem_groupby(
+        membership=None,
         input_cols=["text"], instruction="Group equivalent text."
     )
 

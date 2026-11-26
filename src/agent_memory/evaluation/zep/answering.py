@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import hashlib
 import json
-import re
 from time import perf_counter
 from typing import Any
 
+from agent_memory.adapters.lotus.json_output import SchemaJsonResult, parse_schema_json
 from agent_memory.evaluation.types import BenchmarkQuestion
 from agent_memory.policy.retrieval import RetrievalResult
 from agent_memory.tracing.semantic import semantic_trace_scope
@@ -191,6 +191,8 @@ class AnswerRecord:
     entity_ids: tuple[str, ...]
     fact_ids: tuple[str, ...]
     latency_ms: float
+    raw_response: str | None = None
+    unwrapped_properties: bool = False
 
     @classmethod
     def from_question(
@@ -259,12 +261,17 @@ def generate_answer(
         question_id=question.question_id,
         validate=_validate_answer_response,
     )
-    answer = str(response["answer"])
-    return AnswerRecord.from_question(
+    answer = str(response.value["answer"])
+    record = AnswerRecord.from_question(
         question,
         retrieval,
         answer=answer.strip(),
         latency_ms=(perf_counter() - started) * 1000,
+    )
+    return replace(
+        record,
+        raw_response=response.raw_output,
+        unwrapped_properties=response.unwrapped_properties,
     )
 
 
@@ -301,8 +308,8 @@ def generate_zep_judge(question: BenchmarkQuestion, answer: str) -> Any:
         question_id=question.question_id,
         validate=_validate_judge_response,
     )
-    label = str(response.get("label", "")).strip().upper()
-    reasoning = response.get("reasoning")
+    label = str(response.value.get("label", "")).strip().upper()
+    reasoning = response.value.get("reasoning")
     assert isinstance(reasoning, str)
     return ZepJudgeGrade(
         question_id=question.question_id,
@@ -311,6 +318,8 @@ def generate_zep_judge(question: BenchmarkQuestion, answer: str) -> Any:
         is_correct=label == "CORRECT",
         reasoning=reasoning.strip(),
         latency_ms=round((perf_counter() - started) * 1000, 3),
+        raw_response=response.raw_output,
+        unwrapped_properties=response.unwrapped_properties,
     )
 
 
@@ -358,8 +367,9 @@ def _generate_json(
     phase: str,
     question_id: str,
     validate: Callable[[Mapping[str, Any]], None] | None = None,
-) -> dict[str, Any]:
+) -> SchemaJsonResult:
     import lotus
+    from agent_memory.adapters.lotus.structured import complete_lm_outputs
 
     lm: Any = lotus.settings.lm
     if lm is None:
@@ -381,30 +391,18 @@ def _generate_json(
                 temperature=GENERATION_TEMPERATURE,
                 response_format={"type": "json_object"},
             )
-        outputs = list(getattr(output, "outputs", ()))
-        raw = str(outputs[0]).strip() if outputs else ""
+        raw = complete_lm_outputs(output, 1, operator=prompt_name)[0]
         try:
-            parsed = json.loads(_strip_code_fence(raw))
-            if not isinstance(parsed, dict):
+            parsed = parse_schema_json(raw, response_schema)
+            if not isinstance(parsed.value, dict):
                 raise ValueError("structured response must be a JSON object")
-            _validate_required_fields(parsed, response_schema)
             if validate is not None:
-                validate(parsed)
+                validate(parsed.value)
             return parsed
         except (json.JSONDecodeError, ValueError) as error:
             last_error = ValueError(f"Invalid {prompt_name} response: {error}")
     assert last_error is not None
     raise last_error
-
-
-def _validate_required_fields(
-    value: Mapping[str, Any],
-    response_schema: Mapping[str, Any],
-) -> None:
-    required = response_schema.get("required", ())
-    missing = [name for name in required if name not in value]
-    if missing:
-        raise ValueError(f"structured response is missing fields: {missing}")
 
 
 def _validate_answer_response(value: Mapping[str, Any]) -> None:
@@ -420,14 +418,6 @@ def _validate_judge_response(value: Mapping[str, Any]) -> None:
     reasoning = value.get("reasoning")
     if not isinstance(reasoning, str) or not reasoning.strip():
         raise ValueError("Zep judge requires a non-empty reasoning string")
-
-
-def _strip_code_fence(value: str) -> str:
-    stripped = value.strip()
-    if stripped.startswith("```"):
-        stripped = re.sub(r"^```[a-zA-Z0-9_-]*[ \t]*\r?\n?", "", stripped)
-        stripped = re.sub(r"\r?\n?```[ \t]*$", "", stripped)
-    return stripped.strip()
 
 
 def _records(result: RetrievalResult, channel: str) -> list[dict[str, Any]]:

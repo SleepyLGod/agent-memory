@@ -183,6 +183,46 @@ def test_locomo_schema_echo_is_scored_as_zero_without_special_case() -> None:
     assert contract.deterministic_scorer(question, answer).score == 0.0
 
 
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_locomo_judge_records_raw_response_and_unwrapping(wrapped: bool) -> None:
+    contract = locomo_task_contract()
+    grader = contract.additional_graders[0]
+    question = BenchmarkQuestion(
+        question_id="q1", sample_id="case", question="What was researched?",
+        gold_answer="adoption agencies", evidence_event_ids=(), category="1",
+    )
+    assert grader.judge_plan is not None and grader.judge_reducer is not None
+    step, = grader.judge_plan(question, "adoption agencies")
+    value = {"label": "CORRECT", "reasoning": "The answer matches."}
+    raw = "  " + json.dumps({"properties": value} if wrapped else value) + "\n"
+
+    grade = grader.judge_reducer(question, "adoption agencies", (step.parse(raw),))
+
+    assert grade.score == 1
+    assert grade.details["raw_response"] == raw
+    assert grade.details["unwrapped_properties"] is wrapped
+    assert grader.scorer_digest != step.prompt.prompt_digest
+
+
+@pytest.mark.parametrize("value", [
+    {"properties": {"label": "MAYBE", "reasoning": "uncertain"}},
+    {"properties": {"label": "correct", "reasoning": "matches"}},
+    {"properties": {"label": "CORRECT", "reasoning": 1}},
+    {"properties": {"label": "CORRECT", "reasoning": " "}},
+    {"properties": {"label": "CORRECT", "reasoning": "matches"}, "extra": 1},
+])
+def test_locomo_judge_envelope_does_not_bypass_validation(value: dict) -> None:
+    grader = locomo_task_contract().additional_graders[0]
+    question = BenchmarkQuestion(
+        question_id="q1", sample_id="case", question="What?",
+        gold_answer="answer", evidence_event_ids=(), category="1",
+    )
+    assert grader.judge_plan is not None
+    step, = grader.judge_plan(question, "answer")
+    with pytest.raises(ValueError):
+        step.parse(json.dumps(value))
+
+
 @dataclass
 class _Driver:
     state_dir: Path

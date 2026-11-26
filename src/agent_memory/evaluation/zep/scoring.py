@@ -35,6 +35,8 @@ class ZepJudgeGrade:
     is_correct: bool
     reasoning: str
     latency_ms: float
+    raw_response: str | None = None
+    unwrapped_properties: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-safe artifact payload."""

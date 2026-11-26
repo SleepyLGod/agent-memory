@@ -8,6 +8,7 @@ from types import MappingProxyType
 from typing import Any
 
 from .planner.differential_policy import DifferentiatedPolicy, PolicyDifferentiator
+from .planner.rules import DifferentialRules
 from .policy.logical import MemorySpec, MemoryView, QueryExpr
 from .policy.relation import Log, OverRelation, Relation, SearchRelation, WindowedRelation
 from .policy.retrieval import RetrievalQuery
@@ -109,13 +110,14 @@ class Memory:
         adapter: Any | None = None,
         storage: StorageDeployment | None = None,
         refresh: CountRefresh | None = None,
+        rules: DifferentialRules | None = None,
     ) -> None:
         from .runtime import MemoryRuntime
 
         policy = (
-            self.__class__.differentiate_policy()
+            self.__class__.differentiate_policy(rules=rules)
             if storage is None
-            else PolicyDifferentiator().differentiate(
+            else PolicyDifferentiator(rules=rules).differentiate(
                 self.__class__.spec(),
                 statements=storage.statements,
             )
@@ -171,9 +173,13 @@ class Memory:
         return spec
 
     @classmethod
-    def differentiate_policy(cls) -> DifferentiatedPolicy:
+    def differentiate_policy(
+        cls, *, rules: DifferentialRules | None = None
+    ) -> DifferentiatedPolicy:
         """Return the in-memory differentiated policy artifact for this class."""
 
+        if rules is not None:
+            return PolicyDifferentiator(rules=rules).differentiate(cls.spec())
         cached = cls.__dict__.get("_agent_memory_differentiated_policy")
         if isinstance(cached, DifferentiatedPolicy):
             return cached

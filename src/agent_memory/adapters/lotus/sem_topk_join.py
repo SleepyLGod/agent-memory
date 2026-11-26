@@ -26,6 +26,7 @@ from agent_memory.adapters.lotus.pair_execution import (
     write_semantic_pair_execution_trace,
 )
 from agent_memory.adapters.lotus.sem_topk import LOTUS_PAIRWISE_METHODS
+from agent_memory.adapters.lotus.ranking_validation import checked_ranking_models
 from agent_memory.adapters.lotus.structured import normalize_strategy
 from agent_memory.adapters.lotus.json_output import (
     load_structured_json_with_syntax_repair,
@@ -575,16 +576,17 @@ def _rank_pairwise_group(
         f"Rank {{{right_label}}} by how strongly it satisfies this semantic join "
         f"condition with the fixed {{{left_label}}}: {instruction}"
     )
-    result = source.sem_topk(
-        ranking_instruction,
-        K=k,
-        method=lotus_method,
-        strategy=normalize_strategy(context.config.sem_topk_strategy),
-        cascade_threshold=context.config.sem_topk_cascade_threshold,
-        return_stats=context.config.sem_topk_return_stats,
-        safe_mode=context.config.sem_topk_safe_mode,
-        return_explanations=False,
-    )
+    with checked_ranking_models(context.config.sem_topk_strategy):
+        result = source.sem_topk(
+            ranking_instruction,
+            K=k,
+            method=lotus_method,
+            strategy=normalize_strategy(context.config.sem_topk_strategy),
+            cascade_threshold=context.config.sem_topk_cascade_threshold,
+            return_stats=context.config.sem_topk_return_stats,
+            safe_mode=context.config.sem_topk_safe_mode,
+            return_explanations=False,
+        )
     result_frame = result[0] if isinstance(result, tuple) else result
     positions = [int(position) for position in result_frame["_pair_position"]]
     return group.loc[positions]

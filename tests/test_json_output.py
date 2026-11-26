@@ -3,16 +3,100 @@
 from __future__ import annotations
 
 import json
+from types import MappingProxyType
 from typing import Any
 
 import pytest
+from jsonschema import ValidationError
 
 from agent_memory.adapters.lotus import json_output
 from agent_memory.adapters.lotus.json_output import (
     load_structured_json_with_syntax_repair,
+    parse_schema_json,
     repair_json_structure,
     strict_json_loads,
+    validate_json,
 )
+from agent_memory.maintenance import object_schema
+
+
+def test_validate_json_accepts_frozen_schema_without_changing_value() -> None:
+    schema = MappingProxyType(object_schema({"count": {"type": "integer"}}))
+    value = {"count": 2}
+
+    assert validate_json(value, schema) is None
+    assert value == {"count": 2}
+
+
+@pytest.mark.parametrize("value", [{"count": "2"}, {"count": 2, "extra": 0}, {}])
+def test_validate_json_preserves_schema_errors(value: dict[str, Any]) -> None:
+    with pytest.raises(ValidationError):
+        validate_json(value, object_schema({"count": {"type": "integer"}}))
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf")])
+def test_validate_json_rejects_nonfinite_values(value: float) -> None:
+    with pytest.raises(ValueError, match="Out of range float values"):
+        validate_json(value, {"type": "number"})
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+@pytest.mark.parametrize("fenced", [False, True])
+def test_schema_parser_records_envelope_without_changing_raw(
+    wrapped: bool, fenced: bool,
+) -> None:
+    value = {"answer": "unchanged } properties text", "count": 2}
+    schema = object_schema({"answer": {"type": "string"}, "count": {"type": "integer"}})
+    raw = json.dumps({"properties": value} if wrapped else value)
+    if fenced:
+        raw = f"```json\n{raw}\n```"
+    raw = f"  {raw}\n"
+
+    parsed = parse_schema_json(raw, schema)
+
+    assert parsed.value == value
+    assert parsed.raw_output == raw
+    assert parsed.unwrapped_properties is wrapped
+
+
+def test_schema_parser_prefers_a_valid_properties_business_field() -> None:
+    schema = object_schema({"properties": object_schema({"count": {"type": "integer"}})})
+    raw = '{"properties":{"count":2}}'
+
+    parsed = parse_schema_json(raw, schema)
+
+    assert parsed.value == {"properties": {"count": 2}}
+    assert not parsed.unwrapped_properties
+
+
+@pytest.mark.parametrize("raw", [
+    '{"properties":{"count":2},"extra":0}',
+    '{"properties":{"count":2,"extra":0}}',
+    '{"properties":{"count":"2"}}',
+    '{"properties":{"count":true}}',
+    '{"properties":{}}',
+    '{"properties":null}',
+    '{"properties":[{"count":2}]}',
+    '{"properties":{"properties":{"count":2}}}',
+    '{"result":{"count":2}}',
+    '{"properties":{"count":2,"count":3}}',
+    '{"properties":{"count":2},"properties":{"count":2}}',
+    '{"properties":{"count":NaN}}',
+    '{"properties":{"count":2}',
+    "{'properties':{'count':2}}",
+])
+def test_schema_parser_refuses_other_repairs(raw: str) -> None:
+    with pytest.raises(ValueError):
+        parse_schema_json(raw, object_schema({"count": {"type": "integer"}}))
+
+
+def test_schema_parser_does_not_unwrap_on_business_validation_failure() -> None:
+    # Both outer and inner values satisfy this schema, so direct validation wins.
+    raw = '{"properties":{"answer":"inner"}}'
+    parsed = parse_schema_json(raw, {"type": "object"})
+
+    assert parsed.value == json.loads(raw)
+    assert not parsed.unwrapped_properties
 
 
 def _validate(raw: str) -> Any:

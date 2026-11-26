@@ -8,6 +8,7 @@ from typing import Any
 import pandas as pd
 
 from .planner.differential_policy import PolicyDifferentiator
+from .planner.rules import DifferentialRules
 from .policy.logical import MemorySpec, MemoryView
 from .policy.relation import Log, Relation
 from .runtime.executor import PolicyExecutor
@@ -24,6 +25,7 @@ class SemanticDataflow:
         source: Source,
         views: Mapping[str, Relation],
         adapter: Any | None = None,
+        rules: DifferentialRules | None = None,
     ) -> None:
         if not isinstance(source, Log):
             raise TypeError("source must be a Source")
@@ -56,7 +58,7 @@ class SemanticDataflow:
             private_relations={},
         )
         self._executor = PolicyExecutor(
-            PolicyDifferentiator().differentiate(spec),
+            PolicyDifferentiator(rules=rules).differentiate(spec),
             adapter=adapter,
         )
 

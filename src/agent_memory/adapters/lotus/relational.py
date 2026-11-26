@@ -91,6 +91,8 @@ def execute_group_by(
     if missing:
         raise ValueError(f"group_by key columns not found in DataFrame: {missing}")
     source.attrs["agent_memory_groupby_keys"] = keys
+    if query.params.get("explicit_grouping"):
+        source.attrs["agent_memory_explicit_grouping"] = True
     return source
 
 

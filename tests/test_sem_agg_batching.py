@@ -14,9 +14,11 @@ from agent_memory.adapters.lotus.context import LotusExecutionConfig
 from agent_memory.adapters.lotus.prompt_batching import PromptBatching
 from agent_memory.adapters.lotus.relational import execute_agg
 from agent_memory.adapters.lotus.sem_agg import (
+    AGGREGATE_OUTPUT_CONTRACT,
     _execute_independent_sem_agg_groups,
     _execute_lotus_style_sem_agg,
     execute_native_sem_agg_groups,
+    execute_native_sem_agg_group,
     execute_structured_sem_agg_groups,
 )
 from agent_memory.policy.logical import ColumnSpec, QueryExpr
@@ -67,16 +69,21 @@ class _BudgetModel(_RecordingModel):
         return 100 if "oversized" in text else 4
 
 
-def _run_local_aggregate(path: str, documents: list[str], model: _RecordingModel) -> None:
+def _run_local_aggregate(
+    path: str, documents: list[str], model: _RecordingModel, *, structured: bool = False,
+) -> None:
+    output_cols = (ColumnSpec("summary"),) if structured else None
     if path == "independent":
         _execute_independent_sem_agg_groups(
             [documents], model, "Summarize.", config=LotusExecutionConfig(),
+            output_cols=output_cols,
         )
     else:
         _execute_lotus_style_sem_agg(
             documents, model, "Summarize.", [0] * len(documents),
             safe_mode=False, progress_bar_desc="Test", response_format=None,
             final_model_kwargs=None,
+            structured_output_cols=output_cols,
         )
 
 
@@ -96,6 +103,46 @@ def test_local_aggregate_rejects_oversized_summary_at_next_level(path: str) -> N
     model = _BudgetModel(outputs=[("oversized", "summary")])
     with pytest.raises(ValueError, match="sem_agg document does not fit"):
         _run_local_aggregate(path, ["one", "two", "three"], model)
+    assert len(model.calls) == 1
+    assert len(model.calls[0][0]) == 2
+
+
+@pytest.mark.parametrize("path", ["independent", "lotus-style"])
+@pytest.mark.parametrize("documents", [["one"], ["one", "two", "three"]])
+@pytest.mark.parametrize("failure", ["truncated", "count"])
+@pytest.mark.parametrize("structured", [False, True])
+def test_local_aggregate_stops_before_using_incomplete_output(
+    path: str, documents: list[str], failure: str, structured: bool,
+) -> None:
+    class IncompleteModel(_BudgetModel):
+        def __call__(self, prompts: list[Any], **kwargs: Any) -> Any:
+            output = super().__call__(prompts, **kwargs)
+            if failure == "count":
+                output.outputs = []
+            else:
+                output.response_metadata = [{"finish_reason": "length"}] * len(prompts)
+            return output
+
+    model = IncompleteModel()
+    with pytest.raises(ValueError, match="incomplete structured response|expected .* outputs"):
+        _run_local_aggregate(path, documents, model, structured=structured)
+    assert len(model.calls) == 1
+
+
+def test_cross_group_batch_rejects_one_truncated_response() -> None:
+    class IncompleteModel(_RecordingModel):
+        def __call__(self, prompts: list[Any], **kwargs: Any) -> Any:
+            output = super().__call__(prompts, **kwargs)
+            output.response_metadata = [
+                {"finish_reason": "stop"}, {"finish_reason": "length"},
+            ]
+            return output
+
+    model = IncompleteModel()
+    with pytest.raises(ValueError, match="incomplete structured response"):
+        _execute_independent_sem_agg_groups(
+            [["alpha"], ["beta"]], model, "Summarize.", config=LotusExecutionConfig(),
+        )
     assert len(model.calls) == 1
     assert len(model.calls[0][0]) == 2
 
@@ -183,6 +230,68 @@ def test_provider_batched_sem_agg_preserves_per_group_prompts(
     assert batched_prompts == sequential_prompts
     assert [len(prompts) for prompts, _kwargs in sequential_model.calls] == [1, 1]
     assert [len(prompts) for prompts, _kwargs in batched_model.calls] == [2]
+
+
+def test_native_aggregate_changes_only_output_contract_across_levels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Compare real LOTUS prompt construction, without making model requests."""
+    import lotus
+    from lotus.sem_ops.sem_agg import sem_agg as upstream_aggregate
+    from agent_memory.adapters.lotus.sem_agg import aggregate_group_text
+
+    group = pd.DataFrame({"body": ["first", "second", "third"]})
+    instruction = "Return exactly 'Context: approved'."
+    query = QueryExpr(
+        op="sem_agg", inputs=_query().inputs,
+        params={**_query().params, "instruction": instruction},
+    )
+    responses = [("partial one", "partial two"), ("Context: approved",)]
+    upstream = _BudgetModel(outputs=responses)
+    upstream_aggregate(
+        aggregate_group_text(group, ("body",)), upstream, instruction, [0, 0, 0]
+    )
+    current = _BudgetModel(outputs=responses)
+    monkeypatch.setattr(lotus.settings, "lm", current)
+    answer = execute_native_sem_agg_group(query, group, ("body",))
+    assert answer == "Context: approved"  # Requested headings are not stripped.
+    assert [len(prompts) for prompts, _ in current.calls] == [2, 1]
+    old_prompts = [p for batch, _ in upstream.calls for p in batch]
+    new_prompts = [p for batch, _ in current.calls for p in batch]
+    assert len(old_prompts) == len(new_prompts)
+    for old, new in zip(old_prompts, new_prompts, strict=True):
+        old_text = old[0]["content"]
+        kind = "documents" if "Document 1:" in old_text else "sources"
+        schematic = (
+            f"Follow the following format.\n\nContext: relevant facts from multiple {kind}\n\n"
+            "Instruction: the instruction provided by the user\n\nAnswer: Write your answer\n\n---\n\n"
+        )
+        assert old_text.count(schematic) == 1
+        assert new == [{"role": "user", "content": old_text.replace(schematic, AGGREGATE_OUTPUT_CONTRACT)}]
+
+
+@pytest.mark.parametrize("dispatch", ["sequential", "provider-batched"])
+def test_structured_aggregate_uses_result_boundary(
+    monkeypatch: pytest.MonkeyPatch, dispatch: str,
+) -> None:
+    import lotus
+
+    outputs = ('{"name":"alpha","summary":"A"}', '{"name":"beta","summary":"B"}')
+    model = _RecordingModel(
+        outputs=(outputs,) if dispatch == "provider-batched" else tuple((item,) for item in outputs)
+    )
+    monkeypatch.setattr(lotus.settings, "lm", model)
+    execute_structured_sem_agg_groups(
+        _query(structured=True), _groups(), ("body",),
+        (ColumnSpec("name"), ColumnSpec("summary")),
+        LotusExecutionConfig(sem_agg_dispatch=dispatch),
+    )
+    for prompts, _ in model.calls:
+        for prompt in prompts:
+            text = prompt[0]["content"]
+            assert AGGREGATE_OUTPUT_CONTRACT in text
+            assert "Follow the following format." not in text
+            assert "Return exactly one valid JSON object" in text
 
 
 def test_provider_batched_sem_agg_preserves_independent_hierarchies(

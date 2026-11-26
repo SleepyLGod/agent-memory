@@ -439,6 +439,7 @@ def test_judge_semantic_validation_retries_invalid_label(
         [
             '{"label": "MAYBE", "reasoning": "uncertain"}',
             '{"label": "correct", "reasoning": "The answer matches."}',
+            '{"label": "CORRECT", "reasoning": "The answer matches."}',
         ]
     )
     monkeypatch.setattr(lotus.settings, "lm", lm)
@@ -447,7 +448,55 @@ def test_judge_semantic_validation_retries_invalid_label(
     grade = generate_zep_judge(question, "adoption agencies")
 
     assert grade.label == "CORRECT"
+    assert lm.calls == 3  # Full schema validation also enforces the declared enum.
+    assert not grade.unwrapped_properties
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_native_answer_and_judge_record_envelope_without_retry(
+    monkeypatch: pytest.MonkeyPatch, wrapped: bool,
+) -> None:
+    import lotus
+
+    values = [
+        {"answer": "adoption agencies"},
+        {"label": "CORRECT", "reasoning": "The answer matches."},
+    ]
+    outputs = [" " + json.dumps({"properties": v} if wrapped else v) + "\n" for v in values]
+    lm = _SequencedLM(outputs)
+    monkeypatch.setattr(lotus.settings, "lm", lm)
+    question = normalize_locomo_sample(_fixture(), sample_index=0).questions[0]
+
+    answer = generate_answer(question, _retrieval())
+    grade = generate_zep_judge(question, answer.answer)
+
+    assert answer.answer == "adoption agencies" and grade.is_correct
+    assert answer.raw_response == outputs[0]
+    assert grade.raw_response == outputs[1]
+    assert answer.unwrapped_properties is wrapped
+    assert grade.unwrapped_properties is wrapped
     assert lm.calls == 2
+
+
+def test_native_judge_rejects_incomplete_response_before_unwrapping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import lotus
+
+    calls = []
+
+    def model(*args: object, **kwargs: object) -> SimpleNamespace:
+        calls.append((args, kwargs))
+        return SimpleNamespace(
+            outputs=['{"properties":{"label":"CORRECT","reasoning":"matches"}}'],
+            response_metadata=[{"finish_reason": "length"}],
+        )
+
+    monkeypatch.setattr(lotus.settings, "lm", model)
+    question = normalize_locomo_sample(_fixture(), sample_index=0).questions[0]
+    with pytest.raises(ValueError, match="incomplete structured response"):
+        generate_zep_judge(question, "adoption agencies")
+    assert len(calls) == 1
 
 
 def test_answer_semantic_validation_exhausts_bounded_retries(
