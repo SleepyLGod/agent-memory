@@ -316,8 +316,6 @@ class BudgetLM:
             raise BudgetExceeded(
                 "Request/token reservation limit reached; no retry or fallback"
             )
-        time.sleep(max(0, self.min_interval - (time.time() - self.last_started)))
-        self.last_started = time.time()
         self.requests += len(prompts)
         self.reserved_tokens += reservation
         self.calls += 1
@@ -340,6 +338,9 @@ class BudgetLM:
                 "reserved_tokens_total": self.reserved_tokens,
             },
         )
+        # Artifact writes must not shorten the interval between LM calls.
+        time.sleep(max(0, self.min_interval - (time.time() - self.last_started)))
+        self.last_started = time.time()
         started = time.perf_counter()
         try:
             result = self.lm(prompts, **kwargs)
@@ -708,7 +709,7 @@ def execute_case(
         raise ValueError("--plan-only requires --mode agent without --saved-plan")
     if (resume_from is not None or stop_after is not None) and plan_only:
         raise ValueError("Checkpoints apply to execution, not planning")
-    if resume_from is not None and saved_plans is None:
+    if resume_from is not None and mode == "agent" and saved_plans is None:
         raise ValueError("Resume requires the saved plans; never replan during restore")
     total = len(payload["records"]) if case["kind"] == "policy" else len(case["batch_ranges"])
     limit = total if stop_after is None else stop_after
@@ -940,8 +941,10 @@ def main() -> None:
         parser.error("Validation retries must be 0..3; interval must be nonnegative")
     if args.plan_only and args.validation_retries:
         parser.error("Planner retries are not part of the operator experiment")
-    if args.resume_from is not None and (not args.saved_plan or args.plan_only):
-        parser.error("Resume requires saved execution plans")
+    if args.resume_from is not None and (
+        args.plan_only or (args.mode == "agent" and not args.saved_plan)
+    ):
+        parser.error("Resume requires execution mode and, for agent mode, saved plans")
     if args.resume_source_changes is not None and args.resume_from is None:
         parser.error("Source transition requires --resume-from")
     if args.case == "status":

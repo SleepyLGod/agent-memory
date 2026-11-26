@@ -293,6 +293,78 @@ def test_resume_rejects_changed_inputs_before_model(model: Any, tmp_path: Path) 
     assert len(model.calls) == before
 
 
+@pytest.mark.parametrize("mode", ["composable", "fallback", "baseline"])
+def test_fixed_rule_resume_preserves_mode_without_planning(
+    mode: str, model: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import lotus
+    from lotus.types import LMStats
+
+    monkeypatch.setattr(am, "plan_maintenance", lambda *a, **k: pytest.fail("Called Agent"))
+    case, payload = fixture_case()
+    payload["instruction"] = "Summarize {text}"
+    if mode == "baseline":
+        case["kind"] = "policy"
+        payload = {"records": [
+            {"sample_id": "s", "event_id": str(i), "speaker": "user",
+             "text": f"message {i}", "timestamp": "2024-01-01"} for i in range(2)
+        ]}
+
+    class LM:
+        stats = LMStats()
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(model, name)
+
+        def __call__(self, prompts: Any, **kwargs: Any) -> Any:
+            model.calls.extend(deepcopy(prompts))
+            value = json.dumps({"rows": []}) if mode == "baseline" else "summary"
+            return SimpleNamespace(outputs=[value for _ in prompts], response_metadata=None)
+
+    monkeypatch.setattr(lotus.settings, "lm", LM())
+    first, second = tmp_path / "first", tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    paused = runner.execute_case(case, payload, mode, LotusAdapter(), first,
+                                 data_dir=tmp_path, stop_after=1, maintenance_only=True)
+    assert paused["status"] == "paused"
+    before = len(model.calls)
+    for change in ("data", "model", "mode"):
+        altered = deepcopy(payload)
+        options: dict[str, Any] = {}
+        resume_mode = mode
+        if change == "data":
+            altered["records"][0]["text"] = "changed"
+        elif change == "model":
+            options["model"] = "different-model"
+        else:
+            resume_mode = "composable" if mode != "composable" else "fallback"
+        rejected = tmp_path / change
+        rejected.mkdir()
+        with pytest.raises(ValueError, match="identity mismatch"):
+            runner.execute_case(case, altered, resume_mode, LotusAdapter(), rejected,
+                                data_dir=tmp_path, maintenance_only=True,
+                                resume_from=first / "checkpoint.json", **options)
+        assert len(model.calls) == before
+    done = runner.execute_case(case, payload, mode, LotusAdapter(), second,
+                               data_dir=tmp_path, maintenance_only=True,
+                               resume_from=first / "checkpoint.json")
+    assert done["status"] == "completed" and done["completed_steps"] == 2
+    assert done["plan_fingerprint"] == paused["plan_fingerprint"]
+    assert len(model.calls) == before + 1
+    assert not (second / "step-0001.json").exists()
+    assert not list(second.glob("plan-*.json"))
+    checkpoint = json.loads((second / "checkpoint.json").read_text())
+    assert checkpoint["identity_inputs"]["mode"] == mode
+    assert checkpoint["identity_inputs"]["plans"] is None
+    if mode == "baseline":
+        metrics = json.loads((second / "ingest-metrics.json").read_text())
+        assert [row["event_id"] for row in metrics] == ["0", "1"]
+    else:
+        step = json.loads((second / "step-0002.json").read_text())
+        assert step["outputs"]["answer"] == [{"answer": "summary"}]
+
+
 @pytest.mark.parametrize("recover", [False, True])
 def test_state_validation_retries_identical_request_without_partial_commit(
     model: Any, tmp_path: Path, recover: bool,
@@ -651,6 +723,58 @@ def test_pacing_serializes_multiple_prompts_without_rewriting(
     assert len(list(directory.glob("*.request.json"))) == 2
 
 
+@pytest.mark.parametrize("restore", [False, True])
+@pytest.mark.parametrize("failure", [False, True])
+def test_pacing_uses_dispatch_time_after_slow_artifact_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, restore: bool, failure: bool,
+) -> None:
+    clock = [100.0]
+    dispatches: list[float] = []
+    monkeypatch.setattr(runner.time, "time", lambda: clock[0])
+    monkeypatch.setattr(runner.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+    write_json = runner.write_json
+
+    def slow_write(path: Path, value: Any) -> None:
+        if path.name.endswith(".request.json") and not dispatches:
+            clock[0] += 7
+        write_json(path, value)
+
+    monkeypatch.setattr(runner, "write_json", slow_write)
+
+    class LM:
+        last_call_usage = ProviderCallUsage()
+
+        def count_tokens(self, messages: Any) -> int:
+            return 1
+
+        def __call__(self, prompts: Any, **kwargs: Any) -> Any:
+            dispatches.append(clock[0])
+            if failure and len(dispatches) == 1:
+                raise TimeoutError("test timeout")
+            self.last_call_usage = ProviderCallUsage(completion_tokens=[2])
+            return SimpleNamespace(outputs=["ok"], response_metadata=None)
+
+    ledger = tmp_path / "budget.json"
+    directory = tmp_path / "first" / "calls"
+    directory.mkdir(parents=True)
+    budget = runner.BudgetLM(LM(), directory, 2, 100, 10, min_interval=10, ledger=ledger)
+    if failure:
+        with pytest.raises(TimeoutError, match="test timeout"):
+            budget([[{"content": "first"}]])
+    else:
+        budget([[{"content": "first"}]])
+    if restore:
+        directory = tmp_path / "second" / "calls"
+        directory.mkdir(parents=True)
+        budget = runner.BudgetLM(LM(), directory, 2, 100, 10, min_interval=10, ledger=ledger)
+    budget([[{"content": "second"}]])
+    assert dispatches == [107.0, 117.0]
+    saved = json.loads(ledger.read_text())
+    assert saved["requests"] == 2
+    assert saved["completion_tokens"] == (2 if failure else 4)
+    assert saved["unknown_usage_requests"] == int(failure)
+
+
 def test_failed_next_step_keeps_last_checkpoint(model: Any, tmp_path: Path) -> None:
     case, payload = fixture_case()
     def respond(p: dict) -> dict:
@@ -927,6 +1051,41 @@ def test_saved_plan_preflight_never_reads_credentials_or_configures_model(
     assert result["compile_checks"][0]["control"] == "saved-plan"
     assert result["original_instructions"] == [payload["instruction"]]
     assert result["model_settings"]["output_tokens_per_request"] is None
+
+
+@pytest.mark.parametrize("mode", ["composable", "fallback", "baseline"])
+def test_fixed_rule_resume_cli_accepts_no_agent_plan(
+    mode: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    case, _, _ = prepare_cli_fixture(tmp_path)
+    if mode == "baseline":
+        manifest = json.loads((tmp_path / "manifest.json").read_text())
+        manifest["cases"][0]["kind"] = "policy"
+        runner.write_json(tmp_path / "manifest.json", manifest)
+    monkeypatch.setattr(sys, "argv", [
+        "poc", case["id"], "--data-dir", str(tmp_path), "--mode", mode,
+        "--resume-from", str(tmp_path / "checkpoint.json"),
+    ])
+    monkeypatch.setattr(LotusExecutionContext, "configure", lambda self: pytest.fail("Configured model"))
+    runner.main()
+    assert json.loads(capsys.readouterr().out)["model_calls"] == 0
+
+
+def test_agent_resume_still_requires_saved_plan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case, payload = fixture_case()
+    with pytest.raises(ValueError, match="saved plans"):
+        runner.execute_case(case, payload, "agent", runner.NoExecution(), tmp_path,
+                            data_dir=tmp_path, resume_from=tmp_path / "checkpoint.json")
+    monkeypatch.setattr(sys, "argv", [
+        "poc", case["id"], "--mode", "agent",
+        "--resume-from", str(tmp_path / "checkpoint.json"),
+    ])
+    with pytest.raises(SystemExit) as exc:
+        runner.main()
+    assert exc.value.code == 2
 
 
 @pytest.mark.parametrize(

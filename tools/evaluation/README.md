@@ -1,6 +1,6 @@
 # Memory Benchmarks
 
-## Agent-designed state PoC
+## Semantic maintenance experiments
 
 This opt-in experiment is separate from the benchmark runners below. It keeps
 their Claude policy and evaluation functions unchanged and adds explicit
@@ -38,6 +38,48 @@ input plus maximum output, not billable usage. Reaching a budget stops new calls
 the runner does not change the Agent plan, truncate input or increase the budget.
 Optional operator validation retries and checkpoint continuation are described
 under [maintenance experiment checkpoints](#maintenance-experiment-checkpoints).
+
+### Maintenance experiment conventions
+
+The `maintenance_poc` filename is retained for existing commands. These
+conventions bound maintenance experiments, not the public API or the native
+benchmark runners below.
+
+- Plan separately with `--plan-only`; execute with the exact saved plans. Keep
+  fixed-rule controls in their own mode, without inventing Agent plans for them.
+- Declare input/output columns explicitly in new experiment queries, especially
+  aggregate descriptors. Existing direct `sem_agg` calls with resolved default
+  inputs remain supported. Use unique column names and stable record/key types;
+  group keys belong to the program, not the model-generated result fields.
+- Select and record pacing and validation retries for each experiment; keep
+  comparable conditions consistent. Earlier subscription experiments used serial
+  conditions and `--min-interval 10`; ten seconds is not a universal requirement.
+  Retain every attempt without editing the prompt or repairing output.
+- From the first call, use one shared `--budget-ledger ROUND/budget.json` for the
+  whole round, including continuations. Supply cumulative request, reservation,
+  and observed completion-token limits. Unknown usage stays unknown.
+- Preflight with the actual execution command minus `--run`. Keep the data,
+  saved plans, model, and execution settings unchanged on resume; use a current,
+  trusted checkpoint and a fresh output directory. Source receipts must cover the
+  relevant implementation files, not an empty or deliberately partial selection.
+- Use `--maintenance-only` when testing maintenance; do not accidentally append
+  retrieval, answering, or scoring. Preserve old runs and label evaluation changes
+  separately from maintenance changes.
+
+Runner settings are distinct from those experiment choices:
+
+| Setting | Current runner behavior |
+| --- | --- |
+| Condition order | Chosen by the launcher; the runner does not schedule a matrix |
+| Request spacing | `--min-interval`, default `0`; positive values also serialize multi-prompt calls |
+| Model batch size | Fixed to `1` |
+| Model cache | Disabled |
+| Provider retries | Disabled |
+| Output-validation retries | `--validation-retries`, default `0`, allowed range `0..3` |
+
+Live planning followed by resumable execution, continuation without the shared
+ledger, legacy checkpoint migration, and cache-enabled retries are outside this
+experiment scope.
 
 ### Local subscription gateway (optional)
 
@@ -400,10 +442,12 @@ input step. `--stop-after 16` pauses at the sixteenth step (for Claude, the
 sixteenth original message), without running QA against incomplete evidence.
 The input manifest still describes the full conversation; do not truncate it.
 
-Continue in a new output directory with the same saved plans, source receipt,
-data, model and request settings, adding `--resume-from <old-run>/checkpoint.json`
+Continue in a new output directory with the same mode, source receipt, data,
+model and request settings, adding `--resume-from <old-run>/checkpoint.json`
 and a later `--stop-after`. Restore does not call the Agent or replay committed
-inputs. Data/plan/config changes reject restoration. Checkpoints use the existing
+inputs. Agent mode requires the same saved plans. Fixed-rule modes (`composable`,
+`fallback`, `baseline`) resume without Agent plans and retain their original mode.
+Data/plan/config changes reject restoration. Checkpoints use the existing
 pickle snapshot format: load only trusted local artifacts, never downloaded files.
 Use `--maintenance-only` to stop after ingestion even when the full input has
 been processed; otherwise Claude execution continues to retrieval, answering
@@ -422,7 +466,10 @@ invalid structured output, not a replay of the whole maintenance step. Transport
 authorization, quota and explicitly incomplete-response errors are not retried.
 Defaults remain zero retries in the experiment runner; no output repair or
 prompt modification is introduced.
-`--min-interval 10` spaces dispatches; `--max-completion-tokens` stops new requests
+`--min-interval` spaces LM calls after request artifacts have been written;
+the recorded dispatch time is saved on return or exception for continuation.
+This does not promise recovery of that timestamp after a hard process kill.
+`--max-completion-tokens` stops new requests
 after the observed returned-token threshold (a single response may cross it).
 Token reservations remain estimates, not provider-enforced output caps.
 
