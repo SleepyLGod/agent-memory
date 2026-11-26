@@ -1078,9 +1078,8 @@ def execute_schema_lm(
     """
     import lotus
     from lotus.templates import task_instructions
-    from agent_memory.maintenance import validate_json
     from agent_memory.planner.serialization import stable_value
-    from .json_output import strict_json_loads
+    from .json_output import strict_json_loads, validate_json
     from .relational import _json_default
 
     model = lotus.settings.lm

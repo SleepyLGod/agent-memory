@@ -18,7 +18,6 @@ from .membership import validate_memberships
 from .relational import _strict_json_records
 from .structured import execute_schema_lm
 
-STATE_COLUMNS = ("_scope", "_slot", "_result", "_state")
 AGG_STATE_REQUIREMENTS = """Use New inputs, Previous result, and Previous state to produce two outputs:
 
 - result: the user-visible output requested by Instruction.
@@ -261,7 +260,7 @@ def execute_stateful(
                     "_state": answer["state"],
                 }
             )
-    return pd.DataFrame(output, columns=pd.Index(STATE_COLUMNS))
+    return pd.DataFrame(output, columns=pd.Index(plan.params["columns"]))
 
 
 def finalize_stateful(

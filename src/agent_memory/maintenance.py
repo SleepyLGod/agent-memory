@@ -27,12 +27,6 @@ def object_schema(properties: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def validate_json(value: Any, schema: Mapping[str, Any]) -> None:
-    """Validate finite JSON without coercion, repair, or remote schema resolution."""
-    json.dumps(value, allow_nan=False)
-    Draft202012Validator(stable_value(schema)).validate(value)
-
-
 def validate_state_schema(schema: Mapping[str, Any]) -> None:
     """Accept typed JSON trees, not references, executable code, or untyped blobs."""
     if not isinstance(schema, Mapping):

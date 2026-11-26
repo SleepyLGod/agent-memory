@@ -11,7 +11,10 @@ import re
 from typing import Any, Generic, TypeVar
 
 import json5
+from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError
+
+from agent_memory.planner.serialization import stable_value
 
 
 JSON_REPAIR_VERSION = "bounded-json-v2"
@@ -37,10 +40,14 @@ class SchemaJsonResult:
     unwrapped_properties: bool
 
 
+def validate_json(value: Any, schema: Mapping[str, Any]) -> None:
+    """Validate finite JSON without coercion, repair, or remote schema resolution."""
+    json.dumps(value, allow_nan=False)
+    Draft202012Validator(stable_value(schema)).validate(value)
+
+
 def parse_schema_json(raw_output: str, schema: Mapping[str, Any]) -> SchemaJsonResult:
     """Validate strict JSON, optionally removing one sole properties envelope."""
-    from agent_memory.maintenance import validate_json
-
     text, _ = _strip_fence(raw_output.strip())
     value = strict_json_loads(text)
     try:

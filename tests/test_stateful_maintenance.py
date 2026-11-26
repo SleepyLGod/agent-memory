@@ -17,7 +17,8 @@ from agent_memory.adapters.lotus.context import (
     LotusExecutionContext,
 )
 from agent_memory.adapters.lotus.stateful import expand_assignments
-from agent_memory.maintenance import object_schema, validate_json, validate_state_schema
+from agent_memory.adapters.lotus.json_output import validate_json
+from agent_memory.maintenance import object_schema, validate_state_schema
 from agent_memory.planner.rules import DifferentialRules
 from agent_memory.policy.grouping import GROUP_ID, RECORD_ID
 from agent_memory.policy.logical import QueryExpr
@@ -536,6 +537,7 @@ def test_agg_initial_empty_answer_state_restore_and_prompt(
         if "_state" in f.columns
     ][0]
     assert hidden.iloc[0]["_state"] == {"count": 3}
+    assert hidden.columns.tolist() == ["_scope", "_slot", "_result", "_state"]
     assert [f for f in snapshot["node_state"].values() if "_state" in f.columns][
         0
     ].iloc[0]["_state"] == {"count": 1}
@@ -566,6 +568,12 @@ def test_agg_initial_empty_answer_state_restore_and_prompt(
     calls = len(lm.calls)
     restored.apply(pd.DataFrame(columns=pd.Index(["message"])))
     assert len(lm.calls) == calls
+
+    restored_call = lm.calls[-1]
+    flow.apply(pd.DataFrame({"message": ["Alice", "Alice"]}))
+    assert lm.calls[-1] == restored_call
+    pd.testing.assert_frame_equal(flow.view("out"), restored.view("out"))
+    pd.testing.assert_frame_equal(hidden_state(flow), hidden_state(restored))
 
 
 @pytest.mark.parametrize("membership", ["single", "multiple"])
